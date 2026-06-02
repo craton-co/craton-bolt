@@ -634,6 +634,12 @@ fn emit_op(
             else_lo,
             else_hi,
         } => emit_select_128(b, *dst_lo, *dst_hi, *cond, *then_lo, *then_hi, *else_lo, *else_hi),
+        Op::F64ToI128 { dst_lo, dst_hi, src } => {
+            emit_f64_to_i128(b, *dst_lo, *dst_hi, *src)
+        }
+        Op::I128ToF64 { dst, src_lo, src_hi } => {
+            emit_i128_to_f64(b, *dst, *src_lo, *src_hi)
+        }
     }
 }
 
@@ -1305,6 +1311,102 @@ fn emit_div_128(
     emit_fmt!(b, "subc.u64 {}, 0, {};", q_hi, q_hi)?;
 
     b.emit_label(&format!("DIV_DONE_{}", tag))?;
+    Ok(())
+}
+
+/// Emit `Op::I128ToF64` — convert a signed i128 `(lo, hi)` pair to `f64`,
+/// computing `hi * 2^64 + lo` in floating point.
+///
+/// ```text
+///   cvt.rn.f64.s64 %hf, %hi        // signed high half -> f64
+///   cvt.rn.f64.u64 %lf, %lo        // UNSIGNED low half -> f64
+///   mov.f64        %two64, 0d43F0000000000000   // 2^64
+///   fma.rn.f64     %dst, %hf, %two64, %lf        // hi*2^64 + lo
+/// ```
+///
+/// The low half is converted as UNSIGNED (`cvt.rn.f64.u64`) because in a
+/// two's-complement i128 the value is exactly `hi*2^64 + lo_unsigned` — the
+/// sign already lives entirely in `hi` (converted signed). `fma.rn`
+/// round-to-nearest keeps the single unavoidable rounding step. Precision
+/// loss beyond f64's 53 significant bits is expected for a decimal->float
+/// conversion (documented on `Op::I128ToF64`).
+fn emit_i128_to_f64(b: &mut PtxBuilder, dst: Reg, src_lo: Reg, src_hi: Reg) -> BoltResult<()> {
+    let lo_n = b.alloc.get(src_lo)?.to_string();
+    let hi_n = b.alloc.get(src_hi)?.to_string();
+    let hf = b.alloc.alloc("fd");
+    let lf = b.alloc.alloc("fd");
+    let two64 = b.alloc.alloc("fd");
+    let dst_name = b.alloc.assign(dst, DataType::Float64)?;
+    // 0x43F0000000000000 is 2^64 as an IEEE-754 double.
+    emit_fmt!(b, "cvt.rn.f64.s64 {}, {};", hf, hi_n)?;
+    emit_fmt!(b, "cvt.rn.f64.u64 {}, {};", lf, lo_n)?;
+    emit_fmt!(b, "mov.f64 {}, 0d43F0000000000000;", two64)?;
+    emit_fmt!(b, "fma.rn.f64 {}, {}, {}, {};", dst_name, hf, two64, lf)?;
+    Ok(())
+}
+
+/// Emit `Op::F64ToI128` — convert an `f64` to a signed i128 `(lo, hi)` pair,
+/// rounding HALF AWAY FROM ZERO.
+///
+/// Strategy (all in f64 until the final integer extraction):
+///
+/// 1. `mag = |x|`, `sgn = sign(x)` (via `abs.f64` / `copysign`).
+/// 2. Round half away from zero on the magnitude: `m = trunc(mag + 0.5)`
+///    (`cvt.rzi.f64.f64` truncates toward zero; adding 0.5 to the
+///    non-negative magnitude first gives round-half-up = half-away-from-zero
+///    once the sign is reapplied).
+/// 3. Split `m` into two unsigned 64-bit limbs:
+///    `hi = trunc(m * 2^-64)`, `lo = m - hi*2^64`, each `cvt.rzi.u64.f64`.
+///    For `m < 2^64` the high limb is 0 and the low limb is `m`; for
+///    `m` in `[2^64, 2^128)` both limbs are in range.
+/// 4. Reassemble the unsigned magnitude `(lo, hi)`, then negate the i128
+///    (two's-complement over the pair) iff `x < 0`.
+///
+/// OVERFLOW / NaN (non-trapping, per the `Op::Div128` convention): a
+/// magnitude `>= 2^128` saturates the high limb's `cvt.rzi.u64.f64` to
+/// `u64::MAX`, yielding a deterministic clamped value rather than faulting;
+/// NaN converts to 0. There is no per-row validity signal for cast overflow
+/// on this IR path (see the F5 CAST notes in `physical_plan`).
+fn emit_f64_to_i128(b: &mut PtxBuilder, dst_lo: Reg, dst_hi: Reg, src: Reg) -> BoltResult<()> {
+    let src_n = b.alloc.get(src)?.to_string();
+    let mag = b.alloc.alloc("fd");
+    let m = b.alloc.alloc("fd");
+    let half = b.alloc.alloc("fd");
+    let two64 = b.alloc.alloc("fd");
+    let inv_two64 = b.alloc.alloc("fd");
+    let hi_f = b.alloc.alloc("fd");
+    let lo_f = b.alloc.alloc("fd");
+    let prod = b.alloc.alloc("fd");
+    let neg = b.alloc.alloc("r");
+    let p0 = b.alloc.alloc("p");
+    let (lo_n, hi_n) = b.alloc.assign_pair(dst_lo, dst_hi)?;
+    // Unique label suffix per emission (the lo destination index is unique).
+    let tag = lo_n.trim_start_matches('%').to_string();
+
+    // sgn: is x negative? (setp on the original value; NaN compares false.)
+    emit_fmt!(b, "setp.lt.f64 {}, {}, 0d0000000000000000;", p0, src_n)?;
+    emit_fmt!(b, "selp.b32 {}, 1, 0, {};", neg, p0)?;
+    // mag = |x|; m = trunc(mag + 0.5)  (round half away from zero).
+    emit_fmt!(b, "abs.f64 {}, {};", mag, src_n)?;
+    emit_fmt!(b, "mov.f64 {}, 0d3FE0000000000000;", half)?; // 0.5
+    emit_fmt!(b, "add.f64 {}, {}, {};", mag, mag, half)?;
+    emit_fmt!(b, "cvt.rzi.f64.f64 {}, {};", m, mag)?;
+    // hi_f = trunc(m * 2^-64); lo_f = m - hi_f * 2^64.
+    emit_fmt!(b, "mov.f64 {}, 0d3BF0000000000000;", inv_two64)?; // 2^-64
+    emit_fmt!(b, "mov.f64 {}, 0d43F0000000000000;", two64)?; // 2^64
+    emit_fmt!(b, "mul.f64 {}, {}, {};", hi_f, m, inv_two64)?;
+    emit_fmt!(b, "cvt.rzi.f64.f64 {}, {};", hi_f, hi_f)?;
+    emit_fmt!(b, "mul.f64 {}, {}, {};", prod, hi_f, two64)?;
+    emit_fmt!(b, "sub.f64 {}, {}, {};", lo_f, m, prod)?;
+    // Extract the two unsigned 64-bit limbs (saturating on overflow / NaN->0).
+    emit_fmt!(b, "cvt.rzi.u64.f64 {}, {};", hi_n, hi_f)?;
+    emit_fmt!(b, "cvt.rzi.u64.f64 {}, {};", lo_n, lo_f)?;
+    // If x < 0, negate the i128 magnitude (two's complement over the pair).
+    emit_fmt!(b, "setp.ne.s32 {}, {}, 0;", p0, neg)?;
+    emit_fmt!(b, "@!{} bra F2I_DONE_{};", p0, tag)?;
+    emit_fmt!(b, "sub.cc.u64 {}, 0, {};", lo_n, lo_n)?;
+    emit_fmt!(b, "subc.u64 {}, 0, {};", hi_n, hi_n)?;
+    b.emit_label(&format!("F2I_DONE_{}", tag))?;
     Ok(())
 }
 
@@ -3952,6 +4054,110 @@ mod decimal128_ir_tests {
             "expected setp.ge.u64 for low-half unsigned >= so equal-low fires\n{ptx}"
         );
     }
+
+    /// F5: `Op::Select128` (the i128 CASE selector) lowers to a `setp.ne.s32`
+    /// predicate plus TWO `selp.b64` (one per half) gated on it.
+    #[test]
+    fn select_128_emits_two_selp_b64() {
+        // Load a Bool flag (col 0) and a decimal (col 1); Select128 picks
+        // between the loaded decimal (THEN) and a constant (ELSE).
+        let spec = KernelSpec {
+            inputs: vec![
+                ColumnIO { name: "flag".into(), dtype: DataType::Bool },
+                ColumnIO { name: "d".into(), dtype: dec(18, 2) },
+            ],
+            outputs: vec![ColumnIO { name: "out".into(), dtype: dec(18, 2) }],
+            ops: vec![
+                Op::LoadColumn { dst: Reg(0), col_idx: 0, dtype: DataType::Bool },
+                Op::LoadColumn128 { dst_lo: Reg(1), dst_hi: Reg(2), col_idx: 1 },
+                Op::Const128 { dst_lo: Reg(3), dst_hi: Reg(4), lo: 0, hi: 0 },
+                Op::Select128 {
+                    dst_lo: Reg(5),
+                    dst_hi: Reg(6),
+                    cond: Reg(0),
+                    then_lo: Reg(1),
+                    then_hi: Reg(2),
+                    else_lo: Reg(3),
+                    else_hi: Reg(4),
+                },
+                Op::Store128 { src_lo: Reg(5), src_hi: Reg(6), col_idx: 0 },
+            ],
+            predicate: None,
+            register_count: 7,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_dec128_select").expect("compile");
+        assert!(ptx.contains("setp.ne.s32"), "expected predicate from cond\n{ptx}");
+        assert!(
+            ptx.matches("selp.b64").count() >= 2,
+            "expected >=2 selp.b64 (one per i128 half)\n{ptx}"
+        );
+    }
+
+    /// F5: `Op::F64ToI128` (Float -> Decimal128 conversion) decomposes the
+    /// f64 into two unsigned 64-bit limbs and reassembles them, rounding half
+    /// away from zero. Shape check: `abs.f64`, a `cvt.rzi.f64.f64` truncation,
+    /// and two `cvt.rzi.u64.f64` limb extractions.
+    #[test]
+    fn f64_to_i128_emits_limb_decomposition() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO { name: "f".into(), dtype: DataType::Float64 }],
+            outputs: vec![ColumnIO { name: "out".into(), dtype: dec(20, 0) }],
+            ops: vec![
+                Op::LoadColumn { dst: Reg(0), col_idx: 0, dtype: DataType::Float64 },
+                Op::F64ToI128 { dst_lo: Reg(1), dst_hi: Reg(2), src: Reg(0) },
+                Op::Store128 { src_lo: Reg(1), src_hi: Reg(2), col_idx: 0 },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_f64_to_i128").expect("compile");
+        assert!(ptx.contains("abs.f64"), "expected abs.f64 for |x|\n{ptx}");
+        assert!(
+            ptx.contains("cvt.rzi.f64.f64"),
+            "expected cvt.rzi.f64.f64 for the round-half-away truncation\n{ptx}"
+        );
+        assert!(
+            ptx.matches("cvt.rzi.u64.f64").count() >= 2,
+            "expected >=2 cvt.rzi.u64.f64 limb extractions\n{ptx}"
+        );
+        // Round-half-away adds 0.5 (0d3FE0000000000000) to the magnitude.
+        assert!(
+            ptx.contains("0d3FE0000000000000"),
+            "expected the 0.5 round constant\n{ptx}"
+        );
+    }
+
+    /// F5: `Op::I128ToF64` (Decimal128 -> Float conversion) computes
+    /// `hi*2^64 + lo` via `cvt.rn.f64.s64` (signed hi), `cvt.rn.f64.u64`
+    /// (UNSIGNED lo), and an `fma.rn.f64` against the 2^64 constant.
+    #[test]
+    fn i128_to_f64_emits_hi_times_2pow64_plus_lo() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO { name: "d".into(), dtype: dec(20, 0) }],
+            outputs: vec![ColumnIO { name: "out".into(), dtype: DataType::Float64 }],
+            ops: vec![
+                Op::LoadColumn128 { dst_lo: Reg(0), dst_hi: Reg(1), col_idx: 0 },
+                Op::I128ToF64 { dst: Reg(2), src_lo: Reg(0), src_hi: Reg(1) },
+                Op::Store { src: Reg(2), col_idx: 0, dtype: DataType::Float64 },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_i128_to_f64").expect("compile");
+        assert!(ptx.contains("cvt.rn.f64.s64"), "expected signed hi conversion\n{ptx}");
+        assert!(ptx.contains("cvt.rn.f64.u64"), "expected UNSIGNED lo conversion\n{ptx}");
+        assert!(ptx.contains("fma.rn.f64"), "expected fma for hi*2^64+lo\n{ptx}");
+        assert!(
+            ptx.contains("0d43F0000000000000"),
+            "expected the 2^64 constant\n{ptx}"
+        );
+    }
 }
 
 
@@ -4089,7 +4295,13 @@ fn walk_store_deps(
             Op::WidenToI128 { src, .. } => {
                 stack.push(src.id());
             }
-            Op::NarrowI128ToInt { src_lo, src_hi, .. } => {
+            // F5 Float<->Decimal: F64ToI128 reads one f64 source; I128ToF64
+            // reads an i128 (lo, hi) pair.
+            Op::F64ToI128 { src, .. } => {
+                stack.push(src.id());
+            }
+            Op::NarrowI128ToInt { src_lo, src_hi, .. }
+            | Op::I128ToF64 { src_lo, src_hi, .. } => {
                 stack.push(src_lo.id());
                 stack.push(src_hi.id());
             }
@@ -4199,13 +4411,16 @@ pub fn output_input_dependencies(
             // lands on this producer.
             | Op::WidenToI128 { dst_lo, dst_hi, .. }
             | Op::Div128 { dst_lo, dst_hi, .. }
+            // F5 Float<->Decimal: F64ToI128 produces an i128 (lo, hi) pair.
+            | Op::F64ToI128 { dst_lo, dst_hi, .. }
             | Op::Select128 { dst_lo, dst_hi, .. } => {
                 reg_to_op.insert(dst_lo.id(), op);
                 reg_to_op.insert(dst_hi.id(), op);
             }
             // NarrowI128ToInt collapses an i128 pair to a single 64-bit int
-            // dst — register it as a single-register producer.
-            Op::NarrowI128ToInt { dst, .. } => {
+            // dst; I128ToF64 collapses it to a single f64 dst — register each
+            // as a single-register producer.
+            Op::NarrowI128ToInt { dst, .. } | Op::I128ToF64 { dst, .. } => {
                 reg_to_op.insert(dst.id(), op);
             }
         }

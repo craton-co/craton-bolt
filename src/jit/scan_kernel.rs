@@ -569,7 +569,9 @@ fn emit_op(
         Op::WidenToI128 { .. }
         | Op::NarrowI128ToInt { .. }
         | Op::Div128 { .. }
-        | Op::Select128 { .. } => Err(BoltError::Other(
+        | Op::Select128 { .. }
+        | Op::F64ToI128 { .. }
+        | Op::I128ToF64 { .. } => Err(BoltError::Other(
             "scan_kernel: Decimal128 Div / CAST / CASE-select ops are not \
              lowered into a predicate kernel (use the projection path or host \
              fallback); planner bug if this fires in a WHERE predicate"

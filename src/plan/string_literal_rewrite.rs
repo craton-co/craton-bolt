@@ -67,10 +67,47 @@
 //!     filter. This is **binary** collation, NOT locale-aware / ICU collation,
 //!     which is out of scope.
 //!   * Column-vs-column Utf8 ordering (`col_a < col_b`, both dict columns) is
-//!     NOT folded: there is no single literal to partition one dictionary by,
-//!     and the two columns' index spaces are unrelated. Such a comparison does
-//!     not match the `col OP 'lit'` shape, so it is left intact and routed to
-//!     the host string-comparison path (always correct, no rejection).
+//!     analysed by finding F12 below. It is left intact / routed to the host
+//!     string-comparison path TODAY (always correct, no rejection), because the
+//!     integer-rank lowering it would use needs an executor hook that is not yet
+//!     wired — see the F12 note.
+//!
+//! Column-vs-column Utf8 ordering (finding F12):
+//!   * `col_a OP col_b` (`OP` in `< <= > >=`) over two dict-encoded Utf8
+//!     columns is order-equivalent to comparing the two rows' **collation
+//!     ranks**: `rank(a_row) OP rank(b_row)`, where `rank` maps a row's
+//!     dictionary index to the byte-sorted position of its string. Equality
+//!     already works via index equality; ordering needs ranks because a
+//!     dictionary's insertion-index order is not its lexicographic order.
+//!   * CROSS-DICTIONARY CORRECTNESS: `col_a` and `col_b` may carry DIFFERENT
+//!     dictionaries, so each column's *own* collation rank is meaningless to the
+//!     other (rank 2 in dict A and rank 2 in dict B name unrelated strings).
+//!     The dictionary layer therefore builds ONE shared byte-sorted universe —
+//!     the de-duplicated union of both dictionaries — and ranks BOTH columns
+//!     against it (`unified_rank_maps_of` / `DictionaryColumnAny::
+//!     unified_rank_maps_with`). Then `rank_a(i) OP rank_b(j)` reproduces
+//!     `string_a(i) OP string_b(j)` under byte collation. The same-dictionary
+//!     case is the degenerate one where the union is a single copy and the two
+//!     rank tables coincide. This is **binary collation**, NOT locale/ICU.
+//!   * NULL handling (SQL 3VL): the NULL slot (GPU index 0) maps to the rank
+//!     sentinel `-1` in both tables, and the executor hook (below) must mark the
+//!     comparison output NULL whenever *either* row's index is 0, so a NULL on
+//!     either side drops the row from a filter — never satisfying the ordering.
+//!   * STATUS — DEFERRED EXEC WIRING: the rank *tables* and the cross-dictionary
+//!     correctness are implemented and unit-tested here and in
+//!     [`crate::cuda::dictionary`]. Lowering to an executable predicate would
+//!     emit `__rank_<a> OP __rank_<b>` (integer comparison), but that requires
+//!     the executor to MATERIALISE a per-row rank column
+//!     (`rank_table[index_column[row]]`) on the device and resolve a new
+//!     `__rank_<col>` input — the current engine only knows how to borrow the
+//!     pre-existing `__idx_<col>` index buffer (see
+//!     `src/exec/engine.rs::execute_projection`, the `strip_prefix("__idx_")`
+//!     arm). Until that hook lands the rewriter does NOT emit the rank
+//!     comparison: a bare `__rank_a OP __rank_b` integer compare without the
+//!     materialised columns and without 3VL validity propagation would be a
+//!     silent wrong result, so `col_a OP col_b` is preserved verbatim for the
+//!     always-correct host path. The required exec hook is described in the
+//!     wave report.
 //!
 //! Deferred:
 //!   * `IN ('a','b','c')` — would lower to OR-of-equalities; not in scope.
@@ -131,6 +168,49 @@ impl LiteralIndex {
             LiteralIndex::I64(_) => DataType::Int64,
         }
     }
+}
+
+/// The cross-dictionary rank lowering for a column-vs-column Utf8 ordering
+/// comparison `col_a OP col_b` (finding F12).
+///
+/// Both `rank_a` and `rank_b` are per-GPU-index rank lookup tables computed
+/// against ONE shared byte-sorted universe (the union of the two columns'
+/// dictionaries). Each is indexed by the column's GPU dictionary index (the
+/// same value stored in its `__idx_<col>` column):
+///   * entry `0` is the NULL slot and holds
+///     [`crate::cuda::dictionary::NULL_RANK_SENTINEL`] (`-1`);
+///   * entry `k` (`k >= 1`) is the 0-based rank of that slot's string in the
+///     shared universe.
+///
+/// Because both tables share the universe, `rank_a[idx_a] OP rank_b[idx_b]` is
+/// order-equivalent to the byte-collation comparison of the two underlying
+/// strings — correct even across different dictionaries. The degenerate
+/// same-dictionary case (identical dictionaries) collapses the universe to one
+/// copy and makes the two tables identical.
+///
+/// `rank_col_a` / `rank_col_b` are the names the executor would expose for the
+/// materialised per-row rank columns (one rank value per row, gathered as
+/// `rank_table[index_column[row]]`). They follow the `__rank_<col>` convention,
+/// mirroring `__idx_<col>`. The rewriter would emit `rank_col_a OP rank_col_b`
+/// once the executor can materialise those columns; see the exec-hook note in
+/// the module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColVsColRankPlan {
+    /// Per-GPU-index rank table for `col_a` (slot 0 = NULL sentinel).
+    pub rank_a: Vec<i64>,
+    /// Per-GPU-index rank table for `col_b` (slot 0 = NULL sentinel).
+    pub rank_b: Vec<i64>,
+    /// Name the executor would give `col_a`'s materialised per-row rank column.
+    pub rank_col_a: String,
+    /// Name the executor would give `col_b`'s materialised per-row rank column.
+    pub rank_col_b: String,
+}
+
+/// Convention: the per-row rank column for a Utf8 column named `c` (used only by
+/// the deferred column-vs-column ordering lowering, finding F12) is
+/// `__rank_<c>`. Mirrors [`index_column_name`]'s `__idx_<c>`.
+pub fn rank_column_name(original: &str) -> String {
+    format!("__rank_{}", original)
 }
 
 /// Abstracts dictionary lookups so the rewriter can be exercised without a
@@ -218,6 +298,35 @@ pub trait LiteralResolver {
         literal: &str,
     ) -> Option<Vec<LiteralIndex>> {
         let _ = (column, op, literal);
+        None
+    }
+
+    /// Cross-dictionary rank lowering for a column-vs-column Utf8 ordering
+    /// comparison `col_a OP col_b` (finding F12).
+    ///
+    /// Returns the unified rank lookup tables for the two columns — both ranked
+    /// against ONE shared byte-sorted universe (the union of the two
+    /// dictionaries), so the ranks are directly comparable even when the two
+    /// columns carry completely different dictionaries. See
+    /// [`ColVsColRankPlan`] for the layout. Returns `None` when either column is
+    /// not a registered dictionary column (the caller keeps the original
+    /// host-evaluated string comparison).
+    ///
+    /// This produces the rank *tables* (one rank per dictionary slot); turning
+    /// them into per-row rank columns on the device and comparing those is an
+    /// executor responsibility that is NOT yet wired (see the module-level
+    /// "Deferred" note and the exec-hook description there). Until that hook
+    /// exists the rewriter does not emit a rank comparison — it preserves the
+    /// host string comparison — but this method (and its production
+    /// implementation) is complete and unit-tested so the wiring is a localised
+    /// change. The default returns `None` so non-dict resolvers keep the host
+    /// path.
+    fn col_vs_col_rank_maps(
+        &self,
+        col_a: &str,
+        col_b: &str,
+    ) -> Option<ColVsColRankPlan> {
+        let _ = (col_a, col_b);
         None
     }
 
@@ -460,6 +569,28 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
         Some(out)
     }
 
+    fn col_vs_col_rank_maps(
+        &self,
+        col_a: &str,
+        col_b: &str,
+    ) -> Option<ColVsColRankPlan> {
+        // Both sides must be registered dictionary columns; otherwise there is
+        // no dictionary to rank against and the comparison stays host-side.
+        let dict_a = self.dicts.get(col_a)?;
+        let dict_b = self.dicts.get(col_b)?;
+        // The dictionary layer owns the cross-dictionary correctness: it builds
+        // ONE shared byte-sorted universe (the union of both dictionaries) and
+        // ranks each column's slots against it, so the two rank tables are
+        // directly comparable even when the dictionaries differ.
+        let (rank_a, rank_b) = dict_a.unified_rank_maps_with(dict_b);
+        Some(ColVsColRankPlan {
+            rank_a,
+            rank_b,
+            rank_col_a: rank_column_name(col_a),
+            rank_col_b: rank_column_name(col_b),
+        })
+    }
+
     fn is_complete(&self, column: &str) -> bool {
         // Only columns explicitly opted in via `mark_complete` are trusted as
         // having observed every distinct value. A `DictionaryColumnAny` alone
@@ -537,6 +668,55 @@ fn extract_col_and_string_lit(left: &Expr, right: &Expr) -> Option<(String, Stri
         (Expr::Literal(Literal::Utf8(s)), Expr::Column(c)) => Some((c.clone(), s.clone(), true)),
         _ => None,
     }
+}
+
+/// If both sides of `(left, right)` are `Column`s (after peeling any `Alias`
+/// wrappers), return `(left_col, right_col)`; otherwise `None`. Used to detect
+/// the column-vs-column ordering shape `col_a OP col_b` (finding F12). The order
+/// is preserved (`left` first) so the caller can keep `OP`'s operand order.
+fn extract_two_columns(left: &Expr, right: &Expr) -> Option<(String, String)> {
+    match (strip_alias(left), strip_alias(right)) {
+        (Expr::Column(a), Expr::Column(b)) => Some((a.clone(), b.clone())),
+        _ => None,
+    }
+}
+
+/// Analyse a binary expression for the column-vs-column Utf8 ordering shape
+/// `col_a OP col_b` and, if it matches two registered (non-protected) dict
+/// columns, return the cross-dictionary rank lowering plan (finding F12).
+///
+/// This is the single entry point the orchestrator wires once the executor can
+/// materialise per-row `__rank_<col>` columns: given the plan's
+/// [`ColVsColRankPlan`] it would (1) upload `rank_a` / `rank_b` rank tables,
+/// (2) materialise per-row rank columns `rank_table[index_column[row]]` under
+/// the `rank_col_a` / `rank_col_b` names, propagating NULL validity (a row whose
+/// index is `0` on either side is NULL), and (3) emit
+/// `Expr::Binary { op, Column(rank_col_a), Column(rank_col_b) }` so the existing
+/// integer-comparison machinery executes the ordering. See the module-level F12
+/// note for the exec-hook contract.
+///
+/// Returns `None` (caller keeps the host string comparison) when the expression
+/// is not an ordering `Column OP Column` over two registered, non-protected dict
+/// columns, or when the resolver declines to build the rank tables.
+pub fn plan_col_vs_col_rank<R: LiteralResolver>(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    r: &R,
+) -> Option<(BinaryOp, ColVsColRankPlan)> {
+    if !is_ordering(op) {
+        return None;
+    }
+    let (col_a, col_b) = extract_two_columns(left, right)?;
+    if !(r.knows(&col_a)
+        && r.knows(&col_b)
+        && r.predicate_rewrite_allowed(&col_a)
+        && r.predicate_rewrite_allowed(&col_b))
+    {
+        return None;
+    }
+    let plan = r.col_vs_col_rank_maps(&col_a, &col_b)?;
+    Some((op, plan))
 }
 
 /// Build a Bool predicate that is true iff `column` (an integer index
@@ -746,6 +926,30 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                     // standard type checker surface them.
                 }
             }
+
+            // Finding F12: column-vs-column Utf8 ordering (`col_a OP col_b`,
+            // both registered dict columns). This is order-equivalent to
+            // comparing the two rows' byte-collation ranks computed against a
+            // SHARED universe (the union of both dictionaries) — see
+            // `LiteralResolver::col_vs_col_rank_maps` and the module docs.
+            //
+            // DEFERRED: lowering this to an executable predicate would emit
+            // `__rank_a OP __rank_b`, but that needs the executor to
+            // materialise per-row rank columns on the device and propagate SQL
+            // 3VL validity (NULL when either index is 0). The current engine
+            // can only borrow the pre-existing `__idx_<col>` index buffer, so a
+            // bare `__rank_a OP __rank_b` integer compare would be a silent
+            // wrong result. Until the exec hook lands we PRESERVE the original
+            // `col_a OP col_b` Utf8 comparison for the always-correct host path.
+            //
+            // The detection + cross-dictionary rank-plan construction lives in
+            // `plan_col_vs_col_rank`, which the orchestrator will call once the
+            // executor can consume `__rank_<col>` columns (see that function's
+            // doc and the module-level F12 note). We do NOT call it on the
+            // emitting path here: doing so would require returning an
+            // `__rank_a OP __rank_b` predicate the engine cannot execute, a
+            // silent wrong result. The `col_a OP col_b` comparison therefore
+            // falls through to the preserved host path below — always correct.
 
             Ok(Expr::Binary {
                 op: *op,
@@ -1246,6 +1450,25 @@ mod tests {
                 }
             }
             Some(out)
+        }
+
+        fn col_vs_col_rank_maps(
+            &self,
+            col_a: &str,
+            col_b: &str,
+        ) -> Option<ColVsColRankPlan> {
+            // Mirror the production path: both columns must have scannable
+            // dictionary entries; rank both against the shared sorted union.
+            let dict_a = self.dict_entries.get(col_a)?;
+            let dict_b = self.dict_entries.get(col_b)?;
+            let (rank_a, rank_b) =
+                crate::cuda::dictionary::unified_rank_maps_of(dict_a, dict_b);
+            Some(ColVsColRankPlan {
+                rank_a,
+                rank_b,
+                rank_col_a: super::rank_column_name(col_a),
+                rank_col_b: super::rank_column_name(col_b),
+            })
         }
 
         fn is_complete(&self, column: &str) -> bool {
@@ -2506,5 +2729,221 @@ mod tests {
         assert!(rw
             .ordering_match_indices("unknown", BinaryOp::Lt, "x")
             .is_none());
+    }
+
+    // ---- F12: column-vs-column Utf8 ordering (cross-dictionary ranks) ----
+
+    /// Byte-string comparison oracle for two strings under all four ops.
+    fn str_cmp_oracle(op: BinaryOp, a: &str, b: &str) -> bool {
+        match op {
+            BinaryOp::Lt => a < b,
+            BinaryOp::LtEq => a <= b,
+            BinaryOp::Gt => a > b,
+            BinaryOp::GtEq => a >= b,
+            _ => unreachable!("ordering-only oracle"),
+        }
+    }
+
+    fn rank_cmp(op: BinaryOp, x: i64, y: i64) -> bool {
+        match op {
+            BinaryOp::Lt => x < y,
+            BinaryOp::LtEq => x <= y,
+            BinaryOp::Gt => x > y,
+            BinaryOp::GtEq => x >= y,
+            _ => unreachable!("ordering-only"),
+        }
+    }
+
+    /// `plan_col_vs_col_rank` matches the `col_a OP col_b` shape over two dict
+    /// columns and returns a cross-dictionary-correct rank plan: comparing the
+    /// two columns' ranks reproduces the direct byte-string comparison for every
+    /// row pairing and every ordering op, even though the dictionaries DIFFER.
+    #[test]
+    fn f12_plan_cross_dictionary_ranks_match_string_oracle() {
+        let dict_a = ["delta", "apple", "mango"];
+        let dict_b = ["cherry", "Zebra", "apple"];
+        let r = MockResolver::new()
+            .with_dict("a", &dict_a)
+            .with_dict("b", &dict_b);
+
+        for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+            let (got_op, plan) =
+                plan_col_vs_col_rank(op, &col("a"), &col("b"), &r).expect("plan built");
+            assert_eq!(got_op, op);
+            assert_eq!(plan.rank_col_a, "__rank_a");
+            assert_eq!(plan.rank_col_b, "__rank_b");
+            // Slot 0 is the NULL sentinel on both sides (SQL 3VL).
+            assert_eq!(plan.rank_a[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
+            assert_eq!(plan.rank_b[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
+            // Every row pairing: rank comparison == string comparison.
+            for (ai, a_s) in dict_a.iter().enumerate() {
+                for (bi, b_s) in dict_b.iter().enumerate() {
+                    let by_rank = rank_cmp(op, plan.rank_a[ai + 1], plan.rank_b[bi + 1]);
+                    let by_str = str_cmp_oracle(op, a_s, b_s);
+                    assert_eq!(
+                        by_rank, by_str,
+                        "op {op:?}: {a_s} vs {b_s} rank disagrees with string"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same-dictionary degenerate case still works: the two rank tables coincide
+    /// and the comparison matches the string oracle.
+    #[test]
+    fn f12_plan_same_dictionary() {
+        let dict = ["delta", "apple", "Zebra"];
+        let r = MockResolver::new()
+            .with_dict("a", &dict)
+            .with_dict("b", &dict);
+        let (_, plan) =
+            plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).expect("plan");
+        assert_eq!(plan.rank_a, plan.rank_b, "identical dicts → identical ranks");
+        for (i, a_s) in dict.iter().enumerate() {
+            for (j, b_s) in dict.iter().enumerate() {
+                assert_eq!(
+                    rank_cmp(BinaryOp::Lt, plan.rank_a[i + 1], plan.rank_b[j + 1]),
+                    str_cmp_oracle(BinaryOp::Lt, a_s, b_s)
+                );
+            }
+        }
+    }
+
+    /// Equality / non-ordering ops do NOT match the F12 ordering path (equality
+    /// is already handled by index equality elsewhere).
+    #[test]
+    fn f12_plan_rejects_non_ordering_ops() {
+        let r = MockResolver::new()
+            .with_dict("a", &["x"])
+            .with_dict("b", &["y"]);
+        assert!(plan_col_vs_col_rank(BinaryOp::Eq, &col("a"), &col("b"), &r).is_none());
+        assert!(plan_col_vs_col_rank(BinaryOp::NotEq, &col("a"), &col("b"), &r).is_none());
+    }
+
+    /// If EITHER column is not a registered dict column, the plan declines and
+    /// the caller keeps the host string comparison.
+    #[test]
+    fn f12_plan_rejects_non_dict_column() {
+        let r = MockResolver::new().with_dict("a", &["x", "y"]);
+        // `b` is unknown.
+        assert!(plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).is_none());
+        // Both unknown.
+        let empty = MockResolver::new();
+        assert!(plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &empty).is_none());
+    }
+
+    /// A protected column (projected as bare Utf8 output) declines the rank
+    /// plan, mirroring the F10 protection rule.
+    #[test]
+    fn f12_plan_rejects_protected_column() {
+        let mut r = MockResolver::new()
+            .with_dict("a", &["x", "y"])
+            .with_dict("b", &["x", "y"]);
+        r.protected.insert("a".to_string());
+        assert!(plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).is_none());
+    }
+
+    /// `plan_col_vs_col_rank` peels Alias wrappers off both column operands.
+    #[test]
+    fn f12_plan_peels_alias() {
+        let r = MockResolver::new()
+            .with_dict("a", &["x", "y"])
+            .with_dict("b", &["x", "y"]);
+        let plan = plan_col_vs_col_rank(
+            BinaryOp::Lt,
+            &col("a").alias("l"),
+            &col("b").alias("r"),
+            &r,
+        );
+        assert!(plan.is_some(), "aliased columns must still match the shape");
+    }
+
+    /// DEFERRED-EXEC CONTRACT: the live rewrite does NOT emit a rank comparison
+    /// for `col_a OP col_b` — it preserves the original Utf8 comparison for the
+    /// host path (the executor cannot yet materialise `__rank_<col>` columns).
+    /// This guards against accidentally shipping the half-wired path.
+    #[test]
+    fn f12_live_rewrite_preserves_host_comparison() {
+        let r = MockResolver::new()
+            .with_dict("a", &["x", "y"])
+            .with_dict("b", &["x", "y"]);
+        for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+            let expr = Expr::Binary {
+                op,
+                left: Box::new(col("a")),
+                right: Box::new(col("b")),
+            };
+            let out = rewrite_expr_with(&expr, &r, 0).unwrap();
+            match out {
+                Expr::Binary { op: got_op, left, right } => {
+                    assert_eq!(got_op, op);
+                    assert_column(&left, "a");
+                    assert_column(&right, "b");
+                }
+                other => panic!("col-vs-col must stay a Utf8 comparison, got {other:?}"),
+            }
+        }
+    }
+
+    /// The production `StringPredicateRewriter::col_vs_col_rank_maps` over two
+    /// host-only `DictionaryColumnAny`s with DIFFERENT dictionaries builds the
+    /// cross-dictionary-correct rank tables (matches the string oracle).
+    #[test]
+    fn f12_real_rewriter_cross_dictionary_ranks() {
+        use crate::cuda::dictionary_any::DictionaryColumnAny;
+        let dict_a = ["delta", "apple", "mango"];
+        let dict_b = ["cherry", "Zebra", "apple"];
+        let da = DictionaryColumnAny::new_host_only(
+            dict_a.iter().map(|s| s.to_string()).collect(),
+            3,
+        )
+        .expect("da");
+        let db = DictionaryColumnAny::new_host_only(
+            dict_b.iter().map(|s| s.to_string()).collect(),
+            3,
+        )
+        .expect("db");
+        let mut rw = StringPredicateRewriter::new();
+        rw.register("a", &da);
+        rw.register("b", &db);
+
+        let plan = rw.col_vs_col_rank_maps("a", "b").expect("rank plan");
+        assert_eq!(plan.rank_col_a, "__rank_a");
+        assert_eq!(plan.rank_col_b, "__rank_b");
+        for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+            for (ai, a_s) in dict_a.iter().enumerate() {
+                for (bi, b_s) in dict_b.iter().enumerate() {
+                    assert_eq!(
+                        rank_cmp(op, plan.rank_a[ai + 1], plan.rank_b[bi + 1]),
+                        str_cmp_oracle(op, a_s, b_s),
+                        "op {op:?} {a_s} vs {b_s}"
+                    );
+                }
+            }
+        }
+        // An unregistered column → None (host fallback).
+        assert!(rw.col_vs_col_rank_maps("a", "unknown").is_none());
+    }
+
+    /// NULL handling: the rank sentinel (-1) sits at slot 0 in both tables, and
+    /// is strictly less than every real rank (>= 0). The executor must treat a
+    /// row whose index is 0 on either side as SQL NULL; this test pins that the
+    /// sentinel is distinguishable (negative) from every real rank so the exec
+    /// hook can detect it.
+    #[test]
+    fn f12_null_sentinel_is_distinguishable() {
+        let r = MockResolver::new()
+            .with_dict("a", &["x", "y", "z"])
+            .with_dict("b", &["x", "y", "z"]);
+        let (_, plan) =
+            plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).expect("plan");
+        assert_eq!(plan.rank_a[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
+        assert_eq!(plan.rank_b[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
+        // Every real rank is >= 0, so the sentinel is strictly smaller.
+        for &rk in &plan.rank_a[1..] {
+            assert!(rk >= 0, "real ranks are non-negative");
+            assert!(plan.rank_a[0] < rk, "sentinel must be below every real rank");
+        }
     }
 }

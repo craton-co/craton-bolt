@@ -1532,6 +1532,15 @@ pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
         (Float32, Float64) | (Float64, Float32) => true,
         // Bool <-> integer (0/1 round-trip).
         (Bool, Int32) | (Bool, Int64) | (Int32, Bool) | (Int64, Bool) => true,
+        // F5: Float <-> Decimal128. Float -> Decimal128 scales by `10^s` and
+        // rounds half away from zero to an i128; Decimal128 -> Float divides
+        // the raw i128 by `10^s` in f64 (lossy beyond 53 bits). Both are
+        // lowered to the GPU via `physical_plan::emit_decimal_cast`
+        // (`F64ToI128` / `I128ToF64` + a float scale multiply / divide).
+        (Float32, Decimal128(_, _))
+        | (Float64, Decimal128(_, _))
+        | (Decimal128(_, _), Float32)
+        | (Decimal128(_, _), Float64) => true,
         _ => false,
     }
 }
@@ -1547,8 +1556,32 @@ pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
 /// (`crate::exec::expr_agg::safe_cast_column`). Numeric narrowing / float->int
 /// pairs are already in `cast_is_supported`; the *NULL-on-overflow* behaviour
 /// for those is likewise handled by the host evaluator under `safe = true`.
+///
+/// F5 EXCEPTION (Float<->Decimal128). `cast_is_supported` admits Float<->
+/// Decimal128 because PLAIN `CAST` lowers it on the GPU (`F64ToI128` /
+/// `I128ToF64`). A *safe* cast, however, is routed to the HOST evaluator (see
+/// the `expr_contains_safe_cast` branch in `physical_plan`) to realise the
+/// NULL-on-failure contract — and the host evaluator has no `Decimal128`
+/// `HostColumn` representation, so it can neither read a decimal source column
+/// nor build a decimal result. Rather than type-check a `TRY_CAST` that would
+/// then fail at runtime in the host path, Float<->Decimal128 is deliberately
+/// EXCLUDED from the safe envelope: `TRY_CAST(float AS DECIMAL)` /
+/// `TRY_CAST(decimal AS FLOAT)` surface a clear "unsupported" type error.
+/// (A `Decimal128 HostColumn` + the host scale/round + Arrow round-trip would
+/// be required to lift this; tracked as a follow-up.)
 pub(crate) fn safe_cast_is_supported(src: DataType, target: DataType) -> bool {
     use DataType::*;
+    // Float<->Decimal128 is plain-CAST-only (GPU); not a safe cast — see the
+    // doc note above. Exclude it before consulting the plain-cast superset.
+    if matches!(
+        (src, target),
+        (Float32, Decimal128(_, _))
+            | (Float64, Decimal128(_, _))
+            | (Decimal128(_, _), Float32)
+            | (Decimal128(_, _), Float64)
+    ) {
+        return false;
+    }
     if cast_is_supported(src, target) {
         return true;
     }
@@ -2875,6 +2908,39 @@ mod null_handling_tests {
         assert!(safe_cast_is_supported(DataType::Utf8, DataType::Bool));
         // Still-unsupported pair (no numeric -> Utf8 conversion defined).
         assert!(!safe_cast_is_supported(DataType::Int32, DataType::Utf8));
+    }
+
+    /// F5: PLAIN `CAST` admits Float<->Decimal128 (lowered on the GPU via
+    /// `F64ToI128` / `I128ToF64`), but a *safe* `TRY_CAST` of the same pair is
+    /// deliberately rejected — the safe path routes to the host evaluator,
+    /// which has no `Decimal128` `HostColumn`. (See `safe_cast_is_supported`.)
+    #[test]
+    fn float_decimal_cast_envelope() {
+        let d = DataType::Decimal128(12, 4);
+        // Plain CAST: accepted in both directions, for both float widths.
+        assert!(cast_is_supported(DataType::Float64, d));
+        assert!(cast_is_supported(DataType::Float32, d));
+        assert!(cast_is_supported(d, DataType::Float64));
+        assert!(cast_is_supported(d, DataType::Float32));
+        // Safe CAST: rejected in both directions (host has no decimal column).
+        assert!(!safe_cast_is_supported(DataType::Float64, d));
+        assert!(!safe_cast_is_supported(DataType::Float32, d));
+        assert!(!safe_cast_is_supported(d, DataType::Float64));
+        assert!(!safe_cast_is_supported(d, DataType::Float32));
+        // The plain-cast pairs the safe envelope DOES inherit are unaffected.
+        assert!(safe_cast_is_supported(DataType::Int32, DataType::Int64));
+    }
+
+    /// `CAST(<f64> AS DECIMAL(p,s))` type-checks to the target decimal, while
+    /// the corresponding `TRY_CAST` surfaces a type error (F5).
+    #[test]
+    fn float_to_decimal_cast_typechecks_plain_only() {
+        let schema = Schema::new(vec![Field::new("f", DataType::Float64, false)]);
+        let d = DataType::Decimal128(10, 2);
+        let plain = Expr::Column("f".into()).cast(d);
+        assert_eq!(plain.dtype(&schema).unwrap(), d);
+        let safe = Expr::Column("f".into()).try_cast(d);
+        assert!(safe.dtype(&schema).is_err(), "TRY_CAST float->decimal must be rejected");
     }
 
     /// `TRY_CAST(NULL AS Int32)` type-checks to the target, just like CAST.

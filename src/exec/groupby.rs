@@ -1906,6 +1906,20 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
+        // Decimal128 (grouped) intentionally stays on the HOST. The scalar
+        // Decimal SUM/MIN/MAX path runs on the GPU (dedicated i128 block-reduce
+        // kernels in `crate::jit::decimal_agg`), but the grouped path here uses
+        // a single fixed-width atomic accumulator TABLE per aggregate
+        // (`GpuVec<i32/i64/f32/f64>`, one slot per group) updated by a
+        // per-row `atom.global.<op>` in `bolt_groupby_agg`. A correct grouped
+        // Decimal128 accumulator would need a 16-byte per-slot CAS loop
+        // (`atom.cas.b64` on each (lo,hi) half with a 128-bit compare/add
+        // retry) plus widened acc tables and a 16-byte slot decode in
+        // `build_agg_array` — a substantially larger change than the scalar
+        // kernels. Per the feature's correctness-over-coverage split, grouped
+        // Decimal is left to the higher-level host aggregate fallback rather
+        // than risk a silently-wrong on-device result. Bool / Utf8 likewise
+        // have no integer-atomic kernel here.
         DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name

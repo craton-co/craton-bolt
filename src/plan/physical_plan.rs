@@ -477,6 +477,44 @@ pub enum Op {
         /// ELSE-branch high half.
         else_hi: Reg,
     },
+    /// Convert an `f64` register to a signed i128 `(lo, hi)` pair,
+    /// rounding HALF AWAY FROM ZERO to the nearest integer (matching the
+    /// `round(x)` C convention DuckDB uses for float->decimal). Used by
+    /// `CAST(Float AS Decimal128(p, s))` after the source float has been
+    /// scaled by `10^s` (the scaling multiply is a separate float `Op`).
+    ///
+    /// The emitter takes `|x|`, rounds half away from zero (`trunc(|x|+0.5)`),
+    /// and splits the magnitude into two unsigned 64-bit limbs
+    /// (`hi = trunc(m * 2^-64)`, `lo = m - hi*2^64`), so values up to `~2^128`
+    /// convert without the precision clamp of the fixed `cvt.rzi.s64.f64`
+    /// path; the sign is reapplied by negating the i128 pair. OVERFLOW beyond
+    /// the i128 range saturates the high limb at `u64::MAX` deterministically
+    /// (the engine's non-trapping convention — see `Op::Div128`); NaN -> 0.
+    /// There is no per-row validity signal for cast overflow on this IR path.
+    F64ToI128 {
+        /// Destination low half.
+        dst_lo: Reg,
+        /// Destination high half.
+        dst_hi: Reg,
+        /// Source `f64` register.
+        src: Reg,
+    },
+    /// Convert a signed i128 `(lo, hi)` pair to an `f64` register, computing
+    /// `hi * 2^64 + lo` in floating point. Used by
+    /// `CAST(Decimal128(p, s) AS Float64/Float32)` BEFORE the result is
+    /// divided by `10^s` (the scaling divide is a separate float `Op`).
+    ///
+    /// Precision: an i128 has up to 128 significant bits; `f64` carries 53,
+    /// so large-magnitude decimals lose low-order bits — acceptable for a
+    /// decimal->float CAST (the conversion is inherently lossy).
+    I128ToF64 {
+        /// Destination `f64` register.
+        dst: Reg,
+        /// Source low half.
+        src_lo: Reg,
+        /// Source high half.
+        src_hi: Reg,
+    },
 }
 
 /// Description of an input column the kernel consumes.
@@ -1999,12 +2037,12 @@ impl<'a> Codegen<'a> {
     ///     divide (`Div128`, truncating toward zero) when shrinking it.
     ///   * `Decimal128(p, s) -> Int{32,64}`: divide out the scale
     ///     (`Div128` by `10^s`) then take the low half (`NarrowI128ToInt`).
+    ///   * `Float{32,64} -> Decimal128(p, s)`: scale by `10^s` in f64 then
+    ///     convert to i128 rounding HALF AWAY FROM ZERO (`F64ToI128`).
+    ///   * `Decimal128(p, s) -> Float{32,64}`: convert the raw i128 to f64
+    ///     (`I128ToF64`) then divide by `10^s` (lossy beyond 53 bits).
     ///
-    /// REJECTED (kept as precise errors): Float<->Decimal and Bool/Utf8/
-    /// Timestamp<->Decimal. A correct float<->decimal conversion needs
-    /// round-to-nearest i128 scaling that the fixed `cvt.rzi` PTX path
-    /// can't express without precision loss, so we require an explicit
-    /// two-step CAST through an integer/decimal of the intended scale.
+    /// REJECTED (kept as precise errors): Bool/Utf8/Timestamp<->Decimal.
     fn emit_decimal_cast(&mut self, value: Value, target: DataType) -> BoltResult<Value> {
         use DataType::*;
         match (value.dtype, target) {
@@ -2076,19 +2114,89 @@ impl<'a> Codegen<'a> {
                 });
                 Ok(Value::single(dst, target))
             }
-            (Float32 | Float64, Decimal128(_, _)) | (Decimal128(_, _), Float32 | Float64) => {
-                Err(BoltError::Plan(
-                    "CAST between Float and Decimal128 is not lowered to GPU (a correct \
-                     round-to-nearest i128 scaling is not expressible via the fixed cvt \
-                     PTX path); CAST through an integer or a Decimal128 of the intended \
-                     scale instead"
-                        .into(),
-                ))
+            // F5 sub-feature 4 (Float<->Decimal128). Implemented on the GPU
+            // via the `F64ToI128` / `I128ToF64` ops plus a float multiply /
+            // divide by the `10^s` scale constant.
+            //
+            // ROUNDING: Float -> Decimal multiplies by `10^s` in f64 and then
+            // converts to i128 rounding HALF AWAY FROM ZERO (the C `round()` /
+            // DuckDB convention, realised inside `F64ToI128`). Decimal -> Float
+            // converts the raw i128 to f64 (`hi*2^64 + lo`) and divides by
+            // `10^s` — inherently lossy beyond 53 significant bits, which is
+            // acceptable for a decimal->float CAST.
+            (Float32 | Float64, Decimal128(p, s)) => {
+                if s < 0 {
+                    return Err(BoltError::Plan(format!(
+                        "CAST float -> Decimal128(_, {s}): negative scale unsupported"
+                    )));
+                }
+                // Bring the source up to f64 (a no-op when it already is), then
+                // scale by 10^s in floating point.
+                let f = self.emit_cast(value, Float64);
+                let scaled = if s == 0 {
+                    f
+                } else {
+                    let factor = pow10_i128(s as u32)? as f64;
+                    let factor_v = self.emit_float64_const(factor);
+                    let dst = self.fresh();
+                    self.ops.push(Op::Binary {
+                        dst,
+                        op: BinaryOp::Mul,
+                        lhs: f.reg,
+                        rhs: factor_v.reg,
+                        dtype: Float64,
+                        result_dtype: Float64,
+                    });
+                    Value::single(dst, Float64)
+                };
+                let dst_lo = self.fresh();
+                let dst_hi = self.fresh();
+                self.ops.push(Op::F64ToI128 {
+                    dst_lo,
+                    dst_hi,
+                    src: scaled.reg,
+                });
+                Ok(Value::pair(dst_lo, dst_hi, Decimal128(p, s)))
+            }
+            (Decimal128(_, s), Float32 | Float64) => {
+                if s < 0 {
+                    return Err(BoltError::Plan(format!(
+                        "CAST Decimal128(_, {s}) -> float: negative scale unsupported"
+                    )));
+                }
+                let v_hi = value.hi_reg.ok_or_else(|| {
+                    BoltError::Other("physical_plan: decimal CAST source has no hi_reg".into())
+                })?;
+                let raw_f = self.fresh();
+                self.ops.push(Op::I128ToF64 {
+                    dst: raw_f,
+                    src_lo: value.reg,
+                    src_hi: v_hi,
+                });
+                // Divide out the scale in f64.
+                let scaled = if s == 0 {
+                    Value::single(raw_f, Float64)
+                } else {
+                    let factor = pow10_i128(s as u32)? as f64;
+                    let factor_v = self.emit_float64_const(factor);
+                    let dst = self.fresh();
+                    self.ops.push(Op::Binary {
+                        dst,
+                        op: BinaryOp::Div,
+                        lhs: raw_f,
+                        rhs: factor_v.reg,
+                        dtype: Float64,
+                        result_dtype: Float64,
+                    });
+                    Value::single(dst, Float64)
+                };
+                // Narrow to f32 if that was the requested target.
+                Ok(self.emit_cast(scaled, target))
             }
             (from, to) => Err(BoltError::Plan(format!(
                 "CAST {from:?} -> {to:?} involving Decimal128 is not supported on the GPU \
-                 path (only integer<->Decimal128 and Decimal128<->Decimal128 rescale are \
-                 wired)"
+                 path (only integer<->Decimal128, Float<->Decimal128, and \
+                 Decimal128<->Decimal128 rescale are wired)"
             ))),
         }
     }
@@ -2242,6 +2350,18 @@ impl<'a> Codegen<'a> {
             hi: (bits >> 64) as u64,
         });
         Value::pair(dst_lo, dst_hi, DataType::Decimal128(38, 0))
+    }
+
+    /// Emit an `f64` constant into a fresh register, returning the `Float64`
+    /// `Value`. Used by the Float<->Decimal128 CAST path to materialise the
+    /// `10^s` scale factor for the float multiply / divide.
+    fn emit_float64_const(&mut self, value: f64) -> Value {
+        let dst = self.fresh();
+        self.ops.push(Op::Const {
+            dst,
+            lit: Literal::Float64(value),
+        });
+        Value::single(dst, DataType::Float64)
     }
 
     /// Rescale a Decimal128 `Value` from scale `from_s` to scale `to_s`
@@ -2672,19 +2792,13 @@ impl<'a> Codegen<'a> {
         //     b32, Int64/Float64 + Timestamp (i64 storage) in b64. Date32 /
         //     Timestamp are plain bit-copies through `selp.b32` / `selp.b64`
         //     — the logical temporal dtype rides along on the IR `Value`.
-        //     Utf8 CASE is a heap-aware ABI we don't have; Decimal128 (i128)
-        //     has no `selp.b128`, so both stay rejected.
+        //     Utf8 CASE is a heap-aware ABI we don't have, so it stays
+        //     rejected. Decimal128 (i128) has no `selp.b128`, but lowers to a
+        //     PAIR of `selp.b64` via `Op::Select128` — wired below (F5).
         match result_dtype {
             DataType::Utf8 => {
                 return Err(BoltError::Plan(
                     "CASE over string (Utf8) types not yet lowered to GPU; \
-                     coming in a follow-up"
-                        .into(),
-                ))
-            }
-            DataType::Decimal128(_, _) => {
-                return Err(BoltError::Plan(
-                    "CASE over Decimal128 types not yet lowered to GPU; \
                      coming in a follow-up"
                         .into(),
                 ))
@@ -2695,7 +2809,8 @@ impl<'a> Codegen<'a> {
             | DataType::Float32
             | DataType::Float64
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {}
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _) => {}
         }
 
         // (3) ELSE seed — guarded by the SQL-NULL safety check below. Only a
@@ -2752,7 +2867,7 @@ impl<'a> Codegen<'a> {
                 // ELSE is its last (non-NULL-literal) operand, so it reaches
                 // this typed path.
                 let v = self.emit_expr(e)?;
-                self.emit_cast(v, result_dtype)
+                self.emit_case_branch_cast(v, result_dtype)?
             }
             None => {
                 // Unreachable: the SQL-NULL safety guard above already returned
@@ -2790,18 +2905,74 @@ impl<'a> Codegen<'a> {
             // fallback. So we never emit the PTX-rejected `emit_null_as`
             // const on this path.
             let then_v = self.emit_expr(then_expr)?;
-            let then_cast = self.emit_cast(then_v, result_dtype);
-            let dst = self.fresh();
-            self.ops.push(Op::Select {
-                dst,
-                cond: cond_v.reg,
-                then_val: then_cast.reg,
-                else_val: cur.reg,
-                dtype: result_dtype,
-            });
-            cur = Value::single(dst, result_dtype);
+            let then_cast = self.emit_case_branch_cast(then_v, result_dtype)?;
+            if matches!(result_dtype, DataType::Decimal128(_, _)) {
+                // F5: Decimal128 CASE lowers to the i128 analogue of
+                // `Op::Select` — two `selp.b64` (one per (lo, hi) half) gated
+                // on the same predicate (`Op::Select128`). NULL / 3VL behaviour
+                // is identical to the numeric path: the SQL-NULL safety guard
+                // above already rejected any NULL-output shape, so both branch
+                // (lo, hi) pairs are well-defined non-NULL values.
+                let then_hi = then_cast.hi_reg.ok_or_else(|| {
+                    BoltError::Plan(
+                        "physical_plan: CASE Decimal128 THEN value has no hi_reg — producer bug"
+                            .into(),
+                    )
+                })?;
+                let else_hi = cur.hi_reg.ok_or_else(|| {
+                    BoltError::Plan(
+                        "physical_plan: CASE Decimal128 ELSE value has no hi_reg — producer bug"
+                            .into(),
+                    )
+                })?;
+                let dst_lo = self.fresh();
+                let dst_hi = self.fresh();
+                self.ops.push(Op::Select128 {
+                    dst_lo,
+                    dst_hi,
+                    cond: cond_v.reg,
+                    then_lo: then_cast.reg,
+                    then_hi,
+                    else_lo: cur.reg,
+                    else_hi,
+                });
+                cur = Value::pair(dst_lo, dst_hi, result_dtype);
+            } else {
+                let dst = self.fresh();
+                self.ops.push(Op::Select {
+                    dst,
+                    cond: cond_v.reg,
+                    then_val: then_cast.reg,
+                    else_val: cur.reg,
+                    dtype: result_dtype,
+                });
+                cur = Value::single(dst, result_dtype);
+            }
         }
         Ok(cur)
+    }
+
+    /// Cast a CASE branch value (THEN / ELSE) to the unified CASE result
+    /// dtype, preserving the (lo, hi) register pair when the result is
+    /// `Decimal128`.
+    ///
+    /// For non-Decimal results this is the historical single-register
+    /// `emit_cast` (a no-op when the dtypes already match). For a Decimal128
+    /// result the branch value is routed through `emit_decimal_cast` whenever
+    /// it isn't already exactly the target `Decimal128(p, s)` — that covers
+    /// integer / decimal-of-other-scale branch arms, and is a pair-preserving
+    /// no-op for an arm that is already the result dtype. A Float branch arm
+    /// reaches `emit_decimal_cast`'s Float->Decimal path (F5).
+    fn emit_case_branch_cast(&mut self, v: Value, result_dtype: DataType) -> BoltResult<Value> {
+        if matches!(result_dtype, DataType::Decimal128(_, _)) {
+            if v.dtype == result_dtype {
+                // Already the exact target decimal — keep the (lo, hi) pair as
+                // the single-register `emit_cast` no-op would drop `hi_reg`.
+                return Ok(v);
+            }
+            return self.emit_decimal_cast(v, result_dtype);
+        }
+        Ok(self.emit_cast(v, result_dtype))
     }
 
     /// Append a Store op for column `col_idx`.
@@ -5074,7 +5245,12 @@ fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
             // shuffles — fault-free, so eager-safe.
             | Op::WidenToI128 { .. }
             | Op::NarrowI128ToInt { .. }
-            | Op::Select128 { .. } => true,
+            | Op::Select128 { .. }
+            // Float<->Decimal conversions are pure/total (F64ToI128 saturates
+            // deterministically and never traps; I128ToF64 is a pure cvt) —
+            // eager-safe.
+            | Op::F64ToI128 { .. }
+            | Op::I128ToF64 { .. } => true,
             // F5: 128-bit divide guards div-by-zero (yields 0, never traps),
             // but mirror the scalar `Div` policy and treat it conservatively
             // as eager-UNSAFE so it is never hoisted under a short-circuit
@@ -7564,6 +7740,200 @@ mod tests {
             assert_eq!(
                 super::super::logical_plan_contains_unsupported_cast_target(&ok),
                 None
+            );
+        }
+    }
+
+    /// F5: CASE over Decimal128 and Float<->Decimal128 CAST lowering.
+    mod decimal_case_and_float_cast {
+        use super::super::{Codegen, Op};
+        use crate::plan::logical_plan::{DataType, Expr, Field, Literal, Schema};
+
+        fn dec(p: u8, s: i8) -> DataType {
+            DataType::Decimal128(p, s)
+        }
+
+        /// Schema with a Bool flag, two same-typed Decimal128 columns, and a
+        /// Float64 / Float32 column for the cast tests.
+        fn schema() -> Schema {
+            Schema::new(vec![
+                Field::new("flag", DataType::Bool, false),
+                Field::new("d1", dec(10, 2), false),
+                Field::new("d2", dec(10, 2), false),
+                Field::new("f64", DataType::Float64, false),
+                Field::new("f32", DataType::Float32, false),
+            ])
+        }
+
+        /// `CASE WHEN flag THEN d1 ELSE d2 END` (both arms `Decimal128(10,2)`)
+        /// lowers to an `Op::Select128`, NOT the single-register `Op::Select`,
+        /// and the produced `Value` carries a `(lo, hi)` pair.
+        #[test]
+        fn case_over_decimal_columns_emits_select128() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let case = Expr::Case {
+                branches: vec![(
+                    Expr::Column("flag".into()),
+                    Expr::Column("d1".into()),
+                )],
+                else_branch: Some(Box::new(Expr::Column("d2".into()))),
+            };
+            let v = cg.emit_expr(&case).expect("emit CASE decimal");
+            assert_eq!(v.dtype, dec(10, 2), "CASE result dtype preserved");
+            assert!(v.hi_reg.is_some(), "Decimal CASE result must be a (lo, hi) pair");
+            let n_select128 = cg
+                .ops
+                .iter()
+                .filter(|o| matches!(o, Op::Select128 { .. }))
+                .count();
+            let n_select = cg
+                .ops
+                .iter()
+                .filter(|o| matches!(o, Op::Select { .. }))
+                .count();
+            assert_eq!(n_select128, 1, "exactly one Select128 for the single WHEN");
+            assert_eq!(n_select, 0, "no single-register Select on the decimal path");
+        }
+
+        /// A NULL-output CASE (no ELSE) over Decimal128 keeps the numeric
+        /// path's 3VL rejection — the selp lowering has no NULL slot.
+        #[test]
+        fn case_over_decimal_without_else_rejected() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let case = Expr::Case {
+                branches: vec![(
+                    Expr::Column("flag".into()),
+                    Expr::Column("d1".into()),
+                )],
+                else_branch: None,
+            };
+            let err = cg.emit_expr(&case).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("SQL NULL"),
+                "no-ELSE decimal CASE must hit the NULL-output rejection, got {err:?}"
+            );
+        }
+
+        /// A bare-NULL THEN arm over Decimal128 is rejected identically to the
+        /// numeric path (no NULL representation in the selp lowering).
+        #[test]
+        fn case_over_decimal_bare_null_then_rejected() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let case = Expr::Case {
+                branches: vec![(
+                    Expr::Column("flag".into()),
+                    Expr::Literal(Literal::Null),
+                )],
+                else_branch: Some(Box::new(Expr::Column("d1".into()))),
+            };
+            let err = cg.emit_expr(&case).unwrap_err();
+            assert!(format!("{err:?}").contains("SQL NULL"), "got {err:?}");
+        }
+
+        /// `CAST(f64 AS Decimal128(10,2))` lowers on the GPU to a float scale
+        /// multiply (`Op::Binary` Mul, Float64) followed by `Op::F64ToI128`,
+        /// producing a `(lo, hi)` decimal pair — NOT a rejection.
+        #[test]
+        fn cast_float64_to_decimal_emits_f64_to_i128() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let cast = Expr::Column("f64".into()).cast(dec(10, 2));
+            let v = cg.emit_expr(&cast).expect("emit CAST f64->dec");
+            assert_eq!(v.dtype, dec(10, 2));
+            assert!(v.hi_reg.is_some(), "decimal result is a (lo, hi) pair");
+            assert_eq!(
+                cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
+                1,
+                "one F64ToI128 for the float->decimal conversion"
+            );
+            // The scale-2 multiply by 10^2 must be present as a Float64 Mul.
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary { op: crate::plan::logical_plan::BinaryOp::Mul, dtype: DataType::Float64, .. }
+                )),
+                "expected a Float64 scale multiply by 10^s"
+            );
+        }
+
+        /// `CAST(f32 AS Decimal128(10,2))` widens the source to f64 first
+        /// (an `Op::Cast` Float32->Float64) and still ends in `F64ToI128`.
+        #[test]
+        fn cast_float32_to_decimal_widens_then_converts() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let cast = Expr::Column("f32".into()).cast(dec(10, 2));
+            let v = cg.emit_expr(&cast).expect("emit CAST f32->dec");
+            assert_eq!(v.dtype, dec(10, 2));
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Cast { from: DataType::Float32, to: DataType::Float64, .. }
+            )));
+            assert_eq!(
+                cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
+                1
+            );
+        }
+
+        /// `CAST(d1 AS Float64)` lowers to `Op::I128ToF64` followed by a
+        /// Float64 divide by `10^s`.
+        #[test]
+        fn cast_decimal_to_float64_emits_i128_to_f64() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let cast = Expr::Column("d1".into()).cast(DataType::Float64);
+            let v = cg.emit_expr(&cast).expect("emit CAST dec->f64");
+            assert_eq!(v.dtype, DataType::Float64);
+            assert_eq!(
+                cg.ops.iter().filter(|o| matches!(o, Op::I128ToF64 { .. })).count(),
+                1,
+                "one I128ToF64 for the decimal->float conversion"
+            );
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary { op: crate::plan::logical_plan::BinaryOp::Div, dtype: DataType::Float64, .. }
+                )),
+                "expected a Float64 divide by 10^s"
+            );
+        }
+
+        /// `CAST(d1 AS Float32)` ends with a Float64->Float32 narrowing
+        /// `Op::Cast` after the I128ToF64 + scale divide.
+        #[test]
+        fn cast_decimal_to_float32_narrows_result() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let cast = Expr::Column("d1".into()).cast(DataType::Float32);
+            let v = cg.emit_expr(&cast).expect("emit CAST dec->f32");
+            assert_eq!(v.dtype, DataType::Float32);
+            assert!(cg.ops.iter().any(|o| matches!(o, Op::I128ToF64 { .. })));
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Cast { from: DataType::Float64, to: DataType::Float32, .. }
+            )));
+        }
+
+        /// A scale-0 Decimal target skips the multiply (no `10^0` factor).
+        #[test]
+        fn cast_float_to_decimal_scale0_skips_multiply() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let cast = Expr::Column("f64".into()).cast(dec(10, 0));
+            cg.emit_expr(&cast).expect("emit CAST f64->dec(_,0)");
+            assert!(
+                !cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary { op: crate::plan::logical_plan::BinaryOp::Mul, dtype: DataType::Float64, .. }
+                )),
+                "scale-0 decimal target must not emit a 10^0 multiply"
+            );
+            assert_eq!(
+                cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
+                1
             );
         }
     }

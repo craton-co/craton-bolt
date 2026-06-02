@@ -259,8 +259,10 @@ fn build_one_aggregate(
             }
             // Decimal128: SUM via the dedicated i128 GPU block-reduce kernel
             // (`decimal_sum_from_batch`; host-fold fallback inside it). MIN/MAX
-            // via the host fold over the decoded `Decimal128Array` (raw i128
-            // ordering == decimal ordering at the column's uniform scale).
+            // via the dedicated i128 GPU compare-and-select block-reduce kernel
+            // (`minmax_decimal128_from_batch` → `decimal_minmax_gpu`; host-fold
+            // fallback inside it). Raw i128 ordering == decimal ordering at the
+            // column's uniform scale, so GPU and host agree bit-for-bit.
             if let DataType::Decimal128(p, s) = col_io.dtype {
                 match op {
                     ReduceOp::Sum => {
@@ -519,15 +521,17 @@ fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
     }
 }
 
-/// Host-side MIN/MAX over a `Decimal128` aggregate input.
+/// MIN/MAX over a `Decimal128` aggregate input.
 ///
-/// Like the `SUM(Decimal128)` host fold (`decimal_sum_from_batch` /
-/// `decimal_sum_host`), this exists because the GPU reduction
-/// kernels only handle 32/64-bit primitives — a 128-bit MIN/MAX kernel is a
-/// follow-up optimisation. We fold over the already-decoded
-/// `Decimal128Array` on the host. Because the scale is uniform across every
-/// row of a column, the raw `i128` ordering is identical to the decimal
-/// ordering, so we compare the underlying `i128` values directly.
+/// Like the `SUM(Decimal128)` path (`decimal_sum_from_batch` /
+/// `decimal_sum_gpu` / `decimal_sum_host`), this strips NULLs into a dense
+/// `Vec<i128>` and dispatches to a dedicated GPU 128-bit block-reduce kernel
+/// (`decimal_minmax_gpu`, a compare-and-select twin of the SUM kernel), keeping
+/// the host fold (`decimal_minmax_host`) as the documented graceful fallback
+/// for inputs the GPU path declines (empty input). Because the scale is
+/// uniform across every row of a column, the raw `i128` ordering is identical
+/// to the decimal ordering, so both paths compare the underlying `i128` values
+/// directly and agree bit-for-bit.
 ///
 /// NULL handling mirrors the SUM path: NULL rows are skipped (validity is
 /// respected). Unlike SUM — whose empty/all-NULL identity is 0 — MIN/MAX of
@@ -588,31 +592,11 @@ fn minmax_decimal128_from_batch(
         }
     }
 
-    // Host-side fold: walk every row, skip NULLs, track the running
-    // extremum by raw i128 value. The seed is `None` so that an empty or
-    // all-NULL input yields SQL NULL (rather than a sentinel ±inf), matching
-    // the MIN/MAX semantics the planner declares (`out_field.nullable`).
-    let mut acc: Option<i128> = None;
-    for i in 0..da.len() {
-        if da.is_null(i) {
-            continue;
-        }
-        let v: i128 = da.value(i);
-        acc = Some(match acc {
-            None => v,
-            Some(cur) => match op {
-                ReduceOp::Min => cur.min(v),
-                ReduceOp::Max => cur.max(v),
-                // Unreachable: guarded by the debug_assert and the caller's
-                // dispatch, which only routes Min/Max here.
-                _ => cur,
-            },
-        });
-    }
-
     // MIN/MAX preserve the input (p, s); the planner declares the output
     // dtype as the column's own Decimal128(p, s). Validate the declared
-    // output field agrees so a planner/executor mismatch is loud.
+    // output field agrees so a planner/executor mismatch is loud. Done BEFORE
+    // any GPU work so a misconfigured plan fails fast (and the host-only
+    // "rejects non-decimal output" test never needs a device).
     let (out_p, out_s) = match out_field.dtype {
         DataType::Decimal128(p, s) => (p, s),
         ref other => {
@@ -628,6 +612,30 @@ fn minmax_decimal128_from_batch(
              input dtype Decimal128({precision}, {scale})"
         )));
     }
+
+    // Strip NULLs into a dense host Vec<i128> (MIN/MAX ignore NULL inputs).
+    // This is the dense buffer both the GPU kernel and the host fallback
+    // consume — mirroring the SUM(Decimal128) strip in
+    // `decimal_sum_from_batch`. Because the column's scale is uniform across
+    // rows, raw i128 ordering equals decimal ordering, so we compare raw
+    // i128s directly on both paths.
+    let mut host: Vec<i128> = Vec::with_capacity(da.len() - da.null_count());
+    for i in 0..da.len() {
+        if !da.is_null(i) {
+            host.push(da.value(i));
+        }
+    }
+
+    // GPU path (reachable-but-skippable, exactly like SUM): try the dedicated
+    // 128-bit compare-and-select block-reduce kernel; if it declines (empty
+    // input) fold on the host. Both paths use the identical raw-i128 ordering
+    // so they agree bit-for-bit. The seed is `None` so an empty / all-NULL
+    // input yields SQL NULL (not a sentinel ±extremum), matching the MIN/MAX
+    // semantics the planner declares (`out_field.nullable`).
+    let acc: Option<i128> = match decimal_minmax_gpu(op, &host)? {
+        Some(v) => Some(v),
+        None => decimal_minmax_host(op, &host),
+    };
 
     // `Decimal128Array::from(vec![Option<i128>])` packs a single row whose
     // validity bit follows the `Option`: `None` => SQL NULL.
@@ -1268,6 +1276,121 @@ fn decimal_sum_gpu(host: &[i128]) -> BoltResult<Option<i128>> {
     // so a sum that overflows i128 errors loudly whether or not the GPU path
     // ran (mirrors the never-silently-wrong invariant).
     Ok(Some(decimal_sum_host(&host_partials)?))
+}
+
+/// Host-side `i128` MIN/MAX fold over a dense (NULL-stripped) slice. Returns
+/// `None` for an empty input (SQL NULL). MIN/MAX never overflow (the result is
+/// always one of the inputs), so — unlike SUM — there is no checked-arithmetic
+/// concern. Raw `i128` ordering equals decimal ordering at the column's
+/// uniform scale, so comparing the raw values is correct.
+fn decimal_minmax_host(op: ReduceOp, host: &[i128]) -> Option<i128> {
+    let mut acc: Option<i128> = None;
+    for &v in host {
+        acc = Some(match acc {
+            None => v,
+            Some(cur) => match op {
+                ReduceOp::Min => cur.min(v),
+                ReduceOp::Max => cur.max(v),
+                // The caller only routes Min/Max here.
+                _ => cur,
+            },
+        });
+    }
+    acc
+}
+
+/// Launch the Decimal128 MIN/MAX block-reduce kernel over a dense
+/// (NULL-stripped) `host` slice and fold the per-block `i128` partials with the
+/// same extremum ordering. Returns `Ok(None)` when the GPU path declines
+/// (empty input — nothing to launch), in which case the caller folds on the
+/// host. Any hard GPU error propagates as `Err`.
+///
+/// The kernel carries the accumulator as `(lo, hi)` u64 halves and combines
+/// with a 128-bit signed compare-and-select (`emit_dec_minmax_combine` in
+/// `crate::jit::decimal_agg`) using the *same* signed-high / unsigned-low rule
+/// as the scalar `Op::Cmp128` emitter, so GPU and host agree bit-for-bit on the
+/// i128 ordering. Out-of-range padding lanes load a dominated identity
+/// (`i128::MAX` for MIN, `i128::MIN` for MAX) which can never beat a real
+/// value; the final host fold over the block partials reproduces the exact
+/// extremum.
+fn decimal_minmax_gpu(op: ReduceOp, host: &[i128]) -> BoltResult<Option<i128>> {
+    use crate::jit::decimal_agg::{compile_decimal_minmax_kernel, DecimalMinMax};
+
+    // Empty input: skip the launch + PTX compile; the caller takes the trivial
+    // host fold (which yields SQL NULL for an empty input).
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let which = match op {
+        ReduceOp::Min => DecimalMinMax::Min,
+        ReduceOp::Max => DecimalMinMax::Max,
+        other => {
+            return Err(BoltError::Other(format!(
+                "decimal_minmax_gpu: expected Min/Max, got {:?}",
+                other
+            )))
+        }
+    };
+    let entry = which.entry();
+
+    let stream = CudaStream::null_or_default();
+    let dev = upload_primitive_values_async::<i128>(host, &stream)?;
+
+    let block = BLOCK_SIZE;
+    let mut n_rows_u32: u32 = n_rows_to_u32(host.len())?;
+    let grid_x = grid_x_for(n_rows_u32, block);
+
+    // One i128 partial per block.
+    let partials = GpuVec::<i128>::zeros_async(grid_x as usize, stream.raw())?;
+
+    // Cache key embeds the entry name so MIN and MAX get distinct module slots.
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        entry.to_string(),
+        None,
+        || compile_decimal_minmax_kernel(which),
+    )?;
+    let function = module.function(entry)?;
+
+    let mut input_ptr: CUdeviceptr = dev.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+    let mut kernel_params: [*mut c_void; 3] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+    ];
+
+    // SAFETY: `function` is borrowed from a live module; every param points at
+    // a stack local that outlives the synchronize below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    let _ = input_ptr;
+    let _ = output_ptr;
+
+    let pinned = partials.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let host_partials: Vec<i128> = pinned.as_slice().to_vec();
+    drop(pinned);
+    drop(partials);
+    drop(dev);
+
+    // Fold the per-block partials with the identical extremum ordering. The
+    // partials are all dominated by real values (padding lanes loaded the
+    // "can never win" sentinel), so the fold reproduces the true extremum.
+    Ok(decimal_minmax_host(op, &host_partials))
 }
 
 /// Build a Welford `(count, mean, M2)` state by folding the non-NULL values
@@ -2656,11 +2779,19 @@ mod tests {
         assert_eq!(non_null_count_for_input(&col_io, &batch).unwrap(), 4);
     }
 
-    // -------- MIN/MAX(Decimal128) host-side fold (no GPU) --------
+    // -------- MIN/MAX(Decimal128) batch-level tests --------
     //
-    // These exercise `minmax_decimal128_from_batch` directly: NULL-skipping,
-    // the all-NULL/empty => NULL identity, negatives, single value, and that
-    // the output preserves the input (precision, scale).
+    // These exercise `minmax_decimal128_from_batch`: NULL-skipping, the
+    // all-NULL/empty => NULL identity, negatives, single value, and that the
+    // output preserves the input (precision, scale).
+    //
+    // Decimal MIN/MAX now dispatches to a GPU 128-bit compare-and-select
+    // block-reduce kernel (`decimal_minmax_gpu`) for non-empty inputs, so the
+    // tests with surviving (non-NULL) rows are gated `#[ignore] gpu:` like the
+    // SUM batch test. The all-NULL / empty cases never launch a kernel
+    // (`decimal_minmax_gpu` declines on an empty dense slice and the host fold
+    // yields SQL NULL) and stay host-runnable. The pure-ordering logic is
+    // covered host-only by the `decimal_minmax_host_*` parity tests below.
 
     /// Build a single-column `Decimal128(p, s)` batch from `Option<i128>`
     /// values, mirroring the construction used elsewhere for the SUM path.
@@ -2698,6 +2829,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "gpu:tier1"]
     fn minmax_decimal128_with_nulls() {
         // Underlying NULL positions must be skipped, not folded in.
         let batch = dec128_batch(
@@ -2758,6 +2890,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "gpu:tier1"]
     fn minmax_decimal128_single_value() {
         let batch = dec128_batch("price", 12, 4, vec![Some(42_0000i128)]);
         let col = dec128_col("price", 12, 4);
@@ -2776,6 +2909,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "gpu:tier1"]
     fn minmax_decimal128_negative_values() {
         // Raw i128 ordering must equal decimal ordering across the sign
         // boundary: MIN picks the most-negative, MAX the most-positive.
@@ -2806,6 +2940,69 @@ mod tests {
         let err =
             minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &bad_field).unwrap_err();
         assert!(matches!(err, BoltError::Type(_)));
+    }
+
+    // -------- MIN/MAX(Decimal128) host-fold parity (no GPU) --------
+    //
+    // The `decimal_minmax_host` fold is the device-free fallback AND the
+    // per-block partial finalizer for `decimal_minmax_gpu`; the device kernel
+    // uses the identical signed-high / unsigned-low i128 ordering, so these
+    // host assertions pin the exact values the GPU path must reproduce.
+
+    #[test]
+    fn decimal_minmax_host_empty_is_none() {
+        assert_eq!(decimal_minmax_host(ReduceOp::Min, &[]), None);
+        assert_eq!(decimal_minmax_host(ReduceOp::Max, &[]), None);
+    }
+
+    #[test]
+    fn decimal_minmax_host_basic() {
+        let vals = [500i128, 125, 999, 125];
+        assert_eq!(decimal_minmax_host(ReduceOp::Min, &vals), Some(125));
+        assert_eq!(decimal_minmax_host(ReduceOp::Max, &vals), Some(999));
+    }
+
+    #[test]
+    fn decimal_minmax_host_negatives_cross_sign() {
+        // Ordering must hold across the sign boundary (this is the property
+        // the kernel's signed-high-half / unsigned-low-half compare exists to
+        // preserve).
+        let vals = [-300i128, 50, -1000, 0];
+        assert_eq!(decimal_minmax_host(ReduceOp::Min, &vals), Some(-1000));
+        assert_eq!(decimal_minmax_host(ReduceOp::Max, &vals), Some(50));
+    }
+
+    #[test]
+    fn decimal_minmax_host_high_half_dominates_low() {
+        // Two i128s whose hi halves differ but whose lo halves are crafted so a
+        // naive unsigned-only compare would pick wrong: a = 1<<64 (hi=1, lo=0),
+        // b = (1<<64)-1 (hi=0, lo=u64::MAX). a > b, so MIN=b, MAX=a.
+        let a: i128 = 1i128 << 64;
+        let b: i128 = (1i128 << 64) - 1;
+        assert_eq!(decimal_minmax_host(ReduceOp::Min, &[a, b]), Some(b));
+        assert_eq!(decimal_minmax_host(ReduceOp::Max, &[a, b]), Some(a));
+    }
+
+    /// Device-execution parity: MIN/MAX(Decimal128) over a NULL-bearing column
+    /// must run the GPU compare-and-select kernel and agree with the host fold.
+    /// Gated on a real GPU (`decimal_minmax_gpu` launches a kernel).
+    #[test]
+    #[ignore = "gpu:tier1"]
+    fn decimal_minmax_gpu_matches_host() {
+        // Mixed signs + a NULL to exercise the strip + the cross-sign ordering.
+        let host: Vec<i128> = vec![-300, 50, -1000, 7, 0, 999];
+        let min_gpu = decimal_minmax_gpu(ReduceOp::Min, &host).unwrap();
+        let max_gpu = decimal_minmax_gpu(ReduceOp::Max, &host).unwrap();
+        assert_eq!(min_gpu, Some(-1000));
+        assert_eq!(max_gpu, Some(999));
+        assert_eq!(min_gpu, Some(decimal_minmax_host(ReduceOp::Min, &host).unwrap()));
+        assert_eq!(max_gpu, Some(decimal_minmax_host(ReduceOp::Max, &host).unwrap()));
+
+        // A value that straddles the 2^64 boundary must compare correctly on
+        // device too (high-half dominates).
+        let wide: Vec<i128> = vec![1i128 << 64, (1i128 << 64) - 1, -(1i128 << 70)];
+        assert_eq!(decimal_minmax_gpu(ReduceOp::Min, &wide).unwrap(), Some(-(1i128 << 70)));
+        assert_eq!(decimal_minmax_gpu(ReduceOp::Max, &wide).unwrap(), Some(1i128 << 64));
     }
 
     /// `packed_validity_for` produces the Arrow-LE packed-bit bitmap the

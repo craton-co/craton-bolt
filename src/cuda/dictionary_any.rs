@@ -171,6 +171,44 @@ impl DictionaryColumnAny {
         }
     }
 
+    /// Build the shared byte-sorted universe of `self` and `other` and the
+    /// per-GPU-index rank lookup for each (finding F12, column-vs-column Utf8
+    /// ordering).
+    ///
+    /// Returns `(rank_self, rank_other)`: `rank_self[k]` is the rank of `self`'s
+    /// GPU index `k` (and `rank_other` likewise for `other`) within the *common*
+    /// sorted union of the two dictionaries. Slot 0 (NULL) maps to
+    /// [`crate::cuda::dictionary::NULL_RANK_SENTINEL`] in both. See
+    /// [`crate::cuda::dictionary::unified_rank_maps_of`] for the full contract.
+    ///
+    /// This is the cross-dictionary-correct primitive a `col_a OP col_b` Utf8
+    /// ordering lowering needs: `self` and `other` may carry entirely different
+    /// dictionaries, so each column's *own* collation rank is not comparable to
+    /// the other's. Ranking both against one shared universe makes
+    /// `rank_self(i) OP rank_other(j)` reproduce the byte-collation comparison
+    /// of the underlying strings. Index width is irrelevant — ranks are integer
+    /// positions in the shared universe — so this works uniformly across the
+    /// i32 and i64 variants.
+    ///
+    /// NOTE: this produces the rank *lookup tables* (one entry per dictionary
+    /// slot), NOT the per-row rank columns. Materialising a per-row rank column
+    /// (`rank[index[row]]` for every row) and uploading it to the device is an
+    /// executor responsibility — see the exec-hook note in
+    /// [`crate::plan::string_literal_rewrite`].
+    pub fn unified_rank_maps_with(&self, other: &Self) -> (Vec<i64>, Vec<i64>) {
+        crate::cuda::dictionary::unified_rank_maps_of(self.dictionary(), other.dictionary())
+    }
+
+    /// Per-GPU-index rank lookup of this column against a shared sorted
+    /// `universe` (finding F12). Dispatches to the underlying variant's
+    /// `rank_for_index`; the result is width-independent (integer ranks).
+    pub fn rank_for_index(&self, universe: &[String]) -> Vec<i64> {
+        match self {
+            Self::I32(d) => d.rank_for_index(universe),
+            Self::I64(d) => d.rank_for_index(universe),
+        }
+    }
+
     /// **Stage 7 (S1)** — build a `DictionaryColumnAny` directly from an
     /// Arrow `DictionaryArray<Int32Type>` without re-scanning the values.
     ///
@@ -548,6 +586,46 @@ mod tests {
                 assert!(!got.contains(&0), "NULL slot 0 must be excluded");
             }
         }
+    }
+
+    /// F12: `unified_rank_maps_with` over two i32-backed wrappers with
+    /// DIFFERENT dictionaries ranks both against one shared universe, so a rank
+    /// comparison reproduces the direct byte-string comparison. Mirrors the
+    /// dictionary-layer oracle but through the unified wrapper API the rewriter
+    /// actually calls.
+    #[test]
+    fn unified_rank_maps_with_cross_dictionary() {
+        use crate::plan::logical_plan::BinaryOp;
+        let dict_a = vec!["delta".to_string(), "apple".to_string()];
+        let dict_b = vec!["cherry".to_string(), "apple".to_string()];
+        let a = DictionaryColumnAny::new_host_only(dict_a.clone(), 2).expect("a");
+        let b = DictionaryColumnAny::new_host_only(dict_b.clone(), 2).expect("b");
+        let (rank_a, rank_b) = a.unified_rank_maps_with(&b);
+
+        let cmp = |op: BinaryOp, x: i64, y: i64| match op {
+            BinaryOp::Lt => x < y,
+            BinaryOp::LtEq => x <= y,
+            BinaryOp::Gt => x > y,
+            BinaryOp::GtEq => x >= y,
+            _ => unreachable!(),
+        };
+        for (ai, a_s) in dict_a.iter().enumerate() {
+            for (bi, b_s) in dict_b.iter().enumerate() {
+                for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                    let by_rank = cmp(op, rank_a[ai + 1], rank_b[bi + 1]);
+                    let by_str = match op {
+                        BinaryOp::Lt => a_s < b_s,
+                        BinaryOp::LtEq => a_s <= b_s,
+                        BinaryOp::Gt => a_s > b_s,
+                        BinaryOp::GtEq => a_s >= b_s,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(by_rank, by_str, "op {op:?} {a_s} vs {b_s}");
+                }
+            }
+        }
+        // Shared "apple": dict_a idx2, dict_b idx2 → same rank.
+        assert_eq!(rank_a[2], rank_b[2]);
     }
 
     /// Edge case: an empty dictionary must still dispatch (not panic), and —

@@ -221,6 +221,14 @@ impl DictionaryColumnI64 {
             .collect()
     }
 
+    /// Per-GPU-index rank lookup against a shared sorted `universe`
+    /// (finding F12, column-vs-column Utf8 ordering). i64 sibling of
+    /// [`crate::cuda::dictionary::DictionaryColumn::rank_for_index`]; the rank
+    /// values themselves are integer positions and are width-independent.
+    pub fn rank_for_index(&self, universe: &[String]) -> Vec<i64> {
+        crate::cuda::dictionary::rank_for_index_in(&self.dictionary, universe)
+    }
+
     /// Batched variant of [`Self::index_of`].
     ///
     /// Mirrors [`crate::cuda::dictionary::DictionaryColumn::index_of_many`]:

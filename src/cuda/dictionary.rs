@@ -114,6 +114,110 @@ pub(crate) fn indices_satisfying_in(
         .collect()
 }
 
+/// Sentinel rank assigned to the NULL slot (GPU index 0) in a per-row rank
+/// column (finding F12, column-vs-column Utf8 ordering).
+///
+/// A NULL string has no position in any byte-collation ordering — SQL compares
+/// it as NULL, never satisfying an ordering predicate. When a rank column is
+/// materialised so two dict-encoded Utf8 columns can be compared as integer
+/// ranks (`rank(a) OP rank(b)`), slot 0 must therefore map to a value that the
+/// integer comparison machinery treats as "this row never passes". `-1` is that
+/// value: every real rank is `>= 0` (see [`rank_for_index_in`]), so a `-1` on
+/// either side makes the comparison's outcome irrelevant to correctness *as
+/// long as the executor applies SQL 3VL* (a row with a NULL operand is dropped
+/// by the filter, exactly as it would be for any other NULL comparison).
+///
+/// IMPORTANT (deferred-exec contract): the `-1` sentinel alone does NOT encode
+/// 3VL. A plain `rank_a < rank_b` integer compare with `rank_a = -1` would, for
+/// example, report `true` for `-1 < 0`, which is wrong (NULL `<` anything must
+/// be NULL/false). The executor hook that materialises these rank columns MUST
+/// also propagate the source columns' validity (NULL when *either* index is 0)
+/// onto the comparison's output, so a NULL-operand row is excluded. See the
+/// exec-hook note in [`crate::plan::string_literal_rewrite`]. The sentinel
+/// exists so the rank buffer is total (defined for every GPU index, including
+/// slot 0) and so a debugging/host oracle can detect the NULL rows.
+pub(crate) const NULL_RANK_SENTINEL: i64 = -1;
+
+/// Build a per-GPU-index rank lookup for `dictionary` against a shared,
+/// byte-sorted universe of strings (finding F12).
+///
+/// `universe` must be the byte-lexicographically sorted, de-duplicated set of
+/// strings that defines the common ordering space — typically the sorted union
+/// of two columns' dictionaries (see [`unified_rank_maps_of`]). The returned
+/// vector `out` has length `dictionary.len() + 1` and is indexed by **GPU
+/// index** (the same 1-based convention used everywhere in this module):
+///   * `out[0]` is [`NULL_RANK_SENTINEL`] — the NULL slot has no rank.
+///   * `out[k]` (for `k` in `1..=dictionary.len()`) is the 0-based position of
+///     `dictionary[k - 1]` within `universe`, i.e. its rank in the shared
+///     ordering.
+///
+/// Because both columns' ranks are computed against the *same* `universe`,
+/// `rank_a(i) OP rank_b(j)` is order-equivalent to `string_a(i) OP string_b(j)`
+/// under byte collation — which is exactly what column-vs-column Utf8 ordering
+/// requires, even when the two columns have entirely different dictionaries.
+///
+/// Every entry of `dictionary` is guaranteed to appear in `universe` when the
+/// universe was built as a superset (the union); a defensive `binary_search`
+/// miss falls back to the half-open insertion point, which still yields a
+/// consistent total order for that string relative to the universe.
+///
+/// This is **binary collation** (raw UTF-8 bytes via `str`'s `Ord`), NOT
+/// locale-aware / ICU collation — consistent with [`collation_ranks_of`].
+pub(crate) fn rank_for_index_in(dictionary: &[String], universe: &[String]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(dictionary.len() + 1);
+    // Slot 0 = NULL: no rank.
+    out.push(NULL_RANK_SENTINEL);
+    for s in dictionary {
+        // `universe` is sorted + de-duped, so its byte-order position is the
+        // rank. `binary_search` returns `Ok(pos)` for a present string;
+        // `Err(insert_pos)` (defensive) still gives a consistent position.
+        let rank = match universe.binary_search(s) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        };
+        out.push(rank as i64);
+    }
+    out
+}
+
+/// Build the shared, byte-sorted, de-duplicated universe of two dictionaries
+/// and the per-GPU-index rank lookup for each (finding F12, column-vs-column
+/// Utf8 ordering).
+///
+/// Returns `(rank_a, rank_b)` where `rank_a` is the rank lookup for
+/// `dict_a` and `rank_b` for `dict_b`, both computed against the *same* sorted
+/// union of the two dictionaries (see [`rank_for_index_in`] for the per-column
+/// layout, including the slot-0 NULL sentinel).
+///
+/// This is the cross-dictionary-correct primitive: `dict_a` and `dict_b` may be
+/// completely different dictionaries (different strings, different insertion
+/// order, even different lengths). Comparing each column's *own* collation rank
+/// would be WRONG — rank 2 in one dictionary and rank 2 in another name
+/// unrelated strings. Building one common universe and ranking both columns
+/// against it makes `rank_a(i) OP rank_b(j)` exactly reproduce
+/// `string_a(i) OP string_b(j)` under byte collation. When the two dictionaries
+/// are identical the union collapses to a single copy and the two rank lookups
+/// are identical, which is the degenerate same-dictionary case.
+///
+/// Cost: `O((Na + Nb) log(Na + Nb))` to sort the union, then `O(Na log U +
+/// Nb log U)` for the two rank lookups. Intended for query-plan time, not a
+/// per-row hot path.
+pub(crate) fn unified_rank_maps_of(
+    dict_a: &[String],
+    dict_b: &[String],
+) -> (Vec<i64>, Vec<i64>) {
+    // Sorted, de-duplicated union under byte collation.
+    let mut universe: Vec<String> = Vec::with_capacity(dict_a.len() + dict_b.len());
+    universe.extend(dict_a.iter().cloned());
+    universe.extend(dict_b.iter().cloned());
+    universe.sort();
+    universe.dedup();
+
+    let rank_a = rank_for_index_in(dict_a, &universe);
+    let rank_b = rank_for_index_in(dict_b, &universe);
+    (rank_a, rank_b)
+}
+
 /// On-host string dictionary + on-device i32 indices.
 ///
 /// Strings are encoded as `i32` indices on the GPU; the host holds the
@@ -295,6 +399,18 @@ impl DictionaryColumn {
             .into_iter()
             .map(|p| p as i32)
             .collect()
+    }
+
+    /// Per-GPU-index rank lookup against a shared sorted `universe`
+    /// (finding F12, column-vs-column Utf8 ordering).
+    ///
+    /// Thin wrapper over [`rank_for_index_in`]: see that function for the
+    /// layout (length `dictionary.len() + 1`, indexed by GPU index, slot 0 =
+    /// [`NULL_RANK_SENTINEL`]). Used by the column-vs-column ordering lowering
+    /// to materialise a per-row rank column comparable across two different
+    /// dictionaries.
+    pub fn rank_for_index(&self, universe: &[String]) -> Vec<i64> {
+        rank_for_index_in(&self.dictionary, universe)
     }
 
     /// Batched variant of [`Self::index_of`].
@@ -605,6 +721,115 @@ mod tests {
                 assert!(!col.indices_satisfying(op, lit).contains(&0));
             }
         }
+    }
+
+    // ---- F12: cross-dictionary unified collation ranks (host-only) -------
+
+    /// `rank_for_index` against a shared universe maps each GPU index to the
+    /// byte-sorted position of its string in that universe, with slot 0 (NULL)
+    /// holding the sentinel. Insertion order is deliberately unsorted.
+    #[test]
+    fn rank_for_index_against_universe() {
+        // dict slots:        1        2        3
+        let dict = vec!["mango".to_string(), "apple".to_string(), "delta".to_string()];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // Universe (sorted, deduped) — here equal to the dict's own sorted set.
+        let universe = vec!["apple".to_string(), "delta".to_string(), "mango".to_string()];
+        let ranks = col.rank_for_index(&universe);
+        // index0=NULL sentinel; idx1="mango"->2, idx2="apple"->0, idx3="delta"->1
+        assert_eq!(ranks, vec![NULL_RANK_SENTINEL, 2, 0, 1]);
+    }
+
+    /// `unified_rank_maps_of` over TWO DIFFERENT dictionaries must rank both
+    /// against one shared universe, so `rank_a OP rank_b` reproduces the direct
+    /// byte-string comparison for every row pairing and every ordering op. This
+    /// is the load-bearing cross-dictionary correctness test.
+    #[test]
+    fn unified_rank_maps_cross_dictionary_oracle() {
+        use crate::plan::logical_plan::BinaryOp;
+        // Two genuinely different dictionaries (different strings + order).
+        let dict_a = vec![
+            "delta".to_string(),  // idx1
+            "apple".to_string(),  // idx2
+            "mango".to_string(),  // idx3
+        ];
+        let dict_b = vec![
+            "cherry".to_string(), // idx1
+            "Zebra".to_string(),  // idx2
+            "apple".to_string(),  // idx3 (shared string with dict_a)
+        ];
+        let (rank_a, rank_b) = unified_rank_maps_of(&dict_a, &dict_b);
+        // Slot 0 is the NULL sentinel on both sides.
+        assert_eq!(rank_a[0], NULL_RANK_SENTINEL);
+        assert_eq!(rank_b[0], NULL_RANK_SENTINEL);
+
+        let cmp = |op: BinaryOp, x: i64, y: i64| -> bool {
+            match op {
+                BinaryOp::Lt => x < y,
+                BinaryOp::LtEq => x <= y,
+                BinaryOp::Gt => x > y,
+                BinaryOp::GtEq => x >= y,
+                _ => unreachable!(),
+            }
+        };
+        // For every (a_string, b_string) pairing, the rank comparison must
+        // match the direct byte-string comparison, for all four ops.
+        for (ai, a_s) in dict_a.iter().enumerate() {
+            for (bi, b_s) in dict_b.iter().enumerate() {
+                let ra = rank_a[ai + 1]; // +1: skip NULL slot
+                let rb = rank_b[bi + 1];
+                for op in [BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+                    let by_rank = cmp(op, ra, rb);
+                    let by_string = match op {
+                        BinaryOp::Lt => a_s < b_s,
+                        BinaryOp::LtEq => a_s <= b_s,
+                        BinaryOp::Gt => a_s > b_s,
+                        BinaryOp::GtEq => a_s >= b_s,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        by_rank, by_string,
+                        "op {op:?}: rank({a_s})={ra} vs rank({b_s})={rb} disagrees with strings"
+                    );
+                }
+            }
+        }
+        // Shared string "apple" must get the SAME rank in both tables (it is the
+        // same position in the shared universe): dict_a idx2, dict_b idx3.
+        assert_eq!(rank_a[2], rank_b[3], "shared string must share a rank");
+    }
+
+    /// Same-dictionary degenerate case: the two rank tables coincide and equal
+    /// the column's own `collation_ranks` (offset by the NULL slot).
+    #[test]
+    fn unified_rank_maps_same_dictionary_collapses() {
+        let dict = vec!["delta".to_string(), "apple".to_string(), "Zebra".to_string()];
+        let (rank_a, rank_b) = unified_rank_maps_of(&dict, &dict);
+        assert_eq!(rank_a, rank_b, "identical dicts → identical rank tables");
+        // Drop the NULL sentinel and compare to collation_ranks (which is
+        // indexed by 0-based slot, no NULL entry).
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        let collation: Vec<i64> = col.collation_ranks().iter().map(|&r| r as i64).collect();
+        assert_eq!(&rank_a[1..], collation.as_slice());
+    }
+
+    /// A string present in one dictionary but absent from the universe is
+    /// impossible when the universe is the union (defensive); but a column
+    /// ranked against a SUPERSET universe still gets a consistent position.
+    #[test]
+    fn rank_for_index_superset_universe_is_consistent() {
+        let dict = vec!["banana".to_string(), "apple".to_string()];
+        let col = DictionaryColumn::new_host_only(dict, 0);
+        // Universe is a strict superset (adds "aardvark","cherry").
+        let universe = vec![
+            "aardvark".to_string(),
+            "apple".to_string(),
+            "banana".to_string(),
+            "cherry".to_string(),
+        ];
+        let ranks = col.rank_for_index(&universe);
+        // idx1="banana"->2, idx2="apple"->1
+        assert_eq!(ranks, vec![NULL_RANK_SENTINEL, 2, 1]);
     }
 
     #[test]

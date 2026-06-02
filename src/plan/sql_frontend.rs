@@ -10,7 +10,8 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType as SqlDataType, Distinct,
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident,
     JoinConstraint, JoinOperator, ObjectName, Offset, OrderByExpr, Query, Select, SelectItem,
     SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, UnaryOperator, Value,
 };
@@ -2362,10 +2363,17 @@ const MAX_GROUPING_SET_COLUMNS: usize = 12;
 /// NULL-filled in sets where they are inactive). `is_super` is true when the
 /// clause came from a ROLLUP / CUBE / GROUPING SETS construct (i.e. more than a
 /// plain single GROUP BY), which selects the UNION-ALL rewrite path.
+///
+/// `is_all` is true only for `GROUP BY ALL` (feature F1). Determining the
+/// grouping keys for ALL requires the classified SELECT list (all non-aggregate
+/// output expressions), which is not available where [`parse_group_by`] runs, so
+/// `sets` / `all_cols` are left empty and [`plan_select`] fills them in after
+/// SELECT-item classification — see the GROUP BY ALL handling there.
 struct ParsedGroupBy {
     sets: Vec<Vec<SqlExpr>>,
     all_cols: Vec<SqlExpr>,
     is_super: bool,
+    is_all: bool,
 }
 
 /// Parse `select.group_by` into a [`ParsedGroupBy`], expanding any
@@ -2373,21 +2381,45 @@ struct ParsedGroupBy {
 /// of grouping sets. A plain `GROUP BY a, b` yields a single set `[[a, b]]`
 /// with `is_super = false` so the caller can keep the existing fast path.
 ///
-/// Rejections (precise, documented): `WITH TOTALS` (ClickHouse-specific),
-/// `GROUP BY ALL` (we cannot reliably enumerate the non-aggregated SELECT
-/// columns before lowering), and CUBE/ROLLUP/GROUPING-SETS columns exceeding
-/// [`MAX_GROUPING_SET_COLUMNS`] (combinatorial-blowup guard). A construct may
-/// not be mixed with other top-level GROUP BY items, and constructs may not be
-/// nested, both of which we reject rather than silently mis-expand.
+/// Features handled here:
+/// * `GROUP BY ALL` (F1) — returns the `is_all` sentinel; the actual grouping
+///   keys (every non-aggregated SELECT column) are filled in by [`plan_select`]
+///   once the SELECT list is classified.
+/// * `GROUP BY ... WITH TOTALS` (F3, ClickHouse) — rewritten to the grouping
+///   sets `{(keys), ()}`, i.e. the normal result UNION ALL one grand-total row.
+/// * `GROUP BY ... WITH ROLLUP` / `WITH CUBE` (MySQL trailing modifiers) —
+///   rewritten to `ROLLUP(keys)` / `CUBE(keys)` over the listed columns.
+///
+/// Rejections (precise, documented): CUBE/ROLLUP/GROUPING-SETS columns exceeding
+/// [`MAX_GROUPING_SET_COLUMNS`] (combinatorial-blowup guard); a trailing WITH
+/// modifier combined with an explicit ROLLUP/CUBE/GROUPING SETS construct or
+/// with GROUP BY ALL (ambiguous, ClickHouse-specific); and more than one
+/// trailing WITH modifier. A construct may not be mixed with other top-level
+/// GROUP BY items, and constructs may not be nested, both of which we reject
+/// rather than silently mis-expand.
 fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
     let (exprs, modifiers) = match group_by {
-        GroupByExpr::All(_) => {
-            // GROUP BY ALL = "group by every non-aggregated SELECT column".
-            // Determining that set requires having already classified each
-            // SELECT item as aggregate vs. group key, which happens *after*
-            // this point in `plan_select`; wiring it back here would entangle
-            // the two passes. Kept as a precise rejection (documented).
-            return Err(BoltError::Sql("unsupported: GROUP BY ALL".into()));
+        GroupByExpr::All(modifiers) => {
+            // GROUP BY ALL = "group by every non-aggregated SELECT column"
+            // (DuckDB/Snowflake/ClickHouse semantics; F1). The grouping set is
+            // not knowable here (it needs the classified SELECT list), so we
+            // return a sentinel and let `plan_select` fill `sets` / `all_cols`
+            // in after classification. Trailing WITH modifiers on GROUP BY ALL
+            // (a ClickHouse-only combination) are ambiguous to expand before we
+            // know the key set, so we reject them precisely.
+            if !modifiers.is_empty() {
+                return Err(BoltError::Sql(
+                    "unsupported: trailing WITH ROLLUP/CUBE/TOTALS modifier combined with \
+                     GROUP BY ALL"
+                        .into(),
+                ));
+            }
+            return Ok(ParsedGroupBy {
+                sets: Vec::new(),
+                all_cols: Vec::new(),
+                is_super: false,
+                is_all: true,
+            });
         }
         GroupByExpr::Expressions(exprs, modifiers) => (exprs, modifiers),
     };
@@ -2395,16 +2427,23 @@ fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
     // `WITH ROLLUP` / `WITH CUBE` / `WITH TOTALS` trailing modifiers
     // (MySQL/ClickHouse style) are distinct from the SQL-standard
     // `ROLLUP(...)` / `CUBE(...)` expression constructs handled below.
-    // We reject TOTALS always (ClickHouse-only) and reject the trailing
-    // WITH ROLLUP/CUBE forms too — the standard `GROUP BY ROLLUP(a,b)` /
-    // `GROUP BY CUBE(a,b)` expression forms are the supported spelling.
-    if !modifiers.is_empty() {
-        return Err(BoltError::Sql(
-            "unsupported: trailing GROUP BY modifiers (WITH ROLLUP/CUBE/TOTALS); \
-             use the standard GROUP BY ROLLUP(...) / CUBE(...) / GROUPING SETS (...) forms"
-                .into(),
-        ));
-    }
+    //   * WITH TOTALS (F3) ≡ grouping sets `{(keys), ()}` — the normal GROUP BY
+    //     result plus a single grand-total row (all keys NULL, aggregates over
+    //     the whole input). Reuses the F2 grouping-set machinery.
+    //   * WITH ROLLUP ≡ `ROLLUP(keys)`; WITH CUBE ≡ `CUBE(keys)`.
+    // A trailing modifier may not be combined with an explicit
+    // ROLLUP/CUBE/GROUPING SETS construct (ambiguous), and only one trailing
+    // modifier is allowed.
+    let trailing_modifier = if modifiers.is_empty() {
+        None
+    } else {
+        if modifiers.len() != 1 {
+            return Err(BoltError::Sql(
+                "unsupported: more than one trailing GROUP BY WITH modifier".into(),
+            ));
+        }
+        Some(modifiers[0])
+    };
 
     // Detect whether any top-level GROUP BY item is a super-aggregate
     // construct. If so it must be the *sole* item (mixing
@@ -2414,6 +2453,20 @@ fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
         .iter()
         .any(|e| matches!(e, SqlExpr::Rollup(_) | SqlExpr::Cube(_) | SqlExpr::GroupingSets(_)));
 
+    if let Some(m) = trailing_modifier {
+        if has_super {
+            return Err(BoltError::Sql(
+                "unsupported: trailing GROUP BY WITH modifier combined with an explicit \
+                 ROLLUP/CUBE/GROUPING SETS construct"
+                    .into(),
+            ));
+        }
+        // Rewrite the trailing modifier into the equivalent grouping sets over
+        // the listed columns, then fall into the shared super-aggregate path
+        // below by synthesising the appropriate `sets`.
+        return parse_trailing_modifier(exprs, m);
+    }
+
     if !has_super {
         // Plain `GROUP BY a, b [, ...]` (possibly empty). Single grouping set;
         // every column is active, so no NULL-fill / UNION rewrite is needed.
@@ -2422,6 +2475,7 @@ fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
             all_cols: cols.clone(),
             sets: vec![cols],
             is_super: false,
+            is_all: false,
         });
     }
 
@@ -2555,6 +2609,93 @@ fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
         sets: deduped,
         all_cols,
         is_super: true,
+        is_all: false,
+    })
+}
+
+/// Build a [`ParsedGroupBy`] for a trailing `WITH ROLLUP` / `WITH CUBE` /
+/// `WITH TOTALS` modifier over the listed GROUP BY columns `exprs` (features F3
+/// and the MySQL trailing forms). The expansion reuses the exact F2 grouping-set
+/// semantics:
+///   * `WITH TOTALS` ≡ grouping sets `{(c1..cn), ()}` — the normal GROUP BY
+///     result plus one grand-total row (all keys NULL, aggregates over the whole
+///     input). With no GROUP BY columns this is just the grand total `{()}`.
+///   * `WITH ROLLUP` ≡ `ROLLUP(c1, ..., cn)` — the n+1 prefixes.
+///   * `WITH CUBE` ≡ `CUBE(c1, ..., cn)` — all `2^n` subsets.
+/// The modifier columns must be plain expressions (no nested
+/// ROLLUP/CUBE/GROUPING SETS); the column-count cap applies as for F2.
+fn parse_trailing_modifier(
+    exprs: &[SqlExpr],
+    modifier: GroupByWithModifier,
+) -> BoltResult<ParsedGroupBy> {
+    // The trailing-modifier columns are the plain GROUP BY items; reject any
+    // explicit construct mixed in (already excluded by `has_super` check at the
+    // call site, but guard defensively for nested forms).
+    for e in exprs {
+        if matches!(
+            e,
+            SqlExpr::Rollup(_) | SqlExpr::Cube(_) | SqlExpr::GroupingSets(_)
+        ) {
+            return Err(BoltError::Sql(
+                "unsupported: ROLLUP/CUBE/GROUPING SETS construct combined with a trailing \
+                 GROUP BY WITH modifier"
+                    .into(),
+            ));
+        }
+    }
+    if exprs.len() > MAX_GROUPING_SET_COLUMNS {
+        return Err(BoltError::Sql(format!(
+            "GROUP BY WITH modifier over {} columns exceeds the limit of {}",
+            exprs.len(),
+            MAX_GROUPING_SET_COLUMNS
+        )));
+    }
+
+    let cols: Vec<SqlExpr> = exprs.to_vec();
+    let sets: Vec<Vec<SqlExpr>> = match modifier {
+        GroupByWithModifier::Totals => {
+            // {(keys), ()}: the full set then the grand total.
+            vec![cols.clone(), Vec::new()]
+        }
+        GroupByWithModifier::Rollup => {
+            // n+1 prefixes, full set first down to ().
+            let mut out: Vec<Vec<SqlExpr>> = Vec::with_capacity(cols.len() + 1);
+            for take in (0..=cols.len()).rev() {
+                out.push(cols[..take].to_vec());
+            }
+            out
+        }
+        GroupByWithModifier::Cube => {
+            // All 2^n subsets (full set first).
+            let n = cols.len();
+            let mut out: Vec<Vec<SqlExpr>> = Vec::with_capacity(1usize << n);
+            for mask in (0..(1u32 << n)).rev() {
+                let mut active: Vec<SqlExpr> = Vec::new();
+                for (j, c) in cols.iter().enumerate() {
+                    if mask & (1 << j) != 0 {
+                        active.push(c.clone());
+                    }
+                }
+                out.push(active);
+            }
+            out
+        }
+    };
+
+    // De-duplicate identical grouping sets (mirrors the F2 path: e.g. WITH
+    // TOTALS over an empty GROUP BY collapses {(), ()} to {()}).
+    let mut deduped: Vec<Vec<SqlExpr>> = Vec::with_capacity(sets.len());
+    for set in sets {
+        if !deduped.iter().any(|existing| grouping_sets_eq(existing, &set)) {
+            deduped.push(set);
+        }
+    }
+
+    Ok(ParsedGroupBy {
+        all_cols: cols,
+        sets: deduped,
+        is_super: true,
+        is_all: false,
     })
 }
 
@@ -2604,11 +2745,14 @@ fn sql_expr_struct_eq(a: &SqlExpr, b: &SqlExpr) -> bool {
 }
 
 /// Reject the `GROUPING(...)` / `GROUPING_ID(...)` / `GROUP_ID()` indicator
-/// functions (feature F2 limitation): without them we cannot distinguish a
-/// real NULL from a super-aggregate NULL in the ROLLUP/CUBE output, which is an
-/// accepted v0.x limitation. We scan the SELECT list and HAVING for any call to
-/// one of these names and reject cleanly so the user is not silently given a
-/// plan that omits the indicator column.
+/// functions when used WITHOUT a grouping-set construct. `GROUPING()` is only
+/// defined relative to a ROLLUP/CUBE/GROUPING SETS (or `WITH TOTALS`)
+/// super-aggregate; with a plain GROUP BY (or none) there is no super-aggregate
+/// NULL to distinguish, so the indicator is meaningless and we reject it
+/// cleanly. With a grouping-set construct present (feature F2) GROUPING() is
+/// instead rewritten to a per-branch integer literal — see the
+/// `SelectSource::Grouping` path — and this function is not called. We scan the
+/// SELECT list and HAVING for any call to one of these names.
 fn reject_grouping_indicator(select: &Select) -> BoltResult<()> {
     fn scan(e: &SqlExpr, depth: usize) -> BoltResult<()> {
         if depth > MAX_RECURSION_DEPTH {
@@ -2622,8 +2766,8 @@ fn reject_grouping_indicator(select: &Select) -> BoltResult<()> {
                 let n = ident_to_name(last).to_ascii_lowercase();
                 if n == "grouping" || n == "grouping_id" || n == "group_id" {
                     return Err(BoltError::Sql(
-                        "unsupported: GROUPING()/GROUPING_ID()/GROUP_ID() indicator functions \
-                         (cannot distinguish a real NULL from a super-aggregate NULL)"
+                        "GROUPING()/GROUPING_ID()/GROUP_ID() requires GROUP BY with a \
+                         ROLLUP/CUBE/GROUPING SETS construct (or WITH TOTALS)"
                             .into(),
                     ));
                 }
@@ -2653,6 +2797,72 @@ fn reject_grouping_indicator(select: &Select) -> BoltResult<()> {
         scan(h, 0)?;
     }
     Ok(())
+}
+
+/// If `e` is a bare top-level `GROUPING(c1, ..., cn)` or `GROUPING_ID(...)` call
+/// (feature F2), return its argument expressions; otherwise `None`. Both spell
+/// the same indicator (`GROUPING_ID` is the multi-column alias of `GROUPING`),
+/// so we treat them identically — each yields the integer bitmask of the
+/// per-column grouping bits (MSB = first argument).
+///
+/// Only the bare top-level call form is recognised. A `GROUPING()` nested inside
+/// a larger expression is not matched here; it falls through to the ordinary
+/// lowering, where the unknown `grouping` scalar function is rejected with a
+/// clear message (the per-branch literal substitution this rewrite performs is
+/// only wired for the top-level SELECT-item form).
+fn try_grouping_indicator(e: &SqlExpr) -> BoltResult<Option<Vec<&SqlExpr>>> {
+    let f = match e {
+        SqlExpr::Function(f) => f,
+        _ => return Ok(None),
+    };
+    let name = match f.name.0.last() {
+        Some(last) => ident_to_name(last).to_ascii_lowercase(),
+        None => return Ok(None),
+    };
+    if name != "grouping" && name != "grouping_id" {
+        return Ok(None);
+    }
+    // Reject the unusual call decorations the aggregate path also rejects, so a
+    // malformed GROUPING(...) surfaces a precise message instead of being
+    // silently mis-parsed.
+    if !matches!(f.parameters, FunctionArguments::None) {
+        return Err(BoltError::Sql(
+            "unsupported: parametric GROUPING()".into(),
+        ));
+    }
+    if f.over.is_some() {
+        return Err(BoltError::Sql("unsupported: OVER on GROUPING()".into()));
+    }
+    let list = match &f.args {
+        FunctionArguments::List(list) => list,
+        FunctionArguments::None | FunctionArguments::Subquery(_) => {
+            return Err(BoltError::Sql(
+                "GROUPING()/GROUPING_ID() requires at least one column argument".into(),
+            ));
+        }
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return Err(BoltError::Sql(
+            "unsupported: DISTINCT/clauses inside GROUPING()".into(),
+        ));
+    }
+    if list.args.is_empty() {
+        return Err(BoltError::Sql(
+            "GROUPING()/GROUPING_ID() requires at least one column argument".into(),
+        ));
+    }
+    let mut out: Vec<&SqlExpr> = Vec::with_capacity(list.args.len());
+    for arg in &list.args {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => out.push(inner),
+            _ => {
+                return Err(BoltError::Sql(
+                    "unsupported: GROUPING()/GROUPING_ID() argument must be a plain column".into(),
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Lower a `Select` into Scan [→ Filter] → (Project | Aggregate), optionally
@@ -2822,16 +3032,7 @@ fn plan_select(
     // ROLLUP / CUBE / GROUPING SETS construct into an explicit list of
     // grouping sets (feature F2). A plain `GROUP BY a, b` yields a single set
     // with `is_super = false`, preserving the existing fast path below.
-    let parsed_group_by = parse_group_by(&select.group_by)?;
-    // For the non-super (ordinary) path, `group_by_sql` is the single set's
-    // column list — exactly what the original code expected.
-    let group_by_sql: Vec<&SqlExpr> = parsed_group_by.sets[0].iter().collect();
-    // GROUPING()/GROUPING_ID()/GROUP_ID() are out of scope; reject cleanly
-    // whenever a super-aggregate construct is in play (where they would
-    // normally be used to tag super-aggregate rows).
-    if parsed_group_by.is_super {
-        reject_grouping_indicator(select)?;
-    }
+    let mut parsed_group_by = parse_group_by(&select.group_by)?;
 
     // Expand SELECT items into (expr, optional alias). Wildcards expand to columns
     // of the scan's full schema.
@@ -2864,6 +3065,48 @@ fn plan_select(
                 return Err(BoltError::Sql("unsupported: qualified wildcard".into()));
             }
         }
+    }
+
+    // GROUP BY ALL (feature F1). Semantics (DuckDB/Snowflake/ClickHouse): group
+    // by every non-aggregated column in the SELECT list, then proceed exactly as
+    // an explicit `GROUP BY <those keys>`. We can only enumerate that key set now
+    // that the SELECT items are expanded, so `parse_group_by` returned an
+    // `is_all` sentinel with empty `sets` and we fill them in here. A SELECT item
+    // is a grouping key iff it contains no aggregate; the keys are the underlying
+    // (pre-alias) SQL expressions, in SELECT order. When the SELECT has NO
+    // aggregates at all, every item is a key — so GROUP BY ALL degenerates to
+    // grouping by all selected columns (equivalent to SELECT DISTINCT over them),
+    // matching DuckDB.
+    if parsed_group_by.is_all {
+        let mut keys: Vec<SqlExpr> = Vec::new();
+        for (sql_expr, _) in &items {
+            if !contains_aggregate(sql_expr, &resolver, 0)? {
+                // De-duplicate structurally so `SELECT a, a, SUM(x) GROUP BY ALL`
+                // does not group by `a` twice.
+                if !keys.iter().any(|k| sql_expr_struct_eq(k, sql_expr)) {
+                    keys.push(sql_expr.clone());
+                }
+            }
+        }
+        parsed_group_by = ParsedGroupBy {
+            all_cols: keys.clone(),
+            sets: vec![keys],
+            is_super: false,
+            is_all: true,
+        };
+    }
+
+    // For the non-super (ordinary) path, `group_by_sql` is the single set's
+    // column list — exactly what the original code expected. (For a super
+    // aggregate, `sets[0]` is the first grouping set and `group_by_sql` is only
+    // consulted on the non-super path below, so this is safe.)
+    let group_by_sql: Vec<&SqlExpr> = parsed_group_by.sets[0].iter().collect();
+    // GROUPING()/GROUPING_ID()/GROUP_ID() require a grouping-set construct
+    // (ROLLUP/CUBE/GROUPING SETS or WITH TOTALS). When one is present (F2),
+    // they are rewritten to per-branch integer literals below; reject them
+    // cleanly only when used WITHOUT any such construct.
+    if !parsed_group_by.is_super {
+        reject_grouping_indicator(select)?;
     }
 
     // `COUNT(DISTINCT col)` — the one DISTINCT-quantified aggregate form we
@@ -3109,10 +3352,56 @@ fn plan_select(
             /// (deduplicated by output name). The Project step evaluates
             /// `expr` against the Aggregate's output schema.
             Computed { expr: Expr, alias: Option<String> },
+            /// SELECT is a `GROUPING(c1, ..., cn)` / `GROUPING_ID(...)` indicator
+            /// (feature F2). Each `arg_cols[k]` is the index into `all_group_by`
+            /// of the k-th argument column. The value is a compile-time constant
+            /// *per branch*: bit `n-1-k` (MSB = first arg) is 1 iff that column
+            /// is NOT active in the branch's grouping set (i.e. NULL-filled /
+            /// aggregated away). `build_branch` emits the resulting integer
+            /// literal for each branch.
+            Grouping {
+                arg_cols: Vec<usize>,
+                alias: Option<String>,
+            },
         }
         let mut select_sources: Vec<SelectSource> = Vec::new();
 
         for (sql_expr, alias) in &items {
+            // GROUPING()/GROUPING_ID() indicator (feature F2). Only meaningful
+            // with a grouping-set construct (super-aggregate); resolve each
+            // argument to its index in `all_group_by` so `build_branch` can emit
+            // the per-branch bitmask literal. Rejected when not a super-aggregate
+            // (handled above via `reject_grouping_indicator`) and when nested in
+            // a larger expression (kept to the bare top-level form for now).
+            if let Some(args) = try_grouping_indicator(sql_expr)? {
+                if !parsed_group_by.is_super {
+                    return Err(BoltError::Sql(
+                        "GROUPING()/GROUPING_ID() requires GROUP BY with a ROLLUP/CUBE/\
+                         GROUPING SETS construct (or WITH TOTALS)"
+                            .into(),
+                    ));
+                }
+                let mut arg_cols: Vec<usize> = Vec::with_capacity(args.len());
+                for a in &args {
+                    let lowered = lower_expr(*a, &resolver, 0)?;
+                    let idx = all_group_by
+                        .iter()
+                        .position(|g| expr_eq(g, &lowered))
+                        .ok_or_else(|| {
+                            BoltError::Sql(
+                                "GROUPING()/GROUPING_ID() argument must be a GROUP BY \
+                                 grouping column"
+                                    .into(),
+                            )
+                        })?;
+                    arg_cols.push(idx);
+                }
+                select_sources.push(SelectSource::Grouping {
+                    arg_cols,
+                    alias: alias.clone(),
+                });
+                continue;
+            }
             if let Some(agg) = try_aggregate(sql_expr, &resolver, 0)? {
                 // Bare aggregate path is unchanged: append the aggregate
                 // without deduplication so the Aggregate plan node mirrors
@@ -3201,7 +3490,7 @@ fn plan_select(
             };
 
             let mut proj_exprs: Vec<Expr> = Vec::with_capacity(select_sources.len());
-            for src in &select_sources {
+            for (src_idx, src) in select_sources.iter().enumerate() {
                 match src {
                     SelectSource::GroupKey { col_idx, alias } => {
                         let active_pos = active_cols.iter().position(|&i| i == *col_idx);
@@ -3249,6 +3538,30 @@ fn plan_select(
                             Some(a) => e.alias(a.clone()),
                             None => e,
                         });
+                    }
+                    SelectSource::Grouping { arg_cols, alias } => {
+                        // Per-branch compile-time bitmask. For each argument
+                        // column k (MSB = first arg), bit (n-1-k) is 1 iff the
+                        // column is NOT active in this branch's grouping set
+                        // (i.e. it is aggregated away / NULL-filled). This is the
+                        // SQL-standard GROUPING/GROUPING_ID indicator value.
+                        let n = arg_cols.len();
+                        let mut bits: i64 = 0;
+                        for (k, &col_idx) in arg_cols.iter().enumerate() {
+                            let active = active_cols.contains(&col_idx);
+                            if !active {
+                                bits |= 1i64 << (n - 1 - k);
+                            }
+                        }
+                        let lit = Expr::Literal(Literal::Int64(bits));
+                        // Stable schema column name across branches: the SELECT
+                        // alias if any, else a synthetic positional name (the
+                        // value differs per branch but the *name* must match for
+                        // the UNION schema check).
+                        let out_name = alias
+                            .clone()
+                            .unwrap_or_else(|| format!("__grouping_{src_idx}"));
+                        proj_exprs.push(lit.alias(out_name));
                     }
                 }
             }
@@ -8637,44 +8950,229 @@ mod wave7_tests {
         );
     }
 
+    // ---- F1/F2/F3 helpers --------------------------------------------------
+
+    /// Read the literal projected by a branch's Project at position `pos`,
+    /// unwrapping an enclosing Alias. Returns the constant Int64 value (panics
+    /// if the slot is not a (possibly aliased) integer literal).
+    fn branch_int_literal_at(branch: &LogicalPlan, pos: usize) -> i64 {
+        let exprs = match branch {
+            LogicalPlan::Project { exprs, .. } => exprs,
+            other => panic!("expected Project branch, got {other:?}"),
+        };
+        let mut e = &exprs[pos];
+        if let Expr::Alias(inner, _) = e {
+            e = inner.as_ref();
+        }
+        match e {
+            Expr::Literal(Literal::Int64(v)) => *v,
+            other => panic!("expected Int64 literal at {pos}, got {other:?}"),
+        }
+    }
+
+    /// Active group-key count for a branch's Aggregate (alias of the F2 helper,
+    /// kept local for the F1/F3 tests that read it).
+    fn branch_keys(branch: &LogicalPlan) -> usize {
+        branch_group_key_count(branch)
+    }
+
+    // ---- F2: GROUPING() / GROUPING_ID() indicator --------------------------
+
     #[test]
-    fn grouping_indicator_function_rejected() {
+    fn grouping_indicator_emits_per_branch_bit() {
+        // ROLLUP(region) -> branches {(region), ()}. GROUPING(region) is 0 in
+        // the (region) branch (active) and 1 in the () branch (NULL-filled).
+        let plan = lp_with(
+            "SELECT region, GROUPING(region) AS g, SUM(amount) FROM sales \
+             GROUP BY ROLLUP(region)",
+            &rollup_provider(),
+        );
+        let branches = union_branches(&plan);
+        assert_eq!(branches.len(), 2);
+        // Position 1 in each branch's projection is GROUPING(region).
+        // Pair (active-key-count, grouping-bit): (1,0) and (0,1).
+        let mut pairs: Vec<(usize, i64)> = branches
+            .iter()
+            .map(|b| (branch_keys(b), branch_int_literal_at(b, 1)))
+            .collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(0, 1), (1, 0)]);
+        assert!(plan.schema().is_ok(), "GROUPING union schema must recompute");
+    }
+
+    #[test]
+    fn grouping_id_multi_arg_bitmask() {
+        // CUBE(region, year) -> 4 branches. GROUPING_ID(region, year) is the
+        // 2-bit mask: bit1=region inactive, bit0=year inactive.
+        //   (region,year): 0b00 = 0   (year):  0b10 = 2
+        //   (region):      0b01 = 1   ():       0b11 = 3
+        let plan = lp_with(
+            "SELECT region, year, GROUPING_ID(region, year) AS gid, SUM(amount) \
+             FROM sales GROUP BY CUBE(region, year)",
+            &rollup_provider(),
+        );
+        let branches = union_branches(&plan);
+        assert_eq!(branches.len(), 4);
+        // GROUPING_ID is at projection position 2.
+        let mut masks: Vec<i64> = branches
+            .iter()
+            .map(|b| branch_int_literal_at(b, 2))
+            .collect();
+        masks.sort_unstable();
+        assert_eq!(masks, vec![0, 1, 2, 3], "all 2-bit masks must appear once");
+        assert!(plan.schema().is_ok());
+    }
+
+    #[test]
+    fn grouping_without_construct_rejected() {
+        // Plain GROUP BY (no grouping-set construct): GROUPING() is meaningless.
         let err = parse(
-            "SELECT region, GROUPING(region), SUM(amount) FROM sales \
+            "SELECT region, GROUPING(region) FROM sales GROUP BY region",
+            &rollup_provider(),
+        )
+        .expect_err("GROUPING() without a construct must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("GROUPING") && msg.contains("ROLLUP"),
+            "expected GROUPING-requires-construct message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn grouping_arg_not_a_group_column_rejected() {
+        // GROUPING(amount) where `amount` is not a grouping column.
+        let err = parse(
+            "SELECT region, GROUPING(amount), SUM(amount) FROM sales \
              GROUP BY ROLLUP(region)",
             &rollup_provider(),
         )
-        .expect_err("GROUPING() must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("GROUPING"),
-            "expected GROUPING() rejection, got: {msg}"
-        );
+        .expect_err("GROUPING() over a non-group column must be rejected");
+        assert!(format!("{err}").contains("grouping column"));
     }
 
+    // ---- F3: WITH TOTALS ---------------------------------------------------
+
     #[test]
-    fn with_totals_modifier_rejected() {
-        // ClickHouse `WITH TOTALS` (trailing modifier) stays rejected.
-        let err = parse(
+    fn with_totals_expands_to_keys_and_grand_total() {
+        // `GROUP BY k WITH TOTALS` ≡ grouping sets {(k), ()} = 2 branches.
+        let plan = lp_with(
             "SELECT k, SUM(v) FROM t GROUP BY k WITH TOTALS",
             &having_provider(),
-        )
-        .expect_err("WITH TOTALS must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("TOTALS"),
-            "expected WITH TOTALS rejection, got: {msg}"
         );
+        let branches = union_branches(&plan);
+        assert_eq!(branches.len(), 2, "WITH TOTALS => {{(k), ()}}");
+        let mut counts: Vec<usize> = branches.iter().map(branch_keys).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![0, 1], "one full branch + one grand-total");
+        // The grand-total branch NULL-fills `k`.
+        let fills: usize = branches.iter().map(branch_null_fill_count).sum();
+        assert_eq!(fills, 1);
+        assert!(plan.schema().is_ok());
     }
 
     #[test]
-    fn group_by_all_still_rejected() {
+    fn with_totals_multi_key() {
+        // Two group keys with WITH TOTALS -> {(a,b), ()} (NOT a rollup).
+        let plan = lp_with(
+            "SELECT region, year, SUM(amount) FROM sales \
+             GROUP BY region, year WITH TOTALS",
+            &rollup_provider(),
+        );
+        let branches = union_branches(&plan);
+        assert_eq!(branches.len(), 2, "WITH TOTALS => {{(region,year), ()}}");
+        let mut counts: Vec<usize> = branches.iter().map(branch_keys).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![0, 2]);
+    }
+
+    #[test]
+    fn with_rollup_modifier_expands_like_rollup() {
+        // MySQL trailing `WITH ROLLUP` ≡ ROLLUP(region, year) -> 3 prefix sets.
+        let plan = lp_with(
+            "SELECT region, year, SUM(amount) FROM sales \
+             GROUP BY region, year WITH ROLLUP",
+            &rollup_provider(),
+        );
+        let branches = union_branches(&plan);
+        assert_eq!(branches.len(), 3, "WITH ROLLUP(2 cols) => 3 prefix sets");
+        let mut counts: Vec<usize> = branches.iter().map(branch_keys).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn with_totals_combined_with_construct_rejected() {
+        // A trailing modifier may not combine with an explicit construct.
         let err = parse(
+            "SELECT region, SUM(amount) FROM sales \
+             GROUP BY ROLLUP(region) WITH TOTALS",
+            &rollup_provider(),
+        )
+        .expect_err("WITH TOTALS + ROLLUP(...) must be rejected");
+        assert!(format!("{err}").contains("modifier"));
+    }
+
+    // ---- F1: GROUP BY ALL --------------------------------------------------
+
+    #[test]
+    fn group_by_all_collects_non_aggregate_keys() {
+        // GROUP BY ALL with one aggregate -> group by the single non-aggregate
+        // column `k`; plain (non-super) single-branch Aggregate.
+        let plan = lp_with(
             "SELECT k, SUM(v) FROM t GROUP BY ALL",
             &having_provider(),
-        )
-        .expect_err("GROUP BY ALL must be rejected");
-        assert!(format!("{err}").contains("GROUP BY ALL"));
+        );
+        // Not a UNION (plain group-by fast path); end is Project(Aggregate(..)).
+        match &plan {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Aggregate { group_by, aggregates, .. } => {
+                    assert_eq!(group_by.len(), 1, "GROUP BY ALL groups by `k`");
+                    assert_eq!(aggregates.len(), 1, "one SUM aggregate");
+                }
+                other => panic!("expected Aggregate under Project, got {other:?}"),
+            },
+            other => panic!("expected Project at top, got {other:?}"),
+        }
+        assert!(plan.schema().is_ok());
+    }
+
+    #[test]
+    fn group_by_all_two_keys() {
+        // Two non-aggregate columns + one aggregate -> group by both.
+        let plan = lp_with(
+            "SELECT region, year, SUM(amount) FROM sales GROUP BY ALL",
+            &rollup_provider(),
+        );
+        match &plan {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Aggregate { group_by, .. } => {
+                    assert_eq!(group_by.len(), 2, "GROUP BY ALL groups by region, year");
+                }
+                other => panic!("expected Aggregate, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_all_no_aggregates_is_distinct_over_columns() {
+        // GROUP BY ALL with NO aggregates groups by every selected column
+        // (DuckDB: equivalent to SELECT DISTINCT over them).
+        let plan = lp_with(
+            "SELECT region, year FROM sales GROUP BY ALL",
+            &rollup_provider(),
+        );
+        match &plan {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Aggregate { group_by, aggregates, .. } => {
+                    assert_eq!(group_by.len(), 2, "groups by both selected columns");
+                    assert!(aggregates.is_empty(), "no aggregates");
+                }
+                other => panic!("expected Aggregate, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+        assert!(plan.schema().is_ok());
     }
 
     #[test]
