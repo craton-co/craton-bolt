@@ -1476,6 +1476,89 @@ impl LateralApplyPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Correlated WHERE subquery — host per-row semi/anti/scalar Apply
+// (feature F4 — correlated EXISTS / NOT EXISTS / scalar subquery in WHERE)
+// ---------------------------------------------------------------------------
+
+/// Reserved ephemeral table name the OUTER projection template
+/// ([`CorrelatedWherePlan::post`]) scans — the host-built relation of the
+/// *surviving* outer rows (== [`CorrelatedWherePlan::left_schema`]). Mirrors
+/// [`LATERAL_APPLY_RESULT_TABLE`]. The leading `__` keeps it out of any user
+/// namespace.
+pub const CORR_WHERE_RESULT_TABLE: &str = "__corr_where_result";
+
+/// What per-outer-row test a [`CorrelatedWherePlan`] applies. Re-exported from
+/// [`crate::plan::subquery`] so the engine and explain formatter can match on
+/// it without depending on that module directly.
+pub use crate::plan::subquery::CorrWhereKind;
+
+/// Descriptor for a single `SELECT` whose WHERE contains exactly one
+/// **correlated** subquery (feature F4), executed as a host-orchestrated
+/// per-outer-row Apply (a correlated semi/anti-join, or a correlated
+/// scalar-compare) rather than a single [`LogicalPlan`].
+///
+/// Like [`LateralApplyPlan`], this is a standalone descriptor (not a new
+/// `LogicalPlan`/`Expr` variant) so no exhaustive match in a shared file
+/// breaks. The engine (see
+/// [`crate::exec::engine::Engine::execute_correlated_where`]):
+///
+/// 1. Runs [`Self::left`] → the outer relation (the FROM + every *ordinary*
+///    (uncorrelated) WHERE conjunct applied as a normal `Filter`).
+/// 2. For each outer row (bounded by the SAME mandatory cap as LATERAL —
+///    [`crate::exec::engine::MAX_APPLY_LEFT_ROWS`] /
+///    [`crate::exec::engine::MAX_APPLY_LEFT_ROWS_ENV`]) binds a single-row
+///    [`LATERAL_OUTER_TABLE`] relation holding that row's correlated values
+///    (`__corr_0..N`, in [`Self::corr_left_indices`] order) and:
+///    * for [`CorrWhereKind::Exists`] / [`CorrWhereKind::NotExists`]: runs
+///      [`Self::test_subplan`] and keeps / drops the row on its row count
+///      (>= 1 for EXISTS, == 0 for NOT EXISTS — never NULL);
+///    * for [`CorrWhereKind::Scalar`]: runs [`Self::test_subplan`] (a
+///      `SELECT <the whole conjunct, outer refs and the inner scalar subquery
+///      rewritten> FROM __lateral_outer`) which `resolve_subqueries` folds to a
+///      single boolean — the row is kept iff that boolean is TRUE (a NULL /
+///      FALSE drops it, matching WHERE 3VL; a scalar subquery returning >1 row
+///      errors via the ordinary scalar-fold path).
+/// 3. Concatenates the surviving outer rows, binds them under
+///    [`CORR_WHERE_RESULT_TABLE`] and runs [`Self::post`] (the user's
+///    projection / GROUP BY / HAVING / ORDER BY / LIMIT).
+#[derive(Debug, Clone)]
+pub struct CorrelatedWherePlan {
+    /// Outer (LEFT) relation: the FROM tree with every ordinary uncorrelated
+    /// WHERE conjunct already applied as a `Filter`.
+    pub left: LogicalPlan,
+    /// Output schema of [`Self::left`].
+    pub left_schema: Schema,
+    /// The per-row test subplan. For EXISTS/NOT EXISTS this is the correlated
+    /// subquery with its outer references rewritten to
+    /// `(SELECT __corr_<i> FROM __lateral_outer)`; its *row count* is the test.
+    /// For the scalar kind this is `SELECT <conjunct> FROM __lateral_outer`
+    /// with both the outer references AND the inner scalar subquery's own
+    /// correlations rewritten away — its single boolean cell is the test.
+    pub test_subplan: LogicalPlan,
+    /// Schema of the single-row [`LATERAL_OUTER_TABLE`] relation: one
+    /// `__corr_<i>` field per distinct correlation, carrying the matched outer
+    /// column's dtype.
+    pub outer_schema: Schema,
+    /// For each `__corr_<i>` (in field order of [`Self::outer_schema`]), the
+    /// index into [`Self::left_schema`] of the outer column whose value fills
+    /// it for the current row.
+    pub corr_left_indices: Vec<usize>,
+    /// Which per-row test to apply.
+    pub kind: CorrWhereKind,
+    /// OUTER projection template: the user's projection / GROUP BY / HAVING /
+    /// ORDER BY / LIMIT lowered over a synthetic `Scan` of
+    /// [`CORR_WHERE_RESULT_TABLE`] (== [`Self::left_schema`]).
+    pub post: LogicalPlan,
+}
+
+impl CorrelatedWherePlan {
+    /// Overall output schema (== the OUTER template's schema).
+    pub fn schema(&self) -> BoltResult<Schema> {
+        self.post.schema()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
 // ---------------------------------------------------------------------------
 
@@ -2984,6 +3067,481 @@ fn require_on_true(c: &JoinConstraint) -> BoltResult<()> {
              subquery's WHERE)"
                 .into(),
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Correlated WHERE subquery detector (feature F4)
+// ---------------------------------------------------------------------------
+
+/// Detect a top-level `SELECT` whose WHERE holds a single **correlated**
+/// subquery (correlated `EXISTS` / `NOT EXISTS`, or a scalar-compare conjunct
+/// carrying a correlated scalar subquery) and build its
+/// [`CorrelatedWherePlan`]. Mirrors [`plan_lateral_apply`]: returns `Ok(None)`
+/// for every query that is not such a shape (so the caller falls through), and
+/// `Err` only for a malformed query *of this shape*.
+pub fn plan_correlated_where(
+    sql: &str,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<CorrelatedWherePlan>> {
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if stmts.len() != 1 {
+        return Ok(None);
+    }
+    let stmt = stmts.remove(0);
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    plan_correlated_where_query(&query, provider)
+}
+
+/// Inner detector: see [`plan_correlated_where`]. Operates on a parsed `Query`.
+fn plan_correlated_where_query(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<CorrelatedWherePlan>> {
+    use crate::plan::subquery::{
+        as_exists, count_direct_subqueries, split_and_conjuncts, subquery_is_correlated,
+        CorrWhereKind,
+    };
+
+    // Only a plain single SELECT (no WITH, no set-op) is in scope. A LATERAL
+    // apply is handled by its own (earlier) detector.
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+    if select.from.is_empty() {
+        return Ok(None);
+    }
+    // A WHERE is required for there to be a correlated subquery to find.
+    let where_expr = match &select.selection {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    // A LATERAL anywhere in FROM belongs to the LATERAL detector, not here.
+    let is_lateral = |tf: &TableFactor| matches!(tf, TableFactor::Derived { lateral: true, .. });
+    for twj in &select.from {
+        if is_lateral(&twj.relation) || twj.joins.iter().any(|j| is_lateral(&j.relation)) {
+            return Ok(None);
+        }
+    }
+
+    // --- Build the OUTER (left) relation + a resolver for its scope, exactly
+    // like the LATERAL path (`build_left_relation` with `last_idx` = the final
+    // FROM item and *no* trailing LATERAL to strip). ---
+    let ctes = CteScope::new();
+    // Pass `last_idx = from.len()` so `build_left_relation` strips *no* trailing
+    // LATERAL (there is none here) and includes every FROM item / join.
+    let (mut left_plan, left_resolver) =
+        build_left_relation(select, select.from.len(), provider, &ctes, is_lateral)?;
+    let outer_columns = left_resolver.outer_column_names();
+
+    // --- Split the WHERE into top-level AND conjuncts and find the
+    // correlated-subquery conjunct(s). ---
+    let conjuncts = split_and_conjuncts(where_expr);
+    let mut corr_idx: Option<usize> = None;
+    for (i, c) in conjuncts.iter().enumerate() {
+        // A conjunct is "correlated" iff it directly carries a subquery whose
+        // body references an outer column.
+        let mut is_corr = false;
+        if let Some((subq, _)) = as_exists(c) {
+            is_corr = subquery_is_correlated(subq, &outer_columns, provider)?;
+        } else {
+            // Scan for a direct scalar `(SELECT ...)` that is correlated.
+            for subq in direct_scalar_subqueries(c) {
+                if subquery_is_correlated(subq, &outer_columns, provider)? {
+                    is_corr = true;
+                    break;
+                }
+            }
+        }
+        if is_corr {
+            if corr_idx.is_some() {
+                return Err(BoltError::Sql(
+                    "unsupported: more than one correlated subquery in WHERE \
+                     (only a single correlated EXISTS / NOT EXISTS / scalar \
+                     subquery is supported)"
+                        .into(),
+                ));
+            }
+            corr_idx = Some(i);
+        }
+    }
+    let corr_idx = match corr_idx {
+        Some(i) => i,
+        // No correlated subquery in WHERE — not our shape (an uncorrelated
+        // subquery folds to a constant on the ordinary path).
+        None => return Ok(None),
+    };
+    let corr_conjunct = conjuncts[corr_idx];
+
+    // --- Classify the correlated conjunct + capture its template subquery. ---
+    let (kind, template): (CorrWhereKind, &Query) = if let Some((subq, negated)) =
+        as_exists(corr_conjunct)
+    {
+        (
+            if negated { CorrWhereKind::NotExists } else { CorrWhereKind::Exists },
+            subq,
+        )
+    } else {
+        // Scalar-compare conjunct: it must carry EXACTLY ONE direct subquery
+        // (the correlated scalar). More than one direct subquery in the same
+        // conjunct (e.g. `(SELECT ..) > (SELECT ..)`) is out of scope.
+        if count_direct_subqueries(corr_conjunct) != 1 {
+            return Err(BoltError::Sql(
+                "unsupported: correlated WHERE conjunct with more than one \
+                 subquery (a single correlated scalar subquery per conjunct is \
+                 supported)"
+                    .into(),
+            ));
+        }
+        let subq = direct_scalar_subqueries(corr_conjunct)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                BoltError::Sql(
+                    "unsupported: correlated WHERE subquery shape (expected a \
+                     correlated EXISTS / NOT EXISTS or a scalar comparison \
+                     carrying a correlated scalar subquery)"
+                        .into(),
+                )
+            })?;
+        (CorrWhereKind::Scalar, subq)
+    };
+
+    // --- Apply every ORDINARY (non-correlated) conjunct as a normal Filter on
+    // the outer plan. We rebuild a single AND of them and lower it against the
+    // left resolver, then wrap the plan in a `Filter`. ---
+    let ordinary: Vec<&SqlExpr> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != corr_idx)
+        .map(|(_, c)| *c)
+        .collect();
+    if !ordinary.is_empty() {
+        let folded = and_fold_exprs(&ordinary);
+        let predicate = lower_expr(&folded, &left_resolver, 1)?;
+        left_plan = LogicalPlan::Filter {
+            input: Box::new(left_plan),
+            predicate,
+        };
+    }
+    let left_schema = left_plan.schema()?;
+
+    // --- Collect the correlations against the outer scope and build the
+    // synthetic `__corr_<i>` outer schema + index list, exactly like the
+    // LATERAL path. For EXISTS / NOT EXISTS the correlations live entirely
+    // inside the subquery body. For the scalar kind the conjunct *itself* may
+    // reference outer columns (e.g. `outer.a > (subquery)`) in addition to the
+    // subquery's own correlations — so collect over the whole conjunct. ---
+    let corrs = match kind {
+        CorrWhereKind::Exists | CorrWhereKind::NotExists => {
+            crate::plan::subquery::collect_correlations(template, &outer_columns, provider)?
+        }
+        CorrWhereKind::Scalar => crate::plan::subquery::collect_conjunct_correlations(
+            corr_conjunct,
+            &outer_columns,
+            provider,
+        )?,
+    };
+    if corrs.is_empty() {
+        // Defensive: we only got here because the conjunct *was* correlated.
+        return Ok(None);
+    }
+    let mut outer_fields: Vec<Field> = Vec::with_capacity(corrs.len());
+    let mut corr_left_indices: Vec<usize> = Vec::with_capacity(corrs.len());
+    let mut corr_to_synth: Vec<(crate::plan::subquery::CorrRef, String)> =
+        Vec::with_capacity(corrs.len());
+    for (i, corr) in corrs.iter().enumerate() {
+        let li = left_resolver.resolve_correlation(corr).map_err(|e| {
+            BoltError::Sql(format!(
+                "correlated WHERE subquery references outer column it cannot resolve: {e}"
+            ))
+        })?;
+        let synth = format!("{LATERAL_CORR_COL_PREFIX}{i}");
+        outer_fields.push(Field::new(synth.clone(), left_schema.fields[li].dtype, true));
+        corr_left_indices.push(li);
+        corr_to_synth.push((corr.clone(), synth));
+    }
+    let outer_schema = Schema::new(outer_fields);
+    let ext_provider = LateralProvider {
+        base: provider,
+        outer_schema: &outer_schema,
+    };
+
+    // --- Build the per-row test subplan. ---
+    let test_subplan = match kind {
+        CorrWhereKind::Exists | CorrWhereKind::NotExists => {
+            // Re-run the correlated subquery per row; its row count is the test.
+            let mut rewritten = template.clone();
+            rewrite_correlations_in_query(&mut rewritten, &corr_to_synth, &left_resolver, 0)?;
+            plan_query(&rewritten, &ext_provider, &CteScope::new(), 1)?
+        }
+        CorrWhereKind::Scalar => {
+            // `SELECT (<conjunct>) FROM __lateral_outer`, with the conjunct's
+            // outer references AND the inner correlated subquery's own
+            // correlations rewritten to `(SELECT __corr_<i> FROM __lateral_outer)`.
+            // After `resolve_subqueries` folds the (now-uncorrelated) inner
+            // scalar subquery and the `__corr` cells, this yields one boolean
+            // per row.
+            let mut conj = corr_conjunct.clone();
+            rewrite_corr_expr(&mut conj, &corr_to_synth, 0)?;
+            rewrite_correlations_in_scalar_subqueries(&mut conj, &corr_to_synth, 0)?;
+            let test_query = build_scalar_test_query(&conj)?;
+            plan_query(&test_query, &ext_provider, &CteScope::new(), 1)?
+        }
+    };
+
+    // --- Build the OUTER projection template over `__corr_where_result`
+    // (== the surviving outer rows, same schema as `left`). The user's
+    // qualified `t.col` references resolve against that single table. ---
+    let post = build_corr_where_post(select, query, &left_resolver, &left_schema)?;
+
+    Ok(Some(CorrelatedWherePlan {
+        left: left_plan,
+        left_schema,
+        test_subplan,
+        outer_schema,
+        corr_left_indices,
+        kind,
+        post,
+    }))
+}
+
+/// Collect every *direct* scalar `(SELECT ...)` subquery in `e` (not descending
+/// into a subquery's own body, mirroring the correlation collector). Excludes
+/// `EXISTS` / `IN (SELECT ...)` (handled separately).
+fn direct_scalar_subqueries(e: &SqlExpr) -> Vec<&Query> {
+    fn walk<'a>(e: &'a SqlExpr, out: &mut Vec<&'a Query>) {
+        match e {
+            SqlExpr::Subquery(q) => out.push(q.as_ref()),
+            // Do not descend into EXISTS / IN subquery bodies.
+            SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => {}
+            SqlExpr::Nested(inner)
+            | SqlExpr::UnaryOp { expr: inner, .. }
+            | SqlExpr::IsNull(inner)
+            | SqlExpr::IsNotNull(inner)
+            | SqlExpr::Cast { expr: inner, .. } => walk(inner, out),
+            SqlExpr::BinaryOp { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, out);
+                walk(low, out);
+                walk(high, out);
+            }
+            SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+                walk(expr, out);
+                walk(pattern, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    out
+}
+
+/// Fold a non-empty slice of conjuncts into a single left-deep `AND` AST.
+fn and_fold_exprs(conjuncts: &[&SqlExpr]) -> SqlExpr {
+    let mut iter = conjuncts.iter();
+    let first = (*iter.next().expect("non-empty conjunct list")).clone();
+    iter.fold(first, |acc, c| SqlExpr::BinaryOp {
+        left: Box::new(acc),
+        op: sqlparser::ast::BinaryOperator::And,
+        right: Box::new((*c).clone()),
+    })
+}
+
+/// Rewrite the correlations *inside* every direct scalar `(SELECT ...)`
+/// subquery of `e` (the inner correlated scalar subquery), so that after the
+/// rewrite the inner subquery is uncorrelated and folds normally. The outer
+/// references in `e` itself are rewritten separately by [`rewrite_corr_expr`].
+fn rewrite_correlations_in_scalar_subqueries(
+    e: &mut SqlExpr,
+    corr_to_synth: &[(crate::plan::subquery::CorrRef, String)],
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    match e {
+        SqlExpr::Subquery(q) => {
+            rewrite_correlations_in_query(q, corr_to_synth, &NameResolver::empty(), depth + 1)
+        }
+        // Do not descend into EXISTS / IN bodies here.
+        SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => Ok(()),
+        SqlExpr::Nested(inner)
+        | SqlExpr::UnaryOp { expr: inner, .. }
+        | SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::Cast { expr: inner, .. } => {
+            rewrite_correlations_in_scalar_subqueries(inner, corr_to_synth, depth + 1)
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_correlations_in_scalar_subqueries(left, corr_to_synth, depth + 1)?;
+            rewrite_correlations_in_scalar_subqueries(right, corr_to_synth, depth + 1)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_correlations_in_scalar_subqueries(expr, corr_to_synth, depth + 1)?;
+            rewrite_correlations_in_scalar_subqueries(low, corr_to_synth, depth + 1)?;
+            rewrite_correlations_in_scalar_subqueries(high, corr_to_synth, depth + 1)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            rewrite_correlations_in_scalar_subqueries(expr, corr_to_synth, depth + 1)?;
+            rewrite_correlations_in_scalar_subqueries(pattern, corr_to_synth, depth + 1)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Build the `SELECT (<conjunct>) FROM __lateral_outer` query whose single
+/// boolean cell is the per-row scalar test. The conjunct has already had its
+/// outer references + inner correlations rewritten to `__lateral_outer`
+/// lookups, so the query is self-contained against the synthetic outer table.
+fn build_scalar_test_query(conjunct: &SqlExpr) -> BoltResult<Query> {
+    // Parse a skeleton and splice the rewritten conjunct in as the sole
+    // projection — robust to sqlparser struct churn (same approach as
+    // `lateral_corr_subquery`).
+    let sql = format!("SELECT true AS __corr_test FROM {LATERAL_OUTER_TABLE}");
+    let dialect = GenericDialect {};
+    let mut stmts =
+        Parser::parse_sql(&dialect, &sql).map_err(|e| parse_error_to_bolt_error(e, &sql))?;
+    let stmt = stmts.remove(0);
+    let mut query = match stmt {
+        Statement::Query(q) => *q,
+        _ => unreachable!("synthetic scalar-test query is always a SELECT"),
+    };
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        select.projection = vec![SelectItem::ExprWithAlias {
+            expr: conjunct.clone(),
+            alias: Ident::new("__corr_test"),
+        }];
+    }
+    Ok(query)
+}
+
+/// Build the OUTER projection template for a correlated-WHERE plan: rewrite the
+/// user's SELECT so its FROM is the single [`CORR_WHERE_RESULT_TABLE`] (== the
+/// surviving outer rows) and its `qualifier.col` references resolve against
+/// that relation, then lower it (projection / GROUP BY / HAVING / ORDER BY /
+/// LIMIT). Reuses [`LateralRefMap`] + [`build_lateral_post`]-style rewriting,
+/// but with NO subquery side (the correlated subquery has been consumed by the
+/// per-row test) — so the ref map only carries the left (outer) columns.
+fn build_corr_where_post(
+    select: &Select,
+    query: &Query,
+    left_resolver: &NameResolver<'_>,
+    left_schema: &Schema,
+) -> BoltResult<LogicalPlan> {
+    // A ref map over the left scope only (no lateral subquery columns): an
+    // empty subquery schema makes `LateralRefMap::build` register just the
+    // outer `qualifier.col` / bare-`col` → output-name entries.
+    let empty_sub = Schema::new(Vec::new());
+    let map = LateralRefMap::build(
+        left_resolver,
+        "__corr_where_no_alias",
+        &empty_sub,
+        &[],
+        left_schema,
+    );
+
+    // Rewrite + repoint the SELECT at the result table, dropping the WHERE (it
+    // has been fully applied by the Filter + per-row test).
+    let mut out_select = select.clone();
+    out_select.selection = None;
+    out_select.from = vec![sqlparser::ast::TableWithJoins {
+        relation: TableFactor::Table {
+            name: ObjectName(vec![Ident::new(CORR_WHERE_RESULT_TABLE)]),
+            alias: None,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            partitions: Vec::new(),
+            with_ordinality: false,
+        },
+        joins: Vec::new(),
+    }];
+    rewrite_refs_in_select(&mut out_select, &map)?;
+
+    let result_provider = CorrWhereResultProvider { schema: left_schema };
+    let ctes = CteScope::new();
+    let mut plan = plan_select(&out_select, &result_provider, &ctes, 1)?;
+
+    // ORDER BY / LIMIT / OFFSET, mirroring `build_lateral_post`.
+    if let Some(order_by) = &query.order_by {
+        let mut order_exprs = order_by.exprs.clone();
+        for ob in &mut order_exprs {
+            rewrite_refs_in_expr(&mut ob.expr, &map, 0)?;
+        }
+        let sort_exprs = lower_order_by(
+            &order_exprs,
+            SubqueryCtx {
+                provider: &result_provider,
+                ctes: &ctes,
+            },
+        )?;
+        if !sort_exprs.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                sort_exprs,
+            };
+        }
+    }
+    if !query.limit_by.is_empty() {
+        return Err(BoltError::Sql("unsupported: LIMIT BY".into()));
+    }
+    if query.fetch.is_some() {
+        return Err(BoltError::Sql("unsupported: FETCH".into()));
+    }
+    let limit_value = match &query.limit {
+        Some(e) => Some(usize_from_literal(e, "LIMIT")?),
+        None => None,
+    };
+    let offset_value = match &query.offset {
+        Some(Offset { value, .. }) => Some(usize_from_literal(value, "OFFSET")?),
+        None => None,
+    };
+    if limit_value.is_some() || offset_value.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: limit_value.unwrap_or(usize::MAX),
+            offset: offset_value.unwrap_or(0),
+        };
+    }
+    let _ = plan.schema()?;
+    Ok(plan)
+}
+
+/// A [`TableProvider`] exposing exactly the surviving-outer-rows schema under
+/// [`CORR_WHERE_RESULT_TABLE`]. Mirrors [`LateralResultProvider`].
+struct CorrWhereResultProvider<'a> {
+    schema: &'a Schema,
+}
+impl TableProvider for CorrWhereResultProvider<'_> {
+    fn schema(&self, name: &str) -> BoltResult<Schema> {
+        if name == CORR_WHERE_RESULT_TABLE || name.eq_ignore_ascii_case(CORR_WHERE_RESULT_TABLE) {
+            return Ok(self.schema.clone());
+        }
+        Err(BoltError::Plan(format!(
+            "correlated-WHERE OUTER template referenced unknown table '{name}' \
+             (only the surviving outer relation is in scope)"
+        )))
     }
 }
 

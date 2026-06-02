@@ -463,6 +463,51 @@ pub fn format_lateral_apply(la: &crate::plan::sql_frontend::LateralApplyPlan) ->
     out
 }
 
+/// Render a
+/// [`CorrelatedWherePlan`](crate::plan::sql_frontend::CorrelatedWherePlan) as a
+/// tree-indented string for `EXPLAIN`.
+///
+/// A correlated-WHERE subquery is not a single [`LogicalPlan`] (the engine
+/// re-runs the correlated subquery per outer row; see
+/// `Engine::execute_correlated_where`), so it gets its own renderer. The header
+/// names the test kind (EXISTS semi-join / NOT EXISTS anti-join / scalar) and
+/// the correlated outer columns threaded in; `Outer:` renders the outer
+/// relation (FROM + ordinary WHERE conjuncts), `Test:` the per-row
+/// (correlation-rewritten) test subplan, and `Post:` the OUTER projection
+/// template run over the surviving rows.
+pub fn format_correlated_where(
+    cw: &crate::plan::sql_frontend::CorrelatedWherePlan,
+) -> String {
+    use crate::plan::sql_frontend::CorrWhereKind;
+    let mut out = String::new();
+    let kind = match cw.kind {
+        CorrWhereKind::Exists => "EXISTS (semi-join)",
+        CorrWhereKind::NotExists => "NOT EXISTS (anti-join)",
+        CorrWhereKind::Scalar => "scalar-compare",
+    };
+    let corr_cols: Vec<&str> = cw
+        .outer_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let _ = writeln!(
+        out,
+        "CorrelatedWhere: {kind} correlations=[{}]",
+        corr_cols.join(", ")
+    );
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Outer:");
+    format_logical_into(&cw.left, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Test:");
+    format_logical_into(&cw.test_subplan, 2, &mut out);
+    indent(&mut out, 1);
+    let _ = writeln!(out, "Post:");
+    format_logical_into(&cw.post, 2, &mut out);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // COUNT(DISTINCT col) with GROUP BY (feature F3-finish)
 // ---------------------------------------------------------------------------

@@ -707,3 +707,290 @@ fn correlated_err(reference: &str) -> BoltError {
          only uncorrelated subqueries are supported"
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Correlated WHERE subquery detection (feature F4 — correlated EXISTS /
+// NOT EXISTS / scalar subquery in WHERE).
+// ---------------------------------------------------------------------------
+//
+// The detector below recognises a top-level `SELECT` whose WHERE contains a
+// *correlated* subquery and classifies it as an EXISTS semi-join, a NOT EXISTS
+// anti-join, or a correlated scalar-compare. The engine then executes it as a
+// per-outer-row Apply (see `Engine::execute_correlated_where`), reusing the
+// LATERAL substitution machinery (rewrite each outer reference to a
+// `(SELECT __corr_<i> FROM __lateral_outer)` scalar subquery the engine folds
+// per row). Only a SINGLE correlated subquery in the WHERE is in scope; the
+// rest of the WHERE (ordinary, uncorrelated conjuncts) is applied as a normal
+// `Filter` on the outer plan.
+
+/// Returns `true` iff `query` (as a subquery body) references at least one
+/// column from the enclosing scope described by `outer_columns` — i.e. it is
+/// correlated. A thin wrapper over [`collect_correlations`] used by the
+/// correlated-WHERE detector to tell a correlated subquery (handled via the
+/// per-row Apply) apart from an uncorrelated one (folded to a constant).
+pub(crate) fn subquery_is_correlated(
+    query: &Query,
+    outer_columns: &HashSet<String>,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+) -> BoltResult<bool> {
+    Ok(!collect_correlations(query, outer_columns, provider)?.is_empty())
+}
+
+/// Split a WHERE expression into its top-level `AND` conjuncts (left-to-right
+/// order). A non-`AND` expression yields a single-element vector. `Nested`
+/// (parenthesised) wrappers around an `AND` are flattened so
+/// `a AND (b AND c)` splits into `[a, b, c]`.
+pub(crate) fn split_and_conjuncts(e: &SqlExpr) -> Vec<&SqlExpr> {
+    fn walk<'a>(e: &'a SqlExpr, out: &mut Vec<&'a SqlExpr>) {
+        match e {
+            SqlExpr::BinaryOp {
+                left,
+                op: sqlparser::ast::BinaryOperator::And,
+                right,
+            } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            SqlExpr::Nested(inner) => walk(inner, out),
+            other => out.push(other),
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    out
+}
+
+/// The classification of a correlated WHERE conjunct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrWhereKind {
+    /// `EXISTS (correlated subquery)` — semi-join (keep outer row iff the
+    /// subquery returns >= 1 row).
+    Exists,
+    /// `NOT EXISTS (correlated subquery)` — anti-join (keep outer row iff the
+    /// subquery returns 0 rows).
+    NotExists,
+    /// A scalar comparison conjunct containing exactly one correlated scalar
+    /// subquery (e.g. `outer.a > (SELECT max(b) FROM ... WHERE k = outer.k)`).
+    /// The whole conjunct is evaluated per outer row as a boolean test.
+    Scalar,
+}
+
+/// Count how many subquery nodes (`(SELECT ...)`, `EXISTS (...)`,
+/// `x IN (SELECT ...)`) appear *directly* in `e` (not descending into a
+/// subquery's own body). Used to keep the scalar-correlated path to the
+/// single-subquery case it can soundly evaluate.
+pub(crate) fn count_direct_subqueries(e: &SqlExpr) -> usize {
+    fn walk(e: &SqlExpr, n: &mut usize) {
+        match e {
+            SqlExpr::Subquery(_) | SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => {
+                *n += 1;
+                // Do not descend into the subquery body — a nested subquery
+                // there is validated independently.
+            }
+            SqlExpr::Nested(inner)
+            | SqlExpr::UnaryOp { expr: inner, .. }
+            | SqlExpr::IsNull(inner)
+            | SqlExpr::IsNotNull(inner)
+            | SqlExpr::Cast { expr: inner, .. } => walk(inner, n),
+            SqlExpr::BinaryOp { left, right, .. } => {
+                walk(left, n);
+                walk(right, n);
+            }
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, n);
+                walk(low, n);
+                walk(high, n);
+            }
+            SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+                walk(expr, n);
+                walk(pattern, n);
+            }
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    walk(e, &mut n);
+    n
+}
+
+/// Collect the distinct outer (correlated) references made by a *scalar WHERE
+/// conjunct* `e` against the enclosing scope `outer_columns`.
+///
+/// Unlike [`collect_correlations`] (which works on a subquery `Query` and stops
+/// at the conjunct's own FROM scope), this walks an expression that has NO own
+/// FROM scope — so every outer-column reference at the conjunct level is a
+/// correlation — AND descends into each direct scalar `(SELECT ...)` subquery,
+/// collecting *its* correlations against the same outer scope (using the
+/// subquery's own FROM as that subquery's local scope, via
+/// [`collect_correlations`]). The union, de-duplicated, is returned in
+/// first-seen order. `EXISTS` / `IN (SELECT ...)` bodies are not descended into
+/// here (the correlated-WHERE detector handles EXISTS as its own conjunct kind
+/// and does not mix it with a scalar conjunct).
+pub(crate) fn collect_conjunct_correlations(
+    e: &SqlExpr,
+    outer_columns: &HashSet<String>,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+) -> BoltResult<Vec<CorrRef>> {
+    // The conjunct itself has no FROM scope — an empty `LocalScope` means every
+    // outer-column reference at this level is a correlation.
+    let empty = LocalScope::default();
+    let mut out: Vec<CorrRef> = Vec::new();
+    collect_expr_correlations(e, &empty, outer_columns, &mut out, 0)?;
+    // Descend into each direct scalar subquery and union its correlations.
+    collect_scalar_subquery_correlations(e, outer_columns, provider, &mut out, 0)?;
+    Ok(out)
+}
+
+/// Walk `e`, and for each direct scalar `(SELECT ...)` subquery accumulate its
+/// correlations (via [`collect_correlations`]) into `out`. Does not descend
+/// into `EXISTS` / `IN` subquery bodies.
+fn collect_scalar_subquery_correlations(
+    e: &SqlExpr,
+    outer_columns: &HashSet<String>,
+    provider: &dyn crate::plan::sql_frontend::TableProvider,
+    out: &mut Vec<CorrRef>,
+    depth: usize,
+) -> BoltResult<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(BoltError::Sql(format!(
+            "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
+        )));
+    }
+    match e {
+        SqlExpr::Subquery(q) => {
+            for r in collect_correlations(q, outer_columns, provider)? {
+                push_unique(out, r);
+            }
+            Ok(())
+        }
+        SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => Ok(()),
+        SqlExpr::Nested(inner)
+        | SqlExpr::UnaryOp { expr: inner, .. }
+        | SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::Cast { expr: inner, .. } => {
+            collect_scalar_subquery_correlations(inner, outer_columns, provider, out, depth + 1)
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_scalar_subquery_correlations(left, outer_columns, provider, out, depth + 1)?;
+            collect_scalar_subquery_correlations(right, outer_columns, provider, out, depth + 1)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_scalar_subquery_correlations(expr, outer_columns, provider, out, depth + 1)?;
+            collect_scalar_subquery_correlations(low, outer_columns, provider, out, depth + 1)?;
+            collect_scalar_subquery_correlations(high, outer_columns, provider, out, depth + 1)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            collect_scalar_subquery_correlations(expr, outer_columns, provider, out, depth + 1)?;
+            collect_scalar_subquery_correlations(pattern, outer_columns, provider, out, depth + 1)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Extract the `Query` body of an `EXISTS (subquery)` / `NOT EXISTS (subquery)`
+/// conjunct, returning `(query, negated)`. `None` for any other expression
+/// shape.
+pub(crate) fn as_exists(e: &SqlExpr) -> Option<(&Query, bool)> {
+    match e {
+        SqlExpr::Exists { subquery, negated } => Some((subquery.as_ref(), *negated)),
+        SqlExpr::Nested(inner) => as_exists(inner),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field, Schema};
+    use crate::plan::sql_frontend::MemTableProvider;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    /// Standalone provider (no Engine / no GPU): `o(a Int64, k Int64)` outer,
+    /// `s(sk Int64, v Int64)` for the subqueries.
+    fn provider() -> MemTableProvider {
+        MemTableProvider::new()
+            .with_table(
+                "o",
+                Schema::new(vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("k", DataType::Int64, false),
+                ]),
+            )
+            .with_table(
+                "s",
+                Schema::new(vec![
+                    Field::new("sk", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, false),
+                ]),
+            )
+    }
+
+    fn outer_cols() -> HashSet<String> {
+        ["a", "k"].iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Parse the sole WHERE expression out of a single-SELECT statement.
+    fn where_expr(sql: &str) -> SqlExpr {
+        let dialect = GenericDialect {};
+        let mut stmts = Parser::parse_sql(&dialect, sql).expect("parse");
+        let stmt = stmts.remove(0);
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("not a query"),
+        };
+        match *query.body {
+            SetExpr::Select(s) => (*s).selection.expect("a WHERE"),
+            _ => panic!("not a SELECT"),
+        }
+    }
+
+    #[test]
+    fn split_and_conjuncts_flattens() {
+        let w = where_expr("SELECT 1 FROM o WHERE a > 1 AND (k < 2 AND a < 9)");
+        assert_eq!(split_and_conjuncts(&w).len(), 3);
+    }
+
+    #[test]
+    fn split_and_conjuncts_single() {
+        let w = where_expr("SELECT 1 FROM o WHERE a > 1");
+        assert_eq!(split_and_conjuncts(&w).len(), 1);
+    }
+
+    #[test]
+    fn as_exists_matches_exists_and_not_exists() {
+        let w = where_expr("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM s WHERE sk = o.k)");
+        let (q, neg) = as_exists(&w).expect("EXISTS");
+        assert!(!neg);
+        assert!(subquery_is_correlated(q, &outer_cols(), &provider()).unwrap());
+
+        let w2 = where_expr("SELECT 1 FROM o WHERE NOT EXISTS (SELECT 1 FROM s WHERE sk = o.k)");
+        let (_, neg2) = as_exists(&w2).expect("NOT EXISTS");
+        assert!(neg2);
+    }
+
+    #[test]
+    fn uncorrelated_exists_is_not_correlated() {
+        let w = where_expr("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM s WHERE sk = 5)");
+        let (q, _) = as_exists(&w).unwrap();
+        assert!(!subquery_is_correlated(q, &outer_cols(), &provider()).unwrap());
+    }
+
+    #[test]
+    fn conjunct_correlations_union_outer_and_inner() {
+        // `o.a > (SELECT max(v) FROM s WHERE sk = o.k)`: the conjunct-level
+        // `o.a` AND the subquery-internal `o.k` are both collected.
+        let w = where_expr(
+            "SELECT 1 FROM o WHERE o.a > (SELECT MAX(v) FROM s WHERE sk = o.k)",
+        );
+        let corrs = collect_conjunct_correlations(&w, &outer_cols(), &provider()).unwrap();
+        let cols: HashSet<&str> = corrs.iter().map(|c| c.column.as_str()).collect();
+        assert!(cols.contains("a"), "conjunct-level o.a is a correlation");
+        assert!(cols.contains("k"), "subquery-internal o.k is a correlation");
+    }
+}

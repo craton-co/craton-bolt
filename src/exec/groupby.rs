@@ -87,7 +87,8 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch,
 };
 use arrow_schema::{
     DataType as ArrowDataType, Schema as ArrowSchema,
@@ -112,8 +113,9 @@ use crate::jit::agg_kernels::ReduceOp;
 // remains correct.
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
-    compile_groupby_keys_kernel_dispatched, groupby_block_size,
-    AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
+    compile_groupby_decimal_kernel, compile_groupby_keys_kernel_dispatched,
+    groupby_block_size, GroupedDecimalOp, AGG_DECIMAL_KERNEL_ENTRY, AGG_KERNEL_ENTRY,
+    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::{
     sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema, TimeUnit,
@@ -965,6 +967,102 @@ fn launch_agg_kernel<T: Pod>(
     Ok(())
 }
 
+/// Launch the grouped Decimal128 SUM/MIN/MAX kernel
+/// ([`compile_groupby_decimal_kernel`], entry [`AGG_DECIMAL_KERNEL_ENTRY`]).
+///
+/// Unlike [`launch_agg_kernel`] this carries a 16-byte (`i128`) per-slot
+/// accumulator updated under a per-slot spin lock (sm_70 has no 128-bit
+/// atomic), so it needs two extra device buffers: a `u32` lock table (one word
+/// per slot, init 0) and a single `u32` overflow flag (init 0; SUM-only). The
+/// 128-bit per-slot combine is bit-for-bit identical to the scalar decimal
+/// path: carry-chain add for SUM (with signed-overflow detection that raises
+/// the flag) and signed-hi/unsigned-lo compare-select for MIN/MAX.
+///
+/// Returns `Ok(true)` if a SUM overflow was detected on-device (the caller
+/// raises the same error as the scalar/host path); `Ok(false)` otherwise.
+/// MIN/MAX never overflow and always return `Ok(false)`.
+#[allow(clippy::too_many_arguments)]
+fn launch_decimal_agg_kernel(
+    op: GroupedDecimalOp,
+    group_col: &GpuVec<i64>,
+    keys_table: &GpuVec<i64>,
+    input_col: &GpuVec<i128>,
+    acc_table: &mut GpuVec<i128>,
+    n_rows: usize,
+    k: usize,
+    k_u32: u32,
+    stream: &CudaStream,
+) -> BoltResult<bool> {
+    if n_rows == 0 {
+        return Ok(false);
+    }
+
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("groupby_agg_decimal:{:?}", op),
+        None,
+        || compile_groupby_decimal_kernel(op, false),
+    )?;
+    let function = module.function(AGG_DECIMAL_KERNEL_ENTRY)?;
+
+    // Per-slot lock table (init 0) + single-word overflow flag (init 0).
+    let lock_table = GpuVec::<u32>::zeros_async(k, stream.raw())?;
+    let overflow_flag = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+
+    let mut group_ptr: CUdeviceptr = group_col.device_ptr();
+    let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
+    let mut input_ptr: CUdeviceptr = input_col.device_ptr();
+    let mut acc_ptr: CUdeviceptr = acc_table.device_ptr();
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let mut k_param: u32 = k_u32;
+    let mut lock_ptr: CUdeviceptr = lock_table.device_ptr();
+    let mut overflow_ptr: CUdeviceptr = overflow_flag.device_ptr();
+
+    let block = groupby_block_size();
+    let grid_x = grid_x_for(n_rows_u32, block);
+
+    let mut params: [*mut c_void; 8] = [
+        &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut n_rows_u32 as *mut u32 as *mut c_void,
+        &mut k_param as *mut u32 as *mut c_void,
+        &mut lock_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut overflow_ptr as *mut CUdeviceptr as *mut c_void,
+    ];
+    // SAFETY: `function` is borrowed from a live module; every param points at
+    // a stack local that outlives the synchronize below, and the lock/overflow
+    // GpuVecs stay alive until after `stream.synchronize()`.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+
+    // Read back the overflow flag (SUM only ever sets it).
+    let flag_pinned = overflow_flag.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    let overflowed = flag_pinned.as_slice().first().copied().unwrap_or(0) != 0;
+    drop(flag_pinned);
+    let _ = (
+        group_ptr, keys_ptr, input_ptr, acc_ptr, lock_ptr, overflow_ptr,
+    );
+    drop(lock_table);
+    drop(overflow_flag);
+    Ok(overflowed)
+}
+
 // ---------------------------------------------------------------------------
 // Per-aggregate plumbing: prepare buffer, launch kernel(s), download result.
 // ---------------------------------------------------------------------------
@@ -980,6 +1078,21 @@ enum AccDownload {
     F32(Vec<f32>),
     /// Float64 SUM result column (length `k`).
     F64(Vec<f64>),
+    /// Decimal128 SUM/MIN/MAX result column (length `k`), carried as raw
+    /// `i128`. `(precision, scale)` are the planner's declared OUTPUT dtype
+    /// (SUM widens precision to 38 keeping scale; MIN/MAX preserve `(p, s)`);
+    /// `build_agg_array` rebuilds a `Decimal128Array` with that dtype. Slots
+    /// for groups with no contributing rows hold the op's identity
+    /// (`0` / `i128::MAX` / `i128::MIN`), but every emitted group has at least
+    /// one row so the identity never surfaces.
+    Decimal128 {
+        /// Per-slot raw `i128` accumulator table (length `k`).
+        acc: Vec<i128>,
+        /// Declared output precision (SUM => 38; MIN/MAX => input precision).
+        precision: u8,
+        /// Declared output scale (== input scale for all three ops).
+        scale: i8,
+    },
     /// AVG: a SUM accumulator (downloaded as f64) and a COUNT accumulator
     /// (downloaded as i64), both length `k`.
     Avg { sum: Vec<f64>, count: Vec<i64> },
@@ -1906,21 +2019,109 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
-        // Decimal128 (grouped) intentionally stays on the HOST. The scalar
-        // Decimal SUM/MIN/MAX path runs on the GPU (dedicated i128 block-reduce
-        // kernels in `crate::jit::decimal_agg`), but the grouped path here uses
-        // a single fixed-width atomic accumulator TABLE per aggregate
-        // (`GpuVec<i32/i64/f32/f64>`, one slot per group) updated by a
-        // per-row `atom.global.<op>` in `bolt_groupby_agg`. A correct grouped
-        // Decimal128 accumulator would need a 16-byte per-slot CAS loop
-        // (`atom.cas.b64` on each (lo,hi) half with a 128-bit compare/add
-        // retry) plus widened acc tables and a 16-byte slot decode in
-        // `build_agg_array` — a substantially larger change than the scalar
-        // kernels. Per the feature's correctness-over-coverage split, grouped
-        // Decimal is left to the higher-level host aggregate fallback rather
-        // than risk a silently-wrong on-device result. Bool / Utf8 likewise
-        // have no integer-atomic kernel here.
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
+        // Grouped Decimal128 SUM/MIN/MAX run ON THE GPU via the per-slot-lock
+        // 128-bit accumulator kernel (`compile_groupby_decimal_kernel`,
+        // `launch_decimal_agg_kernel`). sm_70 has no 128-bit atomic, so a
+        // per-slot spin lock guards an exclusive read-modify-write of the
+        // 16-byte slot; the combine (carry-chain add for SUM, signed-hi /
+        // unsigned-lo compare-select for MIN/MAX) is bit-for-bit identical to
+        // the scalar decimal path in `crate::jit::decimal_agg`, so GPU and host
+        // agree on value, ordering, and overflow. Result dtype mirrors the
+        // planner / host grouped Decimal rule (see
+        // `crate::plan::logical_plan::sum_output_dtype` and
+        // `aggregate.rs::minmax_decimal128_from_batch`):
+        //   * SUM     -> Decimal128(38, s)  (precision widened to 38, scale kept)
+        //   * MIN/MAX -> Decimal128(p,  s)  (preserved)
+        // NULLs are excluded by the host-strip in `collect_filtered_primitive`
+        // (key-NULL ∧ value-NULL). SUM overflow of the i128 accumulator is
+        // detected on-device and raised here as the same error the scalar/host
+        // SUM path raises. COUNT(Decimal128) never reaches here (it is a plain
+        // i64 count-of-ones). Bool / Utf8 have no kernel and stay rejected.
+        DataType::Decimal128(p, s) => {
+            let dec_op = GroupedDecimalOp::from_reduce_op(op)?;
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
+            // Guard: the Arrow array's own (p, s) must match the plan dtype,
+            // mirroring the scalar `decimal_sum_from_batch` /
+            // `minmax_decimal128_from_batch` guards (a scale mismatch would
+            // silently misinterpret the raw i128s).
+            if let ArrowDataType::Decimal128(ap, as_) = pa.data_type() {
+                if *ap != p || *as_ != s {
+                    return Err(BoltError::Type(format!(
+                        "GROUP BY {:?}(Decimal128) column '{}': plan dtype Decimal128({p}, {s}) \
+                         disagrees with Arrow dtype Decimal128({ap}, {as_})",
+                        op, col_io.name
+                    )));
+                }
+            }
+            // Dense NULL-stripped host i128 column (key-NULL ∧ value-NULL drop),
+            // exactly the rows the kernel will accumulate.
+            let host: Vec<i128> = collect_filtered_primitive::<arrow_array::types::Decimal128Type>(
+                pa,
+                key_valid,
+                value_valid.as_deref(),
+            );
+            debug_assert_eq!(host.len(), n);
+
+            // Output dtype per the engine's grouped Decimal rule.
+            let (out_p, out_s) = match op {
+                ReduceOp::Sum => match sum_output_dtype(DataType::Decimal128(p, s)) {
+                    DataType::Decimal128(wp, ws) => (wp, ws),
+                    other => {
+                        return Err(BoltError::Type(format!(
+                            "SUM(Decimal128) output dtype expected Decimal128, got {:?}",
+                            other
+                        )))
+                    }
+                },
+                // MIN/MAX preserve (p, s).
+                ReduceOp::Min | ReduceOp::Max => (p, s),
+                ReduceOp::Count => unreachable!("Count never routes through run_typed_agg"),
+            };
+
+            // Per-slot accumulator identity:
+            //   SUM -> 0 ; MIN -> i128::MAX ; MAX -> i128::MIN.
+            let identity: i128 = match dec_op {
+                GroupedDecimalOp::Sum => 0,
+                GroupedDecimalOp::Min => i128::MAX,
+                GroupedDecimalOp::Max => i128::MIN,
+            };
+            let input_gpu = GpuVec::<i128>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<i128> = vec![identity; k];
+            let mut acc = GpuVec::<i128>::from_slice_async(&init, stream.raw())?;
+            let overflowed = launch_decimal_agg_kernel(
+                dec_op,
+                filtered.col(),
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                n,
+                k,
+                k_u32,
+                stream,
+            )?;
+            if overflowed {
+                // Same canonical message as the scalar/host SUM(Decimal128)
+                // overflow path (`aggregate.rs::decimal_sum_host`).
+                return Err(BoltError::Type(
+                    "SUM(Decimal128) precision overflow: accumulator exceeds i128 range"
+                        .to_string(),
+                ));
+            }
+            let acc_host: Vec<i128> = {
+                let pinned = acc.to_pinned_async(stream.raw())?;
+                stream.synchronize()?;
+                pinned.as_slice().to_vec()
+            };
+            Ok(AccDownload::Decimal128 {
+                acc: acc_host,
+                precision: out_p,
+                scale: out_s,
+            })
+        }
+        DataType::Bool | DataType::Utf8 => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2431,6 +2632,41 @@ fn build_agg_array(
             }
             pack_array(out_field.dtype, Scalars::F64(out))
         }
+        // Grouped Decimal128 SUM/MIN/MAX: build a `Decimal128Array` directly
+        // from the per-group raw i128 accumulator slots, tagged with the
+        // planner's declared output `(precision, scale)`. Validate that the
+        // output field agrees, mirroring the scalar
+        // `minmax_decimal128_from_batch` / `decimal_sum_from_batch` guards.
+        (
+            AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_),
+            AccDownload::Decimal128 { acc, precision, scale },
+        ) => {
+            let (out_p, out_s) = match out_field.dtype {
+                DataType::Decimal128(p, s) => (p, s),
+                ref other => {
+                    return Err(BoltError::Type(format!(
+                        "GROUP BY Decimal128 aggregate output dtype must be Decimal128, got {:?}",
+                        other
+                    )))
+                }
+            };
+            if out_p != *precision || out_s != *scale {
+                return Err(BoltError::Type(format!(
+                    "GROUP BY Decimal128 output dtype Decimal128({out_p}, {out_s}) disagrees \
+                     with computed Decimal128({precision}, {scale})"
+                )));
+            }
+            let vals: Vec<i128> = groups.iter().map(|(_, slot)| acc[*slot]).collect();
+            let arr = Decimal128Array::from(vals)
+                .with_precision_and_scale(out_p, out_s)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "GROUP BY Decimal128 result: precision/scale ({out_p}, {out_s}) \
+                         invalid: {e}"
+                    ))
+                })?;
+            Ok(Arc::new(arr) as ArrayRef)
+        }
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             let scalars = match other {
                 AccDownload::I32(host) => Scalars::I32(
@@ -2454,6 +2690,15 @@ fn build_agg_array(
                 AccDownload::Welford { .. } => {
                     return Err(BoltError::Other(
                         "internal: Welford accumulator passed to SUM/MIN/MAX aggregate"
+                            .into(),
+                    ))
+                }
+                // Decimal128 is handled by the dedicated arm above; reaching
+                // here means the pattern order was broken.
+                AccDownload::Decimal128 { .. } => {
+                    return Err(BoltError::Other(
+                        "internal: Decimal128 accumulator should be handled by the \
+                         dedicated build_agg_array arm"
                             .into(),
                     ))
                 }
@@ -3443,5 +3688,200 @@ mod tests {
         let out = collect_filtered_timestamp(arr.as_ref(), "ts", None, Some(&vv))
             .expect("extract");
         assert_eq!(out, vec![10, 30]);
+    }
+
+    // -------- Grouped Decimal128 SUM/MIN/MAX result-assembly + device --------
+
+    /// Host-value parity: `build_agg_array` reads the per-group raw `i128`
+    /// accumulator slots into a `Decimal128Array` carrying the declared output
+    /// `(precision, scale)`. This is the pure-host result-assembly step shared
+    /// by the SUM (precision widened to 38) and MIN/MAX (preserved) paths.
+    #[test]
+    fn build_agg_array_decimal128_reads_slots_with_dtype() {
+        // Two groups occupying slots 3 and 7; per-group accumulator values.
+        let mut acc = vec![0i128; 8];
+        acc[3] = 12_345i128; // group A
+        acc[7] = -6_789i128; // group B (negative)
+        let groups = vec![(100i64, 3usize), (200i64, 7usize)];
+
+        let agg = AggregateExpr::Sum(Expr::Column("v".into()));
+        // SUM(Decimal128(10, 2)) -> Decimal128(38, 2).
+        let out_field = Field::new("s", DataType::Decimal128(38, 2), true);
+        let dl = AccDownload::Decimal128 {
+            acc: acc.clone(),
+            precision: 38,
+            scale: 2,
+        };
+        let arr = build_agg_array(&agg, &out_field, &dl, &groups, groups.len()).expect("build");
+        assert_eq!(
+            arr.data_type(),
+            &ArrowDataType::Decimal128(38, 2),
+            "output dtype must carry the declared (p, s)"
+        );
+        let da = arr
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128Array");
+        assert_eq!(da.value(0), 12_345);
+        assert_eq!(da.value(1), -6_789);
+    }
+
+    /// `build_agg_array` rejects a Decimal accumulator whose computed `(p, s)`
+    /// disagrees with the output field — a guard that mirrors the scalar
+    /// decimal path and prevents silently mislabelling the result scale.
+    #[test]
+    fn build_agg_array_decimal128_rejects_pscale_mismatch() {
+        let acc = vec![1i128; 1];
+        let groups = vec![(0i64, 0usize)];
+        let agg = AggregateExpr::Min(Expr::Column("v".into()));
+        // Field says (10,2) but the accumulator claims (10,3) -> error.
+        let out_field = Field::new("m", DataType::Decimal128(10, 2), true);
+        let dl = AccDownload::Decimal128 {
+            acc,
+            precision: 10,
+            scale: 3,
+        };
+        assert!(
+            build_agg_array(&agg, &out_field, &dl, &groups, 1).is_err(),
+            "scale mismatch between field and accumulator must be rejected"
+        );
+    }
+
+    /// SUM(Decimal128(p,s)) output dtype follows the engine rule: precision
+    /// widened to 38, scale preserved. MIN/MAX preserve `(p,s)`. This pins the
+    /// rule the GPU `run_typed_agg` arm mirrors against the planner.
+    #[test]
+    fn decimal_output_dtype_rule_matches_planner() {
+        assert_eq!(
+            sum_output_dtype(DataType::Decimal128(10, 2)),
+            DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            sum_output_dtype(DataType::Decimal128(38, 6)),
+            DataType::Decimal128(38, 6)
+        );
+    }
+
+    // ---- Device (gpu:) execution tests for the grouped Decimal kernel. ----
+    //
+    // These drive the real keys kernel + `launch_decimal_agg_kernel` over a
+    // small batch and verify per-group SUM/MIN/MAX, NULL exclusion, and SUM
+    // overflow — the bit-for-bit-with-host contract. Gated `#[ignore] gpu:`
+    // because they allocate on the device.
+
+    /// Run the full GPU grouped-decimal pipeline for `op` over `(keys, vals)`
+    /// pairs (already NULL-stripped) and return a host `slot -> i128` map keyed
+    /// by the decoded group key, plus the overflow flag.
+    #[cfg(test)]
+    fn gpu_grouped_decimal(
+        op: GroupedDecimalOp,
+        keys: &[i64],
+        vals: &[i128],
+        identity: i128,
+    ) -> BoltResult<(std::collections::HashMap<i64, i128>, bool)> {
+        let n_rows = keys.len();
+        let n_unique = unique_count(keys);
+        let k = next_pow2((n_unique.saturating_mul(2)).saturating_add(16)).max(64);
+        let k_u32 = u32::try_from(k).unwrap();
+
+        let stream = CudaStream::null_or_default();
+        let host_keys_init: Vec<i64> = vec![EMPTY_KEY; k];
+        let mut keys_table = GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
+        let key_col_gpu = GpuVec::<i64>::from_slice_async(keys, stream.raw())?;
+        launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream)?;
+
+        let input_gpu = GpuVec::<i128>::from_slice_async(vals, stream.raw())?;
+        let init: Vec<i128> = vec![identity; k];
+        let mut acc = GpuVec::<i128>::from_slice_async(&init, stream.raw())?;
+        let overflowed = launch_decimal_agg_kernel(
+            op,
+            &key_col_gpu,
+            &keys_table,
+            &input_gpu,
+            &mut acc,
+            n_rows,
+            k,
+            k_u32,
+            &stream,
+        )?;
+
+        let acc_host: Vec<i128> = {
+            let pinned = acc.to_pinned_async(stream.raw())?;
+            stream.synchronize()?;
+            pinned.as_slice().to_vec()
+        };
+        let keys_host: Vec<i64> = {
+            let pinned = keys_table.to_pinned_async(stream.raw())?;
+            stream.synchronize()?;
+            pinned.as_slice().to_vec()
+        };
+        let mut out = std::collections::HashMap::new();
+        for (slot, &kv) in keys_host.iter().enumerate() {
+            if kv != EMPTY_KEY {
+                out.insert(kv, acc_host[slot]);
+            }
+        }
+        Ok((out, overflowed))
+    }
+
+    /// gpu: grouped SUM(Decimal128) accumulates the correct per-group i128 sum,
+    /// including values whose group sum crosses the 2^64 boundary (exercises
+    /// the carry-chain add under the spin lock).
+    #[test]
+    #[ignore = "gpu: grouped Decimal128 SUM allocates on device"]
+    fn gpu_grouped_decimal_sum_per_group() {
+        // group 1: 3 + 4 = 7 ; group 2: (2^64) + 1 (crosses the word boundary)
+        let big = 1i128 << 64;
+        let keys = [1i64, 1, 2, 2];
+        let vals = [3i128, 4, big, 1];
+        let (m, of) = gpu_grouped_decimal(GroupedDecimalOp::Sum, &keys, &vals, 0).unwrap();
+        assert!(!of, "no overflow expected");
+        assert_eq!(m[&1], 7);
+        assert_eq!(m[&2], big + 1);
+    }
+
+    /// gpu: grouped MIN/MAX(Decimal128) pick the correct extremum per group
+    /// across the sign boundary (raw i128 ordering == decimal ordering).
+    #[test]
+    #[ignore = "gpu: grouped Decimal128 MIN/MAX allocates on device"]
+    fn gpu_grouped_decimal_minmax_per_group() {
+        let keys = [1i64, 1, 1, 2, 2];
+        let vals = [-300i128, 50, -1000, 7, -7];
+
+        let (mn, _) =
+            gpu_grouped_decimal(GroupedDecimalOp::Min, &keys, &vals, i128::MAX).unwrap();
+        assert_eq!(mn[&1], -1000);
+        assert_eq!(mn[&2], -7);
+
+        let (mx, _) =
+            gpu_grouped_decimal(GroupedDecimalOp::Max, &keys, &vals, i128::MIN).unwrap();
+        assert_eq!(mx[&1], 50);
+        assert_eq!(mx[&2], 7);
+    }
+
+    /// gpu: NULLs are excluded by host-strip before upload, so a group whose
+    /// only non-NULL contribution is a single value reduces to exactly that
+    /// value (here the strip is done by the caller; this asserts the kernel
+    /// only folds the rows it is handed).
+    #[test]
+    #[ignore = "gpu: grouped Decimal128 NULL handling allocates on device"]
+    fn gpu_grouped_decimal_null_excluded() {
+        // Caller already stripped NULLs: group 5 contributes only [100, 200].
+        let keys = [5i64, 5];
+        let vals = [100i128, 200];
+        let (m, _) = gpu_grouped_decimal(GroupedDecimalOp::Sum, &keys, &vals, 0).unwrap();
+        assert_eq!(m[&5], 300, "only the surviving (non-NULL) rows are summed");
+    }
+
+    /// gpu: a grouped SUM(Decimal128) whose per-group accumulator overflows
+    /// i128 sets the device overflow flag (the executor turns this into the
+    /// same error the scalar/host SUM path raises) rather than wrapping.
+    #[test]
+    #[ignore = "gpu: grouped Decimal128 SUM overflow allocates on device"]
+    fn gpu_grouped_decimal_sum_overflow_flags() {
+        let keys = [9i64, 9];
+        let vals = [i128::MAX, 1];
+        let (_m, of) = gpu_grouped_decimal(GroupedDecimalOp::Sum, &keys, &vals, 0).unwrap();
+        assert!(of, "i128 overflow must raise the device overflow flag, not wrap");
     }
 }

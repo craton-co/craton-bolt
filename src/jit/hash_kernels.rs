@@ -1493,6 +1493,355 @@ pub fn groupby_block_size() -> u32 {
     BLOCK_SIZE
 }
 
+// ===========================================================================
+// Grouped Decimal128 SUM / MIN / MAX kernel.
+// ===========================================================================
+//
+// The integer/float GROUP BY agg kernels above accumulate into a per-group
+// table of a FIXED, atomically-updatable width (4/8 bytes) via a single
+// `atom.global.<op>` (or, for float MIN/MAX, a single-word `atom.cas.bXX`
+// loop). `Decimal128` is a 16-byte `i128`, and sm_70 has no native 128-bit
+// atomic — neither `atom.add.b128` nor `atom.cas.b128` exists. A *two-word*
+// CAS (CAS lo, then CAS hi) is NOT race-free: the inter-word carry of a SUM
+// (and the all-or-nothing replace of MIN/MAX) can be torn by a peer thread
+// that observes the slot half-updated. The scalar decimal path in
+// `crate::jit::decimal_agg` sidesteps this with an atomic-free block reduce,
+// but that shape does not fit the grouped open-addressing accumulator table
+// (one slot per group, updated by arbitrary threads).
+//
+// The race-free grouped mechanism used here is a **per-slot spin lock**: a
+// parallel `u32` lock table (one word per accumulator slot, initialised to 0)
+// is acquired with a single-word `atom.global.cas.b32(lock, 0, 1)` loop, the
+// 16-byte slot is then read-modified-written with PLAIN `ld.global` /
+// `st.global` (the lock guarantees exclusive access, so no atomicity on the
+// 128-bit value itself is needed), and the lock is released with
+// `atom.global.exch.b32(lock, 0)`. `membar.gl` fences bracket the critical
+// section so the slot stores are globally visible before the unlock and the
+// slot loads happen-after the lock acquire. This is a true mutual-exclusion
+// region — the inter-word carry (SUM) and the all-or-nothing pick (MIN/MAX)
+// are computed entirely inside it, so there is no carry/tear race.
+//
+// The per-slot combine is bit-for-bit identical to the scalar decimal path:
+//   * SUM  — 128-bit carry-chain add (`add.cc.u64` / `addc.u64`), exactly as
+//     `decimal_agg::compile_decimal_sum_kernel`'s combine, with signed-overflow
+//     detection (see below) matching the host `decimal_sum_host` `checked_add`.
+//   * MIN/MAX — 128-bit signed-hi / unsigned-lo compare-and-select, exactly as
+//     `decimal_agg::emit_dec_minmax_combine` and `ptx_gen::emit_cmp_128`, so
+//     GPU and host order the raw `i128`s identically (correct because the
+//     column's scale is uniform across rows).
+//
+// SUM overflow: signed 128-bit addition overflows iff the two addends share a
+// sign and the result's sign differs. We test this on the high words inside
+// the critical section and, on overflow, set a shared `u32` overflow flag
+// (`atom.global.exch.b32(flag, 1)`) WITHOUT storing the wrapped result; the
+// host checks the flag after the launch and raises the same
+// `SUM(Decimal128) precision overflow` error the scalar/host path raises.
+
+/// Entry-point name of the grouped Decimal128 aggregate kernel emitted by
+/// [`compile_groupby_decimal_kernel`]. Distinct from [`AGG_KERNEL_ENTRY`]
+/// because its ABI carries two extra pointers (the per-slot lock table and the
+/// overflow flag) and a 16-byte accumulator slot.
+pub const AGG_DECIMAL_KERNEL_ENTRY: &str = "bolt_groupby_agg_decimal";
+
+/// Byte width of the `i128` input element / accumulator slot.
+const DECIMAL_ELEM_BYTES: usize = 16;
+
+/// Per-iteration `nanosleep.u32` back-off (ns) for the lock-acquire and
+/// CAS-retry spins. Mirrors `float_atomics::SPIN_BACKOFF_NS` — yields SM
+/// cycles to peer warps contending the same slot lock.
+const DECIMAL_SPIN_BACKOFF_NS: u32 = 32;
+
+/// Which grouped Decimal128 reduction [`compile_groupby_decimal_kernel`] emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedDecimalOp {
+    /// `SUM(Decimal128)` — per-slot 128-bit carry-chain add, overflow-checked.
+    Sum,
+    /// `MIN(Decimal128)` — per-slot 128-bit signed minimum.
+    Min,
+    /// `MAX(Decimal128)` — per-slot 128-bit signed maximum.
+    Max,
+}
+
+impl GroupedDecimalOp {
+    /// Map a [`ReduceOp`] to the grouped-decimal op, rejecting Count (decimal
+    /// COUNT is synthesised as a plain i64 SUM-of-ones and never reaches here).
+    pub fn from_reduce_op(op: ReduceOp) -> BoltResult<Self> {
+        Ok(match op {
+            ReduceOp::Sum => GroupedDecimalOp::Sum,
+            ReduceOp::Min => GroupedDecimalOp::Min,
+            ReduceOp::Max => GroupedDecimalOp::Max,
+            ReduceOp::Count => {
+                return Err(BoltError::Other(
+                    "compile_groupby_decimal_kernel: COUNT(Decimal128) does not lower to \
+                     the grouped-decimal kernel (it is a plain i64 count-of-ones)"
+                        .into(),
+                ))
+            }
+        })
+    }
+}
+
+/// Generate PTX for the grouped `SUM` / `MIN` / `MAX` over a `Decimal128`
+/// (`i128`) value column, accumulating into a 16-byte-per-slot table guarded
+/// by a per-slot spin lock. See the module section header above for the
+/// race-freedom argument and the bit-for-bit-with-host combine contract.
+///
+/// `with_value_validity = true` appends a trailing packed-bit value-validity
+/// pointer (param 8) and skips the update for NULL rows, mirroring
+/// [`compile_groupby_agg_kernel_with_validity`].
+///
+/// # ABI
+///
+/// ```text
+/// .visible .entry bolt_groupby_agg_decimal(
+///     .param .u64 group_col_ptr,    // i64 group keys, length n_rows
+///     .param .u64 keys_table_ptr,   // i64, length k, fully populated
+///     .param .u64 input_col_ptr,    // i128, length n_rows
+///     .param .u64 acc_table_ptr,    // i128, length k, init'd to identity
+///     .param .u32 n_rows,
+///     .param .u32 k,                // power-of-two table size
+///     .param .u64 lock_table_ptr,   // u32, length k, init'd to 0
+///     .param .u64 overflow_ptr,     // u32, length 1, init'd to 0 (SUM only;
+///                                   //   MIN/MAX never write it)
+///     [.param .u64 value_validity_ptr]  // packed-bit *u32, validity variant
+/// )
+/// ```
+///
+/// Accumulator identity (host-initialised, matching the scalar/host fold):
+///   * SUM     — `0i128`.
+///   * MIN     — `i128::MAX` (any real value is <=, so the first row wins).
+///   * MAX     — `i128::MIN`.
+pub fn compile_groupby_decimal_kernel(
+    op: GroupedDecimalOp,
+    with_value_validity: bool,
+) -> BoltResult<String> {
+    let entry = AGG_DECIMAL_KERNEL_ENTRY;
+    let mut ptx = String::new();
+
+    writeln!(ptx, ".version 7.5").map_err(write_err)?;
+    writeln!(ptx, ".target sm_70").map_err(write_err)?;
+    writeln!(ptx, ".address_size 64").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // Param list. Indices 0..=7 are fixed; index 8 (validity) is optional.
+    writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_2,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_3,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_4,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {entry}_param_5,").map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {entry}_param_6,").map_err(write_err)?;
+    if with_value_validity {
+        writeln!(ptx, "\t.param .u64 {entry}_param_7,").map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {entry}_param_8").map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\t.param .u64 {entry}_param_7").map_err(write_err)?;
+    }
+    writeln!(ptx, ")").map_err(write_err)?;
+    writeln!(ptx, "{{").map_err(write_err)?;
+
+    // Register pool. %p predicates; %r 32-bit scratch; %rd 64-bit addresses;
+    // %rl 64-bit key/hash scratch.
+    writeln!(ptx, "\t.reg .pred  %p<12>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b32   %r<32>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rd<48>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .u32   %nstime;").map_err(write_err)?;
+    writeln!(ptx).map_err(write_err)?;
+
+    // tid = ctaid.x * ntid.x + tid.x ; bail if tid >= n_rows.
+    writeln!(ptx, "\tmov.u32 %r0, %ctaid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
+    writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_4];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p0 bra DEC_DONE;").map_err(write_err)?;
+
+    // Optional packed-bit value-validity gate (skip NULL rows).
+    if with_value_validity {
+        writeln!(ptx, "\tshr.u32 %r10, %r3, 5;").map_err(write_err)?;
+        writeln!(ptx, "\tand.b32 %r11, %r3, 31;").map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd40, [{entry}_param_8];").map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd40, %rd40;").map_err(write_err)?;
+        writeln!(ptx, "\tmul.wide.u32 %rd41, %r10, 4;").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd42, %rd40, %rd41;").map_err(write_err)?;
+        writeln!(ptx, "\tld.global.nc.u32 %r12, [%rd42];").map_err(write_err)?;
+        writeln!(ptx, "\tbfe.u32 %r13, %r12, %r11, 1;").map_err(write_err)?;
+        writeln!(ptx, "\tsetp.eq.s32 %p1, %r13, 0;").map_err(write_err)?;
+        writeln!(ptx, "\t@%p1 bra DEC_DONE;").map_err(write_err)?;
+    }
+
+    // k and mask = k - 1 ; max_probes = k * MAX_PROBE_FACTOR.
+    writeln!(ptx, "\tld.param.u32 %r5, [{entry}_param_5];").map_err(write_err)?;
+    writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.lo.u32 %r20, %r5, {factor};",
+        factor = MAX_PROBE_FACTOR
+    )
+    .map_err(write_err)?;
+
+    // Load this row's key (read-only input).
+    writeln!(ptx, "\tld.param.u64 %rd0, [{entry}_param_0];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.s64 %rl0, [%rd2];").map_err(write_err)?;
+
+    // Hash: h = ((key * FX_MUL) >> 32) & mask. Identical to the integer kernel.
+    writeln!(ptx, "\tmov.s64 %rl1, {};", FX_MUL).map_err(write_err)?;
+    writeln!(ptx, "\tmul.lo.s64 %rl2, %rl0, %rl1;").map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rl3, %rl2, 32;").map_err(write_err)?;
+    writeln!(ptx, "\tcvt.u32.u64 %r7, %rl3;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
+
+    // Keys-table base (read-only — populated by the prior keys kernel).
+    writeln!(ptx, "\tld.param.u64 %rd3, [{entry}_param_1];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
+
+    // Bounded, non-mutating probe to find this row's slot.
+    writeln!(ptx, "\tmov.u32 %r21, 0;").map_err(write_err)?;
+    writeln!(ptx, "DEC_PROBE_LOOP:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p2, %r21, %r20;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra DEC_DONE;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.s64 %rl5, [%rd5];").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s64 %p3, %rl5, %rl0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DEC_FOUND;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
+    writeln!(ptx, "\tbra DEC_PROBE_LOOP;").map_err(write_err)?;
+    writeln!(ptx, "DEC_FOUND:").map_err(write_err)?;
+
+    // Load this row's i128 candidate value (lo -> %rd6, hi -> %rd7).
+    writeln!(ptx, "\tld.param.u64 %rd8, [{entry}_param_2];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd9, %r3, {bytes};",
+        bytes = DECIMAL_ELEM_BYTES
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.nc.u64 %rd6, [%rd10];").map_err(write_err)?; // cand lo
+    writeln!(ptx, "\tld.global.nc.u64 %rd7, [%rd10+8];").map_err(write_err)?; // cand hi
+
+    // Accumulator slot address: acc_table + slot * 16.
+    writeln!(ptx, "\tld.param.u64 %rd11, [{entry}_param_3];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd11, %rd11;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd12, %r8, {bytes};",
+        bytes = DECIMAL_ELEM_BYTES
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd13, %rd11, %rd12;").map_err(write_err)?; // %rd13 = slot addr
+
+    // Lock-word address: lock_table + slot * 4.
+    writeln!(ptx, "\tld.param.u64 %rd14, [{entry}_param_6];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd14, %rd14;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd15, %r8, 4;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd16, %rd14, %rd15;").map_err(write_err)?; // %rd16 = lock addr
+
+    // --- Acquire the per-slot spin lock: CAS(lock, 0, 1) until we win. ---
+    // %r22 holds the CAS-observed prior value; we own the lock when it was 0.
+    writeln!(ptx, "DEC_LOCK_LOOP:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.cas.b32 %r22, [%rd16], 0, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p4, %r22, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p4 bra DEC_LOCKED;").map_err(write_err)?;
+    // Lost — another thread holds the lock. Back off and retry.
+    writeln!(
+        ptx,
+        "\tmov.u32 %nstime, {ns};",
+        ns = DECIMAL_SPIN_BACKOFF_NS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
+    writeln!(ptx, "\tbra DEC_LOCK_LOOP;").map_err(write_err)?;
+    writeln!(ptx, "DEC_LOCKED:").map_err(write_err)?;
+    // Acquire fence: make the lock acquisition happen-before the slot loads.
+    writeln!(ptx, "\tmembar.gl;").map_err(write_err)?;
+
+    // --- Critical section: exclusive read-modify-write of the 16-byte slot. ---
+    // Load current accumulator (lo -> %rd20, hi -> %rd21).
+    writeln!(ptx, "\tld.global.u64 %rd20, [%rd13];").map_err(write_err)?;
+    writeln!(ptx, "\tld.global.u64 %rd21, [%rd13+8];").map_err(write_err)?;
+
+    match op {
+        GroupedDecimalOp::Sum => {
+            // 128-bit carry-chain add: new = acc + cand. Bit-for-bit identical
+            // to decimal_agg::compile_decimal_sum_kernel's combine.
+            //   %rd22 = lo sum (carry-out), %rd23 = hi sum (carry-in)
+            writeln!(ptx, "\tadd.cc.u64 %rd22, %rd20, %rd6;").map_err(write_err)?;
+            writeln!(ptx, "\taddc.u64 %rd23, %rd21, %rd7;").map_err(write_err)?;
+            // Signed 128-bit overflow detection on the high words: overflow iff
+            // the two addends' signs match AND the result's sign differs.
+            //   same_sign = (acc_hi ^ cand_hi) >= 0  (top bit clear)
+            //   res_diff  = (acc_hi ^ sum_hi)  <  0  (top bit set)
+            //   overflow  = same_sign && res_diff
+            writeln!(ptx, "\txor.b64 %rd24, %rd21, %rd7;").map_err(write_err)?; // acc_hi ^ cand_hi
+            writeln!(ptx, "\tsetp.ge.s64 %p5, %rd24, 0;").map_err(write_err)?; // same_sign
+            writeln!(ptx, "\txor.b64 %rd25, %rd21, %rd23;").map_err(write_err)?; // acc_hi ^ sum_hi
+            writeln!(ptx, "\tsetp.lt.s64 %p6, %rd25, 0;").map_err(write_err)?; // res_diff
+            writeln!(ptx, "\tand.pred %p7, %p5, %p6;").map_err(write_err)?; // overflow
+            // On overflow: set the shared flag and do NOT store the wrapped
+            // result (leave the slot unchanged) — the host turns the flag into
+            // the same error the scalar/host SUM path raises.
+            writeln!(ptx, "\t@!%p7 bra DEC_STORE;").map_err(write_err)?;
+            writeln!(ptx, "\tld.param.u64 %rd30, [{entry}_param_7];").map_err(write_err)?;
+            writeln!(ptx, "\tcvta.to.global.u64 %rd30, %rd30;").map_err(write_err)?;
+            writeln!(ptx, "\tatom.global.exch.b32 %r23, [%rd30], 1;").map_err(write_err)?;
+            writeln!(ptx, "\tbra DEC_UNLOCK;").map_err(write_err)?;
+            writeln!(ptx, "DEC_STORE:").map_err(write_err)?;
+            writeln!(ptx, "\tst.global.u64 [%rd13], %rd22;").map_err(write_err)?;
+            writeln!(ptx, "\tst.global.u64 [%rd13+8], %rd23;").map_err(write_err)?;
+        }
+        GroupedDecimalOp::Min | GroupedDecimalOp::Max => {
+            // 128-bit signed compare-and-select: replace the slot with the
+            // candidate when it wins. Signed-hi / unsigned-lo ordering — the
+            // exact rule in decimal_agg::emit_dec_minmax_combine and
+            // ptx_gen::emit_cmp_128, so GPU and host order i128s identically.
+            //   MIN: candidate wins when cand < acc
+            //   MAX: candidate wins when cand > acc
+            let (hi_cmp, lo_cmp) = match op {
+                GroupedDecimalOp::Min => ("setp.lt.s64", "setp.lt.u64"),
+                GroupedDecimalOp::Max => ("setp.gt.s64", "setp.gt.u64"),
+                GroupedDecimalOp::Sum => unreachable!(),
+            };
+            //   %p5 = (cand_hi <cmp> acc_hi)
+            writeln!(ptx, "\t{} %p5, %rd7, %rd21;", hi_cmp).map_err(write_err)?;
+            //   %p6 = (cand_hi == acc_hi)
+            writeln!(ptx, "\tsetp.eq.s64 %p6, %rd7, %rd21;").map_err(write_err)?;
+            //   %p7 = (cand_lo <cmp_u> acc_lo)
+            writeln!(ptx, "\t{} %p7, %rd6, %rd20;", lo_cmp).map_err(write_err)?;
+            //   %p6 = %p6 && %p7  ; %p5 = %p5 || %p6  -> candidate wins
+            writeln!(ptx, "\tand.pred %p6, %p6, %p7;").map_err(write_err)?;
+            writeln!(ptx, "\tor.pred %p5, %p5, %p6;").map_err(write_err)?;
+            // selp each half: candidate when it wins, else keep the slot.
+            writeln!(ptx, "\tselp.b64 %rd22, %rd6, %rd20, %p5;").map_err(write_err)?;
+            writeln!(ptx, "\tselp.b64 %rd23, %rd7, %rd21, %p5;").map_err(write_err)?;
+            writeln!(ptx, "\tst.global.u64 [%rd13], %rd22;").map_err(write_err)?;
+            writeln!(ptx, "\tst.global.u64 [%rd13+8], %rd23;").map_err(write_err)?;
+        }
+    }
+
+    // --- Release the lock. ---
+    writeln!(ptx, "DEC_UNLOCK:").map_err(write_err)?;
+    // Release fence: make the slot stores globally visible before the unlock.
+    writeln!(ptx, "\tmembar.gl;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.exch.b32 %r24, [%rd16], 0;").map_err(write_err)?;
+
+    writeln!(ptx, "DEC_DONE:").map_err(write_err)?;
+    writeln!(ptx, "\tret;").map_err(write_err)?;
+    writeln!(ptx, "}}").map_err(write_err)?;
+
+    Ok(ptx)
+}
+
 /// F7: map a GROUP BY value-column dtype to the integer dtype the aggregate
 /// kernel actually loads + atomically updates for `op`.
 ///
@@ -2220,5 +2569,135 @@ mod ptx_shape_tests {
         if let Some(v) = prev {
             std::env::set_var("BOLT_HASH_ALGO", v);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Grouped Decimal128 SUM/MIN/MAX kernel PTX-shape tests. Host-only:
+    // they assert the per-slot-lock + 128-bit combine SHAPE, not device
+    // numerics (those live in the `#[ignore] gpu:` e2e tests).
+    // -----------------------------------------------------------------
+
+    /// `GroupedDecimalOp::from_reduce_op` maps Sum/Min/Max and rejects Count.
+    #[test]
+    fn grouped_decimal_op_mapping() {
+        assert_eq!(
+            GroupedDecimalOp::from_reduce_op(ReduceOp::Sum).unwrap(),
+            GroupedDecimalOp::Sum
+        );
+        assert_eq!(
+            GroupedDecimalOp::from_reduce_op(ReduceOp::Min).unwrap(),
+            GroupedDecimalOp::Min
+        );
+        assert_eq!(
+            GroupedDecimalOp::from_reduce_op(ReduceOp::Max).unwrap(),
+            GroupedDecimalOp::Max
+        );
+        assert!(GroupedDecimalOp::from_reduce_op(ReduceOp::Count).is_err());
+    }
+
+    /// The classic (no-validity) grouped Decimal kernel emits its distinct
+    /// entry point and the documented 8-param ABI (params 0..=7); the 9th
+    /// (validity) param is absent.
+    #[test]
+    fn grouped_decimal_entry_and_classic_abi() {
+        for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
+            let ptx = compile_groupby_decimal_kernel(op, false).expect("decimal ptx");
+            assert!(
+                ptx.contains(&format!(".visible .entry {}(", AGG_DECIMAL_KERNEL_ENTRY)),
+                "missing entry for {op:?}:\n{ptx}"
+            );
+            // 8 params: 0..=7, no param_8.
+            assert!(ptx.contains(&format!("{}_param_7", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
+            assert!(!ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
+            // Classic path emits no validity bit-extract.
+            assert!(!ptx.contains("bfe.u32"), "classic decimal must not extract validity:\n{ptx}");
+        }
+    }
+
+    /// The validity variant appends a 9th param and the packed-bit guard.
+    #[test]
+    fn grouped_decimal_validity_abi() {
+        let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, true)
+            .expect("decimal validity ptx");
+        assert!(ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)));
+        assert!(ptx.contains("bfe.u32"), "validity variant must extract the row's bit:\n{ptx}");
+    }
+
+    /// The accumulator update MUST be guarded by a per-slot spin lock — a
+    /// `atom.global.cas.b32(lock,0,1)` acquire loop + `atom.global.exch.b32`
+    /// release, bracketed by `membar.gl` fences. This is the load-bearing
+    /// race-freedom mechanism; a regression that dropped it (or used a naive
+    /// two-word CAS) would tear the inter-word carry / the all-or-nothing pick.
+    #[test]
+    fn grouped_decimal_uses_per_slot_spinlock() {
+        for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
+            let ptx = compile_groupby_decimal_kernel(op, false).unwrap();
+            assert!(
+                ptx.contains("atom.global.cas.b32 %r22, [%rd16], 0, 1;"),
+                "{op:?} missing lock-acquire CAS:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("atom.global.exch.b32 %r24, [%rd16], 0;"),
+                "{op:?} missing lock-release exch:\n{ptx}"
+            );
+            assert_eq!(
+                ptx.matches("membar.gl;").count(),
+                2,
+                "{op:?} must fence acquire + release:\n{ptx}"
+            );
+            assert!(ptx.contains("DEC_LOCK_LOOP:"), "{op:?} missing lock loop");
+            assert!(ptx.contains("DEC_UNLOCK:"), "{op:?} missing unlock label");
+        }
+    }
+
+    /// SUM emits the 128-bit carry-chain add + signed-overflow detection +
+    /// the shared overflow-flag write. It must NOT emit a compare-select.
+    #[test]
+    fn grouped_decimal_sum_is_carry_add_with_overflow() {
+        let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, false).unwrap();
+        assert!(ptx.contains("add.cc.u64"), "SUM needs carry-out add:\n{ptx}");
+        assert!(ptx.contains("addc.u64"), "SUM needs carry-in add:\n{ptx}");
+        // Overflow flag is set via exch on param_7 (the overflow pointer).
+        assert!(
+            ptx.contains(&format!("ld.param.u64 %rd30, [{}_param_7];", AGG_DECIMAL_KERNEL_ENTRY)),
+            "SUM must read the overflow-flag pointer:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("atom.global.exch.b32 %r23, [%rd30], 1;"),
+            "SUM must raise the overflow flag on detected overflow:\n{ptx}"
+        );
+        assert!(!ptx.contains("selp.b64"), "SUM must not compare-select:\n{ptx}");
+    }
+
+    /// MIN/MAX emit the 128-bit signed-hi / unsigned-lo compare-and-select and
+    /// must NOT emit a carry-chain add (that would silently turn them into SUM)
+    /// nor touch the overflow flag.
+    #[test]
+    fn grouped_decimal_minmax_is_compare_select_no_add() {
+        let min = compile_groupby_decimal_kernel(GroupedDecimalOp::Min, false).unwrap();
+        assert!(min.contains("setp.lt.s64"), "MIN hi signed-lt:\n{min}");
+        assert!(min.contains("setp.lt.u64"), "MIN lo unsigned-lt:\n{min}");
+        assert!(min.contains("selp.b64"), "MIN selects via selp.b64:\n{min}");
+        assert!(!min.contains("add.cc.u64") && !min.contains("addc.u64"),
+            "MIN must NOT carry-add:\n{min}");
+
+        let max = compile_groupby_decimal_kernel(GroupedDecimalOp::Max, false).unwrap();
+        assert!(max.contains("setp.gt.s64"), "MAX hi signed-gt:\n{max}");
+        assert!(max.contains("setp.gt.u64"), "MAX lo unsigned-gt:\n{max}");
+        assert!(max.contains("selp.b64"), "MAX selects via selp.b64:\n{max}");
+        assert!(!max.contains("add.cc.u64") && !max.contains("addc.u64"),
+            "MAX must NOT carry-add:\n{max}");
+    }
+
+    /// The slot is loaded + stored as two 8-byte halves (hi at `+8`) with PLAIN
+    /// (non-atomic) loads/stores — correctness rests on the spin lock providing
+    /// exclusion, NOT on per-word atomicity of the 128-bit value.
+    #[test]
+    fn grouped_decimal_slot_is_plain_two_half_rmw() {
+        let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, false).unwrap();
+        assert!(ptx.contains("ld.global.u64 %rd20, [%rd13];"), "lo load:\n{ptx}");
+        assert!(ptx.contains("ld.global.u64 %rd21, [%rd13+8];"), "hi load:\n{ptx}");
+        assert!(ptx.contains("st.global.u64 [%rd13], %rd22;"), "lo store:\n{ptx}");
+        assert!(ptx.contains("st.global.u64 [%rd13+8], %rd23;"), "hi store:\n{ptx}");
     }
 }

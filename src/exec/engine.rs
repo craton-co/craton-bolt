@@ -2274,6 +2274,29 @@ impl Engine {
             }
         }
 
+        // F4 (correlated WHERE subquery): a `SELECT ... WHERE <correlated
+        // EXISTS / NOT EXISTS / scalar subquery>` is detected and orchestrated
+        // host-side as a per-outer-row semi/anti/scalar Apply before the
+        // ordinary pipeline, mirroring the LATERAL hook above (the correlated
+        // subquery has no single LogicalPlan). Returns `Ok(None)` for every
+        // query without a correlated WHERE subquery, so the common path falls
+        // straight through. Failures bump `QueriesFailed` to mirror accounting.
+        match crate::plan::sql_frontend::plan_correlated_where(query, &self.provider) {
+            Ok(Some(cw)) => {
+                let result = self.execute_correlated_where(&cw);
+                if result.is_err() {
+                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                }
+                self.maybe_emit_pool_stats(Instant::now());
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
+                return Err(e);
+            }
+        }
+
         // F3-finish: a sole `COUNT(DISTINCT col)` with `GROUP BY` is detected
         // and orchestrated host-side (per-group distinct counting) before the
         // ordinary pipeline, mirroring the WITH RECURSIVE hook above. The
@@ -2458,6 +2481,14 @@ impl Engine {
             return Ok(format!(
                 "LATERAL apply plan:\n{}",
                 crate::plan::explain::format_lateral_apply(&la)
+            ));
+        }
+        // F4 (correlated WHERE subquery): render the host-orchestrated
+        // correlated semi/anti/scalar Apply descriptor.
+        if let Some(cw) = crate::plan::sql_frontend::plan_correlated_where(query, &self.provider)? {
+            return Ok(format!(
+                "Correlated WHERE plan:\n{}",
+                crate::plan::explain::format_correlated_where(&cw)
             ));
         }
         // F3-finish: render the host-orchestrated COUNT(DISTINCT) + GROUP BY
@@ -3005,6 +3036,175 @@ impl Engine {
         self.gpu_tables
             .borrow_mut()
             .remove(LATERAL_APPLY_RESULT_TABLE);
+        Ok(QueryHandle::from_record_batch(out?))
+    }
+
+    /// Execute a correlated-WHERE subquery (feature F4) as a host
+    /// per-outer-row **Apply** (a correlated semi-join for `EXISTS`, anti-join
+    /// for `NOT EXISTS`, or scalar-compare for a correlated scalar subquery),
+    /// then run the OUTER projection template over the surviving rows.
+    ///
+    /// Algorithm (reusing the LATERAL machinery — the single-row
+    /// [`LATERAL_OUTER_TABLE`] binding, [`Engine::run_subplan`], the mandatory
+    /// row cap, and the streaming overlay — exactly like
+    /// [`Engine::execute_lateral_apply`]):
+    ///
+    /// 1. **Outer.** Run `cw.left` → the outer relation (FROM + ordinary
+    ///    uncorrelated WHERE conjuncts already applied as a `Filter`).
+    /// 2. **Per-row test.** For each outer row (bounded by the SAME mandatory
+    ///    [`max_apply_left_rows`] cap as LATERAL — the loop is
+    ///    `O(outer_rows × subquery)`): bind a single-row
+    ///    [`LATERAL_OUTER_TABLE`] relation holding that row's correlated values
+    ///    (`__corr_0..N`) and run `cw.test_subplan` through
+    ///    [`Engine::run_subplan`]. The row is kept iff:
+    ///    * [`CorrWhereKind::Exists`]: the subplan returns >= 1 row;
+    ///    * [`CorrWhereKind::NotExists`]: the subplan returns 0 rows;
+    ///    * [`CorrWhereKind::Scalar`]: the subplan's single boolean cell is
+    ///      TRUE (a NULL / FALSE drops it; a scalar subquery returning >1 row
+    ///      errors via the ordinary scalar-fold path inside `run_subplan`).
+    /// 3. **Outer projection.** Gather the surviving outer rows into one
+    ///    relation, bind it under [`CORR_WHERE_RESULT_TABLE`] in the streaming
+    ///    overlay and run `cw.post` (projection / GROUP BY / HAVING / ORDER BY
+    ///    / LIMIT) through [`Engine::run_subplan`], then clear the overlay.
+    ///
+    /// An empty outer input yields an empty result. Name collisions with real
+    /// tables under either reserved ephemeral name are rejected up front.
+    fn execute_correlated_where(
+        &self,
+        cw: &crate::plan::sql_frontend::CorrelatedWherePlan,
+    ) -> BoltResult<QueryHandle> {
+        use arrow_array::{Array, BooleanArray, UInt32Array};
+
+        use crate::exec::streaming::TableSource;
+        use crate::plan::sql_frontend::{CorrWhereKind, CORR_WHERE_RESULT_TABLE, LATERAL_OUTER_TABLE};
+
+        // Refuse to shadow real tables under either reserved ephemeral name.
+        for name in [LATERAL_OUTER_TABLE, CORR_WHERE_RESULT_TABLE] {
+            if self.tables.contains_key(name)
+                || self.streaming_sources.borrow().contains_key(name)
+            {
+                return Err(BoltError::Plan(format!(
+                    "correlated WHERE: reserved ephemeral table name '{name}' \
+                     collides with a registered table"
+                )));
+            }
+        }
+
+        // --- 1. Run the OUTER relation. ---
+        let left = self.run_subplan(cw.left.clone())?;
+        let n_left = left.num_rows();
+
+        let outer_arrow = plan_schema_to_arrow_schema(&cw.outer_schema)?;
+        let left_arrow = plan_schema_to_arrow_schema(&cw.left_schema)?;
+
+        // Mandatory per-outer-row cap — the test subplan runs once per outer
+        // row (identical guard to the LATERAL apply path).
+        if n_left > max_apply_left_rows() {
+            return Err(BoltError::Plan(format!(
+                "correlated WHERE: outer input has {n_left} rows, exceeding the \
+                 {}-row safety cap (set {MAX_APPLY_LEFT_ROWS_ENV} to override) — \
+                 the correlated subquery runs once per outer row",
+                max_apply_left_rows()
+            )));
+        }
+
+        // Run the per-row test subplan with the single-row outer relation
+        // bound. The overlay entry is always cleared afterwards (mirrors
+        // `execute_lateral_apply`'s `run_lateral`).
+        let run_test = |outer_row: &RecordBatch| -> BoltResult<RecordBatch> {
+            self.gpu_tables.borrow_mut().remove(LATERAL_OUTER_TABLE);
+            self.streaming_sources.borrow_mut().insert(
+                LATERAL_OUTER_TABLE.to_string(),
+                TableSource::Materialized(vec![outer_row.clone()]),
+            );
+            let out = self.run_subplan(cw.test_subplan.clone());
+            self.streaming_sources
+                .borrow_mut()
+                .remove(LATERAL_OUTER_TABLE);
+            self.gpu_tables.borrow_mut().remove(LATERAL_OUTER_TABLE);
+            out
+        };
+
+        // --- 2. Per-outer-row test → keep/drop. Collect the surviving row
+        // indices. ---
+        let mut keep: Vec<u32> = Vec::new();
+        for row in 0..n_left {
+            let one = UInt32Array::from(vec![row as u32]);
+            let mut outer_cols: Vec<ArrayRef> = Vec::with_capacity(cw.corr_left_indices.len());
+            for &li in &cw.corr_left_indices {
+                let g = arrow::compute::take(left.column(li).as_ref(), &one, None)
+                    .map_err(|e| BoltError::Other(format!("correlated-WHERE outer take: {e}")))?;
+                outer_cols.push(g);
+            }
+            let outer_row = RecordBatch::try_new_with_options(
+                Arc::clone(&outer_arrow),
+                outer_cols,
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(1)),
+            )
+            .map_err(|e| BoltError::Plan(format!("correlated-WHERE outer-row build: {e}")))?;
+
+            let test = run_test(&outer_row)?;
+            let pass = match cw.kind {
+                CorrWhereKind::Exists => test.num_rows() >= 1,
+                CorrWhereKind::NotExists => test.num_rows() == 0,
+                CorrWhereKind::Scalar => {
+                    // The test subplan is `SELECT <predicate> FROM
+                    // __lateral_outer` — exactly one boolean cell. 0 rows /
+                    // NULL / FALSE all drop the outer row (WHERE 3VL).
+                    if test.num_columns() != 1 {
+                        return Err(BoltError::Plan(format!(
+                            "correlated WHERE scalar test produced {} columns, \
+                             expected 1",
+                            test.num_columns()
+                        )));
+                    }
+                    if test.num_rows() == 0 {
+                        false
+                    } else {
+                        let col = test.column(0);
+                        let b = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                            BoltError::Plan(format!(
+                                "correlated WHERE scalar test must be boolean, got {:?}",
+                                col.data_type()
+                            ))
+                        })?;
+                        !b.is_null(0) && b.value(0)
+                    }
+                }
+            };
+            if pass {
+                keep.push(row as u32);
+            }
+        }
+
+        // --- 3. Gather surviving outer rows → the result relation. ---
+        let surviving = if keep.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&left_arrow))
+        } else {
+            let idx = UInt32Array::from(keep);
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(left.num_columns());
+            for li in 0..left.num_columns() {
+                let g = arrow::compute::take(left.column(li).as_ref(), &idx, None)
+                    .map_err(|e| BoltError::Other(format!("correlated-WHERE gather: {e}")))?;
+                cols.push(g);
+            }
+            RecordBatch::try_new(Arc::clone(&left_arrow), cols)
+                .map_err(|e| BoltError::Plan(format!("correlated-WHERE result build: {e}")))?
+        };
+
+        // --- 4. Bind the surviving relation and run the OUTER template. ---
+        self.gpu_tables.borrow_mut().remove(CORR_WHERE_RESULT_TABLE);
+        self.streaming_sources.borrow_mut().insert(
+            CORR_WHERE_RESULT_TABLE.to_string(),
+            TableSource::Materialized(vec![surviving]),
+        );
+        let out = self.run_subplan(cw.post.clone());
+        self.streaming_sources
+            .borrow_mut()
+            .remove(CORR_WHERE_RESULT_TABLE);
+        self.gpu_tables
+            .borrow_mut()
+            .remove(CORR_WHERE_RESULT_TABLE);
         Ok(QueryHandle::from_record_batch(out?))
     }
 
@@ -7893,5 +8093,189 @@ mod tests {
         std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "nope");
         assert_eq!(max_apply_left_rows(), MAX_APPLY_LEFT_ROWS, "non-int falls back");
         std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
+    }
+
+    // -----------------------------------------------------------------------
+    // F4: correlated WHERE subquery (EXISTS / NOT EXISTS / scalar)
+    // -----------------------------------------------------------------------
+    //
+    // Reuse the LATERAL fixtures: `lft(k Int64, lbl Utf8)` (k = 1,2,3) and
+    // `vals(vk Int64, n Int64)` = (1,10),(1,11),(2,20). `lft.k = 3` has no
+    // matching `vals` rows — the discriminating row for semi/anti.
+
+    /// Parse → descriptor: a correlated `EXISTS` in WHERE is detected and
+    /// lowered to a [`CorrelatedWherePlan`] of kind EXISTS with the single
+    /// correlation (`lft.k`). Host-only (no GPU).
+    #[test]
+    fn corr_where_exists_parse_descriptor() {
+        use crate::plan::sql_frontend::CorrWhereKind;
+        let provider = lateral_provider();
+        let cw = crate::plan::sql_frontend::plan_correlated_where(
+            "SELECT lft.k FROM lft WHERE EXISTS (SELECT 1 FROM vals WHERE vk = lft.k)",
+            &provider,
+        )
+        .expect("detector must not error")
+        .expect("a correlated EXISTS must produce a descriptor");
+        assert_eq!(cw.kind, CorrWhereKind::Exists);
+        assert_eq!(cw.outer_schema.fields.len(), 1, "one correlation: lft.k");
+        assert_eq!(cw.corr_left_indices, vec![0], "lft.k is outer column 0");
+    }
+
+    /// Parse → descriptor: a correlated `NOT EXISTS` is detected as the
+    /// anti-join kind. Host-only.
+    #[test]
+    fn corr_where_not_exists_parse_descriptor() {
+        use crate::plan::sql_frontend::CorrWhereKind;
+        let provider = lateral_provider();
+        let cw = crate::plan::sql_frontend::plan_correlated_where(
+            "SELECT lft.k FROM lft WHERE NOT EXISTS (SELECT 1 FROM vals WHERE vk = lft.k)",
+            &provider,
+        )
+        .expect("detector")
+        .expect("a correlated NOT EXISTS must produce a descriptor");
+        assert_eq!(cw.kind, CorrWhereKind::NotExists);
+    }
+
+    /// Parse → descriptor: a correlated scalar-compare conjunct
+    /// (`outer.k <= (SELECT max(n) ... WHERE vk = outer.k)`) is detected as the
+    /// scalar kind, with the conjunct-level outer ref AND the subquery's own
+    /// correlation both threaded in as correlations. Host-only.
+    #[test]
+    fn corr_where_scalar_parse_descriptor() {
+        use crate::plan::sql_frontend::CorrWhereKind;
+        let provider = lateral_provider();
+        let cw = crate::plan::sql_frontend::plan_correlated_where(
+            "SELECT lft.k FROM lft \
+             WHERE lft.k < (SELECT MAX(n) FROM vals WHERE vk = lft.k)",
+            &provider,
+        )
+        .expect("detector")
+        .expect("a correlated scalar subquery must produce a descriptor");
+        assert_eq!(cw.kind, CorrWhereKind::Scalar);
+        // Both `lft.k` references resolve to the same outer column 0, deduped
+        // to a single correlation.
+        assert_eq!(cw.corr_left_indices, vec![0]);
+    }
+
+    /// The detector declines (`Ok(None)`) a query whose WHERE subquery is
+    /// UNCORRELATED — it must fall through to the ordinary fold-to-constant
+    /// path, not be hijacked by the correlated-WHERE machinery. Host-only.
+    #[test]
+    fn corr_where_declines_uncorrelated() {
+        let provider = lateral_provider();
+        let got = crate::plan::sql_frontend::plan_correlated_where(
+            "SELECT k FROM lft WHERE k < (SELECT MAX(n) FROM vals)",
+            &provider,
+        )
+        .expect("detector");
+        assert!(got.is_none(), "an uncorrelated scalar subquery is not our shape");
+    }
+
+    /// The detector declines a query with no WHERE / no subquery. Host-only.
+    #[test]
+    fn corr_where_declines_plain_query() {
+        let provider = lateral_provider();
+        assert!(crate::plan::sql_frontend::plan_correlated_where("SELECT k FROM lft", &provider)
+            .expect("detector")
+            .is_none());
+    }
+
+    /// Out-of-scope shape: two correlated subqueries in the WHERE are rejected
+    /// precisely (only a single correlated subquery is supported). Host-only.
+    #[test]
+    fn corr_where_rejects_two_correlated() {
+        let provider = lateral_provider();
+        let err = crate::plan::sql_frontend::plan_correlated_where(
+            "SELECT lft.k FROM lft \
+             WHERE EXISTS (SELECT 1 FROM vals WHERE vk = lft.k) \
+               AND NOT EXISTS (SELECT 1 FROM vals WHERE vk = lft.k)",
+            &provider,
+        )
+        .expect_err("two correlated subqueries must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("more than one correlated subquery"),
+            "expected multi-correlated rejection, got: {msg}"
+        );
+    }
+
+    /// End-to-end: correlated `EXISTS` is a semi-join — keeps `lft` rows that
+    /// have >= 1 matching `vals` row (k=1, k=2), drops k=3. GPU-gated.
+    #[test]
+    #[ignore = "gpu:e2e — correlated WHERE subplans run through the GPU execute path"]
+    fn corr_where_exists_semijoin() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT lft.k FROM lft \
+                 WHERE EXISTS (SELECT 1 FROM vals WHERE vk = lft.k) ORDER BY lft.k",
+            )
+            .expect("correlated EXISTS must execute");
+        let b = h.record_batch();
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..b.num_rows()).map(|i| k.value(i)).collect();
+        assert_eq!(got, vec![1, 2], "semi-join keeps matching outer rows");
+    }
+
+    /// End-to-end: correlated `NOT EXISTS` is an anti-join — keeps only the
+    /// non-matching outer row (k=3). Covers the 0-row (false) EXISTS case too.
+    /// GPU-gated.
+    #[test]
+    #[ignore = "gpu:e2e — correlated WHERE subplans run through the GPU execute path"]
+    fn corr_where_not_exists_antijoin() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT lft.k FROM lft \
+                 WHERE NOT EXISTS (SELECT 1 FROM vals WHERE vk = lft.k) ORDER BY lft.k",
+            )
+            .expect("correlated NOT EXISTS must execute");
+        let b = h.record_batch();
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..b.num_rows()).map(|i| k.value(i)).collect();
+        assert_eq!(got, vec![3], "anti-join keeps the non-matching outer row");
+    }
+
+    /// End-to-end: correlated scalar-compare per outer row. `MAX(n)` per k is
+    /// 11 for k=1, 20 for k=2, and NULL (no rows) for k=3. The predicate
+    /// `lft.k < MAX(n)`: k=1<11 true, k=2<20 true, k=3<NULL → NULL → dropped.
+    /// GPU-gated.
+    #[test]
+    #[ignore = "gpu:e2e — correlated WHERE subplans run through the GPU execute path"]
+    fn corr_where_scalar_compare_per_row() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT lft.k FROM lft \
+                 WHERE lft.k < (SELECT MAX(n) FROM vals WHERE vk = lft.k) ORDER BY lft.k",
+            )
+            .expect("correlated scalar subquery must execute");
+        let b = h.record_batch();
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..b.num_rows()).map(|i| k.value(i)).collect();
+        assert_eq!(got, vec![1, 2], "k=3 dropped (scalar subquery is NULL)");
+    }
+
+    /// The mandatory per-outer-row safety cap fires with a clean error when the
+    /// outer input exceeds the (env-lowered) cap. GPU-gated (outer subplan runs
+    /// on the device before the cap check).
+    #[test]
+    #[ignore = "gpu:e2e — correlated WHERE outer subplan runs through the GPU execute path"]
+    fn corr_where_outer_row_cap() {
+        let mut engine = Engine::new().expect("ctx");
+        register_lateral_fixtures(&mut engine); // lft has 3 rows
+        std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "2");
+        let err = engine
+            .sql("SELECT lft.k FROM lft WHERE EXISTS (SELECT 1 FROM vals WHERE vk = lft.k)")
+            .expect_err("3 outer rows must exceed the 2-row cap");
+        std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("safety cap") && msg.contains("correlated WHERE"),
+            "expected correlated-WHERE cap error, got: {msg}"
+        );
     }
 }
