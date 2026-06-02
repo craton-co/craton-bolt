@@ -595,9 +595,10 @@ fn rename_columns(
             negated: *negated,
             case_insensitive: *case_insensitive,
         },
-        Expr::Cast { expr, target } => Expr::Cast {
+        Expr::Cast { expr, target, safe } => Expr::Cast {
             expr: Box::new(rename_columns(expr, map)),
             target: *target,
+            safe: *safe,
         },
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind: *kind,

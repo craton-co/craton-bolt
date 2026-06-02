@@ -468,9 +468,10 @@ where
             negated,
             case_insensitive,
         },
-        Expr::Cast { expr, target } => Expr::Cast {
+        Expr::Cast { expr, target, safe } => Expr::Cast {
             expr: Box::new(resolve_expr(*expr, exec)?),
             target,
+            safe,
         },
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind,

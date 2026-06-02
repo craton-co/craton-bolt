@@ -530,6 +530,7 @@ mod tests {
                 predicate: crate::plan::Expr::Cast {
                     expr: Box::new(lit(2_i32)),
                     target: DataType::Int64,
+                    safe: false,
                 }
                 .eq(lit(2_i64))
                 .and(col("b").gt(lit(0_i64))),

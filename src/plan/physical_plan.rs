@@ -1595,7 +1595,12 @@ impl<'a> Codegen<'a> {
             // for arithmetic dtype unification). Non-numeric source/target
             // (Decimal128 / Date32 / Timestamp / Utf8) are still rejected
             // here with a tightened message — see `cast_target_is_supported`.
-            Expr::Cast { expr, target } => self.emit_cast_expr(expr, *target),
+            // GPU codegen path: a `safe` cast never reaches here — the
+            // `LogicalPlan::Project` lowering routes any projection carrying
+            // one to the host-side `PhysicalPlan::Project` (see
+            // `expr_contains_safe_cast`). Plain CAST lowers to `cvt.*` exactly
+            // as before; the `safe` flag is irrelevant on this path.
+            Expr::Cast { expr, target, .. } => self.emit_cast_expr(expr, *target),
             // v0.5/v0.7 surface: parser + type-check land, GPU execution
             // wiring is blocked at the substrate level.
             //
@@ -3149,9 +3154,10 @@ fn substitute_one_depth(
             negated: *negated,
             case_insensitive: *case_insensitive,
         },
-        Expr::Cast { expr, target } => Expr::Cast {
+        Expr::Cast { expr, target, safe } => Expr::Cast {
             expr: Box::new(substitute_one(expr, map)),
             target: *target,
+            safe: *safe,
         },
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind: *kind,
@@ -3874,6 +3880,46 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         // query's expression namespace.
         Expr::ScalarSubquery(_) => false,
         Expr::InSubquery { expr, .. } => expr_contains_concat(expr),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
+/// True if `expr` contains a *safe* cast (`TRY_CAST` / `SAFE_CAST`,
+/// `Expr::Cast { safe: true, .. }`) anywhere.
+///
+/// A safe cast must yield SQL NULL — not an error — when a non-null input
+/// cannot be converted (e.g. a non-numeric string parsed to an integer, or
+/// an out-of-range float narrowed to an int). The fused GPU scan kernel has
+/// no per-row "clear validity on conversion failure" primitive, so `lower()`
+/// routes any projection carrying a safe cast through the host-side
+/// `PhysicalPlan::Project`, whose executor evaluates each output column via
+/// [`crate::exec::expr_agg::eval_expr`] (which realises the NULL-on-failure
+/// contract — see the `Expr::Cast { safe: true, .. }` arm there). Plain
+/// `CAST` (`safe: false`) is unaffected and keeps its GPU `cvt.*` lowering.
+fn expr_contains_safe_cast(expr: &Expr) -> bool {
+    match expr {
+        Expr::Cast { expr, safe, .. } => *safe || expr_contains_safe_cast(expr),
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
+            expr_contains_safe_cast(expr)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_safe_cast(left) || expr_contains_safe_cast(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_safe_cast(operand),
+        Expr::Alias(inner, _) => expr_contains_safe_cast(inner),
+        Expr::Case { branches, else_branch } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_safe_cast(w) || expr_contains_safe_cast(t))
+                || else_branch.as_deref().map(expr_contains_safe_cast).unwrap_or(false)
+        }
+        Expr::Like { expr, .. } => expr_contains_safe_cast(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_safe_cast),
+        // The subquery subplan is a separate query; its internal safe casts
+        // are that plan's own concern. Only the `InSubquery` probe is in this
+        // query's expression namespace.
+        Expr::ScalarSubquery(_) => false,
+        Expr::InSubquery { expr, .. } => expr_contains_safe_cast(expr),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -5233,8 +5279,13 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
             // The `InSubquery` probe is in this query's namespace; an
             // unsupported cast target inside it must route to host too.
             Expr::InSubquery { expr, .. } => expr_bad_cast(expr),
-            Expr::Cast { expr, target } => {
-                if cast_target_unsupported(*target) {
+            Expr::Cast { expr, target, safe } => {
+                // A safe cast to an otherwise-"unsupported" GPU target is fine
+                // here: the projection carrying it is routed to the host-side
+                // `PhysicalPlan::Project` before codegen (see
+                // `expr_contains_safe_cast`), so it never reaches GPU lowering.
+                // Only flag a *plain* cast to an unsupported target.
+                if !*safe && cast_target_unsupported(*target) {
                     return Some(*target);
                 }
                 expr_bad_cast(expr)
@@ -5429,6 +5480,30 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 if project_is_identity(exprs, inner.output_schema(), &output_schema) {
                     return Ok(inner);
                 }
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
+            // F4: TRY_CAST / SAFE_CAST (`Expr::Cast { safe: true, .. }`)
+            // must yield SQL NULL on a conversion failure rather than erroring.
+            // The fused GPU scan kernel has no per-row "clear validity on
+            // conversion failure" primitive, so any SELECT-list expression
+            // carrying a safe cast routes the whole Project to the host-side
+            // `PhysicalPlan::Project`, whose executor evaluates each output
+            // column via `expr_agg::eval_expr` (the NULL-on-failure contract
+            // lives in its `Expr::Cast { safe: true, .. }` arm). Plain CAST is
+            // unaffected and keeps its GPU `cvt.*` lowering below. We lower the
+            // inner plan with NO projection override so every scan column the
+            // cast operands reference is surfaced for the host evaluator.
+            if exprs.iter().any(expr_contains_safe_cast) {
+                log::debug!(
+                    "physical_plan: TRY_CAST/SAFE_CAST in Project; lowering to \
+                     host-side PhysicalPlan::Project for NULL-on-failure semantics"
+                );
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
                 return Ok(PhysicalPlan::Project {
                     input: Box::new(inner),
                     exprs: exprs.clone(),
@@ -7168,6 +7243,7 @@ mod tests {
         let trap_cast = Expr::Cast {
             expr: Box::new(Expr::Column("x".into())),
             target: DataType::Int32,
+            safe: false,
         };
         assert!(
             !expr_eager_safe_under_shortcircuit(&trap_cast),
@@ -7210,6 +7286,7 @@ mod tests {
                 left: Box::new(Expr::Cast {
                     expr: Box::new(Expr::Column("x".into())),
                     target: DataType::Int64,
+                    safe: false,
                 }),
                 right: Box::new(Expr::Literal(Literal::Int64(5))),
             }),
@@ -7468,6 +7545,7 @@ mod tests {
             let probe = Expr::Cast {
                 expr: Box::new(Expr::Column("a".into())),
                 target: DataType::Utf8,
+                safe: false,
             };
             let plan = LogicalPlan::Filter {
                 input: Box::new(one_col_subquery()),

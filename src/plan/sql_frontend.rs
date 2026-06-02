@@ -4905,24 +4905,19 @@ fn lower_expr_in_having(
                     "CAST with FORMAT clause not supported".into(),
                 ));
             }
-            match kind {
-                CastKind::Cast | CastKind::DoubleColon => {}
-                CastKind::TryCast => {
-                    return Err(BoltError::Sql(
-                        "TRY_CAST not supported; use CAST".into(),
-                    ));
-                }
-                CastKind::SafeCast => {
-                    return Err(BoltError::Sql(
-                        "SAFE_CAST not supported; use CAST".into(),
-                    ));
-                }
-            }
+            // `TRY_CAST` / `SAFE_CAST` are synonyms carrying NULL-on-failure
+            // semantics (`safe = true`); plain `CAST` / `::` keep the
+            // error-on-failure behaviour (`safe = false`).
+            let safe = match kind {
+                CastKind::Cast | CastKind::DoubleColon => false,
+                CastKind::TryCast | CastKind::SafeCast => true,
+            };
             let target = lower_cast_data_type(data_type)?;
             let inner = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
             Ok(Expr::Cast {
                 expr: Box::new(inner),
                 target,
+                safe,
             })
         }
         // Anything else is identical to a scalar HAVING fragment; defer to
@@ -5530,9 +5525,10 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
         // `CAST(<expr> AS <type>)`. v0.5 accepts the standard SQL spelling
         // and the Postgres `expr::type` shortcut (both surface as
         // `CastKind::Cast` / `CastKind::DoubleColon`). `TRY_CAST` and
-        // `SAFE_CAST` carry NULL-on-failure semantics the planner can't
-        // honour yet, so we reject them with a clear message rather than
-        // silently treating them as a plain cast.
+        // `SAFE_CAST` (synonyms) carry NULL-on-failure semantics: a
+        // conversion failure on a non-null input yields SQL NULL instead of
+        // an error. They lower to the same `Expr::Cast` shape with
+        // `safe = true`. `CAST ... FORMAT` remains out of scope.
         SqlExpr::Cast {
             kind,
             expr,
@@ -5544,24 +5540,16 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                     "CAST with FORMAT clause not supported".into(),
                 ));
             }
-            match kind {
-                CastKind::Cast | CastKind::DoubleColon => {}
-                CastKind::TryCast => {
-                    return Err(BoltError::Sql(
-                        "TRY_CAST not supported; use CAST".into(),
-                    ));
-                }
-                CastKind::SafeCast => {
-                    return Err(BoltError::Sql(
-                        "SAFE_CAST not supported; use CAST".into(),
-                    ));
-                }
-            }
+            let safe = match kind {
+                CastKind::Cast | CastKind::DoubleColon => false,
+                CastKind::TryCast | CastKind::SafeCast => true,
+            };
             let target = lower_cast_data_type(data_type)?;
             let inner = lower_expr(expr, resolver, depth + 1)?;
             Ok(Expr::Cast {
                 expr: Box::new(inner),
                 target,
+                safe,
             })
         }
         // `SUBSTRING(s FROM i [FOR n])` / `SUBSTRING(s, i [, n])`: sqlparser
@@ -6969,6 +6957,76 @@ mod wave7_tests {
             }
             other => panic!("expected Limit, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // F4: TRY_CAST / SAFE_CAST frontend acceptance + routing
+    // -------------------------------------------------------------------
+
+    /// Helper: pull the (unaliased) Expr at projection slot `n` from a
+    /// top-level `Project`, panicking with the shape if it isn't one.
+    fn nth_proj_expr(plan: &LogicalPlan, n: usize) -> Expr {
+        match plan {
+            LogicalPlan::Project { exprs, .. } => {
+                let mut e = &exprs[n];
+                while let Expr::Alias(inner, _) = e {
+                    e = inner;
+                }
+                e.clone()
+            }
+            other => panic!("expected top-level Project, got {other:?}"),
+        }
+    }
+
+    /// `TRY_CAST(<expr> AS <type>)` is now accepted (no longer rejected) and
+    /// lowers to `Expr::Cast { safe: true, .. }`.
+    #[test]
+    fn try_cast_parses_to_safe_cast() {
+        let plan = lp("SELECT TRY_CAST(a AS BIGINT) FROM t1");
+        match nth_proj_expr(&plan, 0) {
+            Expr::Cast { safe, target, .. } => {
+                assert!(safe, "TRY_CAST must set safe = true");
+                assert_eq!(target, DataType::Int64);
+            }
+            other => panic!("expected Expr::Cast, got {other:?}"),
+        }
+    }
+
+    /// `SAFE_CAST` is a synonym for `TRY_CAST` — also `safe = true`.
+    #[test]
+    fn safe_cast_is_synonym_for_try_cast() {
+        let plan = lp("SELECT SAFE_CAST(a AS BIGINT) FROM t1");
+        match nth_proj_expr(&plan, 0) {
+            Expr::Cast { safe, .. } => assert!(safe, "SAFE_CAST must set safe = true"),
+            other => panic!("expected Expr::Cast, got {other:?}"),
+        }
+    }
+
+    /// Plain `CAST` keeps `safe = false` (semantics preserved).
+    #[test]
+    fn plain_cast_stays_unsafe() {
+        let plan = lp("SELECT CAST(a AS BIGINT) FROM t1");
+        match nth_proj_expr(&plan, 0) {
+            Expr::Cast { safe, .. } => assert!(!safe, "plain CAST must keep safe = false"),
+            other => panic!("expected Expr::Cast, got {other:?}"),
+        }
+    }
+
+    /// A projection carrying a safe cast routes to the host-side
+    /// `PhysicalPlan::Project` (NULL-on-failure semantics live in the host
+    /// evaluator). Plain CAST stays on the GPU `Projection` path.
+    #[test]
+    fn safe_cast_routes_to_host_project() {
+        let safe = pp("SELECT TRY_CAST(a AS BIGINT) FROM t1");
+        assert!(
+            matches!(safe, PhysicalPlan::Project { .. }),
+            "TRY_CAST projection must lower to host Project, got {safe:?}"
+        );
+        let plain = pp("SELECT CAST(a AS BIGINT) FROM t1");
+        assert!(
+            matches!(plain, PhysicalPlan::Projection { .. }),
+            "plain CAST projection must stay on GPU Projection, got {plain:?}"
+        );
     }
 
     #[test]

@@ -100,9 +100,9 @@ pub fn fold_expr(expr: Expr) -> Expr {
             negated,
             case_insensitive,
         },
-        Expr::Cast { expr, target } => {
+        Expr::Cast { expr, target, safe } => {
             let inner = fold_expr(*expr);
-            fold_cast(inner, target)
+            fold_cast(inner, target, safe)
         }
         Expr::ScalarFn { kind, args } => Expr::ScalarFn {
             kind,
@@ -244,15 +244,19 @@ fn fold_unary(op: UnaryOp, operand: Expr) -> Expr {
 /// * **Decimal / Date32 / Timestamp / Utf8 and any NULL** — out of scope;
 ///   `Literal::Null` is untyped, so folding a NULL cast would drop the target
 ///   type annotation. Leave unfolded.
-fn fold_cast(expr: Expr, target: DataType) -> Expr {
+fn fold_cast(expr: Expr, target: DataType, safe: bool) -> Expr {
     if let Expr::Literal(lit) = &expr {
         if let Some(folded) = fold_literal_cast(lit, target) {
+            // Only lossless literal casts fold here; for those, safe and plain
+            // are identical, so dropping the `safe` flag on the folded literal
+            // is correct.
             return Expr::Literal(folded);
         }
     }
     Expr::Cast {
         expr: Box::new(expr),
         target,
+        safe,
     }
 }
 
@@ -550,6 +554,7 @@ mod tests {
         Expr::Cast {
             expr: Box::new(e),
             target,
+            safe: false,
         }
     }
 

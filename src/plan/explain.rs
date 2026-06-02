@@ -140,7 +140,7 @@ pub fn format_expr(expr: &Expr) -> String {
             };
             format!("({} {} '{}')", format_expr(expr), kw, pattern)
         }
-        Expr::Cast { expr, target } => {
+        Expr::Cast { expr, target, .. } => {
             format!("CAST({} AS {})", format_expr(expr), format_dtype(*target))
         }
         Expr::ScalarFn { kind, args } => {

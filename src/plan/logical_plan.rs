@@ -655,6 +655,12 @@ pub enum Expr {
         expr: Box<Expr>,
         /// Target dtype the conversion produces.
         target: DataType,
+        /// When `true`, this is a `TRY_CAST` / `SAFE_CAST`: a conversion
+        /// failure on a non-null input yields SQL NULL instead of an error,
+        /// and the output dtype is forced nullable. When `false` (plain
+        /// `CAST` / `::`), conversion failures error and the output dtype is
+        /// the declared `target` unchanged.
+        safe: bool,
     },
     /// Scalar string function call (UPPER / LOWER / LENGTH / SUBSTRING /
     /// CONCAT). v0.5 MVP scope: parser + type-check only — the physical
@@ -849,6 +855,18 @@ impl Expr {
         Expr::Cast {
             expr: Box::new(self),
             target,
+            safe: false,
+        }
+    }
+
+    /// `TRY_CAST(self AS target)` / `SAFE_CAST(self AS target)`. Identical to
+    /// [`Expr::cast`] except a conversion failure on a non-null input yields
+    /// SQL NULL instead of an error, and the projected output is nullable.
+    pub fn try_cast(self, target: DataType) -> Expr {
+        Expr::Cast {
+            expr: Box::new(self),
+            target,
+            safe: true,
         }
     }
 
@@ -1038,18 +1056,37 @@ impl Expr {
                 }
                 Ok(DataType::Bool)
             }
-            Expr::Cast { expr, target } => {
+            Expr::Cast { expr, target, safe } => {
                 // Tolerate an untyped `Literal::Null` operand the same way
                 // `IS NULL` does — `CAST(NULL AS Int32)` is a legitimate
                 // SQL fragment and the result type is purely declared by
-                // `target` anyway.
+                // `target` anyway. This is independent of `safe`: a NULL
+                // input yields NULL output for both plain and safe casts.
+                //
+                // The result *dtype* is `target` for both plain and safe
+                // casts — `DataType` carries no nullability flag (that lives
+                // on `Field`). The "safe cast output is nullable" guarantee
+                // is realised where the projected output Field is built
+                // (projection always marks computed expressions nullable;
+                // see `physical_plan`), so no dtype change is needed here.
                 if matches!(expr.as_ref(), Expr::Literal(Literal::Null)) {
                     return Ok(*target);
                 }
                 let src = expr.dtype_depth(schema, depth + 1)?;
-                if !cast_is_supported(src, *target) {
+                // A safe cast (`TRY_CAST` / `SAFE_CAST`) additionally accepts
+                // the conversions that can *fail* at runtime — most notably
+                // `Utf8 -> numeric/Bool` parses — because the whole point is
+                // to yield SQL NULL on failure rather than a type error. Plain
+                // CAST keeps the strict `cast_is_supported` envelope unchanged.
+                let supported = if *safe {
+                    safe_cast_is_supported(src, *target)
+                } else {
+                    cast_is_supported(src, *target)
+                };
+                if !supported {
                     return Err(BoltError::Type(format!(
-                        "unsupported CAST from {src:?} to {target:?}"
+                        "unsupported {} from {src:?} to {target:?}",
+                        if *safe { "TRY_CAST" } else { "CAST" }
                     )));
                 }
                 Ok(*target)
@@ -1497,6 +1534,28 @@ pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
         (Bool, Int32) | (Bool, Int64) | (Int32, Bool) | (Int64, Bool) => true,
         _ => false,
     }
+}
+
+/// Source/target pairs accepted by a *safe* cast (`TRY_CAST` / `SAFE_CAST`).
+///
+/// A superset of [`cast_is_supported`]: in addition to every plain-cast pair
+/// (all of which TRY_CAST also accepts, behaving identically when the
+/// conversion cannot fail), safe casts additionally accept the runtime-
+/// fallible string parses `Utf8 -> {Int32, Int64, Float32, Float64, Bool}`.
+/// On a non-parseable / out-of-range input these yield SQL NULL instead of an
+/// error — the NULL-on-failure contract is realised in the host evaluator
+/// (`crate::exec::expr_agg::safe_cast_column`). Numeric narrowing / float->int
+/// pairs are already in `cast_is_supported`; the *NULL-on-overflow* behaviour
+/// for those is likewise handled by the host evaluator under `safe = true`.
+pub(crate) fn safe_cast_is_supported(src: DataType, target: DataType) -> bool {
+    use DataType::*;
+    if cast_is_supported(src, target) {
+        return true;
+    }
+    matches!(
+        (src, target),
+        (Utf8, Int32) | (Utf8, Int64) | (Utf8, Float32) | (Utf8, Float64) | (Utf8, Bool)
+    )
 }
 
 /// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
@@ -2783,6 +2842,47 @@ mod null_handling_tests {
     #[test]
     fn literal_null_dtype_is_none() {
         assert_eq!(Literal::Null.dtype(), None);
+    }
+
+    // -------------------------------------------------------------------
+    // F4: TRY_CAST / SAFE_CAST type-checking
+    // -------------------------------------------------------------------
+
+    /// A safe cast (`TRY_CAST`) accepts the runtime-fallible `Utf8 -> Int32`
+    /// parse that a plain CAST rejects at the type-check, and its declared
+    /// output dtype is the target. (Nullability lives on `Field`, not
+    /// `DataType`; the projection always marks computed exprs nullable.)
+    #[test]
+    fn try_cast_utf8_to_int_typechecks_to_target() {
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let safe = Expr::Column("s".into()).try_cast(DataType::Int32);
+        assert_eq!(safe.dtype(&schema).unwrap(), DataType::Int32);
+        // The plain CAST of the same pair is still a type error (semantics
+        // preserved): Utf8 -> Int32 is not in `cast_is_supported`.
+        let plain = Expr::Column("s".into()).cast(DataType::Int32);
+        assert!(plain.dtype(&schema).is_err());
+    }
+
+    /// The safe-cast envelope is a superset of the plain-cast envelope, plus
+    /// the `Utf8 -> {numeric, Bool}` parses; unrelated pairs stay rejected.
+    #[test]
+    fn safe_cast_supported_envelope() {
+        // Plain-cast pairs are all accepted by safe casts.
+        assert!(safe_cast_is_supported(DataType::Int32, DataType::Int64));
+        // New string-parse pairs.
+        assert!(safe_cast_is_supported(DataType::Utf8, DataType::Int32));
+        assert!(safe_cast_is_supported(DataType::Utf8, DataType::Float64));
+        assert!(safe_cast_is_supported(DataType::Utf8, DataType::Bool));
+        // Still-unsupported pair (no numeric -> Utf8 conversion defined).
+        assert!(!safe_cast_is_supported(DataType::Int32, DataType::Utf8));
+    }
+
+    /// `TRY_CAST(NULL AS Int32)` type-checks to the target, just like CAST.
+    #[test]
+    fn try_cast_of_null_literal_typechecks() {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let e = Expr::Literal(Literal::Null).try_cast(DataType::Int32);
+        assert_eq!(e.dtype(&schema).unwrap(), DataType::Int32);
     }
 
     /// `WHERE x = NULL` with `x: Int32` must type-check (NULL borrows the

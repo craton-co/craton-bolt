@@ -591,7 +591,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             let inner = rewrite_expr_with(inner, r, depth + 1)?;
             Ok(Expr::Alias(Box::new(inner), name.clone()))
         }
-        Expr::Cast { expr: inner, target } => {
+        Expr::Cast { expr: inner, target, safe } => {
             // CAST has no string-literal comparison surface to rewrite —
             // it converts a numeric / boolean expression into another
             // primitive type. Recurse so any rewritable sub-expression
@@ -600,6 +600,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             Ok(Expr::Cast {
                 expr: Box::new(new_inner),
                 target: *target,
+                safe: *safe,
             })
         }
         Expr::Unary { op, operand } => {

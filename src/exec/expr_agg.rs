@@ -343,11 +343,22 @@ fn eval_inner(
             env,
             n_rows,
         ),
-        Expr::Cast { .. } => Err(BoltError::Other(
-            "expr_agg: CAST not yet supported on the host evaluator; \
-             plan-time lowering should have rejected this expression"
-                .into(),
-        )),
+        // F4: TRY_CAST / SAFE_CAST (`safe = true`) is evaluated host-side —
+        // the physical-plan lowering routes any projection carrying one here
+        // (see `physical_plan::expr_contains_safe_cast`). A conversion failure
+        // on a non-null input yields SQL NULL instead of erroring. Plain CAST
+        // (`safe = false`) keeps its error-on-failure semantics; it normally
+        // lowers to the GPU `cvt.*` path, but evaluating it host-side here (if
+        // a future caller routes it) must behave identically to that path, so
+        // we defer to `cast_column` (saturating numeric `as`, Utf8 errors).
+        Expr::Cast { expr, target, safe } => {
+            let inner = eval_inner(expr, env, n_rows)?;
+            if *safe {
+                safe_cast_column(inner, *target)
+            } else {
+                cast_column(inner, *target)
+            }
+        }
         // String scalar functions evaluated host-side. SUBSTRING and TRIM are
         // wired here (the physical-plan boundary routes Projects carrying them
         // to `PhysicalPlan::Project`, whose executor calls `eval_expr`).
@@ -1203,6 +1214,159 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
     })
 }
 
+/// `TRY_CAST` / `SAFE_CAST`: like [`cast_column`] but a conversion failure on
+/// a *non-null* cell yields `None` (SQL NULL) instead of an error, and the
+/// conversion envelope is wider (string parses are accepted). A `None` input
+/// cell stays `None` regardless. The per-conversion-class behaviour:
+///
+///   * Identity (`src == target`): returned unchanged (never fails).
+///   * `Utf8 -> {Int32,Int64,Float32,Float64,Bool}`: parse the trimmed
+///     string; unparseable / out-of-range → `None`.
+///   * Float -> Int (`Float{32,64} -> Int{32,64}`): non-finite (NaN/±inf) or
+///     out of the target integer's range → `None`; otherwise truncate toward
+///     zero (matches Rust `as`, which the GPU `cvt.rzi` path also uses for
+///     in-range values).
+///   * Int64 -> Int32: out of `i32` range → `None`; otherwise the value.
+///   * Every other supported pair (int widening, int->float, float widening,
+///     bool<->int): cannot fail, so identical to the plain cast.
+fn safe_cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
+    use DataType::*;
+    if col.dtype() == to {
+        return Ok(col);
+    }
+    Ok(match to {
+        Int32 => HostColumn::I32(safe_cast_to_i32(col)?),
+        Int64 => HostColumn::I64(safe_cast_to_i64(col)?),
+        Float32 => HostColumn::F32(safe_cast_to_f32(col)?),
+        Float64 => HostColumn::F64(safe_cast_to_f64(col)?),
+        Bool => HostColumn::Bool(safe_cast_to_bool(col)?),
+        Utf8 => HostColumn::Utf8(cast_to_utf8(col)?),
+        Decimal128(_, _) => {
+            return Err(BoltError::Plan(
+                "TRY_CAST to Decimal128 not yet supported (host-side); \
+                 coming in a follow-up"
+                    .into(),
+            ))
+        }
+        Date32 | Timestamp(_, _) => {
+            return Err(BoltError::Type(format!(
+                "TRY_CAST to {to:?} is not supported in the expression evaluator"
+            )));
+        }
+    })
+}
+
+/// Safe cast to `Vec<Option<i32>>`. Utf8 parses (failure → None); Int64 and
+/// floats range-check (out-of-range / non-finite → None); other numerics and
+/// Bool cannot fail.
+fn safe_cast_to_i32(col: HostColumn) -> BoltResult<Vec<Option<i32>>> {
+    Ok(match col {
+        HostColumn::Bool(v) => v.into_iter().map(|o| o.map(|b| b as i32)).collect(),
+        HostColumn::I32(v) => v,
+        HostColumn::I64(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|x| i32::try_from(x).ok()))
+            .collect(),
+        HostColumn::F32(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|x| float_to_int_checked(x as f64, i32::MIN as f64, i32::MAX as f64).map(|y| y as i32)))
+            .collect(),
+        HostColumn::F64(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|x| float_to_int_checked(x, i32::MIN as f64, i32::MAX as f64).map(|y| y as i32)))
+            .collect(),
+        HostColumn::Utf8(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|s| s.trim().parse::<i32>().ok()))
+            .collect(),
+    })
+}
+
+/// Safe cast to `Vec<Option<i64>>`.
+fn safe_cast_to_i64(col: HostColumn) -> BoltResult<Vec<Option<i64>>> {
+    Ok(match col {
+        HostColumn::Bool(v) => v.into_iter().map(|o| o.map(|b| b as i64)).collect(),
+        HostColumn::I32(v) => v.into_iter().map(|o| o.map(|x| x as i64)).collect(),
+        HostColumn::I64(v) => v,
+        HostColumn::F32(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|x| float_to_int_checked(x as f64, i64::MIN as f64, i64::MAX as f64).map(|y| y as i64)))
+            .collect(),
+        HostColumn::F64(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|x| float_to_int_checked(x, i64::MIN as f64, i64::MAX as f64).map(|y| y as i64)))
+            .collect(),
+        HostColumn::Utf8(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|s| s.trim().parse::<i64>().ok()))
+            .collect(),
+    })
+}
+
+/// Safe cast to `Vec<Option<f32>>`. Only Utf8 parses can fail; numeric / Bool
+/// conversions are total (matching the plain-cast `as` behaviour).
+fn safe_cast_to_f32(col: HostColumn) -> BoltResult<Vec<Option<f32>>> {
+    Ok(match col {
+        HostColumn::Utf8(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|s| s.trim().parse::<f32>().ok()))
+            .collect(),
+        other => cast_to_f32(other)?,
+    })
+}
+
+/// Safe cast to `Vec<Option<f64>>`.
+fn safe_cast_to_f64(col: HostColumn) -> BoltResult<Vec<Option<f64>>> {
+    Ok(match col {
+        HostColumn::Utf8(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|s| s.trim().parse::<f64>().ok()))
+            .collect(),
+        other => cast_to_f64(other)?,
+    })
+}
+
+/// Safe cast to `Vec<Option<bool>>`. Utf8 accepts the SQL/`bool` spellings
+/// `true/false`, `t/f`, `1/0`, `yes/no` (case-insensitive, trimmed); anything
+/// else → None. Numeric → `x != 0` (total).
+fn safe_cast_to_bool(col: HostColumn) -> BoltResult<Vec<Option<bool>>> {
+    Ok(match col {
+        HostColumn::Utf8(v) => v
+            .into_iter()
+            .map(|o| o.and_then(|s| parse_bool_loose(&s)))
+            .collect(),
+        other => cast_to_bool(other)?,
+    })
+}
+
+/// Parse a string to bool for `TRY_CAST(... AS BOOL)`. Accepts the common SQL
+/// truthy/falsy spellings, case-insensitively, after trimming whitespace.
+/// Returns `None` for anything unrecognised.
+fn parse_bool_loose(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "1" | "yes" | "y" => Some(true),
+        "false" | "f" | "0" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+/// Truncate-toward-zero a finite float into an inclusive `[lo, hi]` range,
+/// returning `None` if the value is non-finite (NaN/±inf) or rounds outside
+/// the range. `lo`/`hi` are the target integer type's bounds expressed as
+/// `f64`. The caller applies the final `as` narrowing once the value is known
+/// to be in range, so no saturation/UB occurs.
+fn float_to_int_checked(x: f64, lo: f64, hi: f64) -> Option<f64> {
+    if !x.is_finite() {
+        return None;
+    }
+    let t = x.trunc();
+    if t < lo || t > hi {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 /// Cast to `Vec<Option<i32>>`. Bool → 0/1; numerics use `as i32`
 /// (saturating); Utf8 errors.
 fn cast_to_i32(col: HostColumn) -> BoltResult<Vec<Option<i32>>> {
@@ -1418,6 +1582,100 @@ mod tests {
         match out {
             HostColumn::I32(v) => assert_eq!(v, vec![Some(5), Some(6)]),
             other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // F4: TRY_CAST / SAFE_CAST host evaluator (NULL-on-failure)
+    // -------------------------------------------------------------------
+
+    /// `TRY_CAST('abc' AS INT)` → NULL (unparseable string).
+    #[test]
+    fn try_cast_bad_string_to_int_is_null() {
+        let s = HostColumn::Utf8(vec![Some("abc".into())]);
+        let env = env_of(&[("s", &s)]);
+        let expr = col("s").try_cast(DataType::Int32);
+        let out = eval_expr(&expr, &env, DataType::Int32, 1).unwrap();
+        match out {
+            HostColumn::I32(v) => assert_eq!(v, vec![None]),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// `TRY_CAST('123' AS INT)` → 123 (good parse).
+    #[test]
+    fn try_cast_good_string_to_int() {
+        let s = HostColumn::Utf8(vec![Some("123".into()), Some("  -7 ".into())]);
+        let env = env_of(&[("s", &s)]);
+        let expr = col("s").try_cast(DataType::Int32);
+        let out = eval_expr(&expr, &env, DataType::Int32, 2).unwrap();
+        match out {
+            HostColumn::I32(v) => assert_eq!(v, vec![Some(123), Some(-7)]),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// NULL input → NULL output, independent of `safe`.
+    #[test]
+    fn try_cast_of_null_is_null() {
+        let s = HostColumn::Utf8(vec![None]);
+        let env = env_of(&[("s", &s)]);
+        let expr = col("s").try_cast(DataType::Int64);
+        let out = eval_expr(&expr, &env, DataType::Int64, 1).unwrap();
+        match out {
+            HostColumn::I64(v) => assert_eq!(v, vec![None]),
+            other => panic!("expected I64, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Out-of-range narrowing under TRY_CAST → NULL; in-range value survives.
+    #[test]
+    fn try_cast_out_of_range_narrowing_is_null() {
+        let x = HostColumn::I64(vec![Some(i64::from(i32::MAX) + 1), Some(42)]);
+        let env = env_of(&[("x", &x)]);
+        let expr = col("x").try_cast(DataType::Int32);
+        let out = eval_expr(&expr, &env, DataType::Int32, 2).unwrap();
+        match out {
+            HostColumn::I32(v) => assert_eq!(v, vec![None, Some(42)]),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Out-of-range / non-finite float→int under TRY_CAST → NULL.
+    #[test]
+    fn try_cast_float_to_int_overflow_and_nan_are_null() {
+        let x = HostColumn::F64(vec![Some(1e30), Some(f64::NAN), Some(3.9)]);
+        let env = env_of(&[("x", &x)]);
+        let expr = col("x").try_cast(DataType::Int32);
+        let out = eval_expr(&expr, &env, DataType::Int32, 3).unwrap();
+        match out {
+            // 1e30 overflows i32 → None; NaN → None; 3.9 truncates to 3.
+            HostColumn::I32(v) => assert_eq!(v, vec![None, None, Some(3)]),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// A *plain* CAST of the same unparseable string is NOT silently NULL —
+    /// the host evaluator errors (preserving plain-CAST semantics). The GPU
+    /// path likewise rejects Utf8 source; here we assert the host contract.
+    #[test]
+    fn plain_cast_bad_string_to_int_errors() {
+        let s = HostColumn::Utf8(vec![Some("abc".into())]);
+        let env = env_of(&[("s", &s)]);
+        let expr = col("s").cast(DataType::Int32);
+        let err = eval_expr(&expr, &env, DataType::Int32, 1);
+        assert!(err.is_err(), "plain CAST of bad string must error, not NULL");
+    }
+
+    /// A widening safe cast (Int32→Int64) cannot fail: identical to plain CAST.
+    #[test]
+    fn try_cast_widening_matches_plain() {
+        let x = HostColumn::I32(vec![Some(1), Some(-2), None]);
+        let env = env_of(&[("x", &x)]);
+        let out = eval_expr(&col("x").try_cast(DataType::Int64), &env, DataType::Int64, 3).unwrap();
+        match out {
+            HostColumn::I64(v) => assert_eq!(v, vec![Some(1), Some(-2), None]),
+            other => panic!("expected I64, got {:?}", other.dtype()),
         }
     }
 
