@@ -166,10 +166,15 @@ These are real, code-level behaviors to be aware of:
   which return `NULL`). Intentional for now; tracked as the `TODO(null)`
   follow-up.
 - **String handling is dictionary/ASCII-oriented.** String predicates operate
-  over dictionary-encoded literals, and the GPU string functions
-  (`UPPER` / `LOWER` / `LENGTH`) are byte/ASCII-oriented. Treat non-ASCII /
-  multi-byte UTF-8 case-folding and length-in-characters semantics as
-  unverified — `LENGTH` is byte-length, and case conversion is ASCII-range.
+  over dictionary-encoded literals, and the GPU case-folding functions
+  (`UPPER` / `LOWER`) are byte/ASCII-oriented — treat non-ASCII / multi-byte
+  UTF-8 case-folding as unverified, since case conversion is ASCII-range only
+  (any dictionary entry with a non-ASCII byte falls back to the host
+  transform). **`LENGTH` counts characters** (Unicode scalar values —
+  `s.chars().count()`, `src/exec/string_length.rs`), **not bytes**; the
+  byte-length function is **`OCTET_LENGTH`** (UTF-8 byte count,
+  `src/exec/expr_agg.rs`). So for a multi-byte string the two diverge:
+  `LENGTH('café') = 4` while `OCTET_LENGTH('café') = 5`.
   Utf8 ordering comparisons against a literal (`WHERE name < 'M'`) use
   **binary (UTF-8 byte) collation**, not locale-aware / ICU collation, so the
   ordering matches `memcmp` rather than any natural-language collation.
@@ -207,7 +212,7 @@ These are real, code-level behaviors to be aware of:
   CUDA-graph sort, alternate hash/scan algorithms) are gated behind
   environment variables and are not the default path. See
   [`docs/ENV_VARS.md`](ENV_VARS.md).
-- **Persistent PTX cache: opt-in, no automatic eviction.** The
+- **Persistent PTX cache: opt-in, bounded by an LRU eviction policy.** The
   `EngineBuilder::persistent_cache(path)` knob **is** wired into `build()`:
   it installs the path as the process-wide disk PTX-cache override (via
   `install_persistent_cache_override`), so the JIT compile path reads and
@@ -216,9 +221,14 @@ These are real, code-level behaviors to be aware of:
   clear an env-var- or otherwise-installed override (opt-in: a default-built
   engine never enables the disk cache on its own). The override is
   process-global, so it is shared across sequential engines in the same
-  process. The cache directory itself has no size cap or eviction policy —
-  you manage its lifetime. See [`ROADMAP.md`](../ROADMAP.md) "Known
-  limitations" for remaining builder-surface gaps.
+  process. The cache directory **is** bounded: `enforce_bounds`
+  (`src/jit/disk_cache.rs`) runs after each store and evicts least-recently-
+  modified `*.ptx` entries (LRU by mtime) once it exceeds either the total-
+  bytes cap (`CRATON_BOLT_PTX_CACHE_MAX_BYTES`, default 64 MiB) or the
+  entry-count cap (`CRATON_BOLT_PTX_CACHE_MAX_ENTRIES`, default 4096); setting
+  either var to `0` disables that one cap. See
+  [`ENV_VARS.md`](ENV_VARS.md) for the knobs and [`ROADMAP.md`](../ROADMAP.md)
+  "Known limitations" for remaining builder-surface gaps.
 
 ---
 

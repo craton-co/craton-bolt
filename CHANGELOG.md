@@ -77,7 +77,13 @@ the GPU radix sort dispatch in the executor. It also widens the SQL
 surface itself — set operations (`EXCEPT` / `INTERSECT`), host-side
 window functions, non-recursive CTEs, uncorrelated subqueries,
 `JOIN ... USING` / `NATURAL`, `COUNT(DISTINCT)`, and GPU `LIKE` /
-`UPPER` / `LOWER` / `LENGTH`. Items are grouped to mirror the v0.6
+`UPPER` / `LOWER` / `LENGTH`. Later feature waves in the same release
+widen it further — `LATERAL` and derived tables, `WITH RECURSIVE`,
+correlated `WHERE` subqueries, `VALUES` as a row source,
+`generate_series`, `DISTINCT ON`, named `WINDOW` / `QUALIFY`,
+super-aggregates (`ROLLUP` / `CUBE` / `GROUPING SETS`), grouped
+`Decimal128` GPU aggregation, and `FETCH` / `TOP` / `FOR UPDATE` /
+`PREWHERE` query-clause sugar. Items are grouped to mirror the v0.6
 milestone headings.
 
 ### Added — Types (Decimal128 / Date / Timestamp)
@@ -146,6 +152,68 @@ milestone headings.
   `GROUP BY` / `HAVING` / `SELECT DISTINCT`), lowered to
   `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` and
   executed via the new `PhysicalPlan::CountRows` node.
+
+### Added — SQL surface (later 0.7 feature waves: LATERAL / recursive / VALUES / generate_series / super-aggregates)
+- **`LATERAL` derived tables** — `FROM left, LATERAL (SELECT ... WHERE x =
+  left.col) AS d` (and the `CROSS` / `INNER JOIN LATERAL ... ON true` and
+  `LEFT JOIN LATERAL ... ON true` forms). Correlated; executed as a host
+  nested-loop apply (dependent join), bounded by `CRATON_MAX_APPLY_ROWS`
+  (default 100k). Leading / multiple / `RIGHT` / `FULL` LATERAL, a
+  predicate other than `ON true`, and a column-list alias are rejected.
+- **Derived tables** — a subquery in `FROM` (`FROM (SELECT ...) AS alias`)
+  is planned recursively as a self-contained subtree and exposed under the
+  (required) alias. A column-list alias (`AS d(x, y)`) is rejected.
+- **`WITH RECURSIVE`** — host-orchestrated (`execute_recursive_cte` /
+  `execute_mutual_recursive_cte`); the body must be `<anchor> UNION [ALL]
+  <recursive term>`, evaluated to a fixpoint. Linear, non-linear, and
+  mutual recursion, plus an optional recursive-CTE column-list alias
+  (`WITH RECURSIVE c (a, b) AS ...`). Iteration cap
+  `CRATON_MAX_RECURSIVE_ITERATIONS`. A recursive anchor that seeds from a
+  recursive member, a self-reference buried in a subquery, and
+  `UNION BY NAME` are rejected.
+- **Correlated `WHERE` subqueries** — a single correlated subquery in a
+  top-level `WHERE` conjunct: a correlated scalar comparison, `EXISTS`
+  (semi-join), or `NOT EXISTS` (anti-join). Bounded by the same
+  `CRATON_MAX_APPLY_ROWS` cap as `LATERAL`. More than one correlated
+  subquery, a correlation inside an `OR`, and a correlated
+  `IN (SELECT ...)` are rejected.
+- **`VALUES` as a row source** (`plan_values_query` /
+  `execute_values_query`) — bare (`VALUES (...), (...) [ORDER BY] [LIMIT]`)
+  and in `FROM` (`SELECT ... FROM (VALUES (...)) AS t(a, b)`). Per-column
+  dtypes inferred by numeric widening; row count capped
+  (`CRATON_VALUES_MAX_ROWS`, default 1,000,000).
+- **`generate_series(start, stop[, step])`** — the one supported
+  table-valued function in `FROM` (`plan_generate_series_query` /
+  `execute_generate_series_query`); produces an inclusive non-nullable
+  `Int64` series. `step` defaults to `1`; negative `step` descends;
+  `step = 0` errors. Row count capped (`CRATON_GENERATE_SERIES_MAX_ROWS`).
+- **`DISTINCT ON (...)`** (Postgres extension) — host-orchestrated
+  (`plan_distinct_on` / `execute_distinct_on`): the base query runs with
+  the `DISTINCT ON` keys prepended and its `ORDER BY` applied, then the
+  engine keeps the first row per key (`LIMIT` applied after dedup). Keys
+  must be simple column refs; combined with `GROUP BY` / `HAVING` or a
+  computed-expression key, it is rejected.
+- **Named `WINDOW` clause and `QUALIFY`** — `WINDOW w AS (...)` referenced
+  via `OVER w` (including extension, `OVER (w ORDER BY ...)`), and
+  `QUALIFY <window-predicate>` lowered to a `Filter` over the window
+  projection. `QUALIFY` / named `WINDOW` combined with `GROUP BY` /
+  aggregates is rejected.
+- **Super-aggregates** — `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` /
+  `ALL`, the trailing `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE`
+  modifiers, and the `GROUPING()` / `GROUPING_ID()` indicators. Expanded
+  host-side at plan time into one grouping set per result row, rewritten
+  as a `UNION ALL` of the per-set sub-plans (max 12 grouping columns).
+- **Combined `COUNT(DISTINCT col)` forms** — two forms layered on the
+  sole-item distinct-count base plan are now accepted (e.g.
+  `SELECT DISTINCT COUNT(DISTINCT col)`).
+- **Grouped `Decimal128` GPU aggregation** — `SUM` / `MIN` / `MAX` over a
+  `Decimal128` column under `GROUP BY` lowered on-device (complements the
+  scalar `Decimal128` aggregation and arithmetic already in 0.7), and
+  `Decimal128` division added to the GPU arithmetic set.
+- **Query-clause sugar** — `FETCH` and T-SQL `TOP` fold into `LIMIT`,
+  `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, and `PREWHERE`
+  (ClickHouse-ism) folds into `WHERE`. A bare `FROM a, b` comma list
+  desugars to a `CROSS JOIN` chain.
 
 ### Added — GPU string functions
 - **GPU `LIKE` / `NOT LIKE`** over `Utf8` columns — dictionary columns

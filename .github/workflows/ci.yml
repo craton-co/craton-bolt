@@ -13,6 +13,12 @@ on:
   # Allow maintainers to kick the GPU lane on demand.
   workflow_dispatch: {}
 
+# TODO(ci): SHA-pin all third-party action refs (actions/checkout,
+# dtolnay/rust-toolchain, actions/cache, taiki-e/install-action,
+# actions/upload-artifact, codecov/codecov-action) to immutable commit
+# SHAs once we can verify the hashes from a trusted source. Tag/branch
+# refs are kept as-is for now for readability.
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -80,6 +86,86 @@ jobs:
       - name: cargo test (doctests)
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
+
+  # Documentation build under the HOST config. This mirrors what docs.rs
+  # builds (docs.rs cannot link CUDA), so a green run here gives us
+  # docs.rs-parity confidence: if `cargo doc` fails here it will fail on
+  # docs.rs too. We pass `--no-deps` to document only this crate (matching
+  # the surface docs.rs renders for it) and keep RUSTFLAGS clear so a stray
+  # doc warning does not get promoted to a hard error and mask the real
+  # build/link signal.
+  #
+  # NOTE: docs.rs builds with the crate's default features unless overridden
+  # via [package.metadata.docs.rs] in Cargo.toml. We build with
+  # `--no-default-features --features cuda-stub` here because the default
+  # feature set requires a CUDA toolchain that docs.rs lacks; the Cargo.toml
+  # docs.rs metadata should select the same stub feature set.
+  doc:
+    name: doc (docs.rs parity)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doc-
+
+      - name: cargo doc (no-deps, cuda-stub)
+        run: cargo doc --no-default-features --features cuda-stub --no-deps
+
+  # Packaging / crates.io dry-run. `cargo publish --dry-run` packages the
+  # crate exactly as `cargo publish` would (honouring `include`/`exclude`,
+  # the `package.metadata`, and the dependency version requirements) and
+  # compiles the packaged tarball in isolation. This is the highest-risk
+  # crates.io failure mode — a crate that builds in-tree can still fail to
+  # package (path-only deps without versions, files excluded from the
+  # tarball, build scripts referencing untracked files). We surface those
+  # errors here BEFORE a real release rather than at `cargo publish` time.
+  #
+  # Built with `--no-default-features --features cuda-stub` because the
+  # default feature set requires a CUDA toolchain absent on hosted runners.
+  package:
+    name: package (cargo publish --dry-run)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-package-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-package-
+
+      # `--dry-run` builds the would-be-published tarball and verifies it
+      # compiles; it does NOT upload anything. `--allow-dirty` is intentionally
+      # NOT set so an uncommitted-file situation is caught too.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --no-default-features --features cuda-stub
 
   # Host-side coverage (informational, non-blocking for tooling hiccups).
   # Measures HOST coverage under the same --no-default-features --features
@@ -243,13 +329,25 @@ jobs:
   # runner is online, this job stays queued rather than failing — that is
   # expected. The `runs-on` labels below MUST match the registered runner.
   #
+  # NON-BLOCKING: `continue-on-error: true` is set so that even once a runner
+  # is registered (or while the job sits queued / a maintainer cancels it), a
+  # red/absent GPU lane NEVER blocks a PR. The CPU/host lanes above are the
+  # gating signal. Remove `continue-on-error` only once the GPU runner is
+  # stable and we want real-device regressions to gate merges.
+  #
   # The lane is guarded to run only on the canonical repo (NOT on PRs from
   # forks), so untrusted fork code never executes on the self-hosted hardware.
   gpu-integration:
     name: gpu integration (self-hosted NVIDIA GPU)
     # Only run on the main repo — never on fork PRs, so fork code cannot run on
     # the self-hosted GPU hardware. Still runs on push / schedule / dispatch.
+    # This also short-circuits the (currently nonexistent) self-hosted runner:
+    # while no runner with the `self-hosted, gpu` labels is registered, the job
+    # simply has nothing to dispatch to and stays queued rather than failing.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Non-blocking: a missing/red GPU lane must never block a PR while no
+    # self-hosted GPU runner exists (see the comment block above).
+    continue-on-error: true
     # Self-hosted NVIDIA GPU runner. A maintainer must register a runner with
     # these labels (see the comment block above). Placeholder labels — adjust
     # to match the actual runner registration if different.

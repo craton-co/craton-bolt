@@ -469,10 +469,13 @@ query into a clear error).
 **What changed.** `Decimal128` columns are now reachable through GPU
 lowering. Arithmetic (`+`, `-`, `*`) and comparisons (`=`, `!=`, `<`,
 `>`, `<=`, `>=`) lower to the GPU, the latter being usable from `WHERE`
-predicates; `SUM(Decimal128)` is supported via a host-side reduction. In
-0.6, `DataType::Decimal128(p, s)` plumbed through the logical plan and
-Arrow round-trip and `CAST(int AS DECIMAL(p, s))` parsed, but physical
-lowering rejected with `"Decimal128 not yet lowered to GPU"`.
+predicates. `SUM(Decimal128)` runs **on the GPU** — both the scalar
+`SUM(price)` form (dedicated i128 block-reduce kernels, with a host-fold
+fallback inside) and the **grouped** `SUM(price) ... GROUP BY` form (wave 14
+landed grouped on-device Decimal128 aggregates). In 0.6, `DataType::Decimal128(p, s)`
+plumbed through the logical plan and Arrow round-trip and
+`CAST(int AS DECIMAL(p, s))` parsed, but physical lowering rejected with
+`"Decimal128 not yet lowered to GPU"`.
 
 **Classification: Additive** for the surface — no API moved, and the SQL
 itself was already accepted by the parser / type-checker in 0.6.

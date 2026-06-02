@@ -26,10 +26,11 @@
 //! Keys kernel (`with_validity = false`, classic):
 //! ```text
 //! .visible .entry bolt_groupby_keys(
-//!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
-//!     .param .u64 keys_table_ptr,  // i64, length k, init'd to EMPTY_KEY
+//!     .param .u64 group_col_ptr,      // i64 group keys, length n_rows
+//!     .param .u64 keys_table_ptr,     // i64, length k, init'd to EMPTY_KEY
 //!     .param .u32 n_rows,
-//!     .param .u32 k                // power-of-two table size
+//!     .param .u32 k,                  // power-of-two table size
+//!     .param .u64 overflow_counter_ptr // u32, length 1, host-init to 0
 //! )
 //! ```
 //!
@@ -40,9 +41,24 @@
 //!     .param .u64 keys_table_ptr,
 //!     .param .u32 n_rows,
 //!     .param .u32 k,
-//!     .param .u64 key_validity_ptr, // packed-bit *u32 (ceil(n_rows/32) words)
+//!     .param .u64 key_validity_ptr,    // packed-bit *u32 (ceil(n_rows/32) words)
+//!     .param .u64 overflow_counter_ptr // u32, length 1, host-init to 0
 //! )
 //! ```
+//!
+//! ## Overflow counter (probe-bound surfacing)
+//!
+//! Every classic kernel ([`KEYS_KERNEL_ENTRY`], [`AGG_KERNEL_ENTRY`],
+//! [`AGG_DECIMAL_KERNEL_ENTRY`]) takes a trailing `overflow_counter_ptr`
+//! (`*u32`, length 1, host-initialised to `0`) as its LAST parameter. When a
+//! thread exhausts the bounded probe (or, for the decimal kernel, the bounded
+//! lock-acquire) it would otherwise drop its row silently and corrupt the
+//! aggregate with no host-visible signal. Instead it atomically increments
+//! this counter (`atom.global.add.u32 _, [ptr], 1`) before bailing. After
+//! kernel sync the host reads the counter back; a non-zero value means at
+//! least one row was dropped and the result is incomplete, so the host raises
+//! an error rather than returning a wrong answer. This mirrors the proven
+//! spill-counter ABI in [`crate::jit::valid_flag_kernels`].
 //! When the validity bit for this row is `0` the thread bails out
 //! before issuing any `atom.cas` — NULL keys are dropped, matching SQL
 //! semantics where NULL is not equal to itself and therefore does not
@@ -52,12 +68,13 @@
 //! parameterises the load + atomic instruction):
 //! ```text
 //! .visible .entry bolt_groupby_agg(
-//!     .param .u64 group_col_ptr,   // i64 group keys, length n_rows
-//!     .param .u64 keys_table_ptr,  // i64, length k, fully populated
-//!     .param .u64 input_col_ptr,   // T, length n_rows
-//!     .param .u64 acc_table_ptr,   // T, length k, init'd to identity(op)
+//!     .param .u64 group_col_ptr,      // i64 group keys, length n_rows
+//!     .param .u64 keys_table_ptr,     // i64, length k, fully populated
+//!     .param .u64 input_col_ptr,      // T, length n_rows
+//!     .param .u64 acc_table_ptr,      // T, length k, init'd to identity(op)
 //!     .param .u32 n_rows,
-//!     .param .u32 k
+//!     .param .u32 k,
+//!     .param .u64 overflow_counter_ptr // u32, length 1, host-init to 0
 //! )
 //! ```
 //!
@@ -70,7 +87,8 @@
 //!     .param .u64 acc_table_ptr,
 //!     .param .u32 n_rows,
 //!     .param .u32 k,
-//!     .param .u64 value_validity_ptr, // packed-bit *u32
+//!     .param .u64 value_validity_ptr,  // packed-bit *u32
+//!     .param .u64 overflow_counter_ptr // u32, length 1, host-init to 0
 //! )
 //! ```
 //! When the value-validity bit for this row is `0` the thread does NOT
@@ -244,16 +262,27 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, ".address_size 64").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
+    // Param list. The trailing `overflow_counter_ptr` is ALWAYS present and is
+    // ALWAYS the last parameter; its index shifts by one when the optional
+    // key-validity pointer is also emitted. See the overflow-counter ABI note
+    // on [`compile_groupby_keys_kernel`].
+    let overflow_param = if with_key_validity { 5 } else { 4 };
     writeln!(ptx, ".visible .entry {}(", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {}_param_0,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {}_param_1,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u32 {}_param_2,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     if with_key_validity {
         writeln!(ptx, "\t.param .u32 {}_param_3,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
-        writeln!(ptx, "\t.param .u64 {}_param_4", KEYS_KERNEL_ENTRY).map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {}_param_4,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     } else {
-        writeln!(ptx, "\t.param .u32 {}_param_3", KEYS_KERNEL_ENTRY).map_err(write_err)?;
+        writeln!(ptx, "\t.param .u32 {}_param_3,", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     }
+    writeln!(
+        ptx,
+        "\t.param .u64 {}_param_{}",
+        KEYS_KERNEL_ENTRY, overflow_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -363,14 +392,13 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
 
     // Probe loop. %r8 is the current slot; loops on collision.
     writeln!(ptx, "PROBE_LOOP:").map_err(write_err)?;
-    // Bound check: probe_count += 1 ; if probe_count > max_probes -> DONE.
-    // Give-up-silently semantics — the success path is unchanged. Host-side
-    // post-launch detection of "did every key get placed?" is a separate
-    // concern (see the valid-flag SPILL path for the version that surfaces
-    // the overflow to the host).
+    // Bound check: probe_count += 1 ; if probe_count > max_probes -> OVERFLOW.
+    // The bound is purely defensive (the host enforces load factor < 0.5), but
+    // if it ever trips we must NOT silently drop the row: branch to OVERFLOW,
+    // which atomically bumps the host-visible overflow counter before bailing.
     writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra OVERFLOW;").map_err(write_err)?;
     // addr = keys_table + slot * 8
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
@@ -390,6 +418,22 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
     writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
+
+    // OVERFLOW: the bounded probe was exhausted without placing this key.
+    // Surface the dropped row to the host by atomically incrementing the
+    // overflow counter (single u32, host-init to 0). The host treats a
+    // non-zero final value as "the GROUP BY result is incomplete" and errors
+    // rather than returning a wrong aggregate. Mirrors the spill-counter ABI
+    // in `valid_flag_kernels` (atom.global.add.u32 on the overflow path).
+    writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd22, [{}_param_{}];",
+        KEYS_KERNEL_ENTRY, overflow_param
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd22, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r22, [%rd22], 1;").map_err(write_err)?;
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
     writeln!(ptx, "\tret;").map_err(write_err)?;
@@ -795,6 +839,10 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, ".address_size 64").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
+    // Param list. The trailing `overflow_counter_ptr` is ALWAYS present and is
+    // ALWAYS the last parameter; its index shifts by one when the optional
+    // value-validity pointer is also emitted.
+    let overflow_param = if with_value_validity { 7 } else { 6 };
     writeln!(ptx, ".visible .entry {}(", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {}_param_0,", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {}_param_1,", AGG_KERNEL_ENTRY).map_err(write_err)?;
@@ -803,10 +851,16 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\t.param .u32 {}_param_4,", AGG_KERNEL_ENTRY).map_err(write_err)?;
     if with_value_validity {
         writeln!(ptx, "\t.param .u32 {}_param_5,", AGG_KERNEL_ENTRY).map_err(write_err)?;
-        writeln!(ptx, "\t.param .u64 {}_param_6", AGG_KERNEL_ENTRY).map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {}_param_6,", AGG_KERNEL_ENTRY).map_err(write_err)?;
     } else {
-        writeln!(ptx, "\t.param .u32 {}_param_5", AGG_KERNEL_ENTRY).map_err(write_err)?;
+        writeln!(ptx, "\t.param .u32 {}_param_5,", AGG_KERNEL_ENTRY).map_err(write_err)?;
     }
+    writeln!(
+        ptx,
+        "\t.param .u64 {}_param_{}",
+        AGG_KERNEL_ENTRY, overflow_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -925,12 +979,14 @@ fn compile_groupby_agg_kernel_inner(
     // guarantees a matching slot exists; the bounded counter below is the
     // defensive fallback if that contract is violated.
     writeln!(ptx, "PROBE_LOOP:").map_err(write_err)?;
-    // Bound check: probe_count += 1 ; if probe_count > max_probes -> DONE.
-    // Give-up-silently semantics — no atomic update is issued for this row.
+    // Bound check: probe_count += 1 ; if probe_count > max_probes -> OVERFLOW.
+    // The probe is expected to always find a slot (the keys kernel placed it);
+    // if it does not, this row's contribution would be dropped, silently
+    // corrupting the aggregate. Branch to OVERFLOW so the host learns about it.
     // Same shape as the keys kernel's bound (setp.gt.u32 against %r20).
     writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.gt.u32 %p3, %r21, %r20;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra OVERFLOW;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
     // The keys-table is non-mutating from this kernel's POV (it was populated
@@ -994,6 +1050,21 @@ fn compile_groupby_agg_kernel_inner(
         rc = reg_class
     )
     .map_err(write_err)?;
+    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
+
+    // OVERFLOW: the bounded probe never found this row's slot, so its
+    // aggregate contribution was not applied. Atomically bump the host-visible
+    // overflow counter (mirrors the keys kernel) so the host can reject the
+    // incomplete result instead of returning a wrong aggregate.
+    writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd22, [{}_param_{}];",
+        AGG_KERNEL_ENTRY, overflow_param
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd22, %rd22;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r22, [%rd22], 1;").map_err(write_err)?;
 
     writeln!(ptx, "DONE:").map_err(write_err)?;
     writeln!(ptx, "\tret;").map_err(write_err)?;
@@ -1539,8 +1610,9 @@ pub fn groupby_block_size() -> u32 {
 
 /// Entry-point name of the grouped Decimal128 aggregate kernel emitted by
 /// [`compile_groupby_decimal_kernel`]. Distinct from [`AGG_KERNEL_ENTRY`]
-/// because its ABI carries two extra pointers (the per-slot lock table and the
-/// overflow flag) and a 16-byte accumulator slot.
+/// because its ABI carries extra pointers (the per-slot lock table, the SUM
+/// signed-overflow flag, and — like the integer kernels — the probe/lock
+/// overflow counter) and a 16-byte accumulator slot.
 pub const AGG_DECIMAL_KERNEL_ENTRY: &str = "bolt_groupby_agg_decimal";
 
 /// Byte width of the `i128` input element / accumulator slot.
@@ -1550,6 +1622,17 @@ const DECIMAL_ELEM_BYTES: usize = 16;
 /// CAS-retry spins. Mirrors `float_atomics::SPIN_BACKOFF_NS` — yields SM
 /// cycles to peer warps contending the same slot lock.
 const DECIMAL_SPIN_BACKOFF_NS: u32 = 32;
+
+/// Upper bound on the per-slot lock-acquire spin in the grouped Decimal128
+/// kernel. The CAS lock loop (`DEC_LOCK_LOOP`) used to spin unbounded, which
+/// risks a warp-scheduler livelock under pathological contention. After this
+/// many failed `atom.cas` attempts the thread gives up acquiring the lock and
+/// bails into `DEC_OVERFLOW`, which atomically increments the host-visible
+/// overflow counter so the row's dropped contribution is surfaced rather than
+/// silently lost. Mirrors `valid_flag_kernels::SPIN_LIMIT` (1024): at ~32 ns
+/// back-off per iteration the worst-case wait stays well under ~33 us, which
+/// is generous by orders of magnitude versus the real lock-hold window.
+const DECIMAL_MAX_LOCK_ATTEMPTS: u32 = 1024;
 
 /// Which grouped Decimal128 reduction [`compile_groupby_decimal_kernel`] emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1586,9 +1669,16 @@ impl GroupedDecimalOp {
 /// by a per-slot spin lock. See the module section header above for the
 /// race-freedom argument and the bit-for-bit-with-host combine contract.
 ///
-/// `with_value_validity = true` appends a trailing packed-bit value-validity
-/// pointer (param 8) and skips the update for NULL rows, mirroring
+/// `with_value_validity = true` appends a packed-bit value-validity pointer
+/// (param 8) and skips the update for NULL rows, mirroring
 /// [`compile_groupby_agg_kernel_with_validity`].
+///
+/// A trailing `overflow_counter_ptr` (`*u32`, length 1, host-init 0) is ALWAYS
+/// the final parameter (index 8 without validity, 9 with). On a probe-bound or
+/// lock-bound bailout the kernel atomically increments it so the host can
+/// detect and reject dropped rows; see the module-level "Overflow counter"
+/// section. This is DISTINCT from `overflow_ptr` (param 7), which is the SUM
+/// signed-128-bit arithmetic-overflow flag.
 ///
 /// # ABI
 ///
@@ -1604,6 +1694,10 @@ impl GroupedDecimalOp {
 ///     .param .u64 overflow_ptr,     // u32, length 1, init'd to 0 (SUM only;
 ///                                   //   MIN/MAX never write it)
 ///     [.param .u64 value_validity_ptr]  // packed-bit *u32, validity variant
+///     .param .u64 overflow_counter_ptr  // u32, length 1, init'd to 0; ALWAYS
+///                                   //   last. Distinct from overflow_ptr:
+///                                   //   this counts rows dropped by a
+///                                   //   probe-bound or lock-bound bailout.
 /// )
 /// ```
 ///
@@ -1623,7 +1717,11 @@ pub fn compile_groupby_decimal_kernel(
     writeln!(ptx, ".address_size 64").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    // Param list. Indices 0..=7 are fixed; index 8 (validity) is optional.
+    // Param list. Indices 0..=7 are fixed (param_7 = the SUM signed-overflow
+    // FLAG, distinct from the probe/lock OVERFLOW COUNTER added below); index 8
+    // (validity) is optional. The trailing `overflow_counter_ptr` is ALWAYS
+    // present and ALWAYS last; its index shifts by one when validity is emitted.
+    let overflow_param = if with_value_validity { 9 } else { 8 };
     writeln!(ptx, ".visible .entry {entry}(").map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {entry}_param_0,").map_err(write_err)?;
     writeln!(ptx, "\t.param .u64 {entry}_param_1,").map_err(write_err)?;
@@ -1634,10 +1732,11 @@ pub fn compile_groupby_decimal_kernel(
     writeln!(ptx, "\t.param .u64 {entry}_param_6,").map_err(write_err)?;
     if with_value_validity {
         writeln!(ptx, "\t.param .u64 {entry}_param_7,").map_err(write_err)?;
-        writeln!(ptx, "\t.param .u64 {entry}_param_8").map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {entry}_param_8,").map_err(write_err)?;
     } else {
-        writeln!(ptx, "\t.param .u64 {entry}_param_7").map_err(write_err)?;
+        writeln!(ptx, "\t.param .u64 {entry}_param_7,").map_err(write_err)?;
     }
+    writeln!(ptx, "\t.param .u64 {entry}_param_{overflow_param}").map_err(write_err)?;
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -1706,7 +1805,9 @@ pub fn compile_groupby_decimal_kernel(
     writeln!(ptx, "DEC_PROBE_LOOP:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r21, %r21, 1;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.gt.u32 %p2, %r21, %r20;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p2 bra DEC_DONE;").map_err(write_err)?;
+    // Probe-bound bailout: surface the dropped row rather than corrupting the
+    // aggregate silently (see DEC_OVERFLOW).
+    writeln!(ptx, "\t@%p2 bra DEC_OVERFLOW;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.nc.s64 %rl5, [%rd5];").map_err(write_err)?;
@@ -1749,11 +1850,24 @@ pub fn compile_groupby_decimal_kernel(
 
     // --- Acquire the per-slot spin lock: CAS(lock, 0, 1) until we win. ---
     // %r22 holds the CAS-observed prior value; we own the lock when it was 0.
+    // %r29 is the bounded-attempt counter: after DECIMAL_MAX_LOCK_ATTEMPTS
+    // failed acquisitions the thread bails into DEC_OVERFLOW rather than
+    // spinning forever (livelock hardening). The bound is purely defensive —
+    // under the host's load-factor invariant per-slot contention is tiny.
+    writeln!(ptx, "\tmov.u32 %r29, 0;").map_err(write_err)?;
     writeln!(ptx, "DEC_LOCK_LOOP:").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.cas.b32 %r22, [%rd16], 0, 1;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.s32 %p4, %r22, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p4 bra DEC_LOCKED;").map_err(write_err)?;
-    // Lost — another thread holds the lock. Back off and retry.
+    // Lost — another thread holds the lock. Bound the retry, then back off.
+    writeln!(ptx, "\tadd.u32 %r29, %r29, 1;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.gt.u32 %p10, %r29, {limit};",
+        limit = DECIMAL_MAX_LOCK_ATTEMPTS
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p10 bra DEC_OVERFLOW;").map_err(write_err)?;
     writeln!(
         ptx,
         "\tmov.u32 %nstime, {ns};",
@@ -1834,6 +1948,20 @@ pub fn compile_groupby_decimal_kernel(
     // Release fence: make the slot stores globally visible before the unlock.
     writeln!(ptx, "\tmembar.gl;").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.exch.b32 %r24, [%rd16], 0;").map_err(write_err)?;
+    writeln!(ptx, "\tbra DEC_DONE;").map_err(write_err)?;
+
+    // DEC_OVERFLOW: reached when the bounded probe failed to find this row's
+    // slot, or when the bounded lock-acquire gave up. In both cases NO lock is
+    // held (so there is nothing to release) and this row's value was NOT
+    // applied to its accumulator. Atomically bump the host-visible overflow
+    // COUNTER (param_{overflow_param}) — distinct from the SUM signed-overflow
+    // FLAG at param_7 — so the host can reject the incomplete result instead of
+    // returning a wrong aggregate. Mirrors the OVERFLOW path in the integer
+    // keys/agg kernels.
+    writeln!(ptx, "DEC_OVERFLOW:").map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd44, [{entry}_param_{overflow_param}];").map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd44, %rd44;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r30, [%rd44], 1;").map_err(write_err)?;
 
     writeln!(ptx, "DEC_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tret;").map_err(write_err)?;
@@ -1973,48 +2101,67 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 mod ptx_shape_tests {
     use super::*;
 
-    /// The classic (no-validity) keys kernel keeps its historical 4-param ABI
-    /// and emits no `bfe.u32` extraction.
+    /// The classic (no-validity) keys kernel now has a 5-param ABI: the four
+    /// historical params plus the always-present trailing overflow counter at
+    /// param_4. It still emits no `bfe.u32` validity extraction.
     #[test]
-    fn keys_kernel_classic_has_4_params_and_no_bfe() {
+    fn keys_kernel_classic_has_overflow_counter_and_no_bfe() {
         let ptx = compile_groupby_keys_kernel().expect("classic keys ptx");
-        // 4 params: 0..=3
-        assert!(ptx.contains("bolt_groupby_keys_param_3"));
-        assert!(!ptx.contains("bolt_groupby_keys_param_4"));
+        // 5 params: 0..=4, where param_4 is the overflow counter.
+        assert!(ptx.contains("bolt_groupby_keys_param_4"));
+        assert!(!ptx.contains("bolt_groupby_keys_param_5"));
         assert!(!ptx.contains("bfe.u32"));
+        // The probe-bound bailout must surface to the host, not silently drop.
+        assert!(ptx.contains("OVERFLOW:"), "keys kernel must emit OVERFLOW label:\n{ptx}");
+        assert!(ptx.contains("@%p3 bra OVERFLOW;"), "probe bound must branch to OVERFLOW:\n{ptx}");
+        assert!(
+            ptx.contains("ld.param.u64 %rd22, [bolt_groupby_keys_param_4];")
+                && ptx.contains("atom.global.add.u32 %r22, [%rd22], 1;"),
+            "OVERFLOW must atomically bump the counter at param_4:\n{ptx}"
+        );
     }
 
-    /// The Stage C keys kernel adds a 5th param and emits the packed-bit
-    /// extract + branch-to-DONE shape.
+    /// The Stage C keys kernel adds the validity pointer at param_4 and pushes
+    /// the overflow counter to param_5, and emits the packed-bit extract.
     #[test]
     fn keys_kernel_with_validity_adds_param_and_bfe() {
         let ptx = compile_groupby_keys_kernel_with_validity()
             .expect("validity keys ptx");
-        // 5 params: 0..=4
-        assert!(ptx.contains("bolt_groupby_keys_param_4"));
+        // 6 params: 0..=5; param_4 = validity, param_5 = overflow counter.
+        assert!(ptx.contains("bolt_groupby_keys_param_5"));
         // word_idx = tid >> 5
         assert!(ptx.contains("shr.u32 %r10, %r3, 5;"));
         // bit_off = tid & 31
         assert!(ptx.contains("and.b32 %r11, %r3, 31;"));
         // bfe extracts the single bit
         assert!(ptx.contains("bfe.u32 %r13, %r12, %r11, 1;"));
-        // setp + branch on zero
+        // setp + branch on zero (NULL-key gate still goes to DONE, not OVERFLOW)
         assert!(ptx.contains("setp.eq.s32 %p4, %r13, 0;"));
         assert!(ptx.contains("@%p4 bra DONE;"));
+        // Overflow counter now lives at param_5.
+        assert!(ptx.contains("ld.param.u64 %rd22, [bolt_groupby_keys_param_5];"));
     }
 
-    /// The classic agg kernel keeps its historical 6-param ABI.
+    /// The classic agg kernel now has a 7-param ABI: six historical params plus
+    /// the always-present trailing overflow counter at param_6.
     #[test]
-    fn agg_kernel_classic_has_6_params_and_no_bfe() {
+    fn agg_kernel_classic_has_overflow_counter_and_no_bfe() {
         let ptx = compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Int64)
             .expect("classic agg ptx");
-        assert!(ptx.contains("bolt_groupby_agg_param_5"));
-        assert!(!ptx.contains("bolt_groupby_agg_param_6"));
+        assert!(ptx.contains("bolt_groupby_agg_param_6"));
+        assert!(!ptx.contains("bolt_groupby_agg_param_7"));
         assert!(!ptx.contains("bfe.u32"));
+        assert!(ptx.contains("OVERFLOW:"), "agg kernel must emit OVERFLOW label:\n{ptx}");
+        assert!(ptx.contains("@%p3 bra OVERFLOW;"), "probe bound must branch to OVERFLOW:\n{ptx}");
+        assert!(
+            ptx.contains("ld.param.u64 %rd22, [bolt_groupby_agg_param_6];")
+                && ptx.contains("atom.global.add.u32 %r22, [%rd22], 1;"),
+            "OVERFLOW must atomically bump the counter at param_6:\n{ptx}"
+        );
     }
 
-    /// The Stage C agg kernel adds a 7th param (value validity) and emits
-    /// the bit-extract + skip-on-null gate.
+    /// The Stage C agg kernel adds the value-validity pointer at param_6 and
+    /// pushes the overflow counter to param_7.
     #[test]
     fn agg_kernel_with_validity_adds_param_and_bfe() {
         let ptx = compile_groupby_agg_kernel_with_validity(
@@ -2022,7 +2169,7 @@ mod ptx_shape_tests {
             DataType::Int64,
         )
         .expect("validity agg ptx");
-        assert!(ptx.contains("bolt_groupby_agg_param_6"));
+        assert!(ptx.contains("bolt_groupby_agg_param_7"));
         assert!(ptx.contains("shr.u32 %r14, %r3, 5;"));
         assert!(ptx.contains("and.b32 %r15, %r3, 31;"));
         assert!(ptx.contains("bfe.u32 %r17, %r16, %r15, 1;"));
@@ -2030,6 +2177,8 @@ mod ptx_shape_tests {
         assert!(ptx.contains("@%p4 bra DONE;"));
         // The atom.add must still be present after the gate.
         assert!(ptx.contains("atom.global.add.u64"));
+        // Overflow counter now lives at param_7.
+        assert!(ptx.contains("ld.param.u64 %rd22, [bolt_groupby_agg_param_7];"));
     }
 
     /// The fused multi-aggregate kernel hashes the key ONCE and emits one
@@ -2596,8 +2745,10 @@ mod ptx_shape_tests {
     }
 
     /// The classic (no-validity) grouped Decimal kernel emits its distinct
-    /// entry point and the documented 8-param ABI (params 0..=7); the 9th
-    /// (validity) param is absent.
+    /// entry point and a 9-param ABI (params 0..=8): the eight historical
+    /// params plus the always-present trailing overflow counter at param_8.
+    /// The validity param (which would now be param_8) is absent, so param_9
+    /// must not appear.
     #[test]
     fn grouped_decimal_entry_and_classic_abi() {
         for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
@@ -2606,21 +2757,50 @@ mod ptx_shape_tests {
                 ptx.contains(&format!(".visible .entry {}(", AGG_DECIMAL_KERNEL_ENTRY)),
                 "missing entry for {op:?}:\n{ptx}"
             );
-            // 8 params: 0..=7, no param_8.
-            assert!(ptx.contains(&format!("{}_param_7", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
-            assert!(!ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
+            // 9 params: 0..=8, where param_8 is the overflow counter. No param_9.
+            assert!(ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
+            assert!(!ptx.contains(&format!("{}_param_9", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
             // Classic path emits no validity bit-extract.
             assert!(!ptx.contains("bfe.u32"), "classic decimal must not extract validity:\n{ptx}");
+            // Probe-bound + lock-bound bailouts surface via the counter.
+            assert!(ptx.contains("DEC_OVERFLOW:"), "{op:?} missing DEC_OVERFLOW label:\n{ptx}");
+            assert!(ptx.contains("@%p2 bra DEC_OVERFLOW;"), "{op:?} probe bound must reach DEC_OVERFLOW:\n{ptx}");
+            assert!(
+                ptx.contains(&format!("ld.param.u64 %rd44, [{}_param_8];", AGG_DECIMAL_KERNEL_ENTRY))
+                    && ptx.contains("atom.global.add.u32 %r30, [%rd44], 1;"),
+                "{op:?} DEC_OVERFLOW must bump the counter at param_8:\n{ptx}"
+            );
         }
     }
 
-    /// The validity variant appends a 9th param and the packed-bit guard.
+    /// The validity variant appends the validity pointer at param_8 and pushes
+    /// the overflow counter to param_9 (now the last param).
     #[test]
     fn grouped_decimal_validity_abi() {
         let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, true)
             .expect("decimal validity ptx");
-        assert!(ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)));
+        assert!(ptx.contains(&format!("{}_param_9", AGG_DECIMAL_KERNEL_ENTRY)));
         assert!(ptx.contains("bfe.u32"), "validity variant must extract the row's bit:\n{ptx}");
+        // Overflow counter now lives at param_9.
+        assert!(ptx.contains(&format!("ld.param.u64 %rd44, [{}_param_9];", AGG_DECIMAL_KERNEL_ENTRY)));
+    }
+
+    /// The per-slot spin lock must be BOUNDED: a runaway acquire loop is a
+    /// livelock hazard. After DECIMAL_MAX_LOCK_ATTEMPTS failed CASes the kernel
+    /// must bail into DEC_OVERFLOW rather than spinning forever.
+    #[test]
+    fn grouped_decimal_lock_loop_is_bounded() {
+        for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
+            let ptx = compile_groupby_decimal_kernel(op, false).unwrap();
+            assert!(
+                ptx.contains(&format!("setp.gt.u32 %p10, %r29, {};", DECIMAL_MAX_LOCK_ATTEMPTS)),
+                "{op:?} lock loop must compare its attempt counter against the bound:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("@%p10 bra DEC_OVERFLOW;"),
+                "{op:?} exhausted lock loop must branch to DEC_OVERFLOW:\n{ptx}"
+            );
+        }
     }
 
     /// The accumulator update MUST be guarded by a per-slot spin lock — a

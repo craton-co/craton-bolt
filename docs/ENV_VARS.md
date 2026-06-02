@@ -7,7 +7,12 @@ for ordinary use.
 
 The vars below were discovered by grepping `std::env::var(...)` across the
 crate; the source file column is the call site that actually reads the
-variable.
+variable. This list aims to track every runtime/build var the crate reads,
+but the codebase moves quickly — treat it as best-effort, and re-grep
+`std::env::var` / `env::var_os` if you need the ground truth for a given
+release. (Pure path-resolution lookups like `HOME` / `LOCALAPPDATA` /
+`USERPROFILE` / `XDG_CACHE_HOME`, read only to compute the platform-default
+PTX-cache directory, are not configuration knobs and are omitted.)
 
 ## Quick-start matrix
 
@@ -15,9 +20,18 @@ variable.
 | -------------------------------- | -------------------- | ----------- | ----------------------------------------------- |
 | `CRATON_BOLT_POOL_MAX_BYTES`     | 512 MiB              | byte count  | Soft cap on total pooled GPU bytes              |
 | `CRATON_BOLT_POOL_BUCKET_CAP`    | 16                   | integer     | Per-bucket max pooled blocks                    |
-| `CRATON_BOLT_PTX_CACHE_CAP`      | 256                  | integer     | JIT PTX module-cache capacity (FIFO eviction)   |
-| `CRATON_DISTINCT_HOST_MAX_ROWS`  | 10_000_000           | integer > 0 | Host-side DISTINCT / set-op input row cap       |
+| `CRATON_BOLT_PTX_CACHE_CAP`      | 256                  | integer     | In-process JIT PTX module-cache capacity (FIFO) |
+| `CRATON_BOLT_PTX_CACHE_MAX_BYTES`  | 64 MiB             | byte count / `0` | Disk PTX-cache total-bytes cap (`0` disables) |
+| `CRATON_BOLT_PTX_CACHE_MAX_ENTRIES`| 4096               | integer / `0` | Disk PTX-cache entry-count cap (`0` disables)  |
+| `CRATON_DISTINCT_HOST_MAX_ROWS`  | 10_000_000           | integer > 0 | Host-side DISTINCT input row cap                |
+| `CRATON_SETOP_HOST_MAX_ROWS`     | 10_000_000           | integer > 0 | Host-side `UNION`/`EXCEPT`/`INTERSECT` row cap  |
 | `CRATON_PLAN_CACHE_SIZE`         | 64                   | integer > 0 | SQL→LogicalPlan parse-cache capacity (FIFO)     |
+| `CRATON_MAX_SQL_BYTES`           | 1 MiB                | integer > 0 | Pre-parse cap on SQL input length (bytes)       |
+| `CRATON_MAX_SQL_TOKENS`          | 100_000              | integer > 0 | Pre-parse cap on SQL token count                |
+| `CRATON_MAX_RECURSIVE_ITERATIONS`| 1000                 | integer > 0 | `WITH RECURSIVE` fixpoint iteration cap         |
+| `CRATON_MAX_APPLY_ROWS`          | 100_000              | integer > 0 | LATERAL/correlated-apply left-row cap           |
+| `CRATON_VALUES_MAX_ROWS`         | 1_000_000            | integer > 0 | `VALUES` literal row cap                         |
+| `CRATON_GENERATE_SERIES_MAX_ROWS`| 10_000_000           | integer > 0 | `generate_series` output row cap                |
 | `BOLT_POOL_STATS_INTERVAL_SECS`  | 60                   | seconds / 0 | Pool-stats log emit cadence (`0` disables)      |
 | `BOLT_POOL_WATCH_INTERVAL_SECS`  | 5                    | seconds     | Background watcher poll cadence                 |
 | `BOLT_POOL_WATCH_LOW_WATER_FRAC` | 0.10                 | `(0, 1)`    | Watcher proactive-evict threshold (free/total)  |
@@ -25,6 +39,8 @@ variable.
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
 | `BOLT_GPU_SORT`                  | off                  | `1`         | Opt into the GPU radix-sort path for `ORDER BY` |
+| `BOLT_GPU_DISTINCT`              | off                  | `1`/`true`/`yes` | Opt into the GPU sort-based `DISTINCT` path |
+| `BOLT_GPU_WINDOW`                | off                  | `1`         | Opt into the GPU window-function path           |
 | `BOLT_PREFIX_SCAN_ALGO`          | Hillis-Steele        | `blelloch` / `lookback` | Select the GPU prefix-scan kernel   |
 | `BOLT_HASH_ALGO`                 | linear-probe         | `robin_hood` / `rh` | Select the GROUP BY keys hash kernel    |
 | `BOLT_HASH_PROBE_TILED`          | off                  | `1`         | Opt into the tiled SoA hash-join probe kernel   |
@@ -209,6 +225,72 @@ variable.
 - **Source**: `src/jit/disk_cache.rs` (env var name constant:
   `DISK_PTX_CACHE_ENV`).
 
+### `CRATON_BOLT_PTX_CACHE_MAX_BYTES`
+- **Default**: `67_108_864` (64 MiB)
+- **Type**: non-negative integer (bytes), parsed as `u64`; `0` disables the
+  byte cap (the entry-count cap still applies)
+- **What**: Total-bytes cap on the **disk-backed** PTX cache directory (the
+  one enabled by `BOLT_PTX_CACHE_DIR`). After each store, `enforce_bounds`
+  scans the committed `*.ptx` files and, if their combined size exceeds this
+  cap, evicts least-recently-modified entries (LRU by mtime) until the cache
+  is back under both this cap and the entry-count cap. Tempfiles still being
+  written (`*.ptx.tmp.*`) are skipped so eviction never races a `store`.
+- **When**: Raise on long-lived cache directories that legitimately hold many
+  large kernels; lower to bound the on-disk footprint on space-tight hosts.
+- **Notes**: Re-read on each `enforce_bounds` call (cheap env lookup), so it
+  takes effect without a process restart. Eviction is best-effort: a file that
+  fails to delete (e.g. permission denied) is left in place and not
+  double-counted. The naming mirrors the GPU pool's `CRATON_BOLT_POOL_MAX_BYTES`.
+- **Source**: `src/jit/disk_cache.rs::enforce_bounds` (env var name constant:
+  `DISK_PTX_CACHE_MAX_BYTES_ENV`, line 116; default constant
+  `DEFAULT_MAX_CACHE_BYTES`, line 126).
+
+### `CRATON_BOLT_PTX_CACHE_MAX_ENTRIES`
+- **Default**: `4096`
+- **Type**: non-negative integer, parsed as `u64`; `0` disables the
+  entry-count cap (the byte cap still applies)
+- **What**: Entry-count cap on the **disk-backed** PTX cache directory — a
+  second, independent bound (alongside the byte cap) so a flood of tiny
+  entries can't blow up the directory inode count while staying under the byte
+  cap. Eviction is the same LRU-by-mtime pass in `enforce_bounds`.
+- **When**: Raise on directories that cache many distinct kernel shapes; lower
+  to keep the file count small.
+- **Notes**: Setting both this and `CRATON_BOLT_PTX_CACHE_MAX_BYTES` to `0`
+  disables disk-cache eviction entirely (unbounded growth — not recommended).
+- **Source**: `src/jit/disk_cache.rs::enforce_bounds` (env var name constant:
+  `DISK_PTX_CACHE_MAX_ENTRIES_ENV`, line 121; default constant
+  `DEFAULT_MAX_CACHE_ENTRIES`, line 131).
+
+## GPU DISTINCT and window paths
+
+### `BOLT_GPU_DISTINCT`
+- **Default**: off
+- **Type**: truthy string — `1`, `true`, or `yes` (case-insensitive, trimmed)
+  enable; anything else (including unset) is off
+- **What**: Opts `DISTINCT` into the GPU sort-based dedup path for a single
+  fixed-width primitive key (`Int32` / `Int64` / `Float32` / `Float64`). Utf8
+  and wide multi-key shapes always fall back to the host path regardless of
+  this var, as does any input below the device sort's own row threshold.
+- **When**: Enable to exercise or benchmark the device `DISTINCT` path. Left
+  off by default so the host path stays the production default until the
+  device round-trip has soak time on real hardware. Mirrors the `BOLT_GPU_SORT`
+  gate convention.
+- **Source**: `src/exec/distinct.rs::gpu_distinct_enabled` (line 419).
+
+### `BOLT_GPU_WINDOW`
+- **Default**: off
+- **Type**: must equal exactly `"1"` to enable; unset or anything else keeps
+  the host window path
+- **What**: Opts window-function execution (`ROW_NUMBER` / `RANK` /
+  `DENSE_RANK` / running `COUNT` / running `SUM`) into the GPU path on
+  supported key/aggregate dtypes. Unresolved or unsupported column shapes
+  decline cleanly back to the host evaluator.
+- **When**: Enable to exercise or benchmark the device window path. Off by
+  default because device behavior is unverifiable in CI without a GPU. Mirrors
+  the `BOLT_GPU_SORT` gate convention.
+- **Source**: `src/exec/window.rs::try_execute_window_gpu` (env var name
+  constant `BOLT_GPU_WINDOW_ENV`, line 1037; gate at line 1419).
+
 ## Benchmark gates
 
 ### `BOLT_BENCH_GPU`
@@ -327,7 +409,8 @@ path in every case.
 - **Default**: `10_000_000` (ten million rows)
 - **Type**: positive integer, parsed as `usize`; `0` is rejected
 - **What**: Upper bound on the number of input rows the host-side
-  `DISTINCT` / set-op executor (`src/exec/distinct.rs`) will buffer. Without
+  `DISTINCT` executor (`src/exec/distinct.rs`) will buffer. (Set operations
+  have their own independent cap, `CRATON_SETOP_HOST_MAX_ROWS`, below.) Without
   the cap, `SELECT DISTINCT col FROM big_table` on a high-cardinality column
   allocates `n_rows × n_cols × ~24 B` of host RAM with no ceiling — a
   memory-DoS surface on user-controlled inputs. Exceeding the cap produces a
@@ -361,3 +444,110 @@ path in every case.
 - **Source**: `src/plan/sql_frontend.rs::plan_cache_cap` /
   `parse_plan_cache_cap` (env var name constant `PLAN_CACHE_SIZE_ENV`,
   line 818; default constant `PLAN_CACHE_CAP_DEFAULT`, line 824).
+
+### `CRATON_SETOP_HOST_MAX_ROWS`
+- **Default**: `10_000_000` (ten million rows)
+- **Type**: positive integer, parsed as `usize`; `0` is rejected
+- **What**: Upper bound on the input rows the host-side set-operation
+  executor (`src/exec/setops.rs` — `UNION` / `EXCEPT` / `INTERSECT`, with or
+  without `ALL`) will buffer. Same unbounded-growth DoS concern as the
+  DISTINCT cap; exceeding it is a clean error rather than an OOM.
+- **When**: Raise on trusted workloads that legitimately combine more than
+  10M rows on the host; lower to bound host memory on shared / hostile inputs.
+- **Notes**: Latched once per process (`OnceLock`). A value of `0` would
+  disable the cap and is rejected with a one-time `log::warn!`; empty /
+  unparseable values fall back to the default with a warning. Mirrors
+  `CRATON_DISTINCT_HOST_MAX_ROWS`.
+- **Source**: `src/exec/setops.rs::parse_setop_host_max_rows_env` (env var
+  name constant `SETOP_HOST_MAX_ROWS_ENV`, line 77; default constant
+  `SETOP_HOST_MAX_ROWS`, line 70).
+
+### `CRATON_MAX_SQL_BYTES`
+- **Default**: `1_048_576` (1 MiB)
+- **Type**: positive integer (bytes), parsed as `usize`; `0` / empty /
+  unparseable fall back to the default
+- **What**: Pre-parse denial-of-service guard. The SQL frontend rejects any
+  input longer than this many bytes *before* it reaches the `sqlparser`
+  parser, so an adversarially huge query can't build an over-large AST whose
+  recursive `Drop` would crash the process. Exceeding it is a clean
+  `BoltError::Sql(...)`.
+- **When**: Raise for legitimately large generated SQL; lower to tighten the
+  guard on hostile inputs.
+- **Notes**: Read once on first parse and frozen for the process lifetime
+  (`OnceLock`). Pairs with `CRATON_MAX_SQL_TOKENS`.
+- **Source**: `src/plan/sql_frontend.rs::max_sql_bytes` (env var name
+  constant `MAX_SQL_BYTES_ENV`, line 79; default constant
+  `MAX_SQL_BYTES_DEFAULT`, line 65).
+
+### `CRATON_MAX_SQL_TOKENS`
+- **Default**: `100_000`
+- **Type**: positive integer, parsed as `usize`; `0` / empty / unparseable
+  fall back to the default
+- **What**: The second pre-parse DoS guard: after the cheap byte-length
+  check, the frontend runs a flat (non-recursive) tokenizer scan and rejects
+  inputs with more than this many tokens. The tokenizer never builds the
+  recursive AST, so counting tokens here is safe even for adversarial input.
+- **When**: Raise / lower alongside `CRATON_MAX_SQL_BYTES`.
+- **Notes**: Read once on first parse and frozen for the process lifetime
+  (`OnceLock`).
+- **Source**: `src/plan/sql_frontend.rs::max_sql_tokens` (env var name
+  constant `MAX_SQL_TOKENS_ENV`, line 83; default constant
+  `MAX_SQL_TOKENS_DEFAULT`, line 74).
+
+### `CRATON_MAX_RECURSIVE_ITERATIONS`
+- **Default**: `1000`
+- **Type**: positive integer, parsed as `usize`; missing / non-integer / `0`
+  fall back to the default
+- **What**: Caps the number of fixpoint iterations a `WITH RECURSIVE` CTE may
+  run before the engine stops with a clean error. The recursive fixpoint is a
+  host nested loop that grows the accumulated relation each round; the cap
+  bounds runaway or non-terminating recursions.
+- **When**: Raise for legitimately deep recursions (long graph walks, deep
+  hierarchies); lower to fail fast on pathological queries.
+- **Source**: `src/exec/engine.rs::max_recursive_iterations` (env var name
+  constant `MAX_RECURSIVE_ITERATIONS_ENV`, line 88; default constant
+  `MAX_RECURSIVE_ITERATIONS`, line 82).
+
+### `CRATON_MAX_APPLY_ROWS`
+- **Default**: `100_000`
+- **Type**: positive integer, parsed as `usize`; missing / non-integer / `0`
+  fall back to the default
+- **What**: Hard cap on the number of LEFT rows a `LATERAL` / correlated apply
+  will drive. The apply is a host nested loop that re-plans and re-runs the
+  correlated subquery once per left row (`O(left_rows × subquery)`), so a huge
+  left input would spin or OOM; `Engine::execute_lateral_apply` refuses more
+  than this many left rows and returns a clean `BoltError`.
+- **When**: Raise on trusted workloads with large correlated drivers; lower to
+  bound host cost on shared / hostile inputs.
+- **Source**: `src/exec/engine.rs::max_apply_left_rows` (env var name constant
+  `MAX_APPLY_LEFT_ROWS_ENV`, line 112; default constant `MAX_APPLY_LEFT_ROWS`,
+  line 107).
+
+### `CRATON_VALUES_MAX_ROWS`
+- **Default**: `1_000_000` (one million rows)
+- **Type**: positive integer, parsed as `usize`; `0` / empty / unparseable
+  fall back to the default
+- **What**: Row cap on an inline `VALUES (...)` row source. Without it a giant
+  literal blob (`VALUES (1),(2),...,(10^9)`) would allocate host-side without
+  bound. Exceeding the cap is a clean `BoltError::Sql(...)`.
+- **When**: Raise for legitimately large literal tables; lower to tighten the
+  guard.
+- **Notes**: Re-parsed on each use (cheap env lookup, no global latch) so the
+  cap stays per-process overridable.
+- **Source**: `src/plan/sql_frontend.rs::values_max_rows` (env var name
+  constant `VALUES_MAX_ROWS_ENV`, line 1581; default constant
+  `VALUES_MAX_ROWS`, line 1577).
+
+### `CRATON_GENERATE_SERIES_MAX_ROWS`
+- **Default**: `10_000_000` (ten million rows)
+- **Type**: positive integer, parsed as `usize`; `0` / empty / unparseable
+  fall back to the default
+- **What**: Row cap on the `generate_series(...)` table-valued function. The
+  computed row count (via checked arithmetic) is checked against this cap
+  *before* any host allocation, so an unbounded series fails cleanly instead
+  of attempting a runaway allocation.
+- **When**: Raise for legitimately large series; lower to tighten the guard.
+- **Notes**: Re-parsed on each use (cheap env lookup, no global latch).
+- **Source**: `src/plan/sql_frontend.rs::generate_series_max_rows` (env var
+  name constant `GENERATE_SERIES_MAX_ROWS_ENV`, line 2057; default constant
+  `GENERATE_SERIES_MAX_ROWS`, line 2053).

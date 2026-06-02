@@ -458,6 +458,10 @@ fn gpu_distinct_supported_dtype(d: &crate::plan::logical_plan::DataType) -> bool
 /// Returns `Ok(None)` (→ host fallback) when:
 ///   * the batch is not exactly one column,
 ///   * the key column dtype is not one of Int32/Int64/Float32/Float64,
+///   * the key column is a float that may contain `NaN` (the device sort's
+///     bare IEEE compare is false on any NaN operand, so NaN rows would not
+///     collapse to one DISTINCT row — host fallback canonicalises them
+///     correctly; mirrors the Tier-2 float MIN/MAX NaN deferral),
 ///   * the GPU sort declines (`Ok(None)`).
 ///
 /// Returns `Err(BoltError::GpuCapacity(_))` is *not* produced here directly,
@@ -503,6 +507,41 @@ fn try_gpu_distinct(batch: &RecordBatch) -> BoltResult<Option<RecordBatch>> {
         Some(d) if gpu_distinct_supported_dtype(&d) => d,
         _ => return Ok(None),
     };
+
+    // NaN guard (mirror of the Tier-2 float MIN/MAX deferral in
+    // `groupby_tier2_minmax_float_exec::try_execute`): the on-device sort
+    // orders keys with a bare IEEE `setp.gt/lt.f`, which is false on ANY NaN
+    // operand. NaN rows therefore do NOT form one contiguous adjacent run after
+    // the sort, so `adjacent_distinct_mask` can emit MULTIPLE NaN output rows —
+    // diverging from the documented / host "all NaN collapse to one DISTINCT
+    // row" semantics (see the module doc-comment and `canonicalise_f{32,64}`).
+    //
+    // The fix matches the sibling float MIN/MAX executor exactly: DECLINE
+    // (return `Ok(None)`) for any float key column that may contain a NaN, so
+    // the caller takes the correct host path, where `canonicalise_f{32,64}`
+    // fold every NaN bit pattern to one key. We scan the raw values via
+    // `.values().iter().any(|v| v.is_nan())` (the same shape as the sibling); a
+    // NaN sitting under a NULL slot only makes us decline conservatively, which
+    // is safe. Once the device sort + flag kernel implement a NaN-as-equal
+    // total order this guard can be dropped and NaN columns can take the GPU
+    // path directly.
+    let has_nan = match arrow_dt {
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|a| a.values().iter().any(|v| v.is_nan()))
+            .unwrap_or(false),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| a.values().iter().any(|v| v.is_nan()))
+            .unwrap_or(false),
+        // Int32 / Int64 keys cannot carry NaN.
+        _ => false,
+    };
+    if has_nan {
+        return Ok(None);
+    }
 
     // Sort the batch on the single key column. nulls_first=true groups NULLs
     // at the front as one adjacent run; ASC direction is arbitrary for a set
@@ -1339,6 +1378,34 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
         let s: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "a", "b"]));
         let batch = RecordBatch::try_new(schema, vec![s]).unwrap();
+        assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
+    }
+
+    /// NaN guard: a single float key column containing a NaN must DECLINE
+    /// (`Ok(None)`) so the caller takes the host path, where the all-NaN
+    /// values collapse to one DISTINCT row. The decline fires before any sort,
+    /// so this is GPU-free. Mirrors the Tier-2 float MIN/MAX NaN deferral.
+    #[test]
+    fn gpu_distinct_declines_nan_float_columns() {
+        // Float64 with a NaN -> declined.
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![1.0_f64, f64::NAN, 2.0]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
+
+        // Float32 with a NaN -> declined.
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, false)]));
+        let arr: Arc<dyn Array> = Arc::new(Float32Array::from(vec![1.0_f32, f32::NAN]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
+
+        // All-NaN Float64 column -> declined (it would otherwise emit multiple
+        // NaN rows after the bare-IEEE device sort; the host path collapses
+        // them to one).
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
+        let arr: Arc<dyn Array> =
+            Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN, f64::NAN]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
     }
 

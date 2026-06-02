@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [main, dev]
 
+# TODO(ci): SHA-pin actions/checkout@v4 to an immutable commit SHA once we
+# can verify the hash from a trusted source. The DCO verification step below
+# is deliberately inlined (no third-party action) for the same reason.
+
 jobs:
   dco-check:
     name: DCO Sign-off Check

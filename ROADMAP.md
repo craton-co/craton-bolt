@@ -36,6 +36,22 @@ dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
   `JOIN ... USING` / `NATURAL JOIN`, and `COUNT(DISTINCT col)` (sole
   SELECT item). GPU `LIKE` (dict + non-dict `Utf8`) and GPU
   `UPPER` / `LOWER` / `LENGTH`; host-side `SUBSTRING` / `TRIM` / `CONCAT`.
+- **SQL surface expansion (later 0.7 feature waves)**: `LATERAL` derived
+  tables and plain derived tables (subquery in `FROM`); `WITH RECURSIVE`
+  (linear, non-linear, and mutual recursion, optional column-list alias);
+  a single correlated `WHERE` subquery (scalar comparison / `EXISTS` /
+  `NOT EXISTS`); `VALUES` as a row source (bare and in `FROM`); the
+  `generate_series(start, stop[, step])` table-valued function;
+  `DISTINCT ON (...)`; named `WINDOW` clause + `QUALIFY`; super-aggregates
+  (`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` / `ALL`, `WITH TOTALS` /
+  `ROLLUP` / `CUBE`, and `GROUPING()` / `GROUPING_ID()`); and query-clause
+  sugar (`FETCH` / T-SQL `TOP` → `LIMIT`, `FOR UPDATE` / `FOR SHARE`
+  no-op, `PREWHERE` → `WHERE`). The correlated-`WHERE` and `LATERAL`
+  nested-loop apply paths are bounded by `CRATON_MAX_APPLY_ROWS`.
+- **Grouped `Decimal128` GPU aggregation** — `SUM` / `MIN` / `MAX` over a
+  `Decimal128` column under `GROUP BY` lowered on-device, plus
+  `Decimal128` division added to the GPU arithmetic set (complementing the
+  scalar `Decimal128` arithmetic and aggregation above).
 
 ### What works (carried forward from 0.5)
 

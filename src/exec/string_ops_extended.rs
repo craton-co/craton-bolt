@@ -166,8 +166,10 @@ fn sql_substring(s: &str, start_1based: i32, length: i32) -> String {
 /// `DictionaryColumn`. See module docs for the character/UTF-8 semantics.
 ///
 /// TODO(string-fn-gpu): the GPU two-pass SUBSTRING producer exists in
-/// `jit::string_kernel` but is not wired into the executor; this host path is
-/// the supported one.
+/// `jit::string_kernel` but is UNVALIDATED ON GPU HARDWARE as of v0.7.0 and is
+/// not wired into the executor; this host path is the correctness path. A
+/// future hardware bring-up can opt the device kernel in behind
+/// [`crate::exec::string_like::BOLT_GPU_STRING_ENV`] (`BOLT_GPU_STRING=1`).
 pub fn substring_str(s: &str, start_1based: i32, length: i32) -> String {
     sql_substring(s, start_1based, length)
 }

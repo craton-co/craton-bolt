@@ -37,22 +37,34 @@
 //! length pass. NULL rows decode to an empty slice (the dictionary's NULL
 //! sentinel), matching the host fallback.
 //!
-//! ## Fallback (no panic)
+//! ## Fallback (no panic) and the v0.7.0 device-path gate
 //!
-//! The GPU two-pass path is taken only when the transform is ASCII-safe for the
-//! column's dictionary (the kernels case-fold byte-wise, which is correct for
-//! ASCII but NOT for arbitrary Unicode — e.g. `'ß'.to_uppercase()` is `"SS"`,
-//! changing the byte length). When any dictionary entry contains a non-ASCII
-//! byte the executor falls back to the host transform
-//! ([`host_transform_strings`]), which uses full Unicode `to_uppercase` /
-//! `to_lowercase` via [`crate::exec::string_ops`]. Both paths produce the same
-//! `StringArray` for ASCII data.
+//! **The GPU two-pass kernels have never been executed on GPU hardware as of
+//! v0.7.0** (CI has no CUDA device). The host transform is therefore the
+//! production correctness path: the executor must consult
+//! [`gpu_string_enabled`] (`BOLT_GPU_STRING=1`, default OFF) before selecting
+//! the device path, so the validated host helpers run by default. The device
+//! launch is opt-in for hardware bring-up only.
+//!
+//! Even when the gate is ON, the GPU two-pass path is taken only when the
+//! transform is ASCII-safe for the column's dictionary (the kernels case-fold
+//! byte-wise, which is correct for ASCII but NOT for arbitrary Unicode — e.g.
+//! `'ß'.to_uppercase()` is `"SS"`, changing the byte length). When any
+//! dictionary entry contains a non-ASCII byte the executor falls back to the
+//! host transform ([`host_transform_strings`]), which uses full Unicode
+//! `to_uppercase` / `to_lowercase` via [`crate::exec::string_ops`]. Both paths
+//! produce the same `StringArray` for ASCII data.
 
 use arrow_array::StringArray;
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg::{eval_expr, ColumnEnv, HostColumn};
 use crate::plan::logical_plan::{DataType, Expr, ScalarFnKind};
+
+// Re-export the shared GPU-string env gate so the executor and callers of this
+// module can consult a single source of truth. See
+// [`crate::exec::string_like::BOLT_GPU_STRING_ENV`].
+pub use crate::exec::string_like::{gpu_string_enabled, BOLT_GPU_STRING_ENV};
 
 /// Which end(s) a [`StringTransform::Trim`] strips ASCII/Unicode whitespace
 /// from. Mirrors [`crate::exec::string_ops_extended::TrimSide`] but is declared
@@ -266,6 +278,12 @@ fn decode_row<'a>(
 ///
 /// Errors if the concatenated byte length would exceed `i32::MAX` (Arrow
 /// `Utf8`, not `LargeUtf8`).
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. This materialises the input the
+// UPPER/LOWER device length pass consumes; the executor must only build/launch
+// that device path when `gpu_string_enabled` is true (default OFF →
+// host_transform_strings / gpu_path_transform_pure host mirror).
 pub fn build_row_aligned_input(
     dict: &[String],
     keys: &[i32],
@@ -299,6 +317,11 @@ pub fn build_row_aligned_input(
 /// `offsets[r+1] = offsets[r] + row_lens[r]`).
 ///
 /// Errors if the running total would exceed `i32::MAX`.
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. This is the host scan step
+// wedged between the device length and write passes; it is only reached on the
+// gated UPPER/LOWER device path.
 pub fn exclusive_scan_lens(row_lens: &[u32]) -> BoltResult<(Vec<i32>, usize)> {
     let mut offsets: Vec<i32> = Vec::with_capacity(row_lens.len() + 1);
     let mut acc: usize = 0;
@@ -325,6 +348,11 @@ pub fn exclusive_scan_lens(row_lens: &[u32]) -> BoltResult<(Vec<i32>, usize)> {
 ///
 /// Errors if a slice is not valid UTF-8 (a kernel wrote bytes the dictionary
 /// could not have produced) — surfaced rather than masked.
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. On the gated UPPER/LOWER device
+// path this reconstructs the array from the device write-pass download; it is
+// also reused by the pure-host gpu_path_concat_pure mirror.
 pub fn string_array_from_offsets(
     offsets: &[i32],
     bytes: &[u8],
@@ -362,6 +390,13 @@ pub fn string_array_from_offsets(
 /// `StringArray`. The GPU launch must produce an identical result for ASCII
 /// data; this is the reference used by unit tests (and is NOT the Unicode
 /// fallback — see [`host_transform_strings`] for that).
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. NOTE: this function is itself a
+// pure-HOST mirror (it never launches a kernel) and is therefore always safe to
+// run; the comment flags that the *device* kernel it mirrors (jit::string_kernel
+// UPPER/LOWER write pass, launched by Engine::string_transform_column) is the
+// unvalidated path the executor must gate behind gpu_string_enabled.
 pub fn gpu_path_transform_pure(
     dict: &[String],
     keys: &[i32],
@@ -510,6 +545,12 @@ pub fn concat_output_validity(inputs: &[ConcatInput]) -> Vec<bool> {
 /// then reconstruct the `StringArray` re-applying NULL-if-any-arg-NULL. The GPU
 /// launch must produce an identical `out_bytes`/`out_offsets`; this is the
 /// reference used by unit tests (no CUDA runtime needed).
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. The device CONCAT two-pass
+// kernels are NEVER selected by the executor today: Engine::execute_string_project
+// always calls host_concat_strings. This pure-host mirror is retained only as
+// the unit-test reference for the (currently unreachable) device producer.
 pub fn gpu_path_concat_pure(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
     let row_lens = concat_row_lens(inputs)?;
     let (out_offsets, total) = exclusive_scan_lens(&row_lens)?;

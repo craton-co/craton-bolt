@@ -7,7 +7,7 @@
 //! slice of the pipeline. Spans are great for per-query, sampled traces but
 //! awkward for the other half of observability: monotone process-wide
 //! *aggregates* — "how many queries have we run", "what's the PTX cache hit
-//! rate", "how many bytes have we shipped over PCIe". Those want cheap atomic
+//! rate", "how often do we fall back to the host path". Those want cheap atomic
 //! counters and pre-aggregated latency histograms that a scraper can poll on
 //! its own schedule, not a span per event.
 //!
@@ -100,6 +100,16 @@ pub const HISTOGRAM_BUCKETS: usize = 24;
 /// The set is fixed and ordered; [`Counter::ALL`] iterates it in declaration
 /// order, which is also the order [`MetricsSnapshot::counters`] yields. Adding a
 /// variant is non-breaking; reordering / removing is not.
+///
+/// Every variant here is *actually recorded* somewhere on the engine hot path
+/// (see `exec::engine` for the query/launch/fallback bumps and
+/// `exec::module_cache` for the PTX-cache hit/miss bumps). We deliberately do
+/// **not** advertise a counter we never increment: a shipped, documented metric
+/// that is permanently zero is worse than absent, because an operator wiring a
+/// dashboard cannot tell "feature is idle" from "instrumentation is missing".
+/// The H2D/D2H PCIe byte totals once lived here but were never wired at any
+/// `cuda::GpuBuffer` copy site, so they were removed rather than ship a
+/// guaranteed-zero series; add them back only together with the call-site bumps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
 pub enum Counter {
@@ -115,23 +125,17 @@ pub enum Counter {
     GpuLaunchesTotal = 4,
     /// Queries (or sub-plans) that fell back to the host execution path.
     HostFallbacksTotal = 5,
-    /// Cumulative bytes copied host→device (H2D).
-    BytesUploaded = 6,
-    /// Cumulative bytes copied device→host (D2H).
-    BytesDownloaded = 7,
 }
 
 impl Counter {
     /// All counters in declaration / snapshot order.
-    pub const ALL: [Counter; 8] = [
+    pub const ALL: [Counter; 6] = [
         Counter::QueriesTotal,
         Counter::QueriesFailed,
         Counter::PtxCacheHits,
         Counter::PtxCacheMisses,
         Counter::GpuLaunchesTotal,
         Counter::HostFallbacksTotal,
-        Counter::BytesUploaded,
-        Counter::BytesDownloaded,
     ];
 
     /// Stable snake_case name, suitable as a metric key (no `bolt_` prefix —
@@ -144,17 +148,27 @@ impl Counter {
             Counter::PtxCacheMisses => "ptx_cache_misses",
             Counter::GpuLaunchesTotal => "gpu_launches_total",
             Counter::HostFallbacksTotal => "host_fallbacks_total",
-            Counter::BytesUploaded => "bytes_uploaded",
-            Counter::BytesDownloaded => "bytes_downloaded",
         }
     }
 }
 
 /// Named query phases that own a latency histogram.
 ///
-/// Names mirror the tracing span catalogue in
-/// [`observability`](crate::observability) so a span name and its histogram
-/// line up one-to-one. [`Phase::ALL`] iterates in declaration order.
+/// Each name matches the corresponding tracing span in
+/// [`observability`](crate::observability), but the two surfaces are *not* a
+/// one-to-one mapping: the span catalogue is broader (it also covers the
+/// device-side phases), whereas this enum lists only the phases that feed a
+/// histogram. [`Phase::ALL`] iterates in declaration order.
+///
+/// Only phases whose latency is *actually observed* on the hot path live here
+/// (`exec::engine` times `Parse` / `Plan` / `Lower` / `Materialize`). The
+/// device-side phases — `codegen`, `ptx_load`, `launch`, `transfer` — still
+/// appear as tracing spans (see the catalogue in
+/// [`observability`](crate::observability)) but never had a histogram
+/// observation wired at their kernel call sites, so they are intentionally
+/// absent from this enum rather than exposing a permanently empty histogram via
+/// [`snapshot()`]. Re-add a variant only together with the
+/// `observe_duration(Phase::_, …)` call at its source site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
 pub enum Phase {
@@ -164,28 +178,16 @@ pub enum Phase {
     Plan = 1,
     /// `LogicalPlan` → `PhysicalPlan`.
     Lower = 2,
-    /// PhysicalPlan → PTX text.
-    Codegen = 3,
-    /// PTX → loaded driver module.
-    PtxLoad = 4,
-    /// Kernel grid launch + sync.
-    Launch = 5,
-    /// H2D / D2H memcpy.
-    Transfer = 6,
     /// Arrow array packing of results.
-    Materialize = 7,
+    Materialize = 3,
 }
 
 impl Phase {
     /// All phases in declaration / snapshot order.
-    pub const ALL: [Phase; 8] = [
+    pub const ALL: [Phase; 4] = [
         Phase::Parse,
         Phase::Plan,
         Phase::Lower,
-        Phase::Codegen,
-        Phase::PtxLoad,
-        Phase::Launch,
-        Phase::Transfer,
         Phase::Materialize,
     ];
 
@@ -195,10 +197,6 @@ impl Phase {
             Phase::Parse => "parse",
             Phase::Plan => "plan",
             Phase::Lower => "lower",
-            Phase::Codegen => "codegen",
-            Phase::PtxLoad => "ptx_load",
-            Phase::Launch => "launch",
-            Phase::Transfer => "transfer",
             Phase::Materialize => "materialize",
         }
     }
@@ -487,9 +485,9 @@ mod tests {
     #[test]
     fn counter_names_match_variants() {
         // Spot-check a couple and the full count.
-        assert_eq!(Counter::ALL.len(), 8);
+        assert_eq!(Counter::ALL.len(), 6);
         assert_eq!(Counter::QueriesTotal.as_str(), "queries_total");
-        assert_eq!(Counter::BytesDownloaded.as_str(), "bytes_downloaded");
+        assert_eq!(Counter::HostFallbacksTotal.as_str(), "host_fallbacks_total");
         // `as usize` discriminants line up with `ALL` ordering.
         for (i, c) in Counter::ALL.iter().enumerate() {
             assert_eq!(*c as usize, i);
@@ -498,7 +496,7 @@ mod tests {
 
     #[test]
     fn phase_names_match_variants() {
-        assert_eq!(Phase::ALL.len(), 8);
+        assert_eq!(Phase::ALL.len(), 4);
         assert_eq!(Phase::Parse.as_str(), "parse");
         assert_eq!(Phase::Materialize.as_str(), "materialize");
         for (i, p) in Phase::ALL.iter().enumerate() {
@@ -514,12 +512,12 @@ mod tests {
         m.inc(Counter::QueriesTotal);
         assert_eq!(m.counter(Counter::QueriesTotal).get(), 2);
 
-        m.add(Counter::BytesUploaded, 4096);
-        m.add(Counter::BytesUploaded, 100);
-        assert_eq!(m.counter(Counter::BytesUploaded).get(), 4196);
+        m.add(Counter::GpuLaunchesTotal, 4096);
+        m.add(Counter::GpuLaunchesTotal, 100);
+        assert_eq!(m.counter(Counter::GpuLaunchesTotal).get(), 4196);
 
         // Independent counters do not bleed into each other.
-        assert_eq!(m.counter(Counter::BytesDownloaded).get(), 0);
+        assert_eq!(m.counter(Counter::HostFallbacksTotal).get(), 0);
     }
 
     #[test]
@@ -604,9 +602,9 @@ mod tests {
         let m = Metrics::default();
         m.add(Counter::QueriesTotal, 7);
         m.inc(Counter::PtxCacheHits);
-        m.observe(Phase::Launch, 16); // bucket 4 (covers (8,16])
-        m.observe(Phase::Launch, 17); // bucket 5
-        m.observe(Phase::Transfer, 2); // bucket 1
+        m.observe(Phase::Lower, 16); // bucket 4 (covers (8,16])
+        m.observe(Phase::Lower, 17); // bucket 5
+        m.observe(Phase::Materialize, 2); // bucket 1
 
         let snap = m.snapshot();
 
@@ -621,15 +619,15 @@ mod tests {
         assert_eq!(pairs[0], ("queries_total", 7));
 
         // Histograms mirror per-bucket counts.
-        let launch = snap.histogram(Phase::Launch);
-        assert_eq!(launch.count, 2);
-        assert_eq!(launch.sum_micros, 33);
-        assert_eq!(launch.buckets[4], 1);
-        assert_eq!(launch.buckets[5], 1);
+        let lower = snap.histogram(Phase::Lower);
+        assert_eq!(lower.count, 2);
+        assert_eq!(lower.sum_micros, 33);
+        assert_eq!(lower.buckets[4], 1);
+        assert_eq!(lower.buckets[5], 1);
 
-        let transfer = snap.histogram(Phase::Transfer);
-        assert_eq!(transfer.count, 1);
-        assert_eq!(transfer.buckets[1], 1);
+        let materialize = snap.histogram(Phase::Materialize);
+        assert_eq!(materialize.count, 1);
+        assert_eq!(materialize.buckets[1], 1);
 
         // Untouched phase is all zeros.
         let parse = snap.histogram(Phase::Parse);
@@ -637,8 +635,8 @@ mod tests {
         assert!(parse.buckets.iter().all(|&b| b == 0));
 
         // buckets() iterator: cumulative reconstruction equals count.
-        let total: u64 = launch.buckets().map(|(_, n)| n).sum();
-        assert_eq!(total, launch.count);
+        let total: u64 = lower.buckets().map(|(_, n)| n).sum();
+        assert_eq!(total, lower.count);
     }
 
     #[test]

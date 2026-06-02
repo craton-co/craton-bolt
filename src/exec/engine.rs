@@ -139,6 +139,11 @@ fn concat_two_batches(a: &RecordBatch, b: &RecordBatch) -> BoltResult<RecordBatc
 /// literal can produce (Int32/Int64/Float32/Float64/Bool/Utf8) are built — any
 /// other inferred dtype is an internal error (the frontend never infers one).
 ///
+/// A cell literal whose variant does not match the column's inferred dtype
+/// (the frontend should have coerced it) yields a returned
+/// [`BoltError::Plan`] rather than aborting the process — this path is
+/// adjacent to user input, so it stays fallible.
+///
 /// Pure (no GPU / engine state) so it is host-testable directly.
 fn materialize_values_relation(
     relation: &crate::plan::sql_frontend::ValuesRelation,
@@ -162,11 +167,13 @@ fn materialize_values_relation(
                     .rows
                     .iter()
                     .map(|r| match &r[ci] {
-                        Literal::Null => None,
-                        Literal::Int32(v) => Some(*v),
-                        other => unreachable!("VALUES Int32 column got {other:?}"),
+                        Literal::Null => Ok(None),
+                        Literal::Int32(v) => Ok(Some(*v)),
+                        other => Err(BoltError::Plan(format!(
+                            "VALUES Int32 column got {other:?}"
+                        ))),
                     })
-                    .collect();
+                    .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(Int32Array::from(vals))
             }
             DataType::Int64 => {
@@ -174,11 +181,13 @@ fn materialize_values_relation(
                     .rows
                     .iter()
                     .map(|r| match &r[ci] {
-                        Literal::Null => None,
-                        Literal::Int64(v) => Some(*v),
-                        other => unreachable!("VALUES Int64 column got {other:?}"),
+                        Literal::Null => Ok(None),
+                        Literal::Int64(v) => Ok(Some(*v)),
+                        other => Err(BoltError::Plan(format!(
+                            "VALUES Int64 column got {other:?}"
+                        ))),
                     })
-                    .collect();
+                    .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(Int64Array::from(vals))
             }
             DataType::Float32 => {
@@ -186,11 +195,13 @@ fn materialize_values_relation(
                     .rows
                     .iter()
                     .map(|r| match &r[ci] {
-                        Literal::Null => None,
-                        Literal::Float32(v) => Some(*v),
-                        other => unreachable!("VALUES Float32 column got {other:?}"),
+                        Literal::Null => Ok(None),
+                        Literal::Float32(v) => Ok(Some(*v)),
+                        other => Err(BoltError::Plan(format!(
+                            "VALUES Float32 column got {other:?}"
+                        ))),
                     })
-                    .collect();
+                    .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(Float32Array::from(vals))
             }
             DataType::Float64 => {
@@ -198,11 +209,13 @@ fn materialize_values_relation(
                     .rows
                     .iter()
                     .map(|r| match &r[ci] {
-                        Literal::Null => None,
-                        Literal::Float64(v) => Some(*v),
-                        other => unreachable!("VALUES Float64 column got {other:?}"),
+                        Literal::Null => Ok(None),
+                        Literal::Float64(v) => Ok(Some(*v)),
+                        other => Err(BoltError::Plan(format!(
+                            "VALUES Float64 column got {other:?}"
+                        ))),
                     })
-                    .collect();
+                    .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(Float64Array::from(vals))
             }
             DataType::Bool => {
@@ -210,11 +223,13 @@ fn materialize_values_relation(
                     .rows
                     .iter()
                     .map(|r| match &r[ci] {
-                        Literal::Null => None,
-                        Literal::Bool(v) => Some(*v),
-                        other => unreachable!("VALUES Bool column got {other:?}"),
+                        Literal::Null => Ok(None),
+                        Literal::Bool(v) => Ok(Some(*v)),
+                        other => Err(BoltError::Plan(format!(
+                            "VALUES Bool column got {other:?}"
+                        ))),
                     })
-                    .collect();
+                    .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(BooleanArray::from(vals))
             }
             DataType::Utf8 => {
@@ -222,11 +237,13 @@ fn materialize_values_relation(
                     .rows
                     .iter()
                     .map(|r| match &r[ci] {
-                        Literal::Null => None,
-                        Literal::Utf8(v) => Some(v.clone()),
-                        other => unreachable!("VALUES Utf8 column got {other:?}"),
+                        Literal::Null => Ok(None),
+                        Literal::Utf8(v) => Ok(Some(v.clone())),
+                        other => Err(BoltError::Plan(format!(
+                            "VALUES Utf8 column got {other:?}"
+                        ))),
                     })
-                    .collect();
+                    .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(StringArray::from(vals))
             }
             other => {
@@ -4863,6 +4880,16 @@ impl Engine {
         // kernel above and the predicate kernel below; tagging here restores the
         // same `Drop`-fence invariant `mark_launch_stream` gives the outputs.
         for buf in &rank_bufs {
+            buf.mark_stream_use(stream.raw());
+        }
+        // T4/V-1: the synthesised all-valid validity bitmaps are likewise
+        // freshly allocated here (not from the persistent GpuTable cache) and
+        // are read by both the projection kernel above and the predicate
+        // kernel below. Tag them with this launch stream so they observe the
+        // same `Drop`-fence invariant as `output_cols` / `rank_bufs`,
+        // preventing their block from being recycled while the kernel is in
+        // flight.
+        for buf in &synth_validity_bufs {
             buf.mark_stream_use(stream.raw());
         }
         // Debug-only synchronize: pin any in-kernel fault to THIS launch

@@ -43,6 +43,16 @@
 //! Span names are stable across patch releases. New phases may be added
 //! (non-breaking); existing names keep their semantics.
 //!
+//! Note that the span catalogue and the pre-aggregated latency histograms in
+//! [`metrics`](crate::metrics) are *independent* surfaces and do **not** line up
+//! one-to-one. Only the phases the engine explicitly times feed a
+//! [`Phase`](crate::metrics::Phase) histogram (`parse`, `plan`, `lower`,
+//! `materialize`); the device-side spans (`codegen`, `ptx_load`, `launch`,
+//! `transfer`) are emitted here for tracing but have no histogram counterpart in
+//! the registry, so they are absent from [`Phase`](crate::metrics::Phase). Use
+//! a tracing subscriber to time those phases until a histogram observation is
+//! wired at their source sites.
+//!
 //! # Pool-stats observer
 //!
 //! Independent of the tracing surface, [`install_pool_stats_observer`]

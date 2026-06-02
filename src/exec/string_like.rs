@@ -46,6 +46,34 @@ use arrow_array::{Array, BooleanArray, StringArray};
 use crate::error::BoltResult;
 use crate::jit::string_kernel::LikeMode;
 
+/// Env gate for every **GPU string device path** (the per-row `LIKE` matcher
+/// here, and the `UPPER`/`LOWER`/`CONCAT`/`SUBSTRING`/`TRIM` two-pass producers
+/// in [`crate::exec::string_project`]). `BOLT_GPU_STRING=1` (or
+/// `true`/`yes`, case-insensitive) opts in; default OFF.
+///
+/// These device kernels have **never been executed on GPU hardware** as of
+/// v0.7.0 — CI builds with no CUDA device — so the host path is the
+/// correctness path and is selected by default. The gate exists purely so a
+/// hardware bring-up can opt the device kernels in for validation without
+/// editing code. Mirrors the `BOLT_GPU_SORT` / `BOLT_GPU_DISTINCT` gate
+/// convention (see `crate::exec::distinct::gpu_distinct_enabled`).
+pub const BOLT_GPU_STRING_ENV: &str = "BOLT_GPU_STRING";
+
+/// `true` when [`BOLT_GPU_STRING_ENV`] is set to a truthy value (`1` / `true`
+/// / `yes`, case-insensitive). Default OFF — see [`BOLT_GPU_STRING_ENV`].
+///
+/// The executor MUST consult this before selecting any GPU string device path;
+/// when it returns `false` the validated host path is taken.
+pub fn gpu_string_enabled() -> bool {
+    match std::env::var(BOLT_GPU_STRING_ENV) {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Decompose a SQL `LIKE` pattern into a `(mode, literal_bytes)` pair the GPU
 /// matcher can drive, or `None` to signal "host fallback".
 ///
@@ -180,6 +208,12 @@ pub fn like_match_row(row: &[u8], lit: &[u8], mode: LikeMode, negated: bool) -> 
 ///
 /// Errors if the concatenated byte length would exceed `i32::MAX` (Arrow
 /// `Utf8`, not `LargeUtf8`).
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. This builder only feeds the
+// device LIKE matcher (Engine::string_like_mask_gpu), which the executor must
+// gate behind gpu_string_enabled; the default path evaluates LIKE on the host
+// via host_mask_via_mirror / crate::exec::like::host_like.
 pub fn build_row_aligned_from_strings(
     col: &StringArray,
 ) -> BoltResult<(Vec<i32>, Vec<u8>, Vec<bool>)> {
@@ -213,6 +247,11 @@ pub fn build_row_aligned_from_strings(
 /// `mask[r]` is the device matcher's 0/1 output for row `r`; `validity[r]`
 /// gates NULL rows. The `negated` flag was ALREADY applied inside the kernel,
 /// so it is not re-applied here — only NULL re-masking happens.
+//
+// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
+// path; opt-in via BOLT_GPU_STRING for testing. This consumes the mask the
+// device matcher writes (only reached on the gated device path); the default
+// host path produces its mask via host_mask_via_mirror.
 pub fn mask_to_boolean_array(mask: &[u8], validity: &[bool]) -> BooleanArray {
     let pairs: Vec<Option<bool>> = (0..validity.len())
         .map(|r| {
@@ -263,6 +302,35 @@ mod tests {
     fn dec(p: &str) -> Option<(LikeMode, String)> {
         decompose_like_pattern(p, None)
             .map(|(m, b)| (m, String::from_utf8(b).unwrap()))
+    }
+
+    // ---- GPU device-path env gate ----------------------------------------
+
+    #[test]
+    fn gpu_string_gate_constant_name() {
+        // Lock the env-var name so docs / hardware bring-up scripts stay in sync.
+        assert_eq!(BOLT_GPU_STRING_ENV, "BOLT_GPU_STRING");
+    }
+
+    #[test]
+    fn gpu_string_gate_defaults_off_and_parses_truthy() {
+        // Serialised set/remove dance (mirrors `distinct.rs`'s gate test): the
+        // device string path is OFF unless explicitly opted in, so the host
+        // path is the default correctness path on hardware-less CI.
+        let prev = std::env::var(BOLT_GPU_STRING_ENV).ok();
+        std::env::remove_var(BOLT_GPU_STRING_ENV);
+        assert!(!gpu_string_enabled(), "default must be OFF");
+        std::env::set_var(BOLT_GPU_STRING_ENV, "1");
+        assert!(gpu_string_enabled(), "\"1\" opts in");
+        std::env::set_var(BOLT_GPU_STRING_ENV, "TRUE");
+        assert!(gpu_string_enabled(), "\"TRUE\" opts in (case-insensitive)");
+        std::env::set_var(BOLT_GPU_STRING_ENV, "0");
+        assert!(!gpu_string_enabled(), "\"0\" stays OFF");
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(BOLT_GPU_STRING_ENV, v),
+            None => std::env::remove_var(BOLT_GPU_STRING_ENV),
+        }
     }
 
     // ---- decomposer: accepted shapes -------------------------------------
