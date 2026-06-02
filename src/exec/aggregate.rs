@@ -122,7 +122,7 @@ use crate::jit::agg_kernels::{
     REDUCTION_KERNEL_ENTRY, REDUCTION_KERNEL_WITH_VALIDITY_ENTRY,
 };
 use crate::exec::validity_audit::packed_validity_for;
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema, TimeUnit};
 
 // `CudaModule` import dropped: every load site now routes through
 // `exec::module_cache::get_or_build_module_for_scalar_agg` (v0.7 — keys on
@@ -770,13 +770,106 @@ fn reduce_column_from_batch(
                 reduce_gpu_vec::<f64>(op, col_io.dtype, &dev, n_rows, &stream)
             }
         }
+        // F7-finish: Date32 normalises to an i32 reduction. MIN/MAX preserve
+        // the temporal type (the result is rebuilt as a `Date32Array` by
+        // `scalar_to_array` keyed on `out_field.dtype == Date32`). SUM over a
+        // date is meaningless and stays rejected. (COUNT(temporal) does not
+        // reach here — it is handled host-side in `build_one_aggregate`.)
+        DataType::Date32 => {
+            if matches!(op, ReduceOp::Sum) {
+                return Err(BoltError::Type(format!(
+                    "SUM over Date32 is not supported (column '{}')",
+                    col_io.name
+                )));
+            }
+            let pa = arr
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Date32"))?;
+            // Reduce on the i32-normalized storage; the i32 ReduceScalar
+            // finalize handles MIN/MAX (and the seed identities). We pass the
+            // *normalized* `DataType::Int32` so the JIT compiles the i32
+            // reduction kernel — the temporal-ness lives only in the output
+            // rebuild.
+            if has_nulls {
+                let validity_gpu = upload_validity_async(arr, &stream)?;
+                let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
+                reduce_gpu_vec_with_validity::<i32>(
+                    op, DataType::Int32, &dev, &validity_gpu, n_rows, &stream,
+                )
+            } else {
+                let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
+                reduce_gpu_vec::<i32>(op, DataType::Int32, &dev, n_rows, &stream)
+            }
+        }
+        // F7-finish: Timestamp normalises to an i64 reduction. MIN/MAX preserve
+        // the unit + timezone (rebuilt as the concrete `Timestamp*Array` by
+        // `scalar_to_array` keyed on `out_field.dtype`). SUM over a timestamp
+        // is meaningless and stays rejected.
+        DataType::Timestamp(_, _) => {
+            if matches!(op, ReduceOp::Sum) {
+                return Err(BoltError::Type(format!(
+                    "SUM over Timestamp is not supported (column '{}')",
+                    col_io.name
+                )));
+            }
+            let pa = timestamp_values_i64(arr, &col_io.name)?;
+            if has_nulls {
+                let validity_gpu = upload_validity_async(arr, &stream)?;
+                let dev = upload_primitive_values_async::<i64>(&pa, &stream)?;
+                reduce_gpu_vec_with_validity::<i64>(
+                    op, DataType::Int64, &dev, &validity_gpu, n_rows, &stream,
+                )
+            } else {
+                let dev = upload_primitive_values_async::<i64>(&pa, &stream)?;
+                reduce_gpu_vec::<i64>(op, DataType::Int64, &dev, n_rows, &stream)
+            }
+        }
         DataType::Bool
         | DataType::Utf8
-        | DataType::Decimal128(_, _)
-        | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
+        ))),
+    }
+}
+
+/// F7-finish: extract a `Timestamp*Array`'s raw i64 tick buffer as an owned
+/// `Vec<i64>`, dispatching on the concrete Arrow timestamp unit. The four
+/// `Timestamp{Second,Millisecond,Microsecond,Nanosecond}Array` types are all
+/// `PrimitiveArray<_>` over an `i64` native, so we copy the values buffer.
+/// (We return an owned `Vec` rather than a `&[i64]` slice because the concrete
+/// array type differs per unit and cannot be unified behind one borrow.)
+fn timestamp_values_i64(
+    arr: &arrow_array::ArrayRef,
+    name: &str,
+) -> BoltResult<Vec<i64>> {
+    use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
+    macro_rules! ts_vals {
+        ($ty:ty, $label:literal) => {{
+            let pa = arr
+                .as_any()
+                .downcast_ref::<$ty>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            Ok(pa.values().to_vec())
+        }};
+    }
+    match arr.data_type() {
+        ArrowDataType::Timestamp(ArrowTimeUnit::Second, _) => {
+            ts_vals!(arrow_array::TimestampSecondArray, "TimestampSecond")
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, _) => {
+            ts_vals!(arrow_array::TimestampMillisecondArray, "TimestampMillisecond")
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, _) => {
+            ts_vals!(arrow_array::TimestampMicrosecondArray, "TimestampMicrosecond")
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, _) => {
+            ts_vals!(arrow_array::TimestampNanosecondArray, "TimestampNanosecond")
+        }
+        other => Err(BoltError::Type(format!(
+            "aggregate input '{}' is not a Timestamp array: {:?}",
+            name, other
         ))),
     }
 }
@@ -2095,6 +2188,21 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
             Ok(Arc::new(arr) as ArrayRef)
         }
 
+        // F7-finish: MIN/MAX(Date32) reduced on the i32-normalized storage;
+        // rebuild a `Date32Array` so the result preserves the date type
+        // end-to-end (a plain `Int32Array` would silently downgrade
+        // days-since-epoch to a generic integer).
+        (Scalar::I32(v), DataType::Date32) => {
+            Ok(Arc::new(arrow_array::Date32Array::from(vec![v])) as ArrayRef)
+        }
+        // F7-finish: MIN/MAX(Timestamp) reduced on the i64-normalized storage;
+        // rebuild the concrete `Timestamp*Array` matching the output field's
+        // unit and reattach its timezone so a `MIN(Timestamp(Micro, "UTC"))`
+        // returns `Timestamp(Micro, "UTC")`, not a bare i64.
+        (Scalar::I64(v), DataType::Timestamp(unit, tz)) => {
+            Ok(timestamp_scalar_array(v, false, unit, tz))
+        }
+
         (s, dt) => Err(BoltError::Type(format!(
             "aggregate: cannot pack scalar {:?} into output dtype {:?}",
             s, dt
@@ -2133,10 +2241,49 @@ fn null_scalar_array(out_dtype: DataType) -> BoltResult<ArrayRef> {
                 })?;
             Ok(Arc::new(arr) as ArrayRef)
         }
+        // F7-finish: MIN/MAX(Date32) over an empty / all-NULL input is SQL
+        // NULL; pack a single NULL `Date32Array` so the temporal type is
+        // preserved.
+        DataType::Date32 => {
+            Ok(Arc::new(arrow_array::Date32Array::from(vec![Option::<i32>::None])) as ArrayRef)
+        }
+        // F7-finish: MIN/MAX(Timestamp) over an empty / all-NULL input is SQL
+        // NULL; pack a single NULL `Timestamp*Array` carrying the output
+        // unit + timezone.
+        DataType::Timestamp(unit, tz) => Ok(timestamp_scalar_array(0, true, unit, tz)),
         other => Err(BoltError::Type(format!(
             "aggregate: cannot build NULL scalar for output dtype {:?}",
             other
         ))),
+    }
+}
+
+/// F7-finish: build a single-row `Timestamp*Array` for the given output unit +
+/// timezone. When `is_null` is true the row is SQL NULL (the `value` argument
+/// is ignored); otherwise the row carries `value` ticks. Mirrors the
+/// reconstruction in `gpu_compact::timestamp_array_from_i64`, specialised to a
+/// one-element scalar-aggregate result.
+fn timestamp_scalar_array(
+    value: i64,
+    is_null: bool,
+    unit: TimeUnit,
+    tz: Option<&'static str>,
+) -> ArrayRef {
+    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
+    let cell: Vec<Option<i64>> = vec![if is_null { None } else { Some(value) }];
+    match unit {
+        TimeUnit::Second => Arc::new(
+            arrow_array::TimestampSecondArray::from(cell).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
+        TimeUnit::Millisecond => Arc::new(
+            arrow_array::TimestampMillisecondArray::from(cell).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
+        TimeUnit::Microsecond => Arc::new(
+            arrow_array::TimestampMicrosecondArray::from(cell).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
+        TimeUnit::Nanosecond => Arc::new(
+            arrow_array::TimestampNanosecondArray::from(cell).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
     }
 }
 
@@ -2155,8 +2302,17 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output RecordBatch.
+///
+/// F7-finish: this uses the MIN/MAX-temporal variant so a
+/// `MIN`/`MAX`/`COUNT` over a `Date32`/`Timestamp` column can build its
+/// temporal-typed output field (the unit + timezone are carried through). The
+/// only temporal outputs that reach here are the supported reductions —
+/// `SUM(temporal)` is rejected earlier in `reduce_column_from_batch`'s dtype
+/// dispatch (which runs in `build_scalar_aggregates`, after this schema
+/// build), so relaxing the schema builder does not admit any meaningless
+/// temporal SUM result.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_minmax_temporal(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -2944,5 +3100,174 @@ mod tests {
     fn neumaier_sum_empty_is_zero() {
         let empty: [f64; 0] = [];
         assert_eq!(neumaier_sum_f64(empty.iter().copied()), 0.0);
+    }
+
+    // -------- F7-finish: MIN/MAX(Date32 / Timestamp) result rebuild --------
+    //
+    // Host-only tests for the output-array reconstruction and the
+    // SUM(temporal) rejection. The full GPU reduction is exercised by the
+    // `gpu:`-tagged tests below (and the integration suite).
+
+    /// `scalar_to_array` rebuilds a `Date32` MIN/MAX result (reduced on the
+    /// i32-normalized storage) as a `Date32Array`, preserving the date type.
+    #[test]
+    fn scalar_to_array_rebuilds_date32() {
+        let arr = scalar_to_array(Scalar::I32(19_000), DataType::Date32).expect("date32 ok");
+        let d = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .expect("Date32Array");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.value(0), 19_000);
+    }
+
+    /// `scalar_to_array` rebuilds a `Timestamp(Microsecond, "UTC")` MIN/MAX
+    /// result (reduced on the i64-normalized storage) preserving BOTH the unit
+    /// and the timezone.
+    #[test]
+    fn scalar_to_array_rebuilds_timestamp_with_unit_and_tz() {
+        let tz = crate::plan::logical_plan::intern_timezone("UTC");
+        let arr = scalar_to_array(
+            Scalar::I64(1_700_000_000_000_000),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
+        )
+        .expect("timestamp ok");
+        assert_eq!(
+            arr.data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(Arc::from("UTC"))
+            )
+        );
+        let t = arr
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecondArray");
+        assert_eq!(t.value(0), 1_700_000_000_000_000);
+    }
+
+    /// `null_scalar_array` packs a single NULL for the empty / all-NULL
+    /// MIN/MAX(temporal) case, preserving the temporal type (incl. unit + tz
+    /// for Timestamp).
+    #[test]
+    fn null_scalar_array_temporal_is_typed_null() {
+        let date = null_scalar_array(DataType::Date32).expect("date null");
+        assert_eq!(date.data_type(), &arrow_schema::DataType::Date32);
+        assert!(date.is_null(0));
+
+        let tz = crate::plan::logical_plan::intern_timezone("UTC");
+        let ts = null_scalar_array(DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)))
+            .expect("ts null");
+        assert_eq!(
+            ts.data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Nanosecond,
+                Some(Arc::from("UTC"))
+            )
+        );
+        assert!(ts.is_null(0));
+    }
+
+    /// `timestamp_values_i64` extracts the raw i64 tick buffer for each unit.
+    #[test]
+    fn timestamp_values_i64_extracts_ticks() {
+        let arr: ArrayRef = Arc::new(
+            arrow_array::TimestampMillisecondArray::from(vec![10i64, 20, 30]),
+        );
+        let v = timestamp_values_i64(&arr, "ts").expect("extract");
+        assert_eq!(v, vec![10, 20, 30]);
+    }
+
+    /// SUM over a Date32 / Timestamp input is meaningless and stays rejected
+    /// at the reduction dispatch with a clean `Type` error (no GPU needed —
+    /// the rejection fires before any upload).
+    #[test]
+    fn sum_over_temporal_is_rejected() {
+        let date: ArrayRef = Arc::new(arrow_array::Date32Array::from(vec![1i32, 2, 3]));
+        let dbatch = batch_one("d", date);
+        let dcol = ColumnIO {
+            name: "d".to_string(),
+            dtype: DataType::Date32,
+        };
+        let err = reduce_column_from_batch(ReduceOp::Sum, &dcol, &dbatch, 3).unwrap_err();
+        assert!(matches!(err, BoltError::Type(_)));
+
+        let ts: ArrayRef =
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![1i64, 2, 3]));
+        let tbatch = batch_one("t", ts);
+        let tcol = ColumnIO {
+            name: "t".to_string(),
+            dtype: DataType::Timestamp(TimeUnit::Microsecond, None),
+        };
+        let err = reduce_column_from_batch(ReduceOp::Sum, &tcol, &tbatch, 3).unwrap_err();
+        assert!(matches!(err, BoltError::Type(_)));
+    }
+
+    /// gpu: full MIN/MAX over a Date32 column produces a `Date32Array` with the
+    /// correct min/max day values. Requires a device (the reduction uploads).
+    #[test]
+    #[ignore = "gpu: MIN/MAX(Date32) reduction allocates on device"]
+    fn gpu_minmax_date32_end_to_end() {
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+        let arr: ArrayRef =
+            Arc::new(arrow_array::Date32Array::from(vec![19_005i32, 19_000, 19_010, 19_002]));
+        let batch = batch_one("d", arr);
+        let col = ColumnIO {
+            name: "d".to_string(),
+            dtype: DataType::Date32,
+        };
+        let out_field = Field::new("m", DataType::Date32, true);
+        let agg = AggregateExpr::Min(Expr::Column("d".to_string()));
+        let min_out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 4)
+            .expect("min ok");
+        let d = min_out
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .expect("Date32Array");
+        assert_eq!(d.value(0), 19_000);
+
+        let agg = AggregateExpr::Max(Expr::Column("d".to_string()));
+        let max_out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 4)
+            .expect("max ok");
+        let d = max_out
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .expect("Date32Array");
+        assert_eq!(d.value(0), 19_010);
+    }
+
+    /// gpu: full MIN/MAX over a Timestamp(Microsecond, "UTC") column preserves
+    /// the unit + timezone end-to-end. Requires a device.
+    #[test]
+    #[ignore = "gpu: MIN/MAX(Timestamp) reduction allocates on device"]
+    fn gpu_minmax_timestamp_end_to_end_preserves_unit_tz() {
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+        let tz = crate::plan::logical_plan::intern_timezone("UTC");
+        let arr: ArrayRef = Arc::new(
+            arrow_array::TimestampMicrosecondArray::from(vec![300i64, 100, 200])
+                .with_timezone_opt(Some(Arc::<str>::from("UTC"))),
+        );
+        let batch = batch_one("ts", arr);
+        let col = ColumnIO {
+            name: "ts".to_string(),
+            dtype: DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
+        };
+        let out_field =
+            Field::new("m", DataType::Timestamp(TimeUnit::Microsecond, Some(tz)), true);
+        let agg = AggregateExpr::Min(Expr::Column("ts".to_string()));
+        let min_out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 3)
+            .expect("min ok");
+        assert_eq!(
+            min_out.data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(Arc::from("UTC"))
+            )
+        );
+        let t = min_out
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecondArray");
+        assert_eq!(t.value(0), 100);
     }
 }

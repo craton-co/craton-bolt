@@ -367,27 +367,25 @@ fn lower_with_passthrough_column_lowers_to_string_project() {
 }
 
 #[test]
-fn substring_lowers_to_host_project_not_gpu() {
-    // SUBSTRING is a variable-width producer with no GPU kernel wired into the
-    // executor yet; it must NOT route to the GPU StringProject (only UPPER/LOWER
-    // do). Instead it now lowers to the host-side `PhysicalPlan::Project` whose
-    // executor evaluates it via `expr_agg::eval_expr`.
+fn substring_lowers_to_string_project() {
+    // F9: SUBSTRING(col, lit, lit) over a bare Utf8 scan now lowers to the
+    // GPU StringProject (host-realized two-pass producer), like UPPER/LOWER.
     let plan = parse("SELECT SUBSTRING(s, 1, 2) FROM txt").expect("SUBSTRING parses");
-    let phys = lower_physical(&plan).expect("SUBSTRING must lower to a host Project");
+    let phys = lower_physical(&plan).expect("SUBSTRING must lower");
     assert!(
-        matches!(phys, PhysicalPlan::Project { .. }),
-        "SUBSTRING must lower to host PhysicalPlan::Project, got {phys:?}"
+        matches!(phys, PhysicalPlan::StringProject { .. }),
+        "SUBSTRING must lower to PhysicalPlan::StringProject, got {phys:?}"
     );
 }
 
 #[test]
-fn trim_lowers_to_host_project() {
-    // TRIM has no GPU kernel; like SUBSTRING it routes to the host Project.
+fn trim_lowers_to_string_project() {
+    // F9: single-arg TRIM(col) over a bare Utf8 scan now lowers to StringProject.
     let plan = parse("SELECT TRIM(s) FROM txt").expect("TRIM parses");
-    let phys = lower_physical(&plan).expect("TRIM must lower to a host Project");
+    let phys = lower_physical(&plan).expect("TRIM must lower");
     assert!(
-        matches!(phys, PhysicalPlan::Project { .. }),
-        "TRIM must lower to host PhysicalPlan::Project, got {phys:?}"
+        matches!(phys, PhysicalPlan::StringProject { .. }),
+        "TRIM must lower to PhysicalPlan::StringProject, got {phys:?}"
     );
 }
 

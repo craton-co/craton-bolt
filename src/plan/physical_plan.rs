@@ -961,6 +961,20 @@ pub enum StringProjectOutput {
         /// Source Utf8 column names, in concatenation order (>= 2).
         sources: Vec<String>,
     },
+    /// A `Utf8`-result `CASE WHEN ... THEN ... [ELSE ...] END` selecting a
+    /// per-row string. Evaluated host-side over the decoded source columns
+    /// ([`crate::exec::string_project::eval_case_utf8`]) honouring SQL CASE 3VL
+    /// (a NULL/UNKNOWN condition falls through to the next branch / ELSE /
+    /// NULL). Full on-device variable-width CASE is out of scope (no Utf8
+    /// register class); this host realisation is the supported path. The
+    /// `branches` / `else_branch` are carried verbatim from the logical
+    /// `Expr::Case`. Output dtype is `Utf8`.
+    CaseUtf8 {
+        /// `(WHEN condition, THEN value)` pairs in source order.
+        branches: Vec<(Expr, Expr)>,
+        /// Optional `ELSE value` (SQL NULL when absent).
+        else_branch: Option<Box<Expr>>,
+    },
 }
 
 /// The top-level physical plan: a small ordered pipeline of kernels.
@@ -1080,20 +1094,25 @@ pub enum PhysicalPlan {
         /// source dtype).
         output_schema: Schema,
     },
-    /// Fully-GPU `SELECT UPPER(<utf8_col>)` / `LOWER(<utf8_col>)` (plus
-    /// passthrough columns) over a bare table scan.
+    /// Variable-width `Utf8` string projection (plus passthrough columns) over a
+    /// bare table scan: `UPPER`/`LOWER`/`SUBSTRING`/`TRIM`/`CONCAT` and
+    /// `Utf8`-result `CASE` (see [`StringProjectOutput`]).
     ///
     /// This is the variable-width sibling of [`PhysicalPlan::StringLength`]:
-    /// unlike `LENGTH` (a fixed-width `Int32` gather), `UPPER`/`LOWER` produce a
-    /// brand-new `Utf8` array whose per-row byte widths are data-dependent, so
-    /// the executor drives the two-pass length/scan/write kernels in
-    /// [`crate::jit::string_kernel`] (see [`crate::exec::string_project`]). The
-    /// GPU path ASCII-folds byte-wise; columns whose dictionary holds any
-    /// non-ASCII byte fall back to a full-Unicode host transform (no panic).
-    /// The lowering router only produces this variant for the lowest-risk
-    /// shape (a `Project` directly over a `Scan`, every output expr a
-    /// bare/aliased `Column` or `UPPER`/`LOWER(Column)`); `SUBSTRING`/`CONCAT`
-    /// and `LENGTH` still route elsewhere.
+    /// unlike `LENGTH` (a fixed-width `Int32` gather), these produce a brand-new
+    /// `Utf8` array whose per-row byte widths are data-dependent.
+    ///
+    /// * `UPPER`/`LOWER` drive the two-pass length/scan/write kernels in
+    ///   [`crate::jit::string_kernel`] (ASCII byte-wise fold); a dictionary with
+    ///   any non-ASCII byte falls back to a full-Unicode host transform.
+    /// * `SUBSTRING`/`TRIM`/`CONCAT` and `CaseUtf8` are realised via the
+    ///   byte-identical host mirror in [`crate::exec::string_project`] (their
+    ///   device producers exist but are unvalidated on hardware). No panic on
+    ///   any fallback.
+    ///
+    /// The lowering router only produces this variant for the lowest-risk shape
+    /// (a `Project` directly over a `Scan`); chains with a `Filter`, computed
+    /// non-literal args, custom-chars `TRIM`, or nested `CASE` route elsewhere.
     StringProject {
         /// Source table name.
         table: String,
@@ -3859,6 +3878,33 @@ fn expr_contains_concat(expr: &Expr) -> bool {
     }
 }
 
+/// True if `expr` contains an `Expr::Case` anywhere in its subtree.
+///
+/// Used by [`try_lower_string_case`] (F11) to detect a NESTED CASE inside a
+/// Utf8 CASE's WHEN/THEN/ELSE branch: the host evaluator
+/// ([`crate::exec::expr_agg::eval_expr`]) has no CASE arm, so such a shape
+/// cannot be realised on the host CASE path and bails to the existing precise
+/// rejection rather than failing late at execution.
+fn expr_contains_case(expr: &Expr) -> bool {
+    match expr {
+        Expr::Case { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_case(left) || expr_contains_case(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_case(operand),
+        Expr::Alias(inner, _) => expr_contains_case(inner),
+        Expr::Like { expr, .. } => expr_contains_case(expr),
+        Expr::Cast { expr, .. } => expr_contains_case(expr),
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_case),
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_case(expr),
+        Expr::InSubquery { expr, .. } => expr_contains_case(expr),
+        // A subquery subplan is a separate query; its internal CASE is its own
+        // concern (and never reaches this evaluator).
+        Expr::ScalarSubquery(_) => false,
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
+}
+
 /// True if `expr` contains a `Utf8` string literal anywhere in its subtree.
 ///
 /// A surviving `Expr::Literal(Literal::Utf8(_))` in a WHERE predicate means a
@@ -4155,12 +4201,121 @@ fn try_lower_string_length(
 ///   * `CONCAT(Column(a), Column(b), ...)` (optionally aliased) with >= 2 Utf8
 ///     column arguments of the scanned table (the GPU two-pass N-input producer;
 ///     the executor falls back to the host concat for unsupported arities /
-///     layouts).
+///     layouts), or
+///   * `SUBSTRING(Column(name) FROM <int-lit> [FOR <int-lit>])` (optionally
+///     aliased) where `name` is a `Utf8` column and start/length are integer
+///     literals (the executor realises it via the byte-identical host mirror;
+///     non-literal args bail to the host Project), or
+///   * `TRIM`/`LTRIM`/`RTRIM(Column(name))` (optionally aliased, single arg =
+///     default whitespace) where `name` is a `Utf8` column (host-realised; a
+///     custom trim-character set bails to the host Project).
 ///
-/// At least one output must be an `UPPER`/`LOWER`/`CONCAT` (otherwise this is a
+/// At least one output must be a transform / `CONCAT` (otherwise this is a
 /// plain projection the existing codegen path handles). Anything else —
-/// `SUBSTRING` / `LENGTH`, a transform over a non-column argument, a computed
-/// expression, a Filter in the chain — returns `Ok(None)`.
+/// `LENGTH`, a transform over a non-column / non-literal argument, a custom-
+/// chars TRIM, a computed expression, a Filter in the chain — returns
+/// `Ok(None)`.
+/// Extract a constant integer (`Int32`/`Int64`) literal as `i32`, peeling
+/// aliases. Returns `None` for a non-literal, a non-integer literal, or an
+/// `Int64` that does not fit in `i32` (so the SUBSTRING lowering bails to the
+/// host Project, which handles the wide / computed cases). The SUBSTRING
+/// character window is `i32`-indexed (matching
+/// [`crate::exec::string_ops_extended::substring_str`]).
+fn int_literal_i32(e: &Expr) -> Option<i32> {
+    match peel_aliases(e) {
+        Expr::Literal(crate::plan::logical_plan::Literal::Int32(v)) => Some(*v),
+        Expr::Literal(crate::plan::logical_plan::Literal::Int64(v)) => i32::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+/// F11: try to lower a top-level `Project` over a **bare `Scan`** whose SELECT
+/// list contains at least one `Utf8`-result `CASE` into a host-evaluated
+/// [`PhysicalPlan::StringProject`] (the `CaseUtf8` output realises the CASE
+/// host-side; see [`crate::exec::string_project::eval_case_utf8`]). Returns
+/// `Ok(None)` when the shape is out of scope so the caller keeps its existing
+/// routing (the GPU codegen path for non-Utf8 CASEs, or the precise rejection
+/// for residual shapes).
+///
+/// Accepted output exprs (each, alias-peeled):
+///   * a bare `Column(name)` (passthrough — any dtype, lifted from the source
+///     batch), or
+///   * an `Expr::Case` whose result dtype is `Utf8`.
+///
+/// At least one output must be a `Utf8` `CASE` (otherwise nothing here needs the
+/// host CASE path). Anything else — a computed non-CASE expr, a `CASE` over a
+/// non-Utf8 result (handled by the GPU `selp` fold), a Filter in the chain —
+/// returns `Ok(None)`. The CASE's WHEN/THEN/ELSE sub-expressions are NOT
+/// inspected here; unsupported ones surface at execution time from the host
+/// evaluator (e.g. a nested CASE), matching the documented residual-shape
+/// behaviour.
+fn try_lower_string_case(
+    plan: &LogicalPlan,
+    input: &LogicalPlan,
+    exprs: &[Expr],
+) -> BoltResult<Option<PhysicalPlan>> {
+    // Only a bare `Scan` underneath (no Filter / Project chain): the host
+    // evaluator runs over the materialised source batch.
+    let (table, scan_schema) = match input {
+        LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
+        _ => return Ok(None),
+    };
+
+    let mut any_utf8_case = false;
+    // Validate every output is either a bare column or a Utf8-result CASE whose
+    // WHEN/THEN/ELSE sub-expressions the host evaluator can handle.
+    for e in exprs {
+        match peel_aliases(e) {
+            Expr::Column(_) => {}
+            Expr::Case { branches, else_branch } => {
+                if e.dtype(scan_schema)? != DataType::Utf8 {
+                    // A non-Utf8 CASE rides the GPU `selp` fold — not our path.
+                    return Ok(None);
+                }
+                // The host evaluator (`expr_agg::eval_expr`) has no CASE arm, so
+                // a NESTED CASE in any branch cannot be resolved on this path.
+                // Bail so the existing precise rejection fires for that residual
+                // shape rather than failing late at execution.
+                let nested = branches
+                    .iter()
+                    .any(|(w, t)| expr_contains_case(w) || expr_contains_case(t))
+                    || else_branch.as_deref().map(expr_contains_case).unwrap_or(false);
+                if nested {
+                    return Ok(None);
+                }
+                any_utf8_case = true;
+            }
+            _ => return Ok(None),
+        }
+    }
+    if !any_utf8_case {
+        return Ok(None);
+    }
+
+    let output_schema = plan.schema()?;
+    let mut outputs: Vec<StringProjectOutput> = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        match peel_aliases(e) {
+            Expr::Column(name) => {
+                outputs.push(StringProjectOutput::Passthrough { source: name.clone() });
+            }
+            Expr::Case { branches, else_branch } => {
+                outputs.push(StringProjectOutput::CaseUtf8 {
+                    branches: branches.clone(),
+                    else_branch: else_branch.clone(),
+                });
+            }
+            // unreachable: validated above.
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(PhysicalPlan::StringProject {
+        table: table.to_string(),
+        outputs,
+        output_schema,
+    }))
+}
+
 fn try_lower_string_project(
     plan: &LogicalPlan,
     input: &LogicalPlan,
@@ -4214,6 +4369,83 @@ fn try_lower_string_project(
                 outputs.push(StringProjectOutput::Transform {
                     source: src,
                     transform,
+                });
+            }
+            Expr::ScalarFn { kind: ScalarFnKind::Substring, args } => {
+                // SUBSTRING(col FROM start [FOR length]): args are
+                // `[Column, start]` or `[Column, start, length]` where start /
+                // length are integer LITERALS. A non-column source, a non-Utf8
+                // column, or a non-literal start/length bails to the host
+                // Project fallback (which handles computed args).
+                if args.len() != 2 && args.len() != 3 {
+                    return Ok(None);
+                }
+                let src = match peel_aliases(&args[0]) {
+                    Expr::Column(name) => name.clone(),
+                    _ => return Ok(None),
+                };
+                let idx = scan_schema.index_of(&src)?;
+                if scan_schema.fields[idx].dtype != DataType::Utf8 {
+                    return Ok(None);
+                }
+                let start = match int_literal_i32(&args[1]) {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                let length = if args.len() == 3 {
+                    match int_literal_i32(&args[2]) {
+                        Some(v) => Some(v),
+                        None => return Ok(None),
+                    }
+                } else {
+                    None
+                };
+                any_transform = true;
+                outputs.push(StringProjectOutput::Transform {
+                    source: src,
+                    transform: StringTransform::Substring { start, length },
+                });
+            }
+            Expr::ScalarFn { kind, args }
+                if matches!(
+                    kind,
+                    ScalarFnKind::TrimBoth
+                        | ScalarFnKind::TrimLeading
+                        | ScalarFnKind::TrimTrailing
+                ) =>
+            {
+                // TRIM/LTRIM/RTRIM(col): only the single-argument
+                // (default-whitespace) form over a bare Utf8 column. A custom
+                // trim character set (`TRIM(chars FROM col)`, 2 args) bails to
+                // the host Project fallback.
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let src = match peel_aliases(&args[0]) {
+                    Expr::Column(name) => name.clone(),
+                    _ => return Ok(None),
+                };
+                let idx = scan_schema.index_of(&src)?;
+                if scan_schema.fields[idx].dtype != DataType::Utf8 {
+                    return Ok(None);
+                }
+                let mode = match kind {
+                    ScalarFnKind::TrimBoth => {
+                        crate::exec::string_project::TrimMode::Both
+                    }
+                    ScalarFnKind::TrimLeading => {
+                        crate::exec::string_project::TrimMode::Leading
+                    }
+                    ScalarFnKind::TrimTrailing => {
+                        crate::exec::string_project::TrimMode::Trailing
+                    }
+                    // unreachable: the guard restricts `kind` to the three TRIMs.
+                    _ => return Ok(None),
+                };
+                any_transform = true;
+                outputs.push(StringProjectOutput::Transform {
+                    source: src,
+                    transform: StringTransform::Trim { mode },
                 });
             }
             Expr::ScalarFn { kind: ScalarFnKind::Concat, args } => {
@@ -5094,6 +5326,17 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
     }
     match plan {
         LogicalPlan::Project { input, exprs } => {
+            // F11: a top-level `Project` over a bare `Scan` whose SELECT list
+            // has a `Utf8`-result `CASE` is lowered to a host-evaluated
+            // `StringProject` (`CaseUtf8` output). This must run BEFORE the
+            // NULL-output-CASE / codegen routing below: a Utf8 CASE has no GPU
+            // `selp` representation (no Utf8 register class) and the host
+            // `PhysicalPlan::Project` evaluator (`expr_agg::eval_expr`) does not
+            // support CASE — so neither of those paths can serve it. Non-Utf8
+            // CASEs return `Ok(None)` here and keep the existing routing.
+            if let Some(string_case) = try_lower_string_case(plan, input, exprs)? {
+                return Ok(string_case);
+            }
             // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
             // Otherwise (Project over Aggregate, Join, Distinct, etc.) we
             // can't fold into one kernel; emit a thin `Project` rename/reorder
@@ -5259,27 +5502,28 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 if let Some(string_len) = try_lower_string_length(plan, input, exprs)? {
                     return Ok(string_len);
                 }
-                // UPPER/LOWER (plus passthroughs) over a bare scan lowers to the
-                // fully-GPU two-pass `PhysicalPlan::StringProject` (see
-                // `crate::exec::string_project`).
+                // UPPER/LOWER/CONCAT plus SUBSTRING (literal start/length) and
+                // single-arg TRIM/LTRIM/RTRIM (plus passthroughs) over a bare
+                // scan lower to the `PhysicalPlan::StringProject` producer (see
+                // `crate::exec::string_project`). UPPER/LOWER drive the GPU
+                // two-pass kernels for ASCII data; SUBSTRING/TRIM are realised
+                // via the byte-identical host mirror (the device producers are
+                // unvalidated on hardware, like CONCAT).
                 if let Some(string_proj) = try_lower_string_project(plan, input, exprs)? {
                     return Ok(string_proj);
                 }
-                // SUBSTRING / TRIM have no GPU producer wired into the executor
-                // yet, so — exactly like SQL `||` (Concat) above — route them to
-                // the host-side `PhysicalPlan::Project`, whose executor
-                // evaluates each expr via `expr_agg::eval_expr` over a
-                // `HostColumn` env. We lower the inner plan with NO projection
-                // override so every scan column the function args reference is
-                // surfaced for the host evaluator to pull.
-                //
-                // TODO(string-fn-gpu): replace with a GPU two-pass SUBSTRING /
-                // TRIM producer once the executor can launch the
-                // `jit::string_kernel` kernels.
+                // Residual SUBSTRING / TRIM shapes the `StringProject` producer
+                // does NOT accept — a custom trim-character set, computed (non-
+                // literal) start/length, a transform over a computed expression,
+                // a Filter in the chain — fall back to the host-side
+                // `PhysicalPlan::Project`, whose executor evaluates each expr via
+                // `expr_agg::eval_expr` over a `HostColumn` env. We lower the
+                // inner plan with NO projection override so every scan column the
+                // function args reference is surfaced for the host evaluator.
                 if all_scalar_fns_host_evaluable(exprs) {
                     log::debug!(
-                        "physical_plan: SUBSTRING/TRIM in Project; lowering to \
-                         host-side PhysicalPlan::Project (no GPU producer yet)"
+                        "physical_plan: SUBSTRING/TRIM in Project not accepted by \
+                         StringProject; lowering to host-side PhysicalPlan::Project"
                     );
                     let inner = lower(input)?;
                     let output_schema = plan.schema()?;

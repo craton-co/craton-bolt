@@ -291,17 +291,17 @@ fn parse_like_constant_pattern_supported_v05() {
 #[test]
 fn parse_trim_supported_by_frontend() {
     // TRIM is now supported: sqlparser surfaces it as the special-form
-    // `SqlExpr::Trim { .. }`, which the frontend maps to a `ScalarFnKind::Trim*`
-    // and lowers to a host-side `PhysicalPlan::Project` (a GPU TRIM kernel also
-    // exists, but the scalar string fn routes through the host path at lowering).
+    // `SqlExpr::Trim { .. }`, which the frontend maps to a `ScalarFnKind::Trim*`.
+    // F9: single-arg TRIM(col) over a bare Utf8 scan now lowers to the GPU
+    // StringProject (host-realized two-pass producer).
     use craton_bolt::plan::{lower_physical, PhysicalPlan};
     let provider = s_provider();
     let plan = parse_sql("SELECT TRIM(s) FROM t", &provider)
         .expect("TRIM(s) now parses at the frontend");
-    let phys = lower_physical(&plan).expect("TRIM(s) lowers to a host Project");
+    let phys = lower_physical(&plan).expect("TRIM(s) lowers");
     assert!(
-        matches!(phys, PhysicalPlan::Project { .. }),
-        "expected host PhysicalPlan::Project for TRIM(s), got {phys:?}"
+        matches!(phys, PhysicalPlan::StringProject { .. }),
+        "expected PhysicalPlan::StringProject for TRIM(s), got {phys:?}"
     );
 }
 

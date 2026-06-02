@@ -116,7 +116,7 @@ use crate::jit::hash_kernels::{
     AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::{
-    sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema,
+    sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema, TimeUnit,
 };
 use crate::plan::physical_plan::{ColumnIO, PhysicalPlan};
 
@@ -1839,9 +1839,127 @@ fn run_typed_agg(
             )?;
             Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        // F7-finish: Date32 normalises to an i32 grouped reduction. MIN/MAX
+        // preserve the date type — the result is rebuilt as a `Date32Array` by
+        // `pack_array` keyed on `out_field.dtype == Date32`. SUM over a date is
+        // meaningless and stays rejected. (COUNT(temporal) routes through the
+        // dedicated count path, not here.)
+        DataType::Date32 => {
+            if matches!(op, ReduceOp::Sum) {
+                return Err(BoltError::Type(format!(
+                    "SUM over Date32 is not supported (column '{}')",
+                    col_io.name
+                )));
+            }
+            let pa = arr
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Date32"))?;
+            let host: Vec<i32> =
+                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            debug_assert_eq!(host.len(), n);
+            let input_gpu = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<i32> = vec![identity_i32(op); k];
+            let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<i32>(
+                op,
+                DataType::Int32,
+                filtered.col(),
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                n,
+                k_u32,
+                stream,
+                None,
+            )?;
+            Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
+        }
+        // F7-finish: Timestamp normalises to an i64 grouped reduction. MIN/MAX
+        // preserve the unit + timezone — rebuilt as the concrete
+        // `Timestamp*Array` by `pack_array` keyed on `out_field.dtype`. SUM
+        // over a timestamp is meaningless and stays rejected.
+        DataType::Timestamp(_, _) => {
+            if matches!(op, ReduceOp::Sum) {
+                return Err(BoltError::Type(format!(
+                    "SUM over Timestamp is not supported (column '{}')",
+                    col_io.name
+                )));
+            }
+            let host: Vec<i64> =
+                collect_filtered_timestamp(arr.as_ref(), &col_io.name, key_valid, value_valid.as_deref())?;
+            debug_assert_eq!(host.len(), n);
+            let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<i64> = vec![identity_i64(op); k];
+            let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<i64>(
+                op,
+                DataType::Int64,
+                filtered.col(),
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                n,
+                k_u32,
+                stream,
+                None,
+            )?;
+            Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
+        }
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
+        ))),
+    }
+}
+
+/// F7-finish: NULL-filtered i64 tick extraction for a grouped MIN/MAX over a
+/// `Timestamp*Array`. Dispatches on the concrete Arrow timestamp unit and
+/// reuses [`collect_filtered_primitive`] (which drops rows where either the
+/// key or the value is NULL) per unit. Returns an owned `Vec<i64>` because the
+/// concrete array type differs per unit.
+fn collect_filtered_timestamp(
+    arr: &dyn arrow_array::Array,
+    name: &str,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+) -> BoltResult<Vec<i64>> {
+    use arrow_array::types::{
+        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType,
+    };
+    use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
+    macro_rules! collect_ts {
+        ($p:ty, $arr_ty:ty, $label:literal) => {{
+            let pa = arr
+                .as_any()
+                .downcast_ref::<$arr_ty>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            Ok(collect_filtered_primitive::<$p>(pa, key_valid, value_valid))
+        }};
+    }
+    match arr.data_type() {
+        ArrowDataType::Timestamp(ArrowTimeUnit::Second, _) => {
+            collect_ts!(TimestampSecondType, arrow_array::TimestampSecondArray, "TimestampSecond")
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, _) => collect_ts!(
+            TimestampMillisecondType,
+            arrow_array::TimestampMillisecondArray,
+            "TimestampMillisecond"
+        ),
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, _) => collect_ts!(
+            TimestampMicrosecondType,
+            arrow_array::TimestampMicrosecondArray,
+            "TimestampMicrosecond"
+        ),
+        ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, _) => collect_ts!(
+            TimestampNanosecondType,
+            arrow_array::TimestampNanosecondArray,
+            "TimestampNanosecond"
+        ),
+        other => Err(BoltError::Type(format!(
+            "GROUP BY aggregate input '{}' is not a Timestamp array: {:?}",
+            name, other
         ))),
     }
 }
@@ -2463,10 +2581,50 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
         )) as ArrayRef),
 
+        // F7-finish: MIN/MAX(Date32) reduced on the i32-normalized storage;
+        // rebuild a `Date32Array` so the grouped result preserves the date
+        // type (a plain `Int32Array` would silently downgrade it).
+        (Scalars::I32(v), DataType::Date32) => {
+            Ok(Arc::new(arrow_array::Date32Array::from(v)) as ArrayRef)
+        }
+        // F7-finish: MIN/MAX(Timestamp) reduced on the i64-normalized storage;
+        // rebuild the concrete `Timestamp*Array` matching the output unit and
+        // reattach its timezone so the unit + tz survive end-to-end.
+        (Scalars::I64(v), DataType::Timestamp(unit, tz)) => {
+            Ok(timestamp_array_from_i64(v, unit, tz))
+        }
+
         (_, dt) => Err(BoltError::Type(format!(
             "GROUP BY: cannot pack scalars into output dtype {:?}",
             dt
         ))),
+    }
+}
+
+/// F7-finish: build the concrete Arrow `Timestamp*Array` for a per-group i64
+/// tick buffer, dispatching on `TimeUnit` and reattaching the optional
+/// timezone. Mirror of `gpu_compact::timestamp_array_from_i64`, kept local so
+/// `pack_array` can rebuild the grouped MIN/MAX result with the correct unit +
+/// tz.
+fn timestamp_array_from_i64(
+    host: Vec<i64>,
+    unit: TimeUnit,
+    tz: Option<&'static str>,
+) -> ArrayRef {
+    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
+    match unit {
+        TimeUnit::Second => Arc::new(
+            arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
+        TimeUnit::Millisecond => Arc::new(
+            arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
+        TimeUnit::Microsecond => Arc::new(
+            arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
+        TimeUnit::Nanosecond => Arc::new(
+            arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned),
+        ) as ArrayRef,
     }
 }
 
@@ -2567,8 +2725,16 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
+///
+/// F7-finish: uses the MIN/MAX-temporal variant so a grouped
+/// `MIN`/`MAX`/`COUNT` over a `Date32`/`Timestamp` value column can build its
+/// temporal-typed output field (unit + tz carried through). Temporal GROUP BY
+/// *keys* are still rejected earlier in `build_key_arrays` (which runs before
+/// this schema build), and `SUM(temporal)` is rejected in `run_typed_agg`'s
+/// dtype dispatch — so the only temporal output fields that reach here are the
+/// supported aggregate reductions.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_minmax_temporal(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -3188,5 +3354,80 @@ mod tests {
             &other,
             BoltError::Other(msg) if msg.starts_with(PARTITION_REDUCE_SPILL_PREFIX)
         ));
+    }
+
+    // -------- F7-finish: grouped MIN/MAX(Date32 / Timestamp) rebuild --------
+
+    /// `pack_array` rebuilds a grouped `Date32` MIN/MAX result (reduced on the
+    /// i32-normalized accumulator) as a `Date32Array`.
+    #[test]
+    fn pack_array_rebuilds_date32() {
+        let arr = pack_array(DataType::Date32, Scalars::I32(vec![19_000, 19_010]))
+            .expect("date32 pack");
+        let d = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .expect("Date32Array");
+        assert_eq!(d.values(), &[19_000, 19_010]);
+    }
+
+    /// `pack_array` rebuilds a grouped `Timestamp(Microsecond, "UTC")` MIN/MAX
+    /// result preserving the unit + timezone.
+    #[test]
+    fn pack_array_rebuilds_timestamp_with_unit_and_tz() {
+        let tz = crate::plan::logical_plan::intern_timezone("UTC");
+        let arr = pack_array(
+            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
+            Scalars::I64(vec![100, 200]),
+        )
+        .expect("timestamp pack");
+        assert_eq!(
+            arr.data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(Arc::from("UTC"))
+            )
+        );
+        let t = arr
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecondArray");
+        assert_eq!(t.values(), &[100, 200]);
+    }
+
+    /// `timestamp_array_from_i64` round-trips ticks for each unit and reattaches
+    /// the timezone.
+    #[test]
+    fn timestamp_array_from_i64_dispatches_units() {
+        let tz = crate::plan::logical_plan::intern_timezone("UTC");
+        let sec = timestamp_array_from_i64(vec![1, 2], TimeUnit::Second, Some(tz));
+        assert_eq!(
+            sec.data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Second,
+                Some(Arc::from("UTC"))
+            )
+        );
+        let nano = timestamp_array_from_i64(vec![9], TimeUnit::Nanosecond, None);
+        assert_eq!(
+            nano.data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+        );
+    }
+
+    /// `collect_filtered_timestamp` extracts the i64 tick buffer, dropping rows
+    /// where the value is NULL (host-strip semantics shared with the numeric
+    /// grouped paths).
+    #[test]
+    fn collect_filtered_timestamp_drops_value_nulls() {
+        let arr: ArrayRef = Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
+            Some(10i64),
+            None,
+            Some(30),
+        ]));
+        let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
+        let out = collect_filtered_timestamp(arr.as_ref(), "ts", None, Some(&vv))
+            .expect("extract");
+        assert_eq!(out, vec![10, 30]);
     }
 }

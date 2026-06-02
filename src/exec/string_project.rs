@@ -51,7 +51,21 @@
 use arrow_array::StringArray;
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::ScalarFnKind;
+use crate::exec::expr_agg::{eval_expr, ColumnEnv, HostColumn};
+use crate::plan::logical_plan::{DataType, Expr, ScalarFnKind};
+
+/// Which end(s) a [`StringTransform::Trim`] strips ASCII/Unicode whitespace
+/// from. Mirrors [`crate::exec::string_ops_extended::TrimSide`] but is declared
+/// here so the [`StringTransform`] enum stays `Copy` and self-contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimMode {
+    /// Strip from BOTH ends (`TRIM`).
+    Both,
+    /// Strip from the START only (`LTRIM` / `TRIM(LEADING ...)`).
+    Leading,
+    /// Strip from the END only (`RTRIM` / `TRIM(TRAILING ...)`).
+    Trailing,
+}
 
 /// The variable-width string transform a [`crate::plan::physical_plan::PhysicalPlan::StringProject`]
 /// output applies. Mirrors the subset of [`ScalarFnKind`] that this executor
@@ -64,6 +78,27 @@ pub enum StringTransform {
     /// `LOWER(s)` — ASCII lower-case on the GPU; full Unicode on the host
     /// fallback.
     Lower,
+    /// `SUBSTRING(s FROM start [FOR length])` — character-indexed (1-based)
+    /// window. `length` is `None` when the SQL has no `FOR` clause (take to the
+    /// end of the string). Realised via the byte-identical host mirror
+    /// ([`crate::exec::string_ops_extended::substring_str`]); the GPU two-pass
+    /// SUBSTRING producer exists in [`crate::jit::string_kernel`] but is
+    /// unvalidated on hardware (like CONCAT), so this executor uses the host
+    /// path for correctness.
+    Substring {
+        /// 1-based character start position (as written in the SQL).
+        start: i32,
+        /// Character count to take, or `None` for "to the end of the string".
+        length: Option<i32>,
+    },
+    /// `TRIM`/`LTRIM`/`RTRIM(s)` — strip leading/trailing whitespace. Realised
+    /// via the host mirror ([`crate::exec::string_ops_extended::trim_str`],
+    /// full-Unicode whitespace). The GPU kernels trim only ASCII whitespace;
+    /// the host realisation is the supported path.
+    Trim {
+        /// Which end(s) to strip.
+        mode: TrimMode,
+    },
 }
 
 impl StringTransform {
@@ -73,15 +108,49 @@ impl StringTransform {
         match self {
             StringTransform::Upper => ScalarFnKind::Upper,
             StringTransform::Lower => ScalarFnKind::Lower,
+            StringTransform::Substring { .. } => ScalarFnKind::Substring,
+            StringTransform::Trim { mode } => match mode {
+                TrimMode::Both => ScalarFnKind::TrimBoth,
+                TrimMode::Leading => ScalarFnKind::TrimLeading,
+                TrimMode::Trailing => ScalarFnKind::TrimTrailing,
+            },
         }
     }
 
+    /// `true` when this transform is realised purely host-side (no GPU two-pass
+    /// launch wired into the executor): `SUBSTRING` / `TRIM`. The case-fold
+    /// transforms (`UPPER`/`LOWER`) drive the device kernels for ASCII data.
+    pub fn is_host_realized(self) -> bool {
+        matches!(
+            self,
+            StringTransform::Substring { .. } | StringTransform::Trim { .. }
+        )
+    }
+
     /// Apply the **full-Unicode** host transform to a single string (the host
-    /// fallback). Matches `str::to_uppercase` / `str::to_lowercase`.
+    /// fallback / realisation). For `UPPER`/`LOWER` this matches
+    /// `str::to_uppercase` / `str::to_lowercase`; for `SUBSTRING`/`TRIM` it
+    /// matches the host helpers in [`crate::exec::string_ops_extended`].
     pub fn apply_host(self, s: &str) -> String {
+        use crate::exec::string_ops_extended::{substring_str, trim_str, TrimSide};
         match self {
             StringTransform::Upper => s.to_uppercase(),
             StringTransform::Lower => s.to_lowercase(),
+            StringTransform::Substring { start, length } => {
+                // No `FOR` clause → take to the end. `substring_str` clamps a
+                // huge length to the string's character count, so i32::MAX is a
+                // safe "rest of string" sentinel matching the 2-arg SQL form.
+                let len = length.unwrap_or(i32::MAX);
+                substring_str(s, start, len)
+            }
+            StringTransform::Trim { mode } => {
+                let side = match mode {
+                    TrimMode::Both => TrimSide::Both,
+                    TrimMode::Leading => TrimSide::Leading,
+                    TrimMode::Trailing => TrimSide::Trailing,
+                };
+                trim_str(s, side, None)
+            }
         }
     }
 
@@ -94,6 +163,11 @@ impl StringTransform {
     ///
     /// Used by the host mirror of the GPU path ([`gpu_path_transform_pure`]) so
     /// the fallback-vs-GPU equivalence is unit-testable without a CUDA runtime.
+    ///
+    /// Only defined for the byte-wise case folds (`UPPER`/`LOWER`); the
+    /// variable-window transforms (`SUBSTRING`/`TRIM`) are realised whole-string
+    /// host-side and never reach the per-byte fold, so they panic here (a
+    /// programming error if ever called).
     pub fn apply_ascii_byte(self, b: u8) -> u8 {
         match self {
             StringTransform::Upper => {
@@ -109,6 +183,9 @@ impl StringTransform {
                 } else {
                     b
                 }
+            }
+            StringTransform::Substring { .. } | StringTransform::Trim { .. } => {
+                unreachable!("apply_ascii_byte is only valid for UPPER/LOWER")
             }
         }
     }
@@ -295,7 +372,10 @@ pub fn gpu_path_transform_pure(
     let mut out: Vec<Option<String>> = Vec::with_capacity(keys.len());
     for (row, &key) in keys.iter().enumerate() {
         let is_valid = validity.map(|v| v.get(row).copied().unwrap_or(false)).unwrap_or(true);
-        if !is_valid {
+        // Honor the slot-0 NULL sentinel even without an explicit validity slice,
+        // mirroring `host_transform_strings` so the two stay byte-for-byte equal.
+        let is_null_sentinel = matches!(layout, KeyLayout::OneBasedNullSlot0) && key == 0;
+        if !is_valid || is_null_sentinel {
             out.push(None);
             continue;
         }
@@ -327,7 +407,13 @@ pub fn host_transform_strings(
     let mut out: Vec<Option<String>> = Vec::with_capacity(keys.len());
     for (row, &key) in keys.iter().enumerate() {
         let is_valid = validity.map(|v| v.get(row).copied().unwrap_or(false)).unwrap_or(true);
-        if !is_valid {
+        // A row is SQL NULL if the explicit validity bit says so, OR (for the
+        // engine-managed Utf8 layout) the key is the slot-0 NULL sentinel. The
+        // latter makes NULL surface as Arrow NULL even when no separate validity
+        // slice is supplied (production always passes validity = key != 0, so
+        // this only matters for callers that rely on the sentinel alone).
+        let is_null_sentinel = matches!(layout, KeyLayout::OneBasedNullSlot0) && key == 0;
+        if !is_valid || is_null_sentinel {
             out.push(None);
             continue;
         }
@@ -532,6 +618,111 @@ pub fn build_concat_input(
 /// containing a non-ASCII byte to the host fallback.
 pub fn dict_is_ascii(dict: &[String]) -> bool {
     dict.iter().all(|s| s.is_ascii())
+}
+
+// ---------------------------------------------------------------------------
+// F11: host-evaluated CASE with a Utf8 result.
+//
+// A `CASE WHEN c1 THEN v1 [WHEN c2 THEN v2 ...] [ELSE ve] END` whose result
+// type is `Utf8` selects a per-row string. Full on-device variable-width CASE
+// is hard (no Utf8 register class / heap ABI), so we evaluate it host-side over
+// the decoded source columns, honouring SQL CASE 3VL:
+//
+//   * Branches are tested in order; the FIRST branch whose condition is TRUE
+//     wins. A condition that is FALSE *or* NULL (SQL UNKNOWN) does NOT fire —
+//     the row falls through to the next branch (and ultimately to ELSE / NULL).
+//   * With no ELSE, an unmatched row is SQL NULL.
+//   * The selected THEN/ELSE value is itself an expression; its own value
+//     (including NULL) is what the row takes once its branch is chosen.
+//
+// Each WHEN condition and each THEN/ELSE value is evaluated with the existing
+// host evaluator (`expr_agg::eval_expr`), so any non-CASE sub-expression it
+// supports (column refs, string/numeric comparisons, LIKE, literals, CONCAT/
+// SUBSTRING/TRIM-free arithmetic, ...) works. A branch value that does not
+// evaluate to Utf8, or a nested CASE the evaluator rejects, surfaces as an
+// error (the lowering keeps such shapes off this path where it can).
+// ---------------------------------------------------------------------------
+
+/// Evaluate a `Utf8`-result `CASE` expression host-side into a [`StringArray`]
+/// of `n_rows` rows, honouring SQL CASE 3VL (a NULL condition behaves like
+/// FALSE — the row falls through to the next branch / ELSE / NULL).
+///
+/// `branches` are the `(WHEN condition, THEN value)` pairs in source order;
+/// `else_branch` is the optional `ELSE value` (SQL NULL when `None`). `env` is a
+/// [`ColumnEnv`] over the decoded source columns (built by the caller from the
+/// host source batch). Each condition must evaluate to `Bool`; each THEN/ELSE
+/// value must evaluate to `Utf8`.
+pub fn eval_case_utf8(
+    branches: &[(Expr, Expr)],
+    else_branch: Option<&Expr>,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+) -> BoltResult<StringArray> {
+    // Evaluate every WHEN condition (Bool) and THEN value (Utf8) up front, plus
+    // the ELSE value if present. Column-major evaluation reuses the existing
+    // vectorised host evaluator; we then combine row-by-row.
+    let mut conds: Vec<Vec<Option<bool>>> = Vec::with_capacity(branches.len());
+    let mut thens: Vec<Vec<Option<String>>> = Vec::with_capacity(branches.len());
+    for (when, then) in branches {
+        let cond = eval_expr(when, env, DataType::Bool, n_rows)?;
+        let cond_vec = match cond {
+            HostColumn::Bool(v) => v,
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "CASE(Utf8): WHEN condition must be Bool, got {:?}",
+                    other.dtype()
+                )))
+            }
+        };
+        let then_col = eval_expr(then, env, DataType::Utf8, n_rows)?;
+        let then_vec = match then_col {
+            HostColumn::Utf8(v) => v,
+            other => {
+                return Err(BoltError::Plan(format!(
+                    "CASE(Utf8): THEN value must be Utf8, got {:?}",
+                    other.dtype()
+                )))
+            }
+        };
+        conds.push(cond_vec);
+        thens.push(then_vec);
+    }
+    let else_vec: Option<Vec<Option<String>>> = match else_branch {
+        None => None,
+        Some(e) => {
+            let col = eval_expr(e, env, DataType::Utf8, n_rows)?;
+            match col {
+                HostColumn::Utf8(v) => Some(v),
+                other => {
+                    return Err(BoltError::Plan(format!(
+                        "CASE(Utf8): ELSE value must be Utf8, got {:?}",
+                        other.dtype()
+                    )))
+                }
+            }
+        }
+    };
+
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let mut chosen: Option<String> = None;
+        let mut matched = false;
+        for (b, cond) in conds.iter().enumerate() {
+            // SQL 3VL: only a TRUE condition fires; FALSE and NULL fall through.
+            if cond.get(row).copied().flatten() == Some(true) {
+                chosen = thens[b].get(row).cloned().flatten();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            chosen = else_vec
+                .as_ref()
+                .and_then(|v| v.get(row).cloned().flatten());
+        }
+        out.push(chosen);
+    }
+    Ok(StringArray::from(out))
 }
 
 #[cfg(test)]
@@ -830,6 +1021,226 @@ mod tests {
         let b = concat_input(&[Some("x")]);
         let err = concat_row_lens(&[a, b]).unwrap_err();
         assert!(format!("{err}").contains("n_rows mismatch"), "{err}");
+    }
+
+    // ---- SUBSTRING / TRIM host realisation (F9) --------------------------
+
+    #[test]
+    fn substring_host_three_arg_over_dict() {
+        // dict ["hello","world"]; 1-based keys, 0 = NULL.
+        // SUBSTRING(s, 2, 3): "hello"->"ell", "world"->"orl", NULL->NULL.
+        let dict = owned(&["hello", "world"]);
+        let keys = vec![1i32, 2, 0];
+        let t = StringTransform::Substring { start: 2, length: Some(3) };
+        let arr =
+            host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
+        assert_eq!(
+            collect(&arr),
+            vec![Some("ell".to_string()), Some("orl".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn substring_host_no_for_goes_to_end() {
+        // SUBSTRING(s FROM 3) (length = None) takes to the end of the string.
+        let dict = owned(&["hello"]);
+        let keys = vec![1i32];
+        let t = StringTransform::Substring { start: 3, length: None };
+        let arr =
+            host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
+        assert_eq!(collect(&arr), vec![Some("llo".to_string())]);
+    }
+
+    #[test]
+    fn substring_host_unicode_char_indexed() {
+        // "héllo" is 5 CHARACTERS; SUBSTRING(2,1) is the single char 'é'.
+        let dict = owned(&["héllo"]);
+        let keys = vec![1i32];
+        let t = StringTransform::Substring { start: 2, length: Some(1) };
+        let arr =
+            host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
+        assert_eq!(collect(&arr), vec![Some("é".to_string())]);
+    }
+
+    #[test]
+    fn trim_host_modes_and_nulls() {
+        // dict ["  hi  ", "x"]; 1-based keys, NULL row.
+        let dict = owned(&["  hi  ", "x"]);
+        let keys = vec![1i32, 2, 0];
+        for (mode, expected_first) in [
+            (TrimMode::Both, "hi"),
+            (TrimMode::Leading, "hi  "),
+            (TrimMode::Trailing, "  hi"),
+        ] {
+            let t = StringTransform::Trim { mode };
+            let arr =
+                host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
+                    .unwrap();
+            assert_eq!(
+                collect(&arr),
+                vec![Some(expected_first.to_string()), Some("x".to_string()), None],
+                "trim mode {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_host_full_unicode_whitespace() {
+        // The host realisation uses full-Unicode whitespace (str::trim), so a
+        // non-ASCII whitespace codepoint is stripped — the supported behaviour
+        // (the ASCII-only GPU kernels are not used on this path).
+        let nbsp = "\u{2009}go\u{2009}"; // U+2009 THIN SPACE on both ends
+        let dict = owned(&[nbsp]);
+        let keys = vec![1i32];
+        let t = StringTransform::Trim { mode: TrimMode::Both };
+        let arr =
+            host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
+        assert_eq!(collect(&arr), vec![Some("go".to_string())]);
+    }
+
+    #[test]
+    fn substring_trim_scalar_fn_kind_mapping() {
+        use crate::plan::logical_plan::ScalarFnKind;
+        assert_eq!(
+            StringTransform::Substring { start: 1, length: Some(2) }.scalar_fn_kind(),
+            ScalarFnKind::Substring
+        );
+        assert_eq!(
+            StringTransform::Trim { mode: TrimMode::Both }.scalar_fn_kind(),
+            ScalarFnKind::TrimBoth
+        );
+        assert_eq!(
+            StringTransform::Trim { mode: TrimMode::Leading }.scalar_fn_kind(),
+            ScalarFnKind::TrimLeading
+        );
+        assert_eq!(
+            StringTransform::Trim { mode: TrimMode::Trailing }.scalar_fn_kind(),
+            ScalarFnKind::TrimTrailing
+        );
+        assert!(StringTransform::Substring { start: 1, length: None }.is_host_realized());
+        assert!(StringTransform::Trim { mode: TrimMode::Both }.is_host_realized());
+        assert!(!StringTransform::Upper.is_host_realized());
+    }
+
+    #[test]
+    fn substring_trim_kinds_have_compilable_kernels() {
+        // PTX-shape wiring check: every kind a SUBSTRING/TRIM StringTransform
+        // maps to has a two-pass producer that compiles (the executor uses the
+        // host mirror today, but the kernels back the same `ScalarFnKind` and
+        // must stay in sync with the enum mapping).
+        use crate::jit::string_kernel::{
+            compile_varwidth_len_pass, compile_varwidth_write_pass, len_pass_entry,
+            write_pass_entry,
+        };
+        for t in [
+            StringTransform::Substring { start: 1, length: Some(2) },
+            StringTransform::Substring { start: 2, length: None },
+            StringTransform::Trim { mode: TrimMode::Both },
+            StringTransform::Trim { mode: TrimMode::Leading },
+            StringTransform::Trim { mode: TrimMode::Trailing },
+        ] {
+            let kind = t.scalar_fn_kind();
+            let len_ptx = compile_varwidth_len_pass(kind).expect("len pass compiles");
+            let write_ptx = compile_varwidth_write_pass(kind).expect("write pass compiles");
+            assert!(len_ptx.contains(&len_pass_entry(kind).unwrap()));
+            assert!(write_ptx.contains(&write_pass_entry(kind).unwrap()));
+        }
+    }
+
+    // ---- CASE over Utf8 host evaluation (F11) ----------------------------
+
+    fn env_of<'a>(
+        cols: &'a [(&str, &'a HostColumn)],
+    ) -> crate::exec::expr_agg::ColumnEnv<'a> {
+        cols.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn case_utf8_selects_then_else_with_nulls() {
+        use crate::plan::logical_plan::{BinaryOp, Expr, Literal};
+        // grade column: scores 90, 50, NULL.
+        // CASE WHEN score >= 80 THEN 'A' ELSE 'B' END.
+        let score = HostColumn::I64(vec![Some(90), Some(50), None]);
+        let cols = [("score", &score)];
+        let env = env_of(&cols);
+        let when = Expr::Binary {
+            op: BinaryOp::GtEq,
+            left: Box::new(Expr::Column("score".into())),
+            right: Box::new(Expr::Literal(Literal::Int64(80))),
+        };
+        let then = Expr::Literal(Literal::Utf8("A".into()));
+        let els = Expr::Literal(Literal::Utf8("B".into()));
+        let arr = eval_case_utf8(&[(when, then)], Some(&els), &env, 3).unwrap();
+        // Row 0: 90>=80 → 'A'. Row 1: 50>=80 false → 'B'. Row 2: NULL>=80 is
+        // UNKNOWN → falls through to ELSE → 'B' (the ELSE value is not NULL).
+        assert_eq!(
+            collect(&arr),
+            vec![Some("A".to_string()), Some("B".to_string()), Some("B".to_string())]
+        );
+    }
+
+    #[test]
+    fn case_utf8_no_else_unmatched_is_null() {
+        use crate::plan::logical_plan::{BinaryOp, Expr, Literal};
+        let x = HostColumn::I32(vec![Some(1), Some(2)]);
+        let cols = [("x", &x)];
+        let env = env_of(&cols);
+        // CASE WHEN x = 1 THEN 'one' END  (no ELSE → NULL for unmatched).
+        let when = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("x".into())),
+            right: Box::new(Expr::Literal(Literal::Int32(1))),
+        };
+        let then = Expr::Literal(Literal::Utf8("one".into()));
+        let arr = eval_case_utf8(&[(when, then)], None, &env, 2).unwrap();
+        assert_eq!(collect(&arr), vec![Some("one".to_string()), None]);
+    }
+
+    #[test]
+    fn case_utf8_then_value_is_a_column() {
+        use crate::plan::logical_plan::{Expr, Literal};
+        // CASE WHEN flag THEN name ELSE 'none' END, name has a NULL row.
+        let flag = HostColumn::Bool(vec![Some(true), Some(true), Some(false)]);
+        let name = HostColumn::Utf8(vec![Some("ann".into()), None, Some("ignored".into())]);
+        let cols = [("flag", &flag), ("name", &name)];
+        let env = env_of(&cols);
+        let when = Expr::Column("flag".into());
+        let then = Expr::Column("name".into());
+        let els = Expr::Literal(Literal::Utf8("none".into()));
+        let arr = eval_case_utf8(&[(when, then)], Some(&els), &env, 3).unwrap();
+        // Row0: flag true → name 'ann'. Row1: flag true → name is NULL → the
+        // chosen value is that NULL (the branch fired). Row2: flag false → ELSE.
+        assert_eq!(
+            collect(&arr),
+            vec![Some("ann".to_string()), None, Some("none".to_string())]
+        );
+    }
+
+    #[test]
+    fn case_utf8_first_true_branch_wins() {
+        use crate::plan::logical_plan::{BinaryOp, Expr, Literal};
+        // Two overlapping branches; the first TRUE one must win.
+        let x = HostColumn::I32(vec![Some(5)]);
+        let cols = [("x", &x)];
+        let env = env_of(&cols);
+        let b1 = (
+            Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(0))),
+            },
+            Expr::Literal(Literal::Utf8("pos".into())),
+        );
+        let b2 = (
+            Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("x".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(3))),
+            },
+            Expr::Literal(Literal::Utf8("big".into())),
+        );
+        let arr = eval_case_utf8(&[b1, b2], None, &env, 1).unwrap();
+        assert_eq!(collect(&arr), vec![Some("pos".to_string())]);
     }
 
     #[test]

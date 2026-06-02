@@ -3303,8 +3303,9 @@ mod scalar_string_fn_substrate_tests {
             );
         }
 
-        // ---- Now-SUPPORTED via host fallback: SUBSTRING / TRIM route to a
-        // host-side `PhysicalPlan::Project` (no Err — `all_scalar_fns_host_evaluable`). ----
+        // ---- Now-SUPPORTED (F9): SUBSTRING(col, lit, lit) and single-arg
+        // TRIM(col) over a bare Utf8 scan lower to `PhysicalPlan::StringProject`
+        // (host-realized two-pass producer), no longer a plain host Project. ----
         {
             let plan = project(Expr::ScalarFn {
                 kind: ScalarFnKind::Substring,
@@ -3314,11 +3315,10 @@ mod scalar_string_fn_substrate_tests {
                     Expr::Literal(Literal::Int64(2)),
                 ],
             });
-            let phys = lower(&plan)
-                .expect("SUBSTRING should route to a host-side Project now (not an Err)");
+            let phys = lower(&plan).expect("SUBSTRING(col, lit, lit) should lower (not an Err)");
             assert!(
-                matches!(phys, PhysicalPlan::Project { .. }),
-                "SUBSTRING should route to a host-side PhysicalPlan::Project; got: {phys:?}"
+                matches!(phys, PhysicalPlan::StringProject { .. }),
+                "SUBSTRING should lower to PhysicalPlan::StringProject; got: {phys:?}"
             );
         }
         {
@@ -3326,11 +3326,10 @@ mod scalar_string_fn_substrate_tests {
                 kind: ScalarFnKind::TrimBoth,
                 args: vec![s_col.clone()],
             });
-            let phys =
-                lower(&plan).expect("TRIM should route to a host-side Project now (not an Err)");
+            let phys = lower(&plan).expect("TRIM(col) should lower (not an Err)");
             assert!(
-                matches!(phys, PhysicalPlan::Project { .. }),
-                "TRIM should route to a host-side PhysicalPlan::Project; got: {phys:?}"
+                matches!(phys, PhysicalPlan::StringProject { .. }),
+                "single-arg TRIM should lower to PhysicalPlan::StringProject; got: {phys:?}"
             );
         }
 

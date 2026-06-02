@@ -3304,6 +3304,11 @@ impl Engine {
         let src_schema = src_batch.schema();
         let n_rows = src_batch.num_rows();
 
+        // Lazily-built host env (decoded source columns as `HostColumn`s) for
+        // the `CaseUtf8` output path; `None` until the first CASE forces the
+        // lift. Mirrors the `PhysicalPlan::Project` compute path in `execute`.
+        let mut owned_env: Option<Vec<(String, crate::exec::expr_agg::HostColumn)>> = None;
+
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(outputs.len());
         for out in outputs {
             match out {
@@ -3341,6 +3346,52 @@ impl Engine {
                 StringProjectOutput::Concat { sources } => {
                     arrays.push(self.string_concat_column(table, sources, n_rows)?);
                 }
+                StringProjectOutput::CaseUtf8 {
+                    branches,
+                    else_branch,
+                } => {
+                    // Build the host env (decoded source columns) once, lazily.
+                    // Dictionary-encoded Utf8 columns are decoded to a plain
+                    // Utf8 array first (`arrow_array_to_host_column` has no
+                    // Dictionary arm), mirroring the Passthrough decode above.
+                    if owned_env.is_none() {
+                        let mut v = Vec::with_capacity(src_batch.num_columns());
+                        for (i, field) in src_schema.fields().iter().enumerate() {
+                            let arr = src_batch.column(i);
+                            let decoded: ArrayRef = if matches!(
+                                arr.data_type(),
+                                ArrowDataType::Dictionary(_, _)
+                            ) {
+                                arrow::compute::cast(arr.as_ref(), &ArrowDataType::Utf8)
+                                    .map_err(|e| {
+                                        BoltError::Other(format!(
+                                            "StringProject(CaseUtf8): decode dictionary \
+                                             '{}' to Utf8 failed: {e}",
+                                            field.name()
+                                        ))
+                                    })?
+                            } else {
+                                arr.clone()
+                            };
+                            let hc = crate::exec::filter::arrow_array_to_host_column(
+                                decoded.as_ref(),
+                                n_rows,
+                            )?;
+                            v.push((field.name().clone(), hc));
+                        }
+                        owned_env = Some(v);
+                    }
+                    let env_ref = owned_env.as_ref().expect("just built");
+                    let env: crate::exec::expr_agg::ColumnEnv<'_> =
+                        env_ref.iter().map(|(n, c)| (n.clone(), c)).collect();
+                    let arr = crate::exec::string_project::eval_case_utf8(
+                        branches,
+                        else_branch.as_deref(),
+                        &env,
+                        n_rows,
+                    )?;
+                    arrays.push(Arc::new(arr) as ArrayRef);
+                }
             }
         }
 
@@ -3353,9 +3404,16 @@ impl Engine {
         Ok(QueryHandle { batch: batch_out })
     }
 
-    /// Compute `UPPER`/`LOWER(<source>)` for the GPU-resident `Utf8` column
+    /// Compute a [`StringTransform`](crate::exec::string_project::StringTransform)
+    /// — `UPPER`/`LOWER`/`SUBSTRING`/`TRIM` — of the GPU-resident `Utf8` column
     /// `source` of `table`, returning a `Utf8` `ArrayRef` of `n_rows` rows.
     ///
+    /// `SUBSTRING`/`TRIM` are realised via the byte-identical host mirror
+    /// ([`crate::exec::string_project::host_transform_strings`]) regardless of
+    /// the dictionary contents — their GPU two-pass producers exist but are
+    /// unvalidated on hardware (matching the CONCAT path).
+    ///
+    /// For `UPPER`/`LOWER`:
     /// GPU path (ASCII dictionaries): materialise a row-aligned offsets+bytes
     /// input from the column's dictionary + device keys, upload, run the length
     /// pass → host exclusive scan of `row_lens` → allocate output bytes → run
@@ -3427,6 +3485,18 @@ impl Engine {
 
         check_len(keys_host.len(), n_rows)?;
         let validity_slice = validity.as_deref();
+
+        // SUBSTRING / TRIM are realised host-side (byte-identical to the host
+        // helpers in `string_ops_extended`). The GPU two-pass producers for
+        // these exist in `jit::string_kernel` and are PTX-shape-tested, but are
+        // unvalidated on hardware (like CONCAT / LIKE), so we take the
+        // correctness-guaranteed host path here. Results are identical either
+        // way; wiring the device launch is a follow-up.
+        if transform.is_host_realized() {
+            let arr =
+                host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
+            return Ok(Arc::new(arr) as ArrayRef);
+        }
 
         // Host fallback for non-ASCII dictionaries: the byte-wise GPU fold is
         // only correct for ASCII (Unicode case mapping can change byte length).

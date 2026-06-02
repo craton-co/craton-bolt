@@ -7591,21 +7591,31 @@ mod string_fn_tests {
     }
 
     #[test]
-    fn substring_and_trim_lower_to_host_project() {
-        // Both functions have no GPU producer; they must lower to the
-        // host-side PhysicalPlan::Project (not be rejected).
-        for sql in [
+    fn substring_and_trim_lower_to_string_project() {
+        // F9: SUBSTRING(col, lit, lit) and single-arg TRIM(col) over a bare
+        // Utf8 scan now lower to PhysicalPlan::StringProject (host-realized
+        // two-pass producer). A custom-chars TRIM (`TRIM(<chars> FROM col)`)
+        // is still out of scope and falls back to the host PhysicalPlan::Project.
+        let string_project_cases = [
             "SELECT SUBSTRING(s, 2, 3) FROM t",
             "SELECT TRIM(s) FROM t",
-            "SELECT TRIM(TRAILING '-' FROM s) FROM t",
-        ] {
+        ];
+        for sql in string_project_cases {
             let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
             let phys = lower(&plan).unwrap_or_else(|e| panic!("lower {sql}: {e}"));
             assert!(
-                matches!(phys, PhysicalPlan::Project { .. }),
-                "expected host PhysicalPlan::Project for {sql}, got {phys:?}"
+                matches!(phys, PhysicalPlan::StringProject { .. }),
+                "expected PhysicalPlan::StringProject for {sql}, got {phys:?}"
             );
         }
+        // Custom-chars TRIM stays on the host Project fallback (not rejected).
+        let sql = "SELECT TRIM(TRAILING '-' FROM s) FROM t";
+        let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let phys = lower(&plan).unwrap_or_else(|e| panic!("lower {sql}: {e}"));
+        assert!(
+            matches!(phys, PhysicalPlan::Project { .. }),
+            "expected host PhysicalPlan::Project for {sql}, got {phys:?}"
+        );
     }
 
     #[test]

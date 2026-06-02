@@ -338,14 +338,14 @@ fn case_in_scan_chain_select_lowers_successfully() {
     lower_physical(&plan).expect("physical lowering must accept CASE in scan-chain SELECT");
 }
 
-/// CASE over Utf8 branches is still rejected at the codegen boundary —
-/// the v0.7 envelope is numeric / Bool only. The error message must be
-/// tighter than the legacy "CASE not yet lowered to GPU" so the user
-/// knows the path forward (e.g. host-side projection of strings).
+/// F11: a Utf8-result CASE over a bare scan now lowers to a host-realized
+/// `PhysicalPlan::StringProject` (the `CaseUtf8` output evaluates the CASE
+/// host-side) instead of being rejected at the codegen boundary.
 #[test]
-fn case_over_strings_rejected_with_tighter_message() {
+fn case_over_strings_lowers_to_string_project() {
+    use craton_bolt::plan::PhysicalPlan;
     // Build a fixture with a Utf8 column so a CASE over it survives the
-    // type-checker and reaches the GPU codegen, which then rejects it.
+    // type-checker and reaches lowering.
     let schema = Schema::new(vec![
         Field {
             name: "x".into(),
@@ -361,12 +361,9 @@ fn case_over_strings_rejected_with_tighter_message() {
     let provider = MemTableProvider::new().with_table("t", schema);
     let sql = "SELECT CASE WHEN x > 0 THEN name ELSE name END AS s FROM t";
     let plan = parse_sql(sql, &provider).expect("parse must succeed");
-    let err = lower_physical(&plan).expect_err("CASE over Utf8 must still be rejected");
-    let msg = format!("{err}");
+    let phys = lower_physical(&plan).expect("CASE over Utf8 now lowers (host-realized)");
     assert!(
-        msg.contains("CASE over string")
-            || msg.contains("string (Utf8)")
-            || msg.contains("Utf8"),
-        "rejection should mention strings/Utf8 explicitly, got: {msg}"
+        matches!(phys, PhysicalPlan::StringProject { .. }),
+        "expected PhysicalPlan::StringProject for a Utf8 CASE, got {phys:?}"
     );
 }
