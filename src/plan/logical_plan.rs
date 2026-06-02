@@ -2390,6 +2390,9 @@ pub enum LogicalPlan {
     /// SQL UNION ALL — concatenation without dedup. UNION (with dedup) is
     /// parsed and lowered to `Distinct(Union { ... })`. All inputs must share
     /// the same schema; the result schema is the first input's schema.
+    /// Mismatched-but-compatible branch column types are reconciled to a
+    /// common supertype by the SQL frontend (`coerce_set_op_branches`) before
+    /// this node is built, so all inputs already agree per column here.
     Union {
         /// Branches to concatenate, in source order.
         inputs: Vec<LogicalPlan>,
@@ -2397,8 +2400,12 @@ pub enum LogicalPlan {
     /// SQL `EXCEPT` / `INTERSECT` (with optional `ALL`). `left` and `right`
     /// must share a compatible schema (same field count + per-field dtypes,
     /// the same rule [`LogicalPlan::Union`] enforces); the result schema is
-    /// the left input's. The dedup-vs-multiset semantics are chosen by
-    /// `all`:
+    /// the left input's. Mismatched-but-compatible branch column types
+    /// (e.g. `Int32` vs `Int64`, `Int` vs `Float`) are reconciled to a common
+    /// supertype by the SQL frontend (`coerce_set_op_branches`) before this
+    /// node is built, so by the time the plan reaches here the two branches
+    /// already agree per column. The dedup-vs-multiset semantics are chosen
+    /// by `all`:
     ///
     /// * `all == false` (plain `EXCEPT` / `INTERSECT`) — the result is a
     ///   *set*: each surviving row appears at most once.

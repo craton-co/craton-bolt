@@ -36,6 +36,27 @@ fn main() {
     // See docs/JIT_PIPELINE.md for the rust-cuda build hook and stub pattern.
     compile_rust_cuda_kernels();
 
+    // --- GRACEFUL DEGRADATION CONTRACT (GPU-less hosts) -----------------
+    //
+    // This build script NEVER hard-fails (panics / nonzero exit) because a
+    // CUDA toolkit is absent. Two distinct cases are both made to succeed on
+    // a GPU-less host so `cargo package`, docs.rs, and cuda-stub/type-check
+    // CI all work:
+    //
+    //   1. cuda-stub feature ON  -> skip CUDA discovery entirely and return
+    //      below. No `-L` search paths are needed because the stub does not
+    //      link the real driver. (Engine::new returns Err at runtime.)
+    //   2. real build, no toolkit -> CUDA discovery below finds no lib dir
+    //      and emits actionable `cargo:warning=` lines, then RETURNS normally
+    //      (see the `!cuda_lib_found` block). The build proceeds; only a real
+    //      link step (which a GPU-less `cargo package`/`cargo check` does not
+    //      reach) would later fail, with the warning already pointing at the
+    //      cuda-stub escape hatch.
+    //
+    // The only `expect()`/panic paths in this file are gated behind
+    // `--features rust-cuda` (cuda_builder) or read OUT_DIR (always set by
+    // Cargo); none are reachable on a default/cuda-stub GPU-less build.
+    //
     // Skip CUDA discovery when building with the `cuda-stub` feature
     // (e.g. on docs.rs or CUDA-less hosts).
     if std::env::var_os("CARGO_FEATURE_CUDA_STUB").is_some() {

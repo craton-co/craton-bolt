@@ -165,6 +165,20 @@ These are real, code-level behaviors to be aware of:
   `TODO(null)`). This diverges from standard SQL and from DuckDB (both of
   which return `NULL`). Intentional for now; tracked as the `TODO(null)`
   follow-up.
+- **GPU string device path is host-validated only (opt-in, off by default).**
+  The GPU string device kernels — the non-dictionary `LIKE` matcher
+  (`StringLikeFilter` / `compile_like_match_kernel`) and the `UPPER` / `LOWER`
+  / `CONCAT` / `SUBSTRING` / `TRIM` two-pass `StringProject` producers — are
+  implemented and PTX-shape-tested but have **never been executed on GPU
+  hardware** as of v0.7.0 (CI builds with no CUDA device). They are therefore
+  **HOST-VALIDATED ONLY** and **not enabled by default**: the byte-identical
+  **host** path is the correctness path and is selected by default, and the
+  device kernels are reached only when the opt-in `BOLT_GPU_STRING` env var is
+  set (default OFF — see [`docs/ENV_VARS.md`](ENV_VARS.md)). Dictionary
+  `Utf8` `LIKE` / equality / ordering predicates are unaffected: they fold to
+  pure-integer index-membership predicates that run on the GPU and are not part
+  of this string-device gate. (`LENGTH` likewise rides the integer-output
+  `StringLength` path, not a string producer.)
 - **String handling is dictionary/ASCII-oriented.** String predicates operate
   over dictionary-encoded literals, and the GPU case-folding functions
   (`UPPER` / `LOWER`) are byte/ASCII-oriented — treat non-ASCII / multi-byte

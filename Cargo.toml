@@ -107,11 +107,17 @@ cuda-stub = []
 # context were freed against the other at teardown. See
 # `CudaContext::new` in `src/cuda/cuda_sys.rs`.
 cudarc = ["dep:cudarc"]
-# `rust-cuda` (experimental): switches `partition_kernel.rs`'s PTX source
-# from the hand-rolled string emitter to a Rust-source kernel compiled at
-# build time via `cuda_builder` (rustc_codegen_nvvm). Requires the rust-cuda
-# toolchain installed (nightly + libNVVM + LLVM, see kernels/rust-toolchain.toml).
-# Default build remains hand-emit. See `docs/JIT_PIPELINE.md` for background.
+# `rust-cuda` (EXPERIMENTAL — DOES NOT BUILD YET): would switch
+# `partition_kernel.rs`'s PTX source from the hand-rolled string emitter to a
+# Rust-source kernel compiled at build time via `cuda_builder`
+# (rustc_codegen_nvvm). This feature CANNOT currently be built: the crates.io
+# `cuda_builder = "0.3"` build-dep resolves to the stale Feb-2022 0.3.0 release,
+# which is incompatible with the nightly + cuda_std git-rev toolchain the
+# `kernels/` crate targets (see `kernels/rust-toolchain.toml`). It is OFF by
+# default and left wired only as a spike placeholder — enabling it
+# (`--features rust-cuda`) will fail to compile until the build-dep is realigned
+# with the kernels toolchain. Default build remains hand-emit. See
+# `docs/JIT_PIPELINE.md` and `kernels/rust-toolchain.toml` for background.
 rust-cuda = ["dep:cuda_builder"]
 # `pool-sharded` (Stage-3 escape hatch): swaps the `DeviceMemPool::buckets`
 # field from a `DashMap<usize, Mutex<BucketEntry>>` to a fixed-size
@@ -139,6 +145,13 @@ pool-watcher = []
 # backend. Optional + feature-gated so default builds (which do NOT have
 # the rust-cuda toolchain) ignore the dep entirely. Pulled in only when
 # `--features rust-cuda` is on.
+#
+# WARNING: this pin is EXPERIMENTAL and DOES NOT BUILD. `version = "0.3"`
+# resolves to the stale Feb-2022 `cuda_builder` 0.3.0 on crates.io, which is
+# incompatible with the nightly + cuda_std git-rev toolchain the `kernels/`
+# crate targets (see `kernels/rust-toolchain.toml`). The `rust-cuda` feature is
+# OFF by default for this reason; realigning this dep with the kernels toolchain
+# is tracked work. See `docs/JIT_PIPELINE.md` and `kernels/rust-toolchain.toml`.
 cuda_builder = { version = "0.3", optional = true }
 
 [[bench]]

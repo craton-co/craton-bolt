@@ -458,3 +458,157 @@ impl<T: bytemuck::Pod> StagedDownload<T> {
         self.pinned.as_slice().to_vec()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host-only tests for the Decimal128 download reassembly + the
+    //! length-mismatch guard. None of these touch CUDA: the device-buffer
+    //! download is split so the i128 reconstruction + validity decode live
+    //! in `decimal128_from_interleaved`, a pure function over `&[u64]` /
+    //! `Option<&[u8]>` that we exercise directly. (`copy_back` and the
+    //! `GpuVec` variants require a live device and are covered elsewhere.)
+
+    use super::*;
+    use arrow_array::Array;
+
+    /// Build the interleaved `[lo0, hi0, lo1, hi1, ...]` u64 buffer from a
+    /// slice of i128 row values (matching what `Op::Store128` writes).
+    fn interleave(rows: &[i128]) -> Vec<u64> {
+        let mut out = Vec::with_capacity(rows.len() * 2);
+        for &v in rows {
+            let bits = v as u128;
+            out.push(bits as u64); // lo
+            out.push((bits >> 64) as u64); // hi
+        }
+        out
+    }
+
+    /// Pack a per-row validity bool slice into the Arrow-LE lsb-first bitmap
+    /// (one bit per row, bit `row % 8` of byte `row / 8`).
+    fn pack_mask(valid: &[bool]) -> Vec<u8> {
+        let mut bytes = vec![0u8; valid.len().div_ceil(8)];
+        for (row, &v) in valid.iter().enumerate() {
+            if v {
+                bytes[row / 8] |= 1 << (row % 8);
+            }
+        }
+        bytes
+    }
+
+    /// Round-trip a handful of positive values with no validity mask: every
+    /// row is valid and reconstructs to its original i128.
+    #[test]
+    fn positive_values_round_trip() {
+        let rows = [0i128, 1, 42, 1_000_000_000_000i128];
+        let host = interleave(&rows);
+        let arr = decimal128_from_interleaved(&host, rows.len(), None, 38, 0, "test").unwrap();
+        assert_eq!(arr.len(), rows.len());
+        assert_eq!(arr.null_count(), 0);
+        for (i, &want) in rows.iter().enumerate() {
+            assert_eq!(arr.value(i), want, "row {i}");
+        }
+    }
+
+    /// The sign-preservation guard: a NEGATIVE i128 packs its sign bits into
+    /// the high u64 half; reconstructing via `lo | (hi << 64)` then `as i128`
+    /// must recover the original negative value, not a huge positive one.
+    #[test]
+    fn negative_values_preserve_sign() {
+        let rows = [
+            -1i128,
+            -42,
+            i128::MIN,
+            -170_141_183_460_469_231_731i128,
+        ];
+        let host = interleave(&rows);
+        let arr = decimal128_from_interleaved(&host, rows.len(), None, 38, 0, "test").unwrap();
+        for (i, &want) in rows.iter().enumerate() {
+            assert_eq!(arr.value(i), want, "negative row {i} must keep its sign");
+        }
+    }
+
+    /// Validity decode: a row whose validity bit is 0 must become an Arrow
+    /// NULL — NOT `Some(0)`. This is the Decimal128 NULL fix: a zeroed
+    /// bit-pattern for a null row must not surface as the value 0.
+    #[test]
+    fn zero_validity_bit_yields_null_not_zero() {
+        // Row 1 is null but its stored bit-pattern is 0 (the same bits a
+        // legitimate 0 would have) — only the mask distinguishes them.
+        let rows = [7i128, 0, 9];
+        let host = interleave(&rows);
+        let mask = pack_mask(&[true, false, true]);
+        let arr =
+            decimal128_from_interleaved(&host, rows.len(), Some(&mask), 10, 2, "test").unwrap();
+        assert_eq!(arr.null_count(), 1);
+        assert!(arr.is_valid(0));
+        assert_eq!(arr.value(0), 7);
+        assert!(arr.is_null(1), "row 1 must be NULL, not Some(0)");
+        assert!(arr.is_valid(2));
+        assert_eq!(arr.value(2), 9);
+    }
+
+    /// A non-null value that happens to be 0 stays `Some(0)` when its
+    /// validity bit is set — the complement of the test above, confirming
+    /// the mask (not the value) drives nullness.
+    #[test]
+    fn zero_value_with_valid_bit_is_some_zero() {
+        let rows = [0i128];
+        let host = interleave(&rows);
+        let mask = pack_mask(&[true]);
+        let arr = decimal128_from_interleaved(&host, 1, Some(&mask), 10, 2, "test").unwrap();
+        assert_eq!(arr.null_count(), 0);
+        assert!(arr.is_valid(0));
+        assert_eq!(arr.value(0), 0);
+    }
+
+    /// A validity mask shorter than `n_rows` (or absent bytes) decodes the
+    /// missing rows as NULL via the `unwrap_or(0)` byte fallback — defensive
+    /// against an under-sized mask rather than panicking.
+    #[test]
+    fn short_mask_treats_missing_rows_as_null() {
+        let rows = [1i128, 2, 3];
+        let host = interleave(&rows);
+        // Mask covers only row 0 (one byte, bit 0 set) — rows 1 & 2 read a
+        // missing byte => 0 => NULL.
+        let mask = vec![0b0000_0001u8];
+        let arr =
+            decimal128_from_interleaved(&host, rows.len(), Some(&mask), 10, 0, "test").unwrap();
+        assert!(arr.is_valid(0));
+        assert!(arr.is_null(1));
+        assert!(arr.is_null(2));
+    }
+
+    /// `with_precision_and_scale` rejects an out-of-range precision; the
+    /// helper surfaces that as a `BoltError::Type` carrying the supplied
+    /// context string rather than panicking.
+    #[test]
+    fn invalid_precision_is_a_typed_error() {
+        let rows = [1i128];
+        let host = interleave(&rows);
+        // precision 0 is invalid for Arrow Decimal128 (must be 1..=38).
+        let err = decimal128_from_interleaved(&host, 1, None, 0, 0, "ctx-marker")
+            .expect_err("precision 0 must be rejected");
+        match err {
+            BoltError::Type(msg) => assert!(
+                msg.contains("ctx-marker"),
+                "error must carry the caller's context string, got: {msg}"
+            ),
+            other => panic!("expected BoltError::Type, got {other:?}"),
+        }
+    }
+
+    /// `check_len` is the pinned-download invariant guard: equal lengths pass,
+    /// a mismatch returns an `Err` (it is a bug, not a runtime condition).
+    #[test]
+    fn check_len_passes_on_match_errors_on_mismatch() {
+        assert!(check_len(4, 4).is_ok());
+        assert!(check_len(0, 0).is_ok());
+        let err = check_len(3, 4).expect_err("mismatched lengths must error");
+        match err {
+            BoltError::Other(msg) => {
+                assert!(msg.contains('3') && msg.contains('4'), "msg: {msg}");
+            }
+            other => panic!("expected BoltError::Other, got {other:?}"),
+        }
+    }
+}

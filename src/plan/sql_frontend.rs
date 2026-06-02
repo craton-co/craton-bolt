@@ -6106,6 +6106,11 @@ fn lower_set_expr(
                     let mut inputs: Vec<LogicalPlan> = Vec::new();
                     collect_union_branches(left, provider, ctes, dedup, &mut inputs, depth + 1)?;
                     collect_union_branches(right, provider, ctes, dedup, &mut inputs, depth + 1)?;
+                    // Reconcile branch column types to a common supertype
+                    // (Int32 ∪ Int64 → Int64, Int ∪ Float → Float, …) so
+                    // mismatched-but-compatible columns are coerced rather than
+                    // rejected, mirroring how VALUES rows are unified.
+                    coerce_set_op_branches("UNION", &mut inputs)?;
                     let union = LogicalPlan::Union { inputs };
                     Ok(if dedup {
                         LogicalPlan::Distinct {
@@ -6128,6 +6133,13 @@ fn lower_set_expr(
                     };
                     let left_plan = lower_set_expr(left, provider, ctes, depth + 1)?;
                     let right_plan = lower_set_expr(right, provider, ctes, depth + 1)?;
+                    // Coerce the two branches to a common per-column supertype
+                    // (same rule as UNION above). `coerce_set_op_branches`
+                    // operates on a slice, so wrap the pair in an array,
+                    // run it, then unpack back into left/right.
+                    let mut pair = [left_plan, right_plan];
+                    coerce_set_op_branches(set_op.keyword(), &mut pair)?;
+                    let [left_plan, right_plan] = pair;
                     Ok(LogicalPlan::SetOp {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
@@ -6143,6 +6155,115 @@ fn lower_set_expr(
         )),
         SetExpr::Table(_) => Err(BoltError::Sql("unsupported: TABLE statement".into())),
     }
+}
+
+/// Reconcile the column types of set-operation branches to a common
+/// per-column supertype, inserting casts on the branches that need them.
+///
+/// SQL UNION / EXCEPT / INTERSECT require that corresponding columns across
+/// branches share a type. When the branches differ only in
+/// numerically/temporally compatible types (e.g. `Int32` vs `Int64`, `Int`
+/// vs `Float`), standard SQL coerces both branches to a common supertype
+/// rather than rejecting the query. This mirrors how VALUES rows are unified
+/// (see [`values_common_type`] / [`lower_values_relation`]).
+///
+/// Algorithm:
+///   1. Validate every branch has the same column count (a genuine arity
+///      mismatch stays an error — `schema_summary`-style messages are emitted
+///      later by [`LogicalPlan::schema`], so here we only guard the indexing).
+///   2. For each column position, fold the branches' dtypes through
+///      [`values_common_type`]. An incompatible pair (e.g. `Int` vs `Utf8`)
+///      returns a clear `Err`.
+///   3. For each branch whose schema does not already match the computed
+///      target dtypes, wrap it in a `Project` that casts each column to its
+///      target (preserving the branch's own column names). Branches that
+///      already match are left untouched (identical schemas are unchanged).
+///
+/// `op` is the operator keyword (`"UNION"` / `"EXCEPT"` / `"INTERSECT"`) used
+/// in error messages.
+fn coerce_set_op_branches(op: &str, branches: &mut [LogicalPlan]) -> BoltResult<()> {
+    if branches.len() < 2 {
+        // A single branch has nothing to reconcile.
+        return Ok(());
+    }
+    // Compute every branch's schema once.
+    let schemas: Vec<Schema> = branches
+        .iter()
+        .map(|b| b.schema())
+        .collect::<BoltResult<Vec<_>>>()?;
+
+    let n_cols = schemas[0].fields.len();
+    // A genuine column-count mismatch is left for `LogicalPlan::schema` to
+    // report with its richer message; bail out without coercing so we never
+    // index past a shorter branch.
+    if schemas.iter().any(|s| s.fields.len() != n_cols) {
+        return Ok(());
+    }
+
+    // Fold each column's dtype across all branches into a common supertype.
+    let mut targets: Vec<DataType> = Vec::with_capacity(n_cols);
+    for ci in 0..n_cols {
+        let mut common = schemas[0].fields[ci].dtype;
+        for s in &schemas[1..] {
+            let other = s.fields[ci].dtype;
+            common = values_common_type(common, other).ok_or_else(|| {
+                BoltError::Sql(format!(
+                    "{op} branches have incompatible types for column {}: \
+                     {common:?} and {other:?}",
+                    ci + 1
+                ))
+            })?;
+        }
+        targets.push(common);
+    }
+
+    // If every branch already matches the targets exactly, there is nothing
+    // to insert (identical-schema set-ops stay unchanged).
+    let all_match = schemas
+        .iter()
+        .all(|s| s.fields.iter().zip(&targets).all(|(f, t)| f.dtype == *t));
+    if all_match {
+        return Ok(());
+    }
+
+    // Wrap each non-matching branch in a casting `Project`.
+    for (branch, schema) in branches.iter_mut().zip(&schemas) {
+        let needs_cast = schema
+            .fields
+            .iter()
+            .zip(&targets)
+            .any(|(f, t)| f.dtype != *t);
+        if !needs_cast {
+            continue;
+        }
+        let exprs: Vec<Expr> = schema
+            .fields
+            .iter()
+            .zip(&targets)
+            .map(|(f, t)| {
+                let col = Expr::Column(f.name.clone());
+                if f.dtype == *t {
+                    // Already the target type: keep the bare column (its name
+                    // flows through `Project`'s output-name rule unchanged).
+                    col
+                } else {
+                    // Cast, then alias back to the original column name so the
+                    // projected schema keeps the branch's column names rather
+                    // than `Project`'s positional `__expr_{i}` placeholder.
+                    Expr::Alias(Box::new(col.cast(*t)), f.name.clone())
+                }
+            })
+            .collect();
+        // Move the original branch out (replacing it with a cheap empty-Union
+        // placeholder) so it can be re-boxed as the Project's input, then
+        // overwrite the slot with the wrapping projection.
+        let inner = std::mem::replace(branch, LogicalPlan::Union { inputs: Vec::new() });
+        *branch = LogicalPlan::Project {
+            input: Box::new(inner),
+            exprs,
+        };
+    }
+    Ok(())
 }
 
 /// Helper for `lower_set_expr`: if `expr` is itself a same-quantifier UNION,
@@ -11876,6 +11997,21 @@ fn lower_binary_op(op: &BinaryOperator) -> BoltResult<BinaryOp> {
         BinaryOperator::And => BinaryOp::And,
         BinaryOperator::Or => BinaryOp::Or,
         BinaryOperator::StringConcat => BinaryOp::Concat,
+        // Modulo / bitwise / shift have no GPU kernel codegen yet. Surface a
+        // clear "not yet supported" message rather than the generic
+        // "unsupported binary operator" so users know the operator is
+        // recognised but simply not implemented.
+        BinaryOperator::Modulo
+        | BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::PGBitwiseXor
+        | BinaryOperator::PGBitwiseShiftLeft
+        | BinaryOperator::PGBitwiseShiftRight => {
+            return Err(BoltError::Sql(format!(
+                "operator not yet supported: {op}"
+            )));
+        }
         other => {
             return Err(BoltError::Sql(format!(
                 "unsupported binary operator: {other}"
@@ -15081,6 +15217,171 @@ mod root_setop_schema_tests {
             msg.contains("column list"),
             "expected 'column list' message, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod setop_coercion_tests {
+    //! Tests for common-supertype TYPE COERCION across set-operation branches
+    //! (UNION / EXCEPT / INTERSECT). Mismatched-but-compatible column types
+    //! (Int32 vs Int64, Int vs Float) are coerced to a common supertype
+    //! (mirroring VALUES-row unification); identical schemas are left
+    //! unchanged; genuinely incompatible types (Int vs Utf8) stay an error.
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    /// Tables of a single column `x` in several types, so set-ops can mix
+    /// branches whose only column differs in dtype.
+    fn provider() -> MemTableProvider {
+        let mk = |dt: DataType| Schema::new(vec![Field::new("x", dt, false)]);
+        MemTableProvider::new()
+            .with_table("i32t", mk(DataType::Int32))
+            .with_table("i64t", mk(DataType::Int64))
+            .with_table("f64t", mk(DataType::Float64))
+            .with_table("strt", mk(DataType::Utf8))
+    }
+
+    /// dtype of the single output column of a successfully-parsed plan.
+    fn col0_dtype(sql: &str) -> DataType {
+        let plan = parse(sql, &provider())
+            .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"));
+        plan.schema()
+            .unwrap_or_else(|e| panic!("schema recompute failed for {sql:?}: {e}"))
+            .fields[0]
+            .dtype
+    }
+
+    #[test]
+    fn union_int32_int64_widens_to_int64() {
+        // Int32 ∪ Int64 → Int64 (and the dedup-wrapping UNION still recomputes
+        // its schema cleanly through the inserted casting Project).
+        assert_eq!(
+            col0_dtype("SELECT x FROM i32t UNION SELECT x FROM i64t"),
+            DataType::Int64
+        );
+        assert_eq!(
+            col0_dtype("SELECT x FROM i32t UNION ALL SELECT x FROM i64t"),
+            DataType::Int64
+        );
+        // Order-independent: the wider branch on the left also coerces.
+        assert_eq!(
+            col0_dtype("SELECT x FROM i64t UNION ALL SELECT x FROM i32t"),
+            DataType::Int64
+        );
+    }
+
+    #[test]
+    fn union_int_float_widens_to_float() {
+        // Int ∪ Float → Float64.
+        assert_eq!(
+            col0_dtype("SELECT x FROM i32t UNION ALL SELECT x FROM f64t"),
+            DataType::Float64
+        );
+        assert_eq!(
+            col0_dtype("SELECT x FROM i64t UNION ALL SELECT x FROM f64t"),
+            DataType::Float64
+        );
+    }
+
+    #[test]
+    fn except_intersect_coerce_to_supertype() {
+        // EXCEPT / INTERSECT use the same coercion path.
+        assert_eq!(
+            col0_dtype("SELECT x FROM i32t EXCEPT SELECT x FROM i64t"),
+            DataType::Int64
+        );
+        assert_eq!(
+            col0_dtype("SELECT x FROM i32t INTERSECT SELECT x FROM f64t"),
+            DataType::Float64
+        );
+    }
+
+    #[test]
+    fn three_way_union_folds_all_branches() {
+        // A flattened 3-branch UNION ALL folds Int32, Int64, Float64 → Float64.
+        assert_eq!(
+            col0_dtype(
+                "SELECT x FROM i32t UNION ALL SELECT x FROM i64t \
+                 UNION ALL SELECT x FROM f64t"
+            ),
+            DataType::Float64
+        );
+    }
+
+    #[test]
+    fn identical_schemas_unchanged() {
+        // Identical branch types need no coercion and the column type is kept.
+        let plan = parse(
+            "SELECT x FROM i64t UNION ALL SELECT x FROM i64t",
+            &provider(),
+        )
+        .expect("identical-schema UNION must parse");
+        // No casting Project is inserted. Each branch is `SELECT x`, which
+        // naturally lowers to a `Project` over a scan; coercion would wrap
+        // that in an ADDITIONAL `Project` (so `Project { input: Project }`).
+        // For identical schemas, the branch's Project must sit directly on a
+        // non-Project source — i.e. it was not re-wrapped.
+        if let LogicalPlan::Union { inputs } = &plan {
+            for inp in inputs {
+                if let LogicalPlan::Project { input, .. } = inp {
+                    assert!(
+                        !matches!(input.as_ref(), LogicalPlan::Project { .. }),
+                        "identical-schema branch must not be re-wrapped in a coercion Project"
+                    );
+                } else {
+                    panic!("expected each UNION branch to be a Project, got {inp:?}");
+                }
+            }
+        } else {
+            panic!("expected a top-level Union, got {plan:?}");
+        }
+        assert_eq!(
+            col0_dtype("SELECT x FROM i64t UNION ALL SELECT x FROM i64t"),
+            DataType::Int64
+        );
+    }
+
+    #[test]
+    fn incompatible_types_rejected() {
+        // Int vs Utf8 is genuinely incompatible: still an Err naming the op.
+        for (sql, op) in [
+            ("SELECT x FROM i32t UNION SELECT x FROM strt", "UNION"),
+            ("SELECT x FROM i32t EXCEPT SELECT x FROM strt", "EXCEPT"),
+            ("SELECT x FROM i32t INTERSECT SELECT x FROM strt", "INTERSECT"),
+        ] {
+            let err = parse(sql, &provider())
+                .expect_err("incompatible-type set-op must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(op),
+                "expected error naming {op}, got: {msg}"
+            );
+            assert!(
+                msg.contains("incompatible"),
+                "expected 'incompatible' in error, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn modulo_and_bitwise_report_not_yet_supported() {
+        // Scope note: %/bitwise have no codegen; the lowering must surface a
+        // clear "operator not yet supported" message (no codegen added here).
+        for sql in [
+            "SELECT x % 2 FROM i64t",
+            "SELECT x & 1 FROM i64t",
+            "SELECT x | 1 FROM i64t",
+            "SELECT x ^ 1 FROM i64t",
+            "SELECT x << 1 FROM i64t",
+            "SELECT x >> 1 FROM i64t",
+        ] {
+            let err = parse(sql, &provider())
+                .expect_err("modulo/bitwise should not lower (no codegen)");
+            assert!(
+                err.to_string().contains("not yet supported"),
+                "expected 'not yet supported' for {sql:?}, got: {err}"
+            );
+        }
     }
 }
 

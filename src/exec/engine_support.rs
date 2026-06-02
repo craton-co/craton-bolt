@@ -772,3 +772,220 @@ pub(crate) fn host_column_to_arrow_array(col: crate::exec::expr_agg::HostColumn)
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host-only tests for the incremental-cache row helpers and the schema /
+    //! count-rows / host-column bridges.
+    //!
+    //! CUDA scope note: `GpuVec<T>` device allocation (`zeros` / `from_slice`)
+    //! hits the driver and is unavailable under `--features cuda-stub`. The
+    //! only host-constructible `GpuVec` is the zero-length [`GpuVec::empty`],
+    //! so the `column_storage_rows` / `try_extend_column` tests below build
+    //! empty device columns. That still exercises the variant dispatch and
+    //! `try_extend_column`'s `prev_rows == 0` early-return arm without a
+    //! device; the non-empty `/2` Decimal128 arithmetic and the Utf8 /
+    //! DictUtf8 / Decimal128 punt arms (reached only past the non-zero
+    //! `prev_rows` guard) need a live CUDA context and are covered by the
+    //! engine's device-backed integration tests.
+
+    use super::*;
+    use arrow_array::Array;
+    use crate::cuda::GpuVec;
+    use crate::exec::gpu_table::{GpuColumn, GpuColumnData};
+
+    /// A zero-row `GpuColumnData` of the requested shape, built from
+    /// `GpuVec::empty()` (no device allocation). Used only to drive the
+    /// host-side row-count + early-return logic.
+    fn empty_data(kind: &str) -> GpuColumnData {
+        match kind {
+            "i32" => GpuColumnData::I32 {
+                values: GpuVec::<i32>::empty(),
+                validity: None,
+            },
+            "i64" => GpuColumnData::I64 {
+                values: GpuVec::<i64>::empty(),
+                validity: None,
+            },
+            "f32" => GpuColumnData::F32 {
+                values: GpuVec::<f32>::empty(),
+                validity: None,
+            },
+            "f64" => GpuColumnData::F64 {
+                values: GpuVec::<f64>::empty(),
+                validity: None,
+            },
+            "bool" => GpuColumnData::Bool(GpuVec::<u8>::empty()),
+            "boolnull" => GpuColumnData::BoolNullable {
+                values: GpuVec::<u8>::empty(),
+                validity: GpuVec::<u8>::empty(),
+            },
+            "utf8" => GpuColumnData::Utf8 {
+                indices: GpuVec::<i32>::empty(),
+                dictionary: Vec::new(),
+            },
+            "dictutf8" => GpuColumnData::DictUtf8 {
+                keys: GpuVec::<i32>::empty(),
+                dict: Vec::new(),
+                valid_mask: None,
+            },
+            "dec128" => GpuColumnData::Decimal128 {
+                values: GpuVec::<u64>::empty(),
+                precision: 38,
+                scale: 0,
+                valid_mask: None,
+            },
+            other => panic!("unknown kind {other}"),
+        }
+    }
+
+    /// Every variant of `column_storage_rows` maps to its backing buffer's
+    /// `len()`. With zero-length buffers each is 0; the Decimal128 arm
+    /// additionally divides by 2 (`0 / 2 == 0`). This locks in the variant
+    /// dispatch so a future variant addition can't silently fall through.
+    #[test]
+    fn column_storage_rows_dispatches_every_variant() {
+        for kind in [
+            "i32", "i64", "f32", "f64", "bool", "boolnull", "utf8", "dictutf8", "dec128",
+        ] {
+            assert_eq!(
+                column_storage_rows(&empty_data(kind)),
+                0,
+                "empty {kind} column must report 0 rows"
+            );
+        }
+    }
+
+    /// `try_extend_column` short-circuits to `Ok(None)` when the previous
+    /// device column has zero rows (`prev_rows == 0`) — it cannot extend a
+    /// prefix that doesn't exist, so the caller falls back to a full upload.
+    /// This arm runs entirely host-side (no device buffer is touched).
+    #[test]
+    fn try_extend_punts_on_zero_prev_rows() {
+        // A one-column Int32 batch with two rows on the host.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let arr = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
+
+        let prev = GpuColumn {
+            name: "a".to_string(),
+            dtype: DataType::Int32,
+            data: empty_data("i32"), // zero rows on device
+            host_revision: 0,
+        };
+        // prev_rows (0) == 0 => Ok(None) before any device access.
+        let out = try_extend_column(prev, &batch, 0, 2).expect("no error");
+        assert!(out.is_none(), "zero prev_rows must punt to full re-upload");
+    }
+
+    /// `arrow_schema_to_plan_schema` round-trips field names, dtypes, and
+    /// nullability for the common primitive types — pure host conversion.
+    #[test]
+    fn arrow_schema_to_plan_schema_converts_fields() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new("l", ArrowDataType::Int64, true),
+            ArrowField::new("f", ArrowDataType::Float64, true),
+        ]);
+        let plan = arrow_schema_to_plan_schema(&arrow).expect("convert");
+        assert_eq!(plan.fields.len(), 3);
+        assert_eq!(plan.fields[0].name, "i");
+        assert_eq!(plan.fields[0].dtype, DataType::Int32);
+        assert!(!plan.fields[0].nullable);
+        assert_eq!(plan.fields[1].dtype, DataType::Int64);
+        assert!(plan.fields[1].nullable);
+        assert_eq!(plan.fields[2].dtype, DataType::Float64);
+    }
+
+    /// `build_count_rows_batch` produces a single-row, single-column Int64
+    /// batch holding the row count.
+    #[test]
+    fn build_count_rows_batch_holds_count() {
+        let schema = Schema::new(vec![Field::new("cnt", DataType::Int64, false)]);
+        let batch = build_count_rows_batch(42, &schema).expect("build");
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 1);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 column");
+        assert_eq!(col.value(0), 42);
+    }
+
+    /// `build_count_rows_batch` rejects an output schema that isn't exactly
+    /// one column (the CountRows node always emits a single count column).
+    #[test]
+    fn build_count_rows_batch_rejects_multi_column_schema() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        assert!(build_count_rows_batch(1, &schema).is_err());
+    }
+
+    /// `host_column_to_arrow_array` maps each `HostColumn` variant to the
+    /// matching Arrow array type and preserves values.
+    #[test]
+    fn host_column_to_arrow_array_maps_variants() {
+        use crate::exec::expr_agg::HostColumn;
+
+        let i64_arr =
+            host_column_to_arrow_array(HostColumn::I64(vec![Some(1), Some(2), Some(3)])).unwrap();
+        let i64_arr = i64_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(i64_arr.values(), &[1, 2, 3]);
+
+        let bool_arr =
+            host_column_to_arrow_array(HostColumn::Bool(vec![Some(true), Some(false)])).unwrap();
+        let bool_arr = bool_arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(bool_arr.value(0));
+        assert!(!bool_arr.value(1));
+
+        let utf8_arr = host_column_to_arrow_array(HostColumn::Utf8(vec![
+            Some("x".to_string()),
+            Some("y".to_string()),
+        ]))
+                .unwrap();
+        let utf8_arr = utf8_arr
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(utf8_arr.value(0), "x");
+        assert_eq!(utf8_arr.value(1), "y");
+    }
+
+    /// `concat_table_batches` errors on zero batches, clones the single-batch
+    /// case, and concatenates two-plus batches into one.
+    #[test]
+    fn concat_table_batches_handles_arities() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let mk = |vals: Vec<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vals)) as ArrayRef],
+            )
+            .unwrap()
+        };
+
+        // Zero batches => error.
+        assert!(concat_table_batches("t", &[]).is_err());
+
+        // One batch => cloned (same row count).
+        let one = concat_table_batches("t", &[mk(vec![1, 2])]).expect("one");
+        assert_eq!(one.num_rows(), 2);
+
+        // Two batches => concatenated.
+        let two = concat_table_batches("t", &[mk(vec![1, 2]), mk(vec![3, 4, 5])]).expect("two");
+        assert_eq!(two.num_rows(), 5);
+        let col = two.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(col.values(), &[1, 2, 3, 4, 5]);
+    }
+}

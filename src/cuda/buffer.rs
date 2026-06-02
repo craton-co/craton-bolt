@@ -517,6 +517,14 @@ impl<T: Pod> GpuBuffer<T> {
         .entered();
         let mut out: Vec<T> = Vec::with_capacity(self.len);
         if self.len > 0 {
+            // Ordering (cuda.md M1): this synchronous NULL-stream
+            // `cuMemcpyDtoH_v2` is NOT ordered after writes still in flight on
+            // a non-blocking per-query pool stream, so without fencing first it
+            // can read a torn/stale snapshot. Drain every recorded stream
+            // before the read (no-op fast path when none were recorded — the
+            // common purely-synchronous case), mirroring
+            // `GpuVec::extended_with_prefix`.
+            self.fence_recorded_streams();
             // SAFETY: `out` has capacity for `self.len` elements; we copy
             // exactly that many bytes from a live device allocation, then set
             // the logical length to match.
@@ -738,6 +746,14 @@ impl<T: Pod> GpuBuffer<T> {
             )));
         }
         if self.len > 0 {
+            // Ordering (cuda.md M1): this synchronous NULL-stream
+            // `cuMemcpyDtoH_v2` is NOT ordered after writes still in flight on
+            // a non-blocking per-query pool stream, so without fencing first it
+            // can read a torn/stale snapshot. Drain every recorded stream
+            // before the read (no-op fast path when none were recorded — the
+            // common purely-synchronous case), mirroring
+            // `GpuVec::extended_with_prefix`.
+            self.fence_recorded_streams();
             // SAFETY: `dst` is valid for writes of `self.len` elements (checked
             // above), and `self.ptr` is a live device allocation of at least
             // that many `T`s.
@@ -2140,6 +2156,63 @@ mod stream_set_tests {
             }
         });
         FENCED.with(|f| assert!(f.borrow().is_empty()));
+    }
+
+    // ---- M1: synchronous D2H reads fence recorded streams first ----------
+    //
+    // `to_vec` / `copy_to_slice` do a synchronous NULL-stream
+    // `cuMemcpyDtoH_v2`, which is NOT ordered after writes still in flight on
+    // a non-blocking per-query pool stream. Both now call
+    // `fence_recorded_streams()` before the copy. These two tests prove that
+    // public helper host-only (it routes through the same `fence_all_streams`
+    // / `drop_fence_with` seam the copies rely on): the common no-stream case
+    // stays a no-op fast path, and a tagged buffer drains every recorded
+    // stream before the read.
+
+    #[test]
+    fn fence_recorded_streams_no_streams_is_noop() {
+        // Fast path: a buffer only ever touched synchronously records no
+        // stream, so `fence_recorded_streams` (and hence the pre-copy fence in
+        // `to_vec` / `copy_to_slice`) must issue zero fences.
+        FENCED.with(|f| f.borrow_mut().clear());
+        let buf: GpuBuffer<u8> = GpuBuffer::empty();
+        drop_fence_with(recording_fence, || {
+            buf.fence_recorded_streams();
+        });
+        FENCED.with(|f| {
+            assert!(
+                f.borrow().is_empty(),
+                "M1: a buffer with no recorded streams must not fence before a \
+                 synchronous D2H read (preserve the fast path)"
+            );
+        });
+    }
+
+    #[test]
+    fn fence_recorded_streams_drains_every_recorded_stream() {
+        // With in-flight async writes recorded, the pre-copy fence must drain
+        // each distinct stream exactly once so the synchronous D2H read sees a
+        // coherent (non-torn) snapshot.
+        FENCED.with(|f| f.borrow_mut().clear());
+        let buf: GpuBuffer<u8> = GpuBuffer::empty();
+        let a = fake_stream(0x33);
+        let b = fake_stream(0x44);
+        buf.mark_stream_use(a);
+        buf.mark_stream_use(b);
+        buf.mark_stream_use(a); // duplicate — must not produce a 3rd fence
+        drop_fence_with(recording_fence, || {
+            buf.fence_recorded_streams();
+        });
+        FENCED.with(|f| {
+            let fenced = f.borrow();
+            assert_eq!(
+                fenced.len(),
+                2,
+                "M1: a synchronous D2H read must fence each distinct recorded \
+                 stream exactly once before copying"
+            );
+            assert!(fenced.contains(&a) && fenced.contains(&b));
+        });
     }
 
     // ---- Destroyed per-query stream -> device-wide cuCtxSynchronize fallback -

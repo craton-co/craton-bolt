@@ -1133,6 +1133,85 @@ mod tests {
         assert_eq!(inner_code(&other), None);
     }
 
+    // -- hash_ptx boundary logic (128-bit content key) --------------------
+
+    /// `hash_ptx` is deterministic for identical input — the load-bearing
+    /// invariant behind the whole cache (same PTX text ⇒ same key ⇒ reuse).
+    #[test]
+    fn hash_ptx_is_deterministic() {
+        let ptx = "// determinism — unique tag 2f9c01a7\n.version 7.0\n";
+        assert_eq!(hash_ptx(ptx), hash_ptx(ptx));
+    }
+
+    /// The two 64-bit halves are domain-separated (leading `0x10` vs `0x20`),
+    /// so for non-trivial input they must not be equal to each other — a
+    /// regression here would collapse the 128-bit key toward 64 bits of real
+    /// entropy and re-open the birthday-paradox collision window the width
+    /// upgrade was meant to close.
+    #[test]
+    fn hash_ptx_halves_are_domain_separated() {
+        let (hi, lo) = hash_ptx("domain-sep probe — unique tag 5a1b");
+        assert_ne!(
+            hi, lo,
+            "the two halves must use independent domains, not the same digest"
+        );
+    }
+
+    /// Distinct PTX strings (almost surely) produce distinct keys. A
+    /// single-byte perturbation must change the key — otherwise the cache
+    /// would serve one program's module for a different program.
+    #[test]
+    fn hash_ptx_is_content_sensitive() {
+        let a = hash_ptx("// content sensitivity — unique tag c4\nmov.u32 %r0, 1;");
+        let b = hash_ptx("// content sensitivity — unique tag c4\nmov.u32 %r0, 2;");
+        assert_ne!(a, b, "a one-byte change must rotate the key");
+    }
+
+    /// Boundary input: the empty string is a valid (if degenerate) PTX key;
+    /// hashing it must not panic and must still be deterministic.
+    #[test]
+    fn hash_ptx_handles_empty_input() {
+        assert_eq!(hash_ptx(""), hash_ptx(""));
+        // The empty string's two halves are still domain-separated (the
+        // domain byte alone distinguishes them).
+        let (hi, lo) = hash_ptx("");
+        assert_ne!(hi, lo);
+    }
+
+    // -- decode_log boundary logic (NUL-terminated driver log buffer) ------
+
+    /// `decode_log` reads up to the first NUL and trims surrounding
+    /// whitespace — the contract the PTXAS error/info buffers rely on.
+    #[test]
+    fn decode_log_stops_at_first_nul() {
+        // "ptxas error\0<garbage>" -> "ptxas error" (NUL terminates, trailing
+        // garbage after the NUL is ignored).
+        let mut buf = b"ptxas error".to_vec();
+        buf.push(0);
+        buf.extend_from_slice(b"junk-after-nul");
+        assert_eq!(decode_log(&buf), "ptxas error");
+    }
+
+    /// A buffer with no NUL byte at all decodes the whole slice (the
+    /// `unwrap_or(buf.len())` fallback) rather than reading out of bounds.
+    #[test]
+    fn decode_log_without_nul_uses_whole_buffer() {
+        let buf = b"  full buffer no terminator  ";
+        // Leading/trailing whitespace is trimmed.
+        assert_eq!(decode_log(buf), "full buffer no terminator");
+    }
+
+    /// An all-zero (empty) buffer decodes to the empty string — the common
+    /// case when PTXAS emitted no diagnostics. `from_ptx`'s error formatter
+    /// branches on this being empty.
+    #[test]
+    fn decode_log_empty_buffer_is_empty_string() {
+        let buf = [0u8; 16];
+        assert_eq!(decode_log(&buf), "");
+        let empty: [u8; 0] = [];
+        assert_eq!(decode_log(&empty), "");
+    }
+
     // -- ptx_cache_stats observability hook --------------------------------
 
     /// `ptx_cache_stats` returns a `(hits, misses, evictions)` triple

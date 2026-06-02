@@ -5559,6 +5559,16 @@ impl Engine {
             return Ok(Arc::new(arr) as ArrayRef);
         }
 
+        // Gate: the GPU two-pass UPPER/LOWER device path is UNVALIDATED. By
+        // default (gate OFF) take the validated host mirror, which is
+        // byte-identical for ASCII dictionaries. The device launch below is
+        // only reached when `BOLT_GPU_STRING` is truthy.
+        if !crate::exec::string_project::gpu_string_enabled() {
+            let arr =
+                host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
+            return Ok(Arc::new(arr) as ArrayRef);
+        }
+
         // ---- GPU two-pass path -------------------------------------------
         // Pass 0 (host): materialise the row-aligned offsets+bytes input.
         let (src_offsets, src_bytes) =
@@ -5843,9 +5853,15 @@ impl Engine {
 
         // Build the boolean mask: GPU device path, with a host fallback that
         // produces the identical mask if the launch is not viable.
-        let mask: arrow_array::BooleanArray = match self
-            .string_like_mask_gpu(str_arr, literal, mode, negated)
-        {
+        //
+        // The GPU LIKE matcher is an UNVALIDATED device path; by default
+        // (gate OFF) we skip it entirely and take the validated host mirror,
+        // which produces the byte-identical mask. The device launch is only
+        // attempted when `BOLT_GPU_STRING` is truthy.
+        let mask: arrow_array::BooleanArray = if !crate::exec::string_like::gpu_string_enabled() {
+            crate::exec::string_like::host_mask_via_mirror(str_arr, literal, mode, negated)
+        } else {
+            match self.string_like_mask_gpu(str_arr, literal, mode, negated) {
             Ok(m) => m,
             Err(e) => {
                 // Host fallback: evaluate the SAME predicate via the validated
@@ -5859,6 +5875,7 @@ impl Engine {
                 crate::exec::string_like::host_mask_via_mirror(
                     str_arr, literal, mode, negated,
                 )
+            }
             }
         };
 

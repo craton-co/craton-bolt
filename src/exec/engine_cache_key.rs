@@ -195,3 +195,224 @@ impl HostRevisionSnapshot for Option<&HostTableRevision> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host-only tests for the V-15 silent-wrong-module collision guard.
+    //!
+    //! These never touch CUDA: `ModuleCacheKey::new` is a pure function of
+    //! `(KernelSpec, &'static str)` that runs `format!("{:?}", spec)` through
+    //! two domain-separated hashers. We build `KernelSpec`s directly and
+    //! assert the key's discrimination / stability properties.
+
+    use super::*;
+    use crate::plan::physical_plan::{ColumnIO, Op, Reg};
+    use crate::plan::DataType;
+
+    // Two distinct entry symbols mirroring the real call sites
+    // (`KERNEL_ENTRY` / `PREDICATE_ENTRY` in `exec::engine`). They are
+    // `&'static str`, exactly as `ModuleCacheKey::new` requires.
+    const KERNEL_ENTRY: &str = "bolt_kernel";
+    const PREDICATE_ENTRY: &str = "bolt_predicate";
+
+    fn col_io(name: &str, dtype: DataType) -> ColumnIO {
+        ColumnIO {
+            name: name.to_string(),
+            dtype,
+        }
+    }
+
+    /// Minimal `KernelSpec` builder — fills the validity vectors empty and a
+    /// fixed register count so callers only vary the discriminating fields.
+    fn spec_with(inputs: Vec<ColumnIO>, outputs: Vec<ColumnIO>, ops: Vec<Op>) -> KernelSpec {
+        KernelSpec {
+            inputs,
+            outputs,
+            ops,
+            predicate: None,
+            register_count: 16,
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
+        }
+    }
+
+    /// A plain `SELECT a` passthrough: one `LoadColumn`→`Store` pair.
+    fn passthrough_spec(col: &str, dtype: DataType) -> KernelSpec {
+        spec_with(
+            vec![col_io(col, dtype)],
+            vec![col_io(col, dtype)],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype,
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype,
+                },
+            ],
+        )
+    }
+
+    /// The key for a given `(spec, entry)` must be byte-for-byte identical
+    /// across repeated calls — the cache lookup on the warm path depends on
+    /// `Hash`/`Eq` matching the original insert.
+    #[test]
+    fn key_is_stable_across_calls() {
+        let spec = passthrough_spec("a", DataType::Int64);
+        let k1 = ModuleCacheKey::new(&spec, KERNEL_ENTRY);
+        let k2 = ModuleCacheKey::new(&spec, KERNEL_ENTRY);
+        assert_eq!(k1, k2, "same spec+entry must produce an equal key");
+        assert_eq!(
+            (k1.spec_hash_hi, k1.spec_hash_lo),
+            (k2.spec_hash_hi, k2.spec_hash_lo),
+            "both 64-bit halves must be reproducible"
+        );
+    }
+
+    /// Cloning a spec must not perturb its key (the `Debug` text is identical,
+    /// so the hash input is identical).
+    #[test]
+    fn key_is_stable_across_clone() {
+        let spec = passthrough_spec("a", DataType::Int64);
+        let clone = spec.clone();
+        assert_eq!(
+            ModuleCacheKey::new(&spec, KERNEL_ENTRY),
+            ModuleCacheKey::new(&clone, KERNEL_ENTRY),
+        );
+    }
+
+    /// The V-15 core guard: two specs that differ in a load-bearing field
+    /// (here the output column dtype) must NOT collide. A collision would
+    /// silently serve the wrong compiled module.
+    #[test]
+    fn distinct_dtype_produces_distinct_key() {
+        let i32_spec = passthrough_spec("a", DataType::Int32);
+        let i64_spec = passthrough_spec("a", DataType::Int64);
+        assert_ne!(
+            ModuleCacheKey::new(&i32_spec, KERNEL_ENTRY),
+            ModuleCacheKey::new(&i64_spec, KERNEL_ENTRY),
+            "Int32 vs Int64 passthroughs must hash to different keys"
+        );
+    }
+
+    /// Differing column names also discriminate — the name is part of the
+    /// `Debug` output of `ColumnIO`.
+    #[test]
+    fn distinct_column_name_produces_distinct_key() {
+        let a = passthrough_spec("a", DataType::Int64);
+        let b = passthrough_spec("b", DataType::Int64);
+        assert_ne!(
+            ModuleCacheKey::new(&a, KERNEL_ENTRY),
+            ModuleCacheKey::new(&b, KERNEL_ENTRY),
+        );
+    }
+
+    /// A differing op list discriminates: a passthrough vs a compute kernel
+    /// over the same I/O columns must not alias.
+    #[test]
+    fn distinct_ops_produce_distinct_key() {
+        let passthrough = passthrough_spec("a", DataType::Int64);
+        // Same inputs/outputs but a `Binary` add in the op stream.
+        let compute = spec_with(
+            vec![col_io("a", DataType::Int64)],
+            vec![col_io("a", DataType::Int64)],
+            vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::Binary {
+                    dst: Reg(1),
+                    op: crate::plan::BinaryOp::Add,
+                    lhs: Reg(0),
+                    rhs: Reg(0),
+                    dtype: DataType::Int64,
+                    result_dtype: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(1),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+        );
+        assert_ne!(
+            ModuleCacheKey::new(&passthrough, KERNEL_ENTRY),
+            ModuleCacheKey::new(&compute, KERNEL_ENTRY),
+        );
+    }
+
+    /// The presence/absence of a predicate discriminates — a filtered kernel
+    /// emits different PTX than an unfiltered one over identical I/O.
+    #[test]
+    fn predicate_presence_discriminates() {
+        let mut filtered = passthrough_spec("a", DataType::Int64);
+        filtered.predicate = Some(Reg(0));
+        let unfiltered = passthrough_spec("a", DataType::Int64);
+        assert_ne!(
+            ModuleCacheKey::new(&filtered, KERNEL_ENTRY),
+            ModuleCacheKey::new(&unfiltered, KERNEL_ENTRY),
+        );
+    }
+
+    /// The entry-name discriminator: the SAME spec compiled under the full
+    /// projection entry vs the predicate-only mask entry must yield distinct
+    /// keys, or the cache would alias the two PTX shapes for one spec (the
+    /// exact failure mode the `entry` field exists to prevent).
+    #[test]
+    fn entry_name_discriminates() {
+        let spec = passthrough_spec("a", DataType::Int64);
+        let kernel_key = ModuleCacheKey::new(&spec, KERNEL_ENTRY);
+        let predicate_key = ModuleCacheKey::new(&spec, PREDICATE_ENTRY);
+        assert_ne!(
+            kernel_key, predicate_key,
+            "KERNEL_ENTRY and PREDICATE_ENTRY must not alias for one spec"
+        );
+        // The hash halves are derived solely from the spec text (the entry
+        // is NOT fed to the hashers), so they match; only the `entry` field
+        // breaks equality. This documents the design: entry discrimination
+        // is structural (a struct field), not hash-based.
+        assert_eq!(
+            (kernel_key.spec_hash_hi, kernel_key.spec_hash_lo),
+            (predicate_key.spec_hash_hi, predicate_key.spec_hash_lo),
+            "the 128-bit content hash is over the spec only; entry is a separate field"
+        );
+    }
+
+    /// The two domain-separated halves of the 128-bit fingerprint must not be
+    /// identical for a realistic spec — if the domain byte were dropped, both
+    /// `DefaultHasher`s would consume the same bytes and the two halves would
+    /// collapse to one 64-bit value, halving the collision resistance the
+    /// V-15 fix relies on.
+    #[test]
+    fn hash_halves_are_domain_separated() {
+        let spec = passthrough_spec("a", DataType::Int64);
+        let key = ModuleCacheKey::new(&spec, KERNEL_ENTRY);
+        assert_ne!(
+            key.spec_hash_hi, key.spec_hash_lo,
+            "domain separation (0x01 vs 0x02 prefix) must make the two halves independent"
+        );
+    }
+
+    /// `HostRevisionSnapshot::cloned_revision_owned` round-trips the fields it
+    /// needs from a borrowed `HostTableRevision`, and maps `None` to `None`.
+    #[test]
+    fn cloned_revision_owned_copies_fields() {
+        assert!(None::<&HostTableRevision>.cloned_revision_owned().is_none());
+
+        let mut rev = HostTableRevision::default();
+        rev.table_revision = 7;
+        rev.column_revisions.insert("a".to_string(), 3);
+        rev.column_revisions.insert("b".to_string(), 4);
+        let owned = Some(&rev)
+            .cloned_revision_owned()
+            .expect("Some input yields Some");
+        assert_eq!(owned.table_revision, 7);
+        assert_eq!(owned.column_revisions.get("a"), Some(&3));
+        assert_eq!(owned.column_revisions.get("b"), Some(&4));
+    }
+}

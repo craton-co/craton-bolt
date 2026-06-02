@@ -138,3 +138,216 @@ impl crate::plan::statistics::StatsProvider for EngineTableStats {
             .map(|&n| crate::plan::statistics::TableStats::new(n))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host-only tests for the planner-facing null probes. `EngineProvider`
+    //! is pure `RecordBatch` host logic — no CUDA — so we build batches and
+    //! the backing maps directly and drive `has_nulls` / `null_count`
+    //! through the `TableProvider` trait.
+
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+    use crate::exec::streaming::TableSource;
+    use crate::plan::{MemTableProvider, TableProvider};
+
+    /// One-column Int32 `RecordBatch` from optional values (None => NULL row).
+    fn int32_batch(name: &str, values: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            name,
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let arr = Arc::new(Int32Array::from(values)) as arrow_array::ArrayRef;
+        RecordBatch::try_new(schema, vec![arr]).expect("batch")
+    }
+
+    /// Two-column Int32 batch so we can probe a second / out-of-range ordinal.
+    fn two_col_batch(a: Vec<Option<i32>>, b: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]));
+        let ca = Arc::new(Int32Array::from(a)) as arrow_array::ArrayRef;
+        let cb = Arc::new(Int32Array::from(b)) as arrow_array::ArrayRef;
+        RecordBatch::try_new(schema, vec![ca, cb]).expect("batch")
+    }
+
+    /// Build an `EngineProvider` over the given `tables` map and an empty
+    /// streaming overlay, run `f`, and return its result. The `RefCell` and
+    /// `MemTableProvider` are owned by this scope so the `Ref` borrow the
+    /// provider holds stays alive for the whole closure.
+    fn with_provider<R>(
+        tables: &HashMap<String, Vec<RecordBatch>>,
+        streaming: &RefCell<HashMap<String, TableSource>>,
+        f: impl FnOnce(&EngineProvider) -> R,
+    ) -> R {
+        let base = MemTableProvider::new();
+        let provider = EngineProvider {
+            base: &base,
+            tables,
+            streaming: streaming.borrow(),
+        };
+        f(&provider)
+    }
+
+    /// `has_nulls` returns true iff ANY batch has a NULL on the column —
+    /// tested across a MULTI-batch table where only the second batch has one.
+    #[test]
+    fn has_nulls_scans_all_batches() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "t".to_string(),
+            vec![
+                int32_batch("a", vec![Some(1), Some(2)]), // no nulls
+                int32_batch("a", vec![Some(3), None]),    // null in batch 2
+            ],
+        );
+        let streaming = RefCell::new(HashMap::new());
+        with_provider(&tables, &streaming, |p| {
+            assert!(p.has_nulls("t", 0), "null in any batch => true");
+        });
+    }
+
+    /// A fully non-null multi-batch table reports no nulls.
+    #[test]
+    fn has_nulls_false_when_all_batches_clean() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "t".to_string(),
+            vec![
+                int32_batch("a", vec![Some(1)]),
+                int32_batch("a", vec![Some(2), Some(3)]),
+            ],
+        );
+        let streaming = RefCell::new(HashMap::new());
+        with_provider(&tables, &streaming, |p| {
+            assert!(!p.has_nulls("t", 0));
+        });
+    }
+
+    /// `null_count` sums across every batch (saturating add); skipping a
+    /// per-batch out-of-range ordinal rather than counting it.
+    #[test]
+    fn null_count_sums_across_batches() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "t".to_string(),
+            vec![
+                int32_batch("a", vec![Some(1), None]),   // 1 null
+                int32_batch("a", vec![None, None, Some(4)]), // 2 nulls
+            ],
+        );
+        let streaming = RefCell::new(HashMap::new());
+        with_provider(&tables, &streaming, |p| {
+            assert_eq!(p.null_count("t", 0), Some(3));
+        });
+    }
+
+    /// An out-of-range `col_idx` is skipped per batch (e.g. a dict-extended
+    /// `__idx_*` ordinal): `has_nulls` is safe-false and `null_count` counts
+    /// nothing for the missing ordinal.
+    #[test]
+    fn out_of_range_col_idx_is_skipped() {
+        let mut tables = HashMap::new();
+        // Column 0 has a null; column 5 doesn't exist (only 2 columns).
+        tables.insert(
+            "t".to_string(),
+            vec![two_col_batch(vec![Some(1), None], vec![Some(2), Some(3)])],
+        );
+        let streaming = RefCell::new(HashMap::new());
+        with_provider(&tables, &streaming, |p| {
+            // In-range column 0 sees the null; out-of-range column 5 is skipped.
+            assert!(p.has_nulls("t", 0));
+            assert!(!p.has_nulls("t", 5), "out-of-range ordinal => safe-false");
+            assert_eq!(p.null_count("t", 5), Some(0), "skipped ordinal counts zero");
+            // Column 1 (b) has no nulls.
+            assert!(!p.has_nulls("t", 1));
+        });
+    }
+
+    /// An unknown table: `has_nulls` is safe-false, `null_count` is `None`.
+    #[test]
+    fn unknown_table_is_safe_false_and_none() {
+        let tables = HashMap::new();
+        let streaming = RefCell::new(HashMap::new());
+        with_provider(&tables, &streaming, |p| {
+            assert!(!p.has_nulls("missing", 0));
+            assert_eq!(p.null_count("missing", 0), None);
+        });
+    }
+
+    /// A table present ONLY in the (materialised) streaming overlay resolves
+    /// through `batches_for`'s second arm and answers identically.
+    #[test]
+    fn materialized_streaming_overlay_is_probed() {
+        let tables = HashMap::new();
+        let mut sm = HashMap::new();
+        sm.insert(
+            "s".to_string(),
+            TableSource::Materialized(vec![int32_batch("a", vec![Some(1), None])]),
+        );
+        let streaming = RefCell::new(sm);
+        with_provider(&tables, &streaming, |p| {
+            assert!(p.has_nulls("s", 0), "overlay batch null must be seen");
+            assert_eq!(p.null_count("s", 0), Some(1));
+        });
+    }
+
+    /// A still-`Streaming` overlay entry (not yet materialised) is treated as
+    /// absent by `batches_for` — `has_nulls` is safe-false and `null_count`
+    /// is `None`. (A real query materialises the source before building the
+    /// provider; this guards the defensive "caller forgot" path.)
+    #[test]
+    fn still_streaming_overlay_is_treated_as_absent() {
+        let tables = HashMap::new();
+        let mut sm = HashMap::new();
+        // A trivial replayable producer that yields no batches. Its mere
+        // presence as `Streaming` (not `Materialized`) is what we test.
+        let producer: crate::exec::streaming::BatchProducer =
+            Box::new(|| Box::new(std::iter::empty()));
+        sm.insert("live".to_string(), TableSource::Streaming(producer));
+        let streaming = RefCell::new(sm);
+        with_provider(&tables, &streaming, |p| {
+            assert!(!p.has_nulls("live", 0));
+            assert_eq!(p.null_count("live", 0), None);
+        });
+    }
+
+    /// `tables` takes precedence over the streaming overlay for the same name
+    /// (the `batches_for` lookup order). A clean `tables` entry wins over a
+    /// null-bearing overlay entry of the same name.
+    #[test]
+    fn tables_shadow_streaming_overlay() {
+        let mut tables = HashMap::new();
+        tables.insert("t".to_string(), vec![int32_batch("a", vec![Some(1)])]);
+        let mut sm = HashMap::new();
+        sm.insert(
+            "t".to_string(),
+            TableSource::Materialized(vec![int32_batch("a", vec![None])]),
+        );
+        let streaming = RefCell::new(sm);
+        with_provider(&tables, &streaming, |p| {
+            assert!(
+                !p.has_nulls("t", 0),
+                "the non-null `tables` entry must shadow the null overlay entry"
+            );
+        });
+    }
+
+    /// `EngineTableStats` returns a `TableStats` for known tables and `None`
+    /// for absent ones (keeping join-reorder conservative).
+    #[test]
+    fn engine_table_stats_lookup() {
+        use crate::plan::statistics::StatsProvider;
+        let mut stats = EngineTableStats::default();
+        stats.row_counts.insert("t".to_string(), 100);
+        assert!(stats.table_stats("t").is_some());
+        assert!(stats.table_stats("absent").is_none());
+    }
+}

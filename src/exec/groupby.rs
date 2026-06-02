@@ -602,8 +602,18 @@ pub fn execute_groupby(
     let mut keys_table = GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
     let key_col_gpu = GpuVec::<i64>::from_slice_async(&host_keys, stream.raw())?;
 
+    // Round 1 ABI: a single zero-initialised `u32` device counter shared by the
+    // keys launch, every agg launch, and the decimal launch. Each classic
+    // kernel atomically increments it when a probe-bound (or decimal lock-bound)
+    // overflow would otherwise SILENTLY DROP a row. We read it back after the
+    // final stream sync and error if non-zero, rather than returning a wrong
+    // GROUP BY result. (The Robin Hood keys kernel and the float-atomics
+    // MIN/MAX kernel were NOT changed and do not touch this counter.)
+    let overflow_counter = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+    let overflow_ptr: CUdeviceptr = overflow_counter.device_ptr();
+
     // Launch the keys-only kernel.
-    launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream)?;
+    launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream, overflow_ptr)?;
 
     // For each aggregate, prepare its accumulator and launch the agg kernel.
     // We collect (input_dtype_for_acc, downloaded acc vector as a typed enum)
@@ -678,6 +688,7 @@ pub fn execute_groupby(
             // per-aggregate D2H re-download of `key_col_gpu`.
             &host_keys,
             any_input_has_validity,
+            overflow_ptr,
         )?;
         acc_results.push(acc);
     }
@@ -692,6 +703,24 @@ pub fn execute_groupby(
     };
     drop(keys_table);
     drop(key_col_gpu);
+
+    // Round 1 ABI: after the final sync, read the shared overflow counter back.
+    // A non-zero value means at least one row was dropped on a hash-probe
+    // (or decimal lock) overflow, so the GROUP BY result is incomplete — error
+    // rather than return a wrong aggregate.
+    let overflow_count: u32 = {
+        let pinned = overflow_counter.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        pinned.as_slice().first().copied().unwrap_or(0)
+    };
+    drop(overflow_counter);
+    if overflow_count != 0 {
+        return Err(BoltError::Other(format!(
+            "GROUP BY result incomplete: {} rows dropped on hash-table overflow \
+             (increase hash table size)",
+            overflow_count
+        )));
+    }
 
     // Walk the keys table: every non-empty slot is a group. Build a list of
     // `(key, slot)` and sort by key for deterministic output ordering.
@@ -752,12 +781,20 @@ pub fn execute_groupby(
 // ---------------------------------------------------------------------------
 
 /// Launch the keys-only kernel.
+///
+/// `overflow_ptr` is the device pointer of the shared single-`u32` overflow
+/// counter (host-init `0`). The CLASSIC linear-probe kernel takes it as its
+/// new trailing argument (Round 1 ABI: idx 4) and atomically increments it
+/// when a probe-bound overflow would otherwise silently drop a row. The Robin
+/// Hood variant was NOT changed and keeps its old 4-param ABI, so the counter
+/// is only appended on the linear branch.
 fn launch_keys_kernel(
     group_col: &GpuVec<i64>,
     keys_table: &mut GpuVec<i64>,
     n_rows: usize,
     k_u32: u32,
     stream: &CudaStream,
+    overflow_ptr: CUdeviceptr,
 ) -> BoltResult<()> {
     if n_rows == 0 {
         // Nothing to insert; the empty keys table is already correct.
@@ -765,8 +802,9 @@ fn launch_keys_kernel(
     }
 
     // Dispatch to classic linear-probe (default) or Robin Hood (when
-    // BOLT_HASH_ALGO=robin_hood). Both kernels share the same 4-param ABI;
-    // only the entry-point name varies. Route through the consolidated
+    // BOLT_HASH_ALGO=robin_hood). The classic kernel now takes a trailing
+    // `overflow_counter_ptr` (5 params); the Robin Hood kernel was NOT
+    // changed and keeps the old 4-param ABI. Route through the consolidated
     // module cache so the two variants are cached separately by spec id.
     let want_rh = std::env::var("BOLT_HASH_ALGO")
         .map(|s| {
@@ -794,34 +832,62 @@ fn launch_keys_kernel(
     let mut keys_ptr: CUdeviceptr = keys_table.device_ptr();
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
-
-    let mut params: [*mut c_void; 4] = [
-        &mut group_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut n_rows_u32 as *mut u32 as *mut c_void,
-        &mut k_param as *mut u32 as *mut c_void,
-    ];
+    let mut overflow: CUdeviceptr = overflow_ptr;
 
     let block = groupby_block_size();
     let grid_x = grid_x_for(n_rows_u32, block);
 
-    unsafe {
-        cuda_sys::check(cuda_sys::cuLaunchKernel(
-            function.raw(),
-            grid_x,
-            1,
-            1,
-            block,
-            1,
-            1,
-            0,
-            stream.raw(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        ))?;
+    // The classic linear-probe kernel now takes the trailing overflow counter
+    // (5 params); the Robin Hood kernel was NOT changed and keeps the 4-param
+    // ABI. Attach the extra arg only on the linear branch.
+    if want_rh {
+        let mut params: [*mut c_void; 4] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+    } else {
+        let mut params: [*mut c_void; 5] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+            &mut overflow as *mut CUdeviceptr as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
     }
     stream.synchronize()?;
-    let _ = (group_ptr, keys_ptr);
+    let _ = (group_ptr, keys_ptr, overflow);
     Ok(())
 }
 
@@ -842,6 +908,13 @@ fn launch_keys_kernel(
 /// requested — that emitter has no `_with_validity` companion yet
 /// (Stage G follow-up); the caller's
 /// [`column_should_use_native_validity`] gate already drops that combo.
+///
+/// `overflow_ptr` is the device pointer of the shared single-`u32` overflow
+/// counter (host-init `0`). The classic integer agg kernel takes it as its
+/// new trailing argument (idx 6 classic / idx 7 with-validity) and bumps it on
+/// a probe-bound overflow that would otherwise drop a row silently. The float
+/// MIN/MAX path routes through `float_atomics`, whose kernel was NOT changed
+/// and keeps its old 6-param ABI — the counter is NOT attached there.
 #[allow(clippy::too_many_arguments)]
 fn launch_agg_kernel<T: Pod>(
     op: ReduceOp,
@@ -854,6 +927,7 @@ fn launch_agg_kernel<T: Pod>(
     k_u32: u32,
     stream: &CudaStream,
     validity_ptr: Option<CUdeviceptr>,
+    overflow_ptr: CUdeviceptr,
 ) -> BoltResult<()> {
     if n_rows == 0 {
         return Ok(());
@@ -908,11 +982,16 @@ fn launch_agg_kernel<T: Pod>(
     let block = groupby_block_size();
     let grid_x = grid_x_for(n_rows_u32, block);
 
+    let mut overflow: CUdeviceptr = overflow_ptr;
     if let Some(vp) = validity_ptr {
         // Account the native-dispatch launch for inline-test observability.
         NATIVE_VALIDITY_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // With-validity ABI: 7 classic params + trailing overflow counter at
+        // idx 7 = 8 params. (The native-validity kernel is the integer-atomic
+        // emitter; float MIN/MAX never reaches this branch — see the dispatch
+        // predicate.)
         let mut vptr: CUdeviceptr = vp;
-        let mut params: [*mut c_void; 7] = [
+        let mut params: [*mut c_void; 8] = [
             &mut group_ptr as *mut CUdeviceptr as *mut c_void,
             &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
             &mut input_ptr as *mut CUdeviceptr as *mut c_void,
@@ -920,6 +999,7 @@ fn launch_agg_kernel<T: Pod>(
             &mut n_rows_u32 as *mut u32 as *mut c_void,
             &mut k_param as *mut u32 as *mut c_void,
             &mut vptr as *mut CUdeviceptr as *mut c_void,
+            &mut overflow as *mut CUdeviceptr as *mut c_void,
         ];
         unsafe {
             cuda_sys::check(cuda_sys::cuLaunchKernel(
@@ -937,7 +1017,9 @@ fn launch_agg_kernel<T: Pod>(
             ))?;
         }
         let _ = vptr;
-    } else {
+    } else if is_float_min_max {
+        // Float MIN/MAX uses the UNCHANGED `float_atomics` kernel (6 params,
+        // no overflow counter). Do NOT attach the trailing arg here.
         let mut params: [*mut c_void; 6] = [
             &mut group_ptr as *mut CUdeviceptr as *mut c_void,
             &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
@@ -961,9 +1043,36 @@ fn launch_agg_kernel<T: Pod>(
                 ptr::null_mut(),
             ))?;
         }
+    } else {
+        // Classic integer-atomic ABI: 6 classic params + trailing overflow
+        // counter at idx 6 = 7 params.
+        let mut params: [*mut c_void; 7] = [
+            &mut group_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut input_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut acc_ptr as *mut CUdeviceptr as *mut c_void,
+            &mut n_rows_u32 as *mut u32 as *mut c_void,
+            &mut k_param as *mut u32 as *mut c_void,
+            &mut overflow as *mut CUdeviceptr as *mut c_void,
+        ];
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
     }
     stream.synchronize()?;
-    let _ = (group_ptr, keys_ptr, input_ptr, acc_ptr);
+    let _ = (group_ptr, keys_ptr, input_ptr, acc_ptr, overflow);
     Ok(())
 }
 
@@ -981,6 +1090,12 @@ fn launch_agg_kernel<T: Pod>(
 /// Returns `Ok(true)` if a SUM overflow was detected on-device (the caller
 /// raises the same error as the scalar/host path); `Ok(false)` otherwise.
 /// MIN/MAX never overflow and always return `Ok(false)`.
+///
+/// `overflow_ptr` is the device pointer of the shared single-`u32` probe/lock
+/// OVERFLOW COUNTER (host-init `0`), distinct from the per-launch SUM
+/// signed-overflow FLAG allocated below. The decimal kernel takes it as its
+/// new trailing argument (idx 8 classic) and bumps it on a probe-bound or
+/// lock-bound bailout that would otherwise drop a row silently.
 #[allow(clippy::too_many_arguments)]
 fn launch_decimal_agg_kernel(
     op: GroupedDecimalOp,
@@ -992,6 +1107,7 @@ fn launch_decimal_agg_kernel(
     k: usize,
     k_u32: u32,
     stream: &CudaStream,
+    overflow_ptr: CUdeviceptr,
 ) -> BoltResult<bool> {
     if n_rows == 0 {
         return Ok(false);
@@ -1016,12 +1132,16 @@ fn launch_decimal_agg_kernel(
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let mut k_param: u32 = k_u32;
     let mut lock_ptr: CUdeviceptr = lock_table.device_ptr();
-    let mut overflow_ptr: CUdeviceptr = overflow_flag.device_ptr();
+    // param_7: the SUM signed-overflow FLAG (per-launch, distinct from the
+    // shared probe/lock overflow counter passed in as `overflow_ptr`).
+    let mut sum_overflow_flag_ptr: CUdeviceptr = overflow_flag.device_ptr();
+    // param_8: the shared probe/lock OVERFLOW COUNTER (new Round 1 trailing arg).
+    let mut overflow_counter: CUdeviceptr = overflow_ptr;
 
     let block = groupby_block_size();
     let grid_x = grid_x_for(n_rows_u32, block);
 
-    let mut params: [*mut c_void; 8] = [
+    let mut params: [*mut c_void; 9] = [
         &mut group_ptr as *mut CUdeviceptr as *mut c_void,
         &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
         &mut input_ptr as *mut CUdeviceptr as *mut c_void,
@@ -1029,7 +1149,8 @@ fn launch_decimal_agg_kernel(
         &mut n_rows_u32 as *mut u32 as *mut c_void,
         &mut k_param as *mut u32 as *mut c_void,
         &mut lock_ptr as *mut CUdeviceptr as *mut c_void,
-        &mut overflow_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut sum_overflow_flag_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut overflow_counter as *mut CUdeviceptr as *mut c_void,
     ];
     // SAFETY: `function` is borrowed from a live module; every param points at
     // a stack local that outlives the synchronize below, and the lock/overflow
@@ -1056,7 +1177,8 @@ fn launch_decimal_agg_kernel(
     let overflowed = flag_pinned.as_slice().first().copied().unwrap_or(0) != 0;
     drop(flag_pinned);
     let _ = (
-        group_ptr, keys_ptr, input_ptr, acc_ptr, lock_ptr, overflow_ptr,
+        group_ptr, keys_ptr, input_ptr, acc_ptr, lock_ptr, sum_overflow_flag_ptr,
+        overflow_counter,
     );
     drop(lock_table);
     drop(overflow_flag);
@@ -1140,6 +1262,9 @@ fn run_one_aggregate(
     // here to feed `prepare_filtered_keys` without a per-aggregate D2H.
     cached_host_keys: &[i64],
     any_input_has_validity: bool,
+    // Round 1 ABI: device pointer of the shared overflow counter, forwarded to
+    // every classic kernel launch this aggregate issues.
+    overflow_ptr: CUdeviceptr,
 ) -> BoltResult<AccDownload> {
     match agg {
         AggregateExpr::Sum(expr)
@@ -1150,7 +1275,7 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
             run_typed_agg(
                 op, col_io, group_col, keys_table, batch, n_rows, k, k_u32, stream,
-                key_valid, cached_host_keys, any_input_has_validity,
+                key_valid, cached_host_keys, any_input_has_validity, overflow_ptr,
             )
         }
 
@@ -1193,6 +1318,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc_table, stream)?))
         }
@@ -1272,6 +1398,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             let sum_host = download_pinned_f64(&sum_acc, stream)?;
 
@@ -1291,6 +1418,7 @@ fn run_one_aggregate(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             let count_host = download_pinned_i64(&count_acc, stream)?;
 
@@ -1736,6 +1864,8 @@ fn run_typed_agg(
     // host-filter reuses it instead of re-downloading `group_col`.
     cached_host_keys: &[i64],
     any_input_has_validity: bool,
+    // Round 1 ABI: device pointer of the shared overflow counter.
+    overflow_ptr: CUdeviceptr,
 ) -> BoltResult<AccDownload> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
@@ -1786,6 +1916,7 @@ fn run_typed_agg(
             k,
             k_u32,
             stream,
+            overflow_ptr,
         );
     }
 
@@ -1846,6 +1977,7 @@ fn run_typed_agg(
                     k_u32,
                     stream,
                     None,
+                    overflow_ptr,
                 )?;
                 Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
             } else {
@@ -1865,6 +1997,7 @@ fn run_typed_agg(
                     k_u32,
                     stream,
                     None,
+                    overflow_ptr,
                 )?;
                 Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
             }
@@ -1897,6 +2030,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
@@ -1923,6 +2057,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
         }
@@ -1949,6 +2084,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
@@ -1985,6 +2121,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
         }
@@ -2016,6 +2153,7 @@ fn run_typed_agg(
                 k_u32,
                 stream,
                 None,
+                overflow_ptr,
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
@@ -2101,6 +2239,7 @@ fn run_typed_agg(
                 k,
                 k_u32,
                 stream,
+                overflow_ptr,
             )?;
             if overflowed {
                 // Same canonical message as the scalar/host SUM(Decimal128)
@@ -2204,6 +2343,8 @@ fn run_typed_agg_native_validity(
     k: usize,
     k_u32: u32,
     stream: &CudaStream,
+    // Round 1 ABI: device pointer of the shared overflow counter.
+    overflow_ptr: CUdeviceptr,
 ) -> BoltResult<AccDownload> {
     debug_assert_eq!(value_valid.len(), n_rows);
     // Pack the validity bitmap into the kernel's u32-word layout. Reuse
@@ -2249,6 +2390,7 @@ fn run_typed_agg_native_validity(
                     k_u32,
                     stream,
                     validity_ptr,
+                    overflow_ptr,
                 )?;
                 let _ = validity_gpu; // keep validity buffer alive across launch
                 Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
@@ -2268,6 +2410,7 @@ fn run_typed_agg_native_validity(
                     k_u32,
                     stream,
                     validity_ptr,
+                    overflow_ptr,
                 )?;
                 let _ = validity_gpu;
                 Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
@@ -2299,6 +2442,7 @@ fn run_typed_agg_native_validity(
                 k_u32,
                 stream,
                 validity_ptr,
+                overflow_ptr,
             )?;
             let _ = validity_gpu;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
@@ -2325,6 +2469,7 @@ fn run_typed_agg_native_validity(
                 k_u32,
                 stream,
                 validity_ptr,
+                overflow_ptr,
             )?;
             let _ = validity_gpu;
             Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
@@ -2350,6 +2495,7 @@ fn run_typed_agg_native_validity(
                 k_u32,
                 stream,
                 validity_ptr,
+                overflow_ptr,
             )?;
             let _ = validity_gpu;
             Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
@@ -3788,7 +3934,9 @@ mod tests {
         let host_keys_init: Vec<i64> = vec![EMPTY_KEY; k];
         let mut keys_table = GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
         let key_col_gpu = GpuVec::<i64>::from_slice_async(keys, stream.raw())?;
-        launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream)?;
+        let overflow_counter = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+        let overflow_ptr: CUdeviceptr = overflow_counter.device_ptr();
+        launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream, overflow_ptr)?;
 
         let input_gpu = GpuVec::<i128>::from_slice_async(vals, stream.raw())?;
         let init: Vec<i128> = vec![identity; k];
@@ -3803,6 +3951,7 @@ mod tests {
             k,
             k_u32,
             &stream,
+            overflow_ptr,
         )?;
 
         let acc_host: Vec<i128> = {

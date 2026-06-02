@@ -179,13 +179,19 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   GPU lowering), `TRY_CAST` / `SAFE_CAST` (NULL-on-failure, host-evaluated;
   Float↔`Decimal128` rejected at type-check) and `CAST(... FORMAT '<pattern>')`
   (host-evaluated temporal⇄string, bounded pattern vocab),
-  `LIKE` (GPU over `Utf8`), `||` (host-side), `NOT` (GPU). String
-  functions: `UPPER` / `LOWER` / `LENGTH` (GPU); `SUBSTRING` (literal args)
-  and single-arg `TRIM` over a bare `Utf8` scan are **host-realized** via the
-  `StringProject` producer (custom-chars `TRIM` and computed `SUBSTRING` args
-  fall back to the host `Project`); `CONCAT` is host-side and NULL-if-any-arg-
-  NULL (GPU two-pass kernels implemented but the executor uses a byte-identical
-  host mirror for now).
+  `LIKE` (GPU over a **dictionary** `Utf8` column via integer index-membership;
+  the non-dictionary device matcher is host-validated-only and host by default —
+  see below), `||` (host-side), `NOT` (GPU). String
+  functions: `LENGTH` (GPU integer output); `UPPER` / `LOWER`, `SUBSTRING`
+  (literal args) and single-arg `TRIM` over a bare `Utf8` scan run on the
+  **host** by default via the `StringProject` producer (custom-chars `TRIM` and
+  computed `SUBSTRING` args fall back to the host `Project`); `CONCAT` is
+  host-side and NULL-if-any-arg-NULL. The matching GPU **string device
+  producers** (`UPPER` / `LOWER` / `CONCAT` / `SUBSTRING` / `TRIM`) and the
+  non-dictionary `LIKE` matcher are implemented and PTX-shape-tested but
+  **host-validated only** as of v0.7.0 — they are off by default and reached
+  only behind the opt-in `BOLT_GPU_STRING` env var (see
+  [`ENV_VARS.md`](ENV_VARS.md)).
 - Joins: one or more `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`
   JOINs per `SELECT`, with `ON` / `USING (...)` / `NATURAL` constraints
   (equi-keys only). Each shape has a gated GPU fast path that falls back
@@ -227,7 +233,10 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   type / timestamp unit + timezone.
 - Utf8 predicates: equality / inequality against string literals (folded
   to integer comparisons on the dictionary index at plan time, GPU),
-  `LIKE` (GPU as of v0.7, with a host-side fallback), and — as of v0.7 —
+  `LIKE` (a **dictionary** `Utf8` column folds to a GPU integer
+  index-membership predicate; a non-dictionary column uses the
+  host-validated-only device matcher, host by default, opt-in via
+  `BOLT_GPU_STRING` — see [`ENV_VARS.md`](ENV_VARS.md)), and — as of v0.7 —
   **ordering comparisons against a string literal** (`WHERE name < 'M'`,
   GPU via byte/binary collation; not locale/ICU), and **ordering of two Utf8
   columns** (`a < b`, GPU via a cross-dictionary rank compare — a NULL on
@@ -364,16 +373,19 @@ the knobs that actually exist today.
 
 ### Env vars
 
-Full reference: [`ENV_VARS.md`](ENV_VARS.md). The ones you're most
-likely to touch:
+[`ENV_VARS.md`](ENV_VARS.md) is the **authoritative** list — every runtime /
+build var the crate reads, with full per-var notes and source call sites. The
+handful below are the ones you're most likely to touch:
 
-| Var                              | Default     | What                                                  |
-| -------------------------------- | ----------- | ----------------------------------------------------- |
-| `CRATON_BOLT_POOL_MAX_BYTES`     | 512 MiB     | Soft cap on total pooled GPU memory.                  |
-| `CRATON_BOLT_PTX_CACHE_CAP`      | 256         | Compiled-PTX module cache size (FIFO eviction).       |
-| `BOLT_POOL_STATS_INTERVAL_SECS`  | 60          | Pool-stats log cadence. Set to `0` to silence.        |
-| `BOLT_POOL_WATCH_INTERVAL_SECS`  | 5           | `pool-watcher` poll cadence (only with that feature). |
-| `BOLT_GPU_JOIN_TABLE_CAP_MB`     | driver-detected | Override the GPU hash-join byte cap, 64..=4096 MiB. |
+| Var                                 | Default     | What                                                  |
+| ----------------------------------- | ----------- | ----------------------------------------------------- |
+| `CRATON_BOLT_POOL_MAX_BYTES`        | 512 MiB     | Soft cap on total pooled GPU memory.                  |
+| `CRATON_BOLT_PTX_CACHE_CAP`         | 256         | In-process JIT PTX module-cache size (FIFO eviction). |
+| `CRATON_BOLT_PTX_CACHE_MAX_BYTES`   | 64 MiB      | Disk PTX-cache total-bytes cap (`0` disables).        |
+| `CRATON_BOLT_PTX_CACHE_MAX_ENTRIES` | 4096        | Disk PTX-cache entry-count cap (`0` disables).        |
+| `BOLT_POOL_STATS_INTERVAL_SECS`     | 60          | Pool-stats log cadence. Set to `0` to silence.        |
+| `BOLT_POOL_WATCH_INTERVAL_SECS`     | 5           | `pool-watcher` poll cadence (only with that feature). |
+| `BOLT_GPU_JOIN_TABLE_CAP_MB`        | driver-detected | Override the GPU hash-join byte cap, 64..=4096 MiB. |
 
 Example — bound the engine's resident footprint on a shared GPU:
 

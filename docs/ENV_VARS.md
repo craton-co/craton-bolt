@@ -40,6 +40,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
 | `BOLT_GPU_SORT`                  | off                  | `1`         | Opt into the GPU radix-sort path for `ORDER BY` |
 | `BOLT_GPU_DISTINCT`              | off                  | `1`/`true`/`yes` | Opt into the GPU sort-based `DISTINCT` path |
+| `BOLT_GPU_STRING`                | off                  | `1`/`true`/`yes` | Opt into the (host-validated-only) GPU string device kernels |
 | `BOLT_GPU_WINDOW`                | off                  | `1`         | Opt into the GPU window-function path           |
 | `BOLT_PREFIX_SCAN_ALGO`          | Hillis-Steele        | `blelloch` / `lookback` | Select the GPU prefix-scan kernel   |
 | `BOLT_HASH_ALGO`                 | linear-probe         | `robin_hood` / `rh` | Select the GROUP BY keys hash kernel    |
@@ -276,6 +277,26 @@ PTX-cache directory, are not configuration knobs and are omitted.)
   device round-trip has soak time on real hardware. Mirrors the `BOLT_GPU_SORT`
   gate convention.
 - **Source**: `src/exec/distinct.rs::gpu_distinct_enabled` (line 419).
+
+### `BOLT_GPU_STRING`
+- **Default**: off
+- **Type**: truthy string — `1`, `true`, or `yes` (case-insensitive, trimmed)
+  enable; anything else (including unset) is off
+- **What**: Single gate for **every GPU string device path**: the per-row
+  `LIKE` / `NOT LIKE` / `ILIKE` matcher (`StringLikeFilter` /
+  `compile_like_match_kernel`) and the `UPPER` / `LOWER` / `CONCAT` /
+  `SUBSTRING` / `TRIM` two-pass producers in `src/exec/string_project.rs`. When
+  off (the default) those operations take the **host** code path, which is the
+  correctness path. The device kernels are **host-validated only** — they have
+  never been executed on GPU hardware as of v0.7.0 (CI builds with no CUDA
+  device), so the gate exists purely so a hardware bring-up can opt the device
+  kernels in for validation without editing code.
+- **When**: Enable only on a GPU host doing string-kernel bring-up /
+  validation. Leave off for ordinary use. Mirrors the `BOLT_GPU_SORT` /
+  `BOLT_GPU_DISTINCT` gate convention.
+- **Source**: `src/exec/string_like.rs::gpu_string_enabled` (env var name
+  constant `BOLT_GPU_STRING_ENV`, line 60); re-exported (with
+  `gpu_string_enabled`) from `src/exec/string_project.rs`.
 
 ### `BOLT_GPU_WINDOW`
 - **Default**: off

@@ -100,14 +100,20 @@ ignore = [
     # under `unmaintained = "deny"`. We therefore keep this scoped, non-blocking
     # rather than globally loosening `unmaintained`.
     #
-    # The advisory id below is a PLACEHOLDER: at the time of writing the exact
-    # RUSTSEC id for the unmaintained `xz 0.1.0` crate could not be confirmed
-    # (likely RUSTSEC-2022-0011, "xz crate is unmaintained", but UNVERIFIED).
-    # It is intentionally left COMMENTED OUT so we do not suppress an
-    # unverified/fabricated id (cargo-deny would also warn on an id that matches
-    # nothing). To make the all-features scan blocking, confirm the id at
-    # https://rustsec.org/advisories/ , uncomment, and update this note.
-    #   "RUSTSEC-2022-0011", # PLACEHOLDER — confirm before enabling; xz 0.1.0 (rust-cuda tree)
+    # No RUSTSEC id is listed for the unmaintained `xz 0.1.0` crate here on
+    # purpose. The exact advisory id could not be confirmed at the time of
+    # writing, and we deliberately do NOT hardcode a guessed/real-looking id:
+    # an id that matches nothing makes cargo-deny warn, and an id we cannot
+    # verify could silently suppress the wrong advisory. Because the default
+    # host graph (graph.all-features=false) never contains `xz 0.1.0`, an
+    # ignore entry would have no effect on the blocking default scan anyway —
+    # it would only matter to the non-blocking all-features job.
+    #
+    # TO ENABLE (only if the all-features job is later made blocking): look up
+    # the unmaintained-`xz` advisory at https://rustsec.org/advisories/ ,
+    # confirm the exact id and that it targets `xz 0.1.0`, then add it below
+    # with this justification. Until verified, leave the list empty.
+    #   "<RUSTSEC-ID-TO-BE-CONFIRMED>", # xz 0.1.0 (rust-cuda tree); confirm id before enabling
 ]
 
 [sources]

@@ -1671,6 +1671,246 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Total bytes of committed `*.ptx` entries (ignoring tempfiles) in `dir`.
+    fn total_ptx_bytes(dir: &Path) -> u64 {
+        fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        let n = e.file_name();
+                        let n = n.to_string_lossy();
+                        n.ends_with(".ptx") && !n.contains(".tmp.")
+                    })
+                    .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Over the BYTE cap, `enforce_bounds` (run automatically after each
+    /// `store`) evicts oldest-first until the directory is back under the cap.
+    /// We assert the post-condition the policy guarantees portably: total
+    /// bytes land at or below the cap and at least one entry was evicted. We do
+    /// NOT assert *which* file survived here — mtime resolution is
+    /// filesystem-dependent — that ordering claim is pinned by the
+    /// `#[cfg(unix)]` mtime-controlled test below.
+    #[test]
+    fn byte_cap_evicts_until_under_cap() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_b = std::env::var(DISK_PTX_CACHE_MAX_BYTES_ENV).ok();
+        let prev_e = std::env::var(DISK_PTX_CACHE_MAX_ENTRIES_ENV).ok();
+        // A tiny byte cap; entry-count cap disabled so only bytes drive it.
+        std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, "200");
+        std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "0");
+
+        let dir = fresh_tempdir("evict_bytes");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        // Each stored file is header (~`#bolt-ptx-cache v1 ` + 32 hex + `\n`,
+        // ~52 bytes) plus a 100-byte body => well over 100 bytes apiece, so a
+        // handful of them blows past the 200-byte cap and forces eviction.
+        let body: String = std::iter::repeat('x').take(100).collect();
+        for i in 0..6u64 {
+            cache.store(&hash_to_key(i, i), &body).expect("store");
+        }
+
+        let bytes = total_ptx_bytes(&dir);
+        assert!(
+            bytes <= 200,
+            "byte cap of 200 must hold: {bytes} bytes remain after eviction"
+        );
+        assert!(
+            count_ptx_entries(&dir) < 6,
+            "at least one entry must have been evicted under the byte cap"
+        );
+        // Each entry (~152 B: a ~52 B header + 100 B body) fits under the
+        // 200 B cap on its own, so the policy converges to a single most-
+        // recently-written entry rather than emptying the directory.
+        assert_eq!(
+            count_ptx_entries(&dir),
+            1,
+            "a single ~152 B entry fits under the 200 B cap, so exactly one survives"
+        );
+
+        match prev_b {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_BYTES_ENV),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Under BOTH caps (defaults are large), `enforce_bounds` is a no-op:
+    /// every stored entry survives. We drive it through the public store path
+    /// (which calls `enforce_bounds` after each insert) with generous caps.
+    #[test]
+    fn enforce_bounds_is_noop_under_cap() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_b = std::env::var(DISK_PTX_CACHE_MAX_BYTES_ENV).ok();
+        let prev_e = std::env::var(DISK_PTX_CACHE_MAX_ENTRIES_ENV).ok();
+        std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, "1000000");
+        std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "1000");
+
+        let dir = fresh_tempdir("evict_noop");
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        for i in 0..5u64 {
+            cache.store(&hash_to_key(i, i), "small").expect("store");
+        }
+        assert_eq!(
+            count_ptx_entries(&dir),
+            5,
+            "no entry may be evicted while comfortably under both caps"
+        );
+        // And every entry still round-trips (eviction did not touch them).
+        for i in 0..5u64 {
+            assert_eq!(
+                cache.lookup(&hash_to_key(i, i)).as_deref(),
+                Some("small"),
+                "entry {i} must survive the no-op sweep"
+            );
+        }
+
+        match prev_b {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_BYTES_ENV),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory left OVER the entry-count cap by a previous process is
+    /// trimmed back to exactly the cap on `open` (which calls
+    /// `enforce_bounds` before serving). We pre-plant the files directly so
+    /// the over-cap state exists before the handle is constructed.
+    #[test]
+    fn open_trims_oversized_dir_to_entry_cap() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_b = std::env::var(DISK_PTX_CACHE_MAX_BYTES_ENV).ok();
+        let prev_e = std::env::var(DISK_PTX_CACHE_MAX_ENTRIES_ENV).ok();
+        std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, "0"); // bytes disabled
+        std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "2");
+
+        let dir = fresh_tempdir("evict_open");
+        fs::create_dir_all(&dir).expect("mkdir");
+        // Pre-plant 5 committed entries before any handle exists.
+        for i in 0..5u64 {
+            let key = hash_to_key(i, i);
+            fs::write(dir.join(format!("{key}.ptx")), "x").expect("plant");
+        }
+        assert_eq!(count_ptx_entries(&dir), 5, "precondition: over-cap dir");
+
+        // open() runs enforce_bounds() on an enabled handle, trimming to cap.
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        if cache.is_disk_enabled() {
+            assert_eq!(
+                count_ptx_entries(&dir),
+                2,
+                "open must trim an oversized dir down to the entry cap"
+            );
+        }
+        // (On a platform where the trust check disables the disk layer,
+        // enforce_bounds is intentionally skipped — see DiskPtxCache::open.)
+
+        match prev_b {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_BYTES_ENV),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// LRU-by-mtime ordering (Unix only): with the oldest entries' mtimes
+    /// pushed into the past via `libc::utimes`, `enforce_bounds` must evict
+    /// the OLDEST-mtime entries first, keeping the newest under the cap. We
+    /// gate to `cfg(unix)` because std offers no portable set-mtime API and
+    /// `libc` (already a crate dep) gives us `utimes` only on Unix; the
+    /// portable byte/entry-cap tests above cover the rest.
+    #[cfg(unix)]
+    #[test]
+    fn lru_by_mtime_evicts_oldest_first_unix() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_b = std::env::var(DISK_PTX_CACHE_MAX_BYTES_ENV).ok();
+        let prev_e = std::env::var(DISK_PTX_CACHE_MAX_ENTRIES_ENV).ok();
+        std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, "0"); // bytes disabled
+        std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "2");
+
+        let dir = fresh_tempdir("evict_lru");
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        // Plant 4 entries and stamp each with a strictly increasing mtime so
+        // their LRU order is unambiguous regardless of filesystem timestamp
+        // resolution. keys[0] is oldest, keys[3] is newest.
+        let keys: Vec<String> = (0..4u64).map(|i| hash_to_key(i, 100 + i)).collect();
+        for (rank, key) in keys.iter().enumerate() {
+            let p = dir.join(format!("{key}.ptx"));
+            fs::write(&p, "x").expect("plant");
+            set_mtime_secs_unix(&p, 1_000_000 + rank as i64 * 100);
+        }
+        assert_eq!(count_ptx_entries(&dir), 4, "precondition: 4 entries");
+
+        // open -> enforce_bounds trims to the newest 2 (highest mtime).
+        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        if cache.is_disk_enabled() {
+            assert_eq!(count_ptx_entries(&dir), 2, "entry cap of 2 after trim");
+            // The two OLDEST (keys[0], keys[1]) must be gone; the two NEWEST
+            // (keys[2], keys[3]) must remain.
+            assert!(
+                !dir.join(format!("{}.ptx", keys[0])).exists(),
+                "oldest-mtime entry must be evicted first"
+            );
+            assert!(
+                !dir.join(format!("{}.ptx", keys[1])).exists(),
+                "second-oldest-mtime entry must be evicted"
+            );
+            assert!(
+                dir.join(format!("{}.ptx", keys[2])).exists(),
+                "newer entry must survive"
+            );
+            assert!(
+                dir.join(format!("{}.ptx", keys[3])).exists(),
+                "newest entry must survive"
+            );
+        }
+
+        match prev_b {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_BYTES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_BYTES_ENV),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Set a file's atime+mtime to `secs` since the Unix epoch via
+    /// `libc::utimes`. Test-only helper (Unix) so the LRU-by-mtime test can
+    /// pin a deterministic ordering without depending on wall-clock spacing
+    /// or filesystem timestamp granularity. `libc` is already a crate dep.
+    #[cfg(unix)]
+    fn set_mtime_secs_unix(path: &Path, secs: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+        let tv = libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        // SAFETY: `c` is a valid NUL-terminated path and `times` is a valid
+        // 2-element array of `timeval`, matching the `utimes(2)` contract.
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes must succeed on a just-written temp file");
+    }
+
     // -----------------------------------------------------------------
     // V-3: path-traversal hardening.
     // -----------------------------------------------------------------
@@ -1707,6 +1947,138 @@ mod tests {
         ] {
             assert!(valid_key(good), "key must be accepted: {good:?}");
         }
+    }
+
+    /// Exhaustive path-traversal / injection table for `valid_key`. This is
+    /// the single gate in front of *every* filesystem touch the cache makes
+    /// (`entry_path` → `lookup`/`store`), so we are deliberately broad about
+    /// the shapes an attacker-influenced `entry` symbol could take. Each
+    /// rejected key is one that — if interpolated into `root.join("{key}.ptx")`
+    /// — could escape the cache root or name something other than a plain file
+    /// directly under it.
+    #[test]
+    fn valid_key_traversal_table_is_exhaustive() {
+        // (key, human-readable reason) so a failure points at the class.
+        let rejected: &[(&str, &str)] = &[
+            ("", "empty"),
+            (".", "current-dir component"),
+            ("..", "parent-dir traversal token"),
+            ("...", "all-dots run"),
+            ("....", "longer all-dots run"),
+            // Forward-slash separators (POSIX traversal).
+            ("a/b", "forward slash"),
+            ("/", "bare root slash"),
+            ("/abs", "absolute path marker"),
+            ("/etc/passwd", "absolute POSIX path"),
+            ("../../evil", "relative parent escape"),
+            ("a/../b", "interior parent escape"),
+            ("foo/", "trailing slash"),
+            ("./foo", "leading dot-slash"),
+            // Back-slash separators (Windows traversal).
+            ("a\\b", "back slash"),
+            ("\\", "bare backslash"),
+            ("..\\..\\evil", "windows parent escape"),
+            ("C:\\windows\\system32", "windows absolute drive path"),
+            ("\\\\server\\share", "UNC path"),
+            // Drive-letter / NTFS alternate-data-stream colon.
+            ("a:b", "colon (drive / ADS separator)"),
+            ("C:", "bare drive letter"),
+            ("key:$DATA", "NTFS ADS stream syntax"),
+            // NUL and other control bytes (filesystem-injection).
+            ("a\0b", "embedded NUL"),
+            ("\0", "bare NUL"),
+            ("a\nb", "embedded newline"),
+            ("a\tb", "embedded tab"),
+            ("a\rb", "embedded carriage return"),
+            // Whitespace and shell/glob metacharacters outside the charset.
+            ("foo bar", "space"),
+            (" leading", "leading space"),
+            ("trailing ", "trailing space"),
+            ("a*b", "glob star"),
+            ("a?b", "glob question mark"),
+            ("a|b", "pipe"),
+            ("a;b", "semicolon"),
+            ("$VAR", "dollar / shell var"),
+            ("a%b", "percent"),
+            ("a&b", "ampersand"),
+            ("a'b", "single quote"),
+            ("a\"b", "double quote"),
+            ("a`b", "backtick"),
+            ("~", "tilde / home"),
+            ("héllo", "non-ASCII byte"),
+            // The crate's own former separator must never slip through.
+            ("scalar_agg::x", "old `::` separator"),
+        ];
+        for (bad, why) in rejected {
+            assert!(
+                !valid_key(bad),
+                "key {bad:?} must be rejected ({why})"
+            );
+            // The gate must also deny it a filesystem path everywhere it is
+            // consulted: a fresh cache yields no entry_path / lookup / store.
+            let dir = fresh_tempdir("vk_table");
+            let cache = DiskPtxCache::open(dir.clone()).expect("open");
+            assert!(
+                cache.entry_path(bad).is_none(),
+                "entry_path({bad:?}) must be None ({why})"
+            );
+            assert!(
+                cache.lookup(bad).is_none(),
+                "lookup({bad:?}) must miss ({why})"
+            );
+            assert!(
+                cache.store(bad, "payload").is_ok(),
+                "store({bad:?}) must be an Ok no-op ({why})"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Accepted: the full filename-safe charset `[0-9A-Za-z._-]+`, plus the
+        // real key shapes the engine composes.
+        let accepted: &[&str] = &[
+            "a",
+            "0",
+            "A",
+            "_",
+            "-",
+            "a.b",      // interior dot is fine — it is not a whole `.`/`..`
+            "..a",      // dots are allowed bytes; only an ALL-dots run is denied
+            "a..",
+            "a..b",
+            "abc",
+            "deadbeef",
+            "DEADBEEF",
+            "a.b_c-d",
+            "cg2-v0.7.0-arch_sm_70_isa_7.5-scalar_agg__bolt_reduce-00112233445566778899aabbccddeeff",
+        ];
+        for good in accepted {
+            assert!(valid_key(good), "key {good:?} must be accepted");
+        }
+
+        // Hex content keys and full composed disk keys always pass the gate.
+        assert!(valid_key(hash_to_key(0, 0).as_str()));
+        assert!(valid_key(hash_to_key(u64::MAX, u64::MAX).as_str()));
+        assert!(valid_key(&disk_key("bolt_reduce", 0xdead_beef, 0xcafe_babe)));
+    }
+
+    /// `valid_key` accepts a long-but-legitimate key (a real composed disk
+    /// key is ~80+ chars) and the charset gate itself imposes no length
+    /// ceiling — the contract is charset-based, not length-based, so we pin
+    /// that behaviour explicitly rather than asserting a cap the code does
+    /// not enforce.
+    #[test]
+    fn valid_key_length_behavior() {
+        // An empty key is the one length that is rejected.
+        assert!(!valid_key(""), "empty key must be rejected");
+        // A single safe char is the minimum accepted key.
+        assert!(valid_key("a"));
+        // A very long all-safe-charset key is still accepted (no length cap).
+        let long: String = std::iter::repeat('a').take(4096).collect();
+        assert!(valid_key(&long), "a long all-safe key must be accepted");
+        // A long key that is ALL dots is still rejected (traversal guard wins
+        // regardless of length).
+        let long_dots: String = std::iter::repeat('.').take(64).collect();
+        assert!(!valid_key(&long_dots), "an all-dots run must be rejected at any length");
     }
 
     /// A traversal key must produce no on-disk path: `lookup` misses and

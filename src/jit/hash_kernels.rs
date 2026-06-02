@@ -2101,6 +2101,11 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 mod ptx_shape_tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global `BOLT_HASH_ALGO` env
+    /// var, which the dispatcher reads. Without this, the default-branch test
+    /// and the robin-hood test race under the default multi-threaded runner.
+    static HASH_ALGO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The classic (no-validity) keys kernel now has a 5-param ABI: the four
     /// historical params plus the always-present trailing overflow counter at
     /// param_4. It still emits no `bfe.u32` validity extraction.
@@ -2678,6 +2683,7 @@ mod ptx_shape_tests {
     /// name returned matches the default path).
     #[test]
     fn dispatcher_defaults_to_linear_probe() {
+        let _guard = HASH_ALGO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Save + clear the env so the dispatcher takes the default branch.
         let prev = std::env::var("BOLT_HASH_ALGO").ok();
         std::env::remove_var("BOLT_HASH_ALGO");
@@ -2695,6 +2701,7 @@ mod ptx_shape_tests {
     /// shorthand.
     #[test]
     fn dispatcher_opts_into_robin_hood() {
+        let _guard = HASH_ALGO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("BOLT_HASH_ALGO").ok();
 
         std::env::set_var("BOLT_HASH_ALGO", "robin_hood");
