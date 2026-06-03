@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Exclusive prefix-sum offsets for Tier-2 hash-partitioned GROUP BY.
 //!
@@ -227,13 +227,12 @@ fn with_pinned_scratch<R>(
             // Allocate on first use for this thread (or after a context-epoch
             // invalidation). If allocation fails we leave the slot empty so a
             // later call can retry.
-            let buf = PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1)
-                .map_err(|e| {
-                    BoltError::Other(format!(
-                        "partition_offsets: failed to allocate per-thread \
+            let buf = PinnedHostBuffer::<u32>::new(NUM_PARTITIONS as usize + 1).map_err(|e| {
+                BoltError::Other(format!(
+                    "partition_offsets: failed to allocate per-thread \
                          pinned scratch (cuMemAllocHost): {e}"
-                    ))
-                })?;
+                ))
+            })?;
             *slot = Some((buf, epoch));
         }
         // SAFETY of unwrap: just installed `Some` if it was `None`.
@@ -563,7 +562,12 @@ mod tests {
         for &n in &[0usize, 1, 2, 17, 1023, NUM_PARTITIONS as usize, 4096] {
             let counts = vec![1u32; n];
             let offsets = prefix_sum_cpu(&counts).unwrap();
-            assert_eq!(offsets.len(), n + 1, "length invariant violated at n = {}", n);
+            assert_eq!(
+                offsets.len(),
+                n + 1,
+                "length invariant violated at n = {}",
+                n
+            );
         }
     }
 
@@ -651,10 +655,8 @@ mod tests {
         // Sanity check that the pinned-async path returns the same
         // prefix-sum as the host scan. Counts chosen to exercise the
         // wrapping accumulator and a non-trivial offsets[K].
-        let host_counts: Vec<u32> =
-            (0..NUM_PARTITIONS).map(|k| (k * 11 + 1) % 257).collect();
-        let dev_counts =
-            GpuVec::<u32>::from_slice(&host_counts).expect("upload counts");
+        let host_counts: Vec<u32> = (0..NUM_PARTITIONS).map(|k| (k * 11 + 1) % 257).collect();
+        let dev_counts = GpuVec::<u32>::from_slice(&host_counts).expect("upload counts");
 
         let offsets = compute_partition_offsets(&dev_counts).expect("async compute");
         assert_eq!(offsets.len(), NUM_PARTITIONS as usize + 1);
@@ -677,8 +679,7 @@ mod tests {
         use crate::exec::launch::CudaStream;
 
         let host_counts: Vec<u32> = (0..NUM_PARTITIONS).map(|k| k + 1).collect();
-        let dev_counts =
-            GpuVec::<u32>::from_slice(&host_counts).expect("upload counts");
+        let dev_counts = GpuVec::<u32>::from_slice(&host_counts).expect("upload counts");
 
         let stream = CudaStream::new().expect("create stream");
         let (offsets, dev_offsets) =
@@ -750,18 +751,17 @@ mod tests {
                 // hits `with_pinned_scratch` directly so the test stays
                 // CUDA-free (no `GpuVec` allocation needed).
                 for iter in 0..32u32 {
-                    let result: BoltResult<Vec<u32>> =
-                        with_pinned_scratch(|scratch| {
-                            // Use the pinned region as scratch: write a
-                            // deterministic pattern in, prefix-sum it,
-                            // return the result. Mirrors the real
-                            // download-then-scan call shape.
-                            let s = scratch.as_mut_slice();
-                            for k in 0..NUM_PARTITIONS as usize {
-                                s[k] = tid.wrapping_add(iter).wrapping_add(k as u32);
-                            }
-                            prefix_sum_cpu(&s[..NUM_PARTITIONS as usize])
-                        });
+                    let result: BoltResult<Vec<u32>> = with_pinned_scratch(|scratch| {
+                        // Use the pinned region as scratch: write a
+                        // deterministic pattern in, prefix-sum it,
+                        // return the result. Mirrors the real
+                        // download-then-scan call shape.
+                        let s = scratch.as_mut_slice();
+                        for k in 0..NUM_PARTITIONS as usize {
+                            s[k] = tid.wrapping_add(iter).wrapping_add(k as u32);
+                        }
+                        prefix_sum_cpu(&s[..NUM_PARTITIONS as usize])
+                    });
                     if let Ok(v) = result {
                         // Sanity: prefix sum's first element is 0 and
                         // length is correct. Any cross-thread state
@@ -812,10 +812,8 @@ mod tests {
                 // attach. If that fails, return a sentinel `None` so the
                 // outer assertion can skip — the test is `#[ignore]`'d
                 // already, so the run only happens on a CUDA host.
-                let dev = GpuVec::<u32>::from_slice(&host[..])
-                    .expect("upload per-thread counts");
-                let offsets = compute_partition_offsets(&dev)
-                    .expect("compute per-thread offsets");
+                let dev = GpuVec::<u32>::from_slice(&host[..]).expect("upload per-thread counts");
+                let offsets = compute_partition_offsets(&dev).expect("compute per-thread offsets");
                 (tid, offsets, host)
             }));
         }

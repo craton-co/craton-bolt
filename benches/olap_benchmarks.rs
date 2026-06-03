@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **h2o.ai db-benchmark — groupby subset, three-engine comparison.**
 //!
@@ -188,15 +188,8 @@ fn duckdb_conn(n: usize) -> duckdb::Connection {
     {
         let mut app = conn.appender("x").expect("appender");
         for i in 0..n {
-            app.append_row(duckdb::params![
-                id1(i),
-                id2(i),
-                id3(i),
-                v1(i),
-                v2(i),
-                v3(i)
-            ])
-            .expect("append");
+            app.append_row(duckdb::params![id1(i), id2(i), id3(i), v1(i), v2(i), v3(i)])
+                .expect("append");
         }
         app.flush().expect("flush");
     }
@@ -245,11 +238,12 @@ fn polars_q(df: &polars::prelude::DataFrame, q: &str) -> QueryResult {
     let lf = df.clone().lazy();
     let r = match q {
         Q1 => lf.group_by([col("id1")]).agg([col("v1").sum().alias("s1")]),
-        Q2 => lf.group_by([col("id2")]).agg([
-            col("v1").sum().alias("s1"),
-            col("v2").sum().alias("s2"),
-        ]),
-        Q3 => lf.group_by([col("id1"), col("id2")]).agg([col("v1").sum().alias("s1")]),
+        Q2 => lf
+            .group_by([col("id2")])
+            .agg([col("v1").sum().alias("s1"), col("v2").sum().alias("s2")]),
+        Q3 => lf
+            .group_by([col("id1"), col("id2")])
+            .agg([col("v1").sum().alias("s1")]),
         Q4 => lf.group_by([col("id1")]).agg([
             col("v1").mean().alias("a1"),
             col("v2").mean().alias("a2"),
@@ -415,10 +409,7 @@ fn bolt_decode(h: &craton_bolt::exec::QueryHandle, q: &str) -> QueryResult {
             for i in 0..n {
                 aggs[ai].push(f.value(i));
             }
-        } else if let Some(i64a) = col
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-        {
+        } else if let Some(i64a) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
             for i in 0..n {
                 aggs[ai].push(i64a.value(i) as f64);
             }
@@ -486,9 +477,7 @@ fn assert_results_match(label: &str, expected: &QueryResult, actual: &QueryResul
 /// `bench_bolt_group`, where it shares a single long-lived engine with the
 /// timed runs.
 fn verify_polars_vs_duckdb() {
-    eprintln!(
-        "[h2o-bench] verifying Polars ⇄ DuckDB equivalence on {VERIFY_ROWS}-row fixture…"
-    );
+    eprintln!("[h2o-bench] verifying Polars ⇄ DuckDB equivalence on {VERIFY_ROWS}-row fixture…");
     let polars = polars_df(VERIFY_ROWS);
     let duck = duckdb_conn(VERIFY_ROWS);
     for (name, sql) in QUERIES {

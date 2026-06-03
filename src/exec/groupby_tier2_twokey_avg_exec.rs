@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **Two-key multi-AVG at Tier 2.1** — high-cardinality
 //! `SELECT a, b, AVG(v1), AVG(v2), … FROM x GROUP BY a, b` executor.
@@ -45,8 +45,8 @@ use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
 use crate::exec::partition_offsets;
 use crate::jit::{
-    partition_kernel_i64, partition_reduce_kernel_count_i64,
-    partition_reduce_kernel_multi_i64, scatter_kernel_i64, CudaModule,
+    partition_kernel_i64, partition_reduce_kernel_count_i64, partition_reduce_kernel_multi_i64,
+    scatter_kernel_i64, CudaModule,
 };
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
@@ -80,7 +80,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
+            KernelSpec::PartitionI64ShmemStaging => {
+                partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?
+            }
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceMultiI64 { n_vals } => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -110,13 +112,9 @@ fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try the two-key Tier-2.1 multi-AVG fast path. `None` on any
 /// precondition miss so the caller falls through to the next strategy.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -273,7 +271,8 @@ fn execute_inner(
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         for j in 0..n_vals {
-            let cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+            let cursors: GpuVec<u32> =
+                GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
             let mut keys_ptr = keys_gpu.device_ptr();
             let mut vals_ptr = vals_gpu[j].device_ptr();
             let mut pids_ptr = partition_ids.device_ptr();
@@ -342,8 +341,7 @@ fn execute_inner(
         n_vals: n_vals as u32,
     })?;
     {
-        let entry =
-            partition_reduce_kernel_multi_i64::kernel_entry_with_spill(n_vals as u32);
+        let entry = partition_reduce_kernel_multi_i64::kernel_entry_with_spill(n_vals as u32);
         let func = reduce_multi_module.function(&entry)?;
 
         let mut storage: Vec<CUdeviceptr> = Vec::with_capacity(4 + 2 * n_vals + 1);
@@ -420,8 +418,7 @@ fn execute_inner(
 
     // ---- Stage-4 (P1b): pinned D2H for every output buffer; sync once.
     let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
-    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> =
-        Vec::with_capacity(n_vals);
+    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> = Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
         pinned_vals.push(ov.to_pinned_async(stream.raw())?);
     }
@@ -437,10 +434,7 @@ fn execute_inner(
         )));
     }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
-    let host_out_vals: Vec<Vec<f64>> = pinned_vals
-        .iter()
-        .map(|p| p.as_slice().to_vec())
-        .collect();
+    let host_out_vals: Vec<Vec<f64>> = pinned_vals.iter().map(|p| p.as_slice().to_vec()).collect();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
     let host_out_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
 
@@ -460,9 +454,7 @@ fn execute_inner(
                 continue;
             }
             let cf = c as f64;
-            let avgs: Vec<f64> = (0..n_vals)
-                .map(|j| host_out_vals[j][idx] / cf)
-                .collect();
+            let avgs: Vec<f64> = (0..n_vals).map(|j| host_out_vals[j][idx] / cf).collect();
             rows.push((host_out_keys[idx], avgs));
         }
     }
@@ -512,9 +504,9 @@ fn execute_inner(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {
@@ -610,8 +602,7 @@ mod tests {
     fn rejects_mixed_aggregates() {
         let mut plan = build_twokey_avg_plan(1);
         if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
-            aggregate.aggregates =
-                vec![AggregateExpr::Sum(Expr::Column("v0".into()))];
+            aggregate.aggregates = vec![AggregateExpr::Sum(Expr::Column("v0".into()))];
         }
         let batch = twokey_avg_batch(300_000, 1);
         assert!(try_execute(&plan, &batch).is_none());
@@ -708,13 +699,13 @@ mod cache_tests {
             Ok(m) => m,
             Err(_) => return,
         };
-        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 })
-            .expect("n_vals=2 build");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 }).expect("n_vals=2 build");
         let baseline = LOAD_COUNT.load(Ordering::SeqCst);
-        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 1 })
-            .expect("n_vals=1 hit");
-        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 })
-            .expect("n_vals=2 hit");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 1 }).expect("n_vals=1 hit");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 }).expect("n_vals=2 hit");
         assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
     }
 }
@@ -741,9 +732,18 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k1".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "k2".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Avg(Expr::Column("v".into()))],

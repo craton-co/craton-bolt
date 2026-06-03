@@ -94,7 +94,10 @@ fn format_dtype(dt: DataType) -> String {
 /// expressions are always fully parenthesised so precedence is unambiguous.
 pub fn format_expr(expr: &Expr) -> String {
     match expr {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => format!("{expr:?}"),
+        Expr::Extract { .. }
+        | Expr::DateTrunc { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. } => format!("{expr:?}"),
         Expr::Column(name) => name.clone(),
         Expr::Literal(lit) => format_literal(lit),
         Expr::Binary { op, left, right } => {
@@ -318,7 +321,12 @@ fn format_logical_into(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 format_logical_into(child, depth + 1, out);
             }
         }
-        LogicalPlan::SetOp { left, right, op, all } => {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
             let all_str = if *all { " all" } else { "" };
             let _ = writeln!(out, "SetOp: op={}{all_str}", op.keyword());
             format_logical_into(left, depth + 1, out);
@@ -340,7 +348,11 @@ fn format_logical_into(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 Some(f) => format!(" filter={}", format_expr(f)),
                 None => String::new(),
             };
-            let _ = writeln!(out, "Join: type={}{on_str}{filt}", join_type_str(*join_type));
+            let _ = writeln!(
+                out,
+                "Join: type={}{on_str}{filt}",
+                join_type_str(*join_type)
+            );
             format_logical_into(left, depth + 1, out);
             format_logical_into(right, depth + 1, out);
         }
@@ -362,7 +374,12 @@ fn format_logical_into(plan: &LogicalPlan, depth: usize, out: &mut String) {
 /// indent level deeper under a labelled sub-header.
 pub fn format_recursive_cte(rec: &crate::plan::sql_frontend::RecursiveCtePlan) -> String {
     let mut out = String::new();
-    let cols: Vec<&str> = rec.cte_schema.fields.iter().map(|f| f.name.as_str()).collect();
+    let cols: Vec<&str> = rec
+        .cte_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
     let union = if rec.all { "UNION ALL" } else { "UNION" };
     // A non-linear (self-join) recursive term is evaluated naively (the full
     // accumulated relation is re-bound each iteration); surface that in the
@@ -399,7 +416,12 @@ pub fn format_mutual_recursive_cte(
     let mut out = String::new();
     let _ = writeln!(out, "MutualRecursiveCte: {} CTEs", rec.ctes.len());
     for term in &rec.ctes {
-        let cols: Vec<&str> = term.cte_schema.fields.iter().map(|f| f.name.as_str()).collect();
+        let cols: Vec<&str> = term
+            .cte_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         indent(&mut out, 1);
         let kind = match &term.recursive {
             Some(_) if term.all => "recursive UNION ALL",
@@ -481,9 +503,7 @@ pub fn format_lateral_apply(la: &crate::plan::sql_frontend::LateralApplyPlan) ->
 /// relation (FROM + ordinary WHERE conjuncts), `Test:` the per-row
 /// (correlation-rewritten) test subplan, and `Post:` the OUTER projection
 /// template run over the surviving rows.
-pub fn format_correlated_where(
-    cw: &crate::plan::sql_frontend::CorrelatedWherePlan,
-) -> String {
+pub fn format_correlated_where(cw: &crate::plan::sql_frontend::CorrelatedWherePlan) -> String {
     use crate::plan::sql_frontend::CorrWhereKind;
     let mut out = String::new();
     let kind = match cw.kind {
@@ -547,8 +567,7 @@ pub fn format_values_query(vp: &crate::plan::sql_frontend::ValuesQueryPlan) -> S
         None => {
             if !vp.order_by.is_empty() {
                 indent(&mut out, 1);
-                let keys: Vec<String> =
-                    vp.order_by.iter().map(|s| format_expr(&s.expr)).collect();
+                let keys: Vec<String> = vp.order_by.iter().map(|s| format_expr(&s.expr)).collect();
                 let _ = writeln!(out, "OrderBy: [{}]", keys.join(", "));
             }
             if let Some((limit, offset)) = vp.limit {
@@ -662,9 +681,7 @@ pub fn format_count_distinct_groupby(
 /// output order); the `Base:` sub-header renders the subplan that materialises
 /// `[group_keys..., agg_inputs...]`, and a `Post:` sub-header (when present)
 /// renders the HAVING / ORDER BY / LIMIT plan.
-pub fn format_multi_agg_groupby(
-    cd: &crate::plan::sql_frontend::MultiAggGroupByPlan,
-) -> String {
+pub fn format_multi_agg_groupby(cd: &crate::plan::sql_frontend::MultiAggGroupByPlan) -> String {
     use crate::plan::sql_frontend::CdAgg;
     let mut out = String::new();
     let aggs: Vec<&str> = cd
@@ -774,11 +791,7 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 Some(k) => format!(" pre=kernel({})", format_kernel(k)),
                 None => String::new(),
             };
-            let aggs: Vec<String> = aggregate
-                .aggregates
-                .iter()
-                .map(format_aggregate)
-                .collect();
+            let aggs: Vec<String> = aggregate.aggregates.iter().map(format_aggregate).collect();
             let _ = writeln!(
                 out,
                 "Aggregate: table={table} group_keys={} aggs=[{}]{pre_str}",
@@ -813,15 +826,18 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 format_physical_into(child, depth + 1, out);
             }
         }
-        PhysicalPlan::SetOp { left, right, op, all } => {
+        PhysicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
             let all_str = if *all { " all" } else { "" };
             let _ = writeln!(out, "SetOp: op={}{all_str}", op.keyword());
             format_physical_into(left, depth + 1, out);
             format_physical_into(right, depth + 1, out);
         }
-        PhysicalPlan::Project {
-            input, exprs, ..
-        } => {
+        PhysicalPlan::Project { input, exprs, .. } => {
             let rendered: Vec<String> = exprs.iter().map(format_expr).collect();
             let _ = writeln!(out, "Project: [{}]", rendered.join(", "));
             format_physical_into(input, depth + 1, out);
@@ -847,7 +863,11 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 Some(f) => format!(" filter={}", format_expr(f)),
                 None => String::new(),
             };
-            let _ = writeln!(out, "Join: type={}{on_str}{filt}", join_type_str(*join_type));
+            let _ = writeln!(
+                out,
+                "Join: type={}{on_str}{filt}",
+                join_type_str(*join_type)
+            );
             format_physical_into(left, depth + 1, out);
             format_physical_into(right, depth + 1, out);
         }
@@ -924,17 +944,11 @@ mod tests {
         let plan = LogicalPlan::Aggregate {
             input: Box::new(scan_t()),
             group_by: vec![col("a")],
-            aggregates: vec![
-                AggregateExpr::Count(col("b")),
-                AggregateExpr::Sum(col("a")),
-            ],
+            aggregates: vec![AggregateExpr::Count(col("b")), AggregateExpr::Sum(col("a"))],
         };
         let out = format_logical(&plan);
         let first = out.lines().next().unwrap();
-        assert_eq!(
-            first,
-            "Aggregate: group_by=[a] aggs=[COUNT(b), SUM(a)]"
-        );
+        assert_eq!(first, "Aggregate: group_by=[a] aggs=[COUNT(b), SUM(a)]");
         // child scan is indented one level.
         assert!(out.contains("\n  Scan: table=t"));
     }

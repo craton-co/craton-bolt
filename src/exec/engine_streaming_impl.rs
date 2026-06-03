@@ -209,25 +209,24 @@ impl Engine {
         if aggregate.output_schema.fields.len() != aggregate.aggregates.len() {
             return None;
         }
-        let all_streamable =
-            aggregate
-                .aggregates
-                .iter()
-                .zip(aggregate.output_schema.fields.iter())
-                .all(|(a, f)| {
-                    let distributive = matches!(
-                        a,
-                        AggregateExpr::Count(_)
-                            | AggregateExpr::Sum(_)
-                            | AggregateExpr::Min(_)
-                            | AggregateExpr::Max(_)
-                    );
-                    let foldable_dtype = matches!(
-                        f.dtype,
-                        DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
-                    );
-                    distributive && foldable_dtype
-                });
+        let all_streamable = aggregate
+            .aggregates
+            .iter()
+            .zip(aggregate.output_schema.fields.iter())
+            .all(|(a, f)| {
+                let distributive = matches!(
+                    a,
+                    AggregateExpr::Count(_)
+                        | AggregateExpr::Sum(_)
+                        | AggregateExpr::Min(_)
+                        | AggregateExpr::Max(_)
+                );
+                let foldable_dtype = matches!(
+                    f.dtype,
+                    DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+                );
+                distributive && foldable_dtype
+            });
         if all_streamable {
             Some(table.as_str())
         } else {

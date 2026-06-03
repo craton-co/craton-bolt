@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for GPU-side filter compaction (prefix scan + gather).
 //!
@@ -215,34 +215,14 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     // n_rows
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r4, [{}_param_3];",
-        SCAN_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_3];", SCAN_KERNEL_ENTRY).map_err(write_err)?;
 
     // -------- Globalize parameter pointers.
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd0, [{}_param_0];",
-        SCAN_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", SCAN_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd1, [{}_param_1];",
-        SCAN_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_1];", SCAN_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd2, [{}_param_2];",
-        SCAN_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_2];", SCAN_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
 
     // -------- Load this thread's mask byte (0 if past the end). Treat any
@@ -318,12 +298,7 @@ pub fn compile_prefix_scan_kernel() -> BoltResult<String> {
             step = step
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tsub.s64 %rd10, %rd8, {off};",
-            off = off_bytes
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tsub.s64 %rd10, %rd8, {off};", off = off_bytes).map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u32 %r8, [%rd10];").map_err(write_err)?;
         writeln!(ptx, "SKIP_LOAD_{step}:", step = step).map_err(write_err)?;
         // sum = own + neighbor (or own + 0)
@@ -462,7 +437,10 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
 
     // log2(BLOCK_SIZE). BLOCK_SIZE is a compile-time pow2 by construction
     // (= 256), so this is exact.
-    debug_assert!(BLOCK_SIZE.is_power_of_two(), "Blelloch requires pow2 BLOCK_SIZE");
+    debug_assert!(
+        BLOCK_SIZE.is_power_of_two(),
+        "Blelloch requires pow2 BLOCK_SIZE"
+    );
     let k_levels: u32 = BLOCK_SIZE.trailing_zeros();
 
     let mut ptx = String::new();
@@ -482,30 +460,10 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
     // Signature mirrors the Hillis-Steele kernel exactly so the host launcher
     // can swap PTX without touching argument plumbing.
     writeln!(ptx, ".visible .entry {}(", SCAN_KERNEL_ENTRY_BLELLOCH).map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\t.param .u64 {}_param_0,",
-        SCAN_KERNEL_ENTRY_BLELLOCH
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\t.param .u64 {}_param_1,",
-        SCAN_KERNEL_ENTRY_BLELLOCH
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\t.param .u64 {}_param_2,",
-        SCAN_KERNEL_ENTRY_BLELLOCH
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\t.param .u32 {}_param_3",
-        SCAN_KERNEL_ENTRY_BLELLOCH
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_0,", SCAN_KERNEL_ENTRY_BLELLOCH).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_1,", SCAN_KERNEL_ENTRY_BLELLOCH).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u64 {}_param_2,", SCAN_KERNEL_ENTRY_BLELLOCH).map_err(write_err)?;
+    writeln!(ptx, "\t.param .u32 {}_param_3", SCAN_KERNEL_ENTRY_BLELLOCH).map_err(write_err)?;
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -612,39 +570,23 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
         .map_err(write_err)?;
 
         // Predicate: skip if `tid >= active_threads`.
-        writeln!(
-            ptx,
-            "\tsetp.ge.u32 %p2, %r2, {at};",
-            at = active_threads
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tsetp.ge.u32 %p2, %r2, {at};", at = active_threads).map_err(write_err)?;
         writeln!(ptx, "\t@%p2 bra UPSWEEP_SKIP_{d};", d = d).map_err(write_err)?;
 
         // idx_r = tid * stride + (stride - 1); byte offset = idx_r * 4.
         // We compute the address directly to avoid a redundant intermediate.
         // %r10 = tid * stride
-        writeln!(ptx, "\tmul.lo.u32 %r10, %r2, {stride};", stride = stride)
-            .map_err(write_err)?;
+        writeln!(ptx, "\tmul.lo.u32 %r10, %r2, {stride};", stride = stride).map_err(write_err)?;
         // %r11 = idx_r = %r10 + (stride - 1)
-        writeln!(
-            ptx,
-            "\tadd.s32 %r11, %r10, {sm1};",
-            sm1 = stride - 1
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r11, %r10, {sm1};", sm1 = stride - 1).map_err(write_err)?;
         // %r12 = idx_l = idx_r - half_stride
-        writeln!(
-            ptx,
-            "\tsub.s32 %r12, %r11, {hs};",
-            hs = half_stride
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tsub.s32 %r12, %r11, {hs};", hs = half_stride).map_err(write_err)?;
         // Byte offsets and shared addresses for idx_r / idx_l.
         writeln!(ptx, "\tmul.wide.u32 %rd10, %r11, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd11, %rd5, %rd10;").map_err(write_err)?; // &arr[idx_r]
         writeln!(ptx, "\tmul.wide.u32 %rd12, %r12, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd13, %rd5, %rd12;").map_err(write_err)?; // &arr[idx_l]
-        // arr[idx_r] += arr[idx_l]
+                                                                            // arr[idx_r] += arr[idx_l]
         writeln!(ptx, "\tld.shared.u32 %r13, [%rd11];").map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u32 %r14, [%rd13];").map_err(write_err)?;
         writeln!(ptx, "\tadd.s32 %r15, %r13, %r14;").map_err(write_err)?;
@@ -663,8 +605,11 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
     //   because it can also issue the final `block_sums[blockIdx.x]`
     //   store later (no extra barrier needed: only thread 0 reads %r20).
     // ============================================================
-    writeln!(ptx, "\t// ---- BLELLOCH ZERO-INIT (exclusive-scan identity) ----")
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\t// ---- BLELLOCH ZERO-INIT (exclusive-scan identity) ----"
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p3, %r2, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra AFTER_PIVOT;").map_err(write_err)?;
     // Last-element address: %rd5 + (BLOCK_SIZE - 1) * 4
@@ -713,34 +658,18 @@ pub fn compile_prefix_scan_kernel_blelloch() -> BoltResult<String> {
         )
         .map_err(write_err)?;
 
-        writeln!(
-            ptx,
-            "\tsetp.ge.u32 %p4, %r2, {at};",
-            at = active_threads
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tsetp.ge.u32 %p4, %r2, {at};", at = active_threads).map_err(write_err)?;
         writeln!(ptx, "\t@%p4 bra DOWNSWEEP_SKIP_{d};", d = d).map_err(write_err)?;
 
         // idx_r / idx_l + addresses (same shape as upsweep).
-        writeln!(ptx, "\tmul.lo.u32 %r25, %r2, {stride};", stride = stride)
-            .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tadd.s32 %r26, %r25, {sm1};",
-            sm1 = stride - 1
-        )
-        .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tsub.s32 %r27, %r26, {hs};",
-            hs = half_stride
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tmul.lo.u32 %r25, %r2, {stride};", stride = stride).map_err(write_err)?;
+        writeln!(ptx, "\tadd.s32 %r26, %r25, {sm1};", sm1 = stride - 1).map_err(write_err)?;
+        writeln!(ptx, "\tsub.s32 %r27, %r26, {hs};", hs = half_stride).map_err(write_err)?;
         writeln!(ptx, "\tmul.wide.u32 %rd20, %r26, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd21, %rd5, %rd20;").map_err(write_err)?; // &arr[idx_r]
         writeln!(ptx, "\tmul.wide.u32 %rd22, %r27, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd23, %rd5, %rd22;").map_err(write_err)?; // &arr[idx_l]
-        // t = arr[idx_l]
+                                                                            // t = arr[idx_l]
         writeln!(ptx, "\tld.shared.u32 %r28, [%rd23];").map_err(write_err)?;
         // r29 = arr[idx_r]
         writeln!(ptx, "\tld.shared.u32 %r29, [%rd21];").map_err(write_err)?;
@@ -1042,12 +971,7 @@ pub fn compile_prefix_scan_kernel_lookback() -> BoltResult<String> {
             step = step
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tsub.s64 %rd10, %rd8, {off};",
-            off = off_bytes
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tsub.s64 %rd10, %rd8, {off};", off = off_bytes).map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u32 %r8, [%rd10];").map_err(write_err)?;
         writeln!(ptx, "LB_SKIP_LOAD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tadd.s32 %r9, %r7, %r8;").map_err(write_err)?;
@@ -1203,12 +1127,7 @@ pub fn compile_prefix_scan_kernel_lookback() -> BoltResult<String> {
 
     // Stash block_prefix into the shared broadcast slot so every lane can
     // read it after the upcoming bar.sync.
-    writeln!(
-        ptx,
-        "\tadd.s64 %rd20, %rd5, {off};",
-        off = block_prefix_off
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd20, %rd5, {off};", off = block_prefix_off).map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd20], %r30;").map_err(write_err)?;
 
     // ============================================================
@@ -1218,12 +1137,7 @@ pub fn compile_prefix_scan_kernel_lookback() -> BoltResult<String> {
     writeln!(ptx, "BROADCAST:").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
 
-    writeln!(
-        ptx,
-        "\tadd.s64 %rd21, %rd5, {off};",
-        off = block_prefix_off
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd5, {off};", off = block_prefix_off).map_err(write_err)?;
     writeln!(ptx, "\tld.shared.u32 %r40, [%rd21];").map_err(write_err)?;
     writeln!(ptx, "\tadd.s32 %r41, %r11, %r40;").map_err(write_err)?;
 
@@ -1590,9 +1504,8 @@ mod tests {
             DataType::Float32,
             DataType::Float64,
         ] {
-            let ptx = compile_gather_kernel(dtype).unwrap_or_else(|e| {
-                panic!("compile_gather_kernel({:?}) failed: {}", dtype, e)
-            });
+            let ptx = compile_gather_kernel(dtype)
+                .unwrap_or_else(|e| panic!("compile_gather_kernel({:?}) failed: {}", dtype, e));
             let entry = gather_kernel_entry(dtype);
             assert!(
                 ptx.contains(&format!(".visible .entry {entry}(")),
@@ -1703,8 +1616,14 @@ mod tests {
         );
 
         // High-half offset on both sides.
-        assert!(ptx.contains("[%rd12+8]"), "missing input high-half [+8] load");
-        assert!(ptx.contains("[%rd14+8]"), "missing output high-half [+8] store");
+        assert!(
+            ptx.contains("[%rd12+8]"),
+            "missing input high-half [+8] load"
+        );
+        assert!(
+            ptx.contains("[%rd14+8]"),
+            "missing output high-half [+8] store"
+        );
 
         // The single-value typed copy of the scalar path must NOT appear —
         // the decimal kernel never emits a `.s32` / `.s64` value move.
@@ -1829,7 +1748,10 @@ mod tests {
         let blelloch = compile_prefix_scan_kernel_blelloch().expect("blelloch compiles");
         let hillis = compile_prefix_scan_kernel().expect("hillis-steele compiles");
         assert!(!blelloch.is_empty());
-        assert_ne!(blelloch, hillis, "Blelloch and Hillis-Steele PTX must differ");
+        assert_ne!(
+            blelloch, hillis,
+            "Blelloch and Hillis-Steele PTX must differ"
+        );
 
         // Hillis-Steele uses two ping-pong shmem buffers (2048 bytes);
         // Blelloch uses one (1024 bytes). The shared decl is the most
@@ -1889,8 +1811,7 @@ mod tests {
     /// synchronization correct on sm_70+.
     #[test]
     fn lookback_ptx_has_shape() {
-        let ptx =
-            compile_prefix_scan_kernel_lookback().expect("lookback PTX compiles");
+        let ptx = compile_prefix_scan_kernel_lookback().expect("lookback PTX compiles");
 
         // Header.
         assert!(ptx.contains(".version 7.5"));
@@ -1958,7 +1879,11 @@ mod tests {
     fn lookback_guard_enforces_row_bounds() {
         // n_rows at/over the 30-bit value budget saturates the prefix → unsafe
         // even with ample co-residency.
-        assert!(lookback_launch_is_safe(1, 1, LOOKBACK_MAX_ROWS as usize - 1));
+        assert!(lookback_launch_is_safe(
+            1,
+            1,
+            LOOKBACK_MAX_ROWS as usize - 1
+        ));
         assert!(!lookback_launch_is_safe(1, 1, LOOKBACK_MAX_ROWS as usize));
         // n_rows above i32::MAX mis-addresses in the s32 tid math → unsafe.
         assert!(!lookback_launch_is_safe(1, 1, i32::MAX as usize + 1));

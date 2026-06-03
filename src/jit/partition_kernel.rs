@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Hash-partition pass-1 kernel (Tier 2 of the GROUP BY perf plan).
 //!
@@ -291,12 +291,7 @@ pub fn compile_partition_kernel_global_atomics() -> BoltResult<String> {
     // Constant: Knuth multiplier. Materialised in %r7 once outside the loop;
     // the assembler doesn't reliably fold a 32-bit immediate into `mul.lo.u32`
     // on every toolchain we target.
-    writeln!(
-        ptx,
-        "\tmov.u32 %r7, 0x{mult:08X};",
-        mult = HASH_MULTIPLIER
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r7, 0x{mult:08X};", mult = HASH_MULTIPLIER).map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // ----------------------------------------------------------------------
@@ -321,12 +316,7 @@ pub fn compile_partition_kernel_global_atomics() -> BoltResult<String> {
     writeln!(ptx, "\tmul.lo.u32 %r9, %r8, %r7;").map_err(write_err)?;
 
     // pid = hash & (NUM_PARTITIONS - 1)
-    writeln!(
-        ptx,
-        "\tand.b32 %r10, %r9, 0x{mask:X};",
-        mask = mask
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r10, %r9, 0x{mask:X};", mask = mask).map_err(write_err)?;
 
     // atomicAdd(&counts[pid], 1). The "%r11" destination receives the old
     // value but we never read it — required syntactically by PTX.
@@ -459,12 +449,7 @@ pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
     writeln!(ptx).map_err(write_err)?;
 
     // Knuth multiplier — same as the global-atomics variant.
-    writeln!(
-        ptx,
-        "\tmov.u32 %r7, 0x{mult:08X};",
-        mult = HASH_MULTIPLIER
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r7, 0x{mult:08X};", mult = HASH_MULTIPLIER).map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     // ----------------------------------------------------------------------
@@ -487,12 +472,7 @@ pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
     for k in 0..slots_per_thread {
         // slot_index = tid + k * block_threads
         let offset = k * block_threads;
-        writeln!(
-            ptx,
-            "\tadd.u32 %r14, %r2, {off};",
-            off = offset
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.u32 %r14, %r2, {off};", off = offset).map_err(write_err)?;
         writeln!(ptx, "\tmul.wide.u32 %rd20, %r14, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd21, %rd3, %rd20;").map_err(write_err)?;
         writeln!(ptx, "\tst.shared.u32 [%rd21], %r13;").map_err(write_err)?;
@@ -523,8 +503,7 @@ pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
     writeln!(ptx, "\tmul.lo.u32 %r9, %r8, %r7;").map_err(write_err)?;
 
     // pid = hash & (NUM_PARTITIONS - 1)
-    writeln!(ptx, "\tand.b32 %r10, %r9, 0x{mask:X};", mask = mask)
-        .map_err(write_err)?;
+    writeln!(ptx, "\tand.b32 %r10, %r9, 0x{mask:X};", mask = mask).map_err(write_err)?;
 
     // atomicAdd(&block_counts[pid], 1). Shared atomic add — never hits L2.
     // The destination register %r11 captures the pre-increment value
@@ -567,12 +546,7 @@ pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
     for k in 0..slots_per_thread {
         let offset = k * block_threads;
         // slot_index = tid + k * block_threads
-        writeln!(
-            ptx,
-            "\tadd.u32 %r20, %r2, {off};",
-            off = offset
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.u32 %r20, %r2, {off};", off = offset).map_err(write_err)?;
         // shared_addr = &block_counts[slot_index]
         writeln!(ptx, "\tmul.wide.u32 %rd30, %r20, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;
@@ -821,10 +795,10 @@ mod tests {
     /// first row count that crosses into the shmem-staging path.
     #[test]
     fn dispatcher_boundary_is_inclusive_at_threshold() {
-        let below = compile_partition_kernel_for_n_rows(SHMEM_STAGING_MIN_ROWS - 1)
-            .expect("compile");
-        let at_threshold = compile_partition_kernel_for_n_rows(SHMEM_STAGING_MIN_ROWS)
-            .expect("compile");
+        let below =
+            compile_partition_kernel_for_n_rows(SHMEM_STAGING_MIN_ROWS - 1).expect("compile");
+        let at_threshold =
+            compile_partition_kernel_for_n_rows(SHMEM_STAGING_MIN_ROWS).expect("compile");
         // The two PTX strings must differ — proves the dispatcher
         // actually switches variants at the threshold.
         assert_ne!(

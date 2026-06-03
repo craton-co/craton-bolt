@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! GPU-resident table storage: columns uploaded once and queried in place.
 
@@ -372,9 +372,7 @@ impl GpuColumn {
                             dictionary: dict.dictionary,
                         }
                     }
-                    A::Dictionary(key_ty, value_ty)
-                        if matches!(value_ty.as_ref(), A::Utf8) =>
-                    {
+                    A::Dictionary(key_ty, value_ty) if matches!(value_ty.as_ref(), A::Utf8) => {
                         let n = arr.len();
                         let (keys_i32, dict_strings) = match key_ty.as_ref() {
                             A::Int32 => {
@@ -393,8 +391,7 @@ impl GpuColumn {
                                             "GpuColumn: dict values are not StringArray".into(),
                                         )
                                     })?;
-                                let mut dict_strings: Vec<String> =
-                                    Vec::with_capacity(sa.len());
+                                let mut dict_strings: Vec<String> = Vec::with_capacity(sa.len());
                                 for i in 0..sa.len() {
                                     // NULL dict entries shouldn't happen for a
                                     // sane Arrow input, but defensively keep
@@ -455,8 +452,7 @@ impl GpuColumn {
                                             "GpuColumn: dict values are not StringArray".into(),
                                         )
                                     })?;
-                                let mut dict_strings: Vec<String> =
-                                    Vec::with_capacity(sa.len());
+                                let mut dict_strings: Vec<String> = Vec::with_capacity(sa.len());
                                 for i in 0..sa.len() {
                                     if sa.is_null(i) {
                                         dict_strings.push(String::new());
@@ -691,10 +687,7 @@ impl GpuColumn {
     /// [`GpuColumnData::DictUtf8`] without going through `StringArray`
     /// flattening. Used by the engine when it ingests dictionary-encoded
     /// columns directly (Stage 6+).
-    pub fn upload_dict_utf8(
-        name: String,
-        arr: &DictionaryArray<Int32Type>,
-    ) -> BoltResult<Self> {
+    pub fn upload_dict_utf8(name: String, arr: &DictionaryArray<Int32Type>) -> BoltResult<Self> {
         // Values must be Utf8.
         let dict_vals = arr
             .values()
@@ -979,9 +972,9 @@ mod tests {
             match GpuColumn::upload("ts".to_string(), &placeholder, dtype) {
                 Ok(_) => panic!("{dtype:?} upload of an Int32Array must fail the downcast"),
                 Err(BoltError::Type(_)) => { /* expected clean downcast error */ }
-                Err(other) => panic!(
-                    "{dtype:?} downcast mismatch must be BoltError::Type, got: {other:?}"
-                ),
+                Err(other) => {
+                    panic!("{dtype:?} downcast mismatch must be BoltError::Type, got: {other:?}")
+                }
             }
         }
     }
@@ -1096,11 +1089,9 @@ mod tests {
             ArrowDataType::Utf8,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(strings.clone()))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(strings.clone()))])
+                .unwrap();
 
         let table = GpuTable::from_record_batch(&batch).expect("GpuTable upload");
         let col = table.column("name").expect("name column");
@@ -1194,8 +1185,7 @@ mod tests {
         let arr = Decimal128Array::from(vec![Some(123i128), None, Some(456)])
             .with_precision_and_scale(10, 2)
             .unwrap();
-        let col = GpuColumn::upload("d".into(), &arr, DataType::Decimal128(10, 2))
-            .expect("upload");
+        let col = GpuColumn::upload("d".into(), &arr, DataType::Decimal128(10, 2)).expect("upload");
         // The upload must carry a validity bitmap (source had a null).
         match &col.data {
             GpuColumnData::Decimal128 { valid_mask, .. } => {
@@ -1219,8 +1209,7 @@ mod tests {
         let arr = Decimal128Array::from(vec![1i128, 2, 3])
             .with_precision_and_scale(10, 2)
             .unwrap();
-        let col = GpuColumn::upload("d".into(), &arr, DataType::Decimal128(10, 2))
-            .expect("upload");
+        let col = GpuColumn::upload("d".into(), &arr, DataType::Decimal128(10, 2)).expect("upload");
         match &col.data {
             GpuColumnData::Decimal128 { valid_mask, .. } => {
                 assert!(valid_mask.is_none(), "no-nulls upload should omit validity");

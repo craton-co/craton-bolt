@@ -333,10 +333,18 @@ impl<'a> ColumnReader<'a> {
     pub(crate) fn value_at(&self, row: usize) -> RowKeyValue {
         match self {
             ColumnReader::I32(a) => {
-                if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::I32(a.value(row)) }
+                if a.is_null(row) {
+                    RowKeyValue::Null
+                } else {
+                    RowKeyValue::I32(a.value(row))
+                }
             }
             ColumnReader::I64(a) => {
-                if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::I64(a.value(row)) }
+                if a.is_null(row) {
+                    RowKeyValue::Null
+                } else {
+                    RowKeyValue::I64(a.value(row))
+                }
             }
             ColumnReader::F32(a) => {
                 if a.is_null(row) {
@@ -355,7 +363,11 @@ impl<'a> ColumnReader<'a> {
                 }
             }
             ColumnReader::Bool(a) => {
-                if a.is_null(row) { RowKeyValue::Null } else { RowKeyValue::Bool(a.value(row)) }
+                if a.is_null(row) {
+                    RowKeyValue::Null
+                } else {
+                    RowKeyValue::Bool(a.value(row))
+                }
             }
             ColumnReader::Utf8(a) => {
                 if a.is_null(row) {
@@ -810,7 +822,13 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("expected Int32 column");
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -835,10 +853,7 @@ mod tests {
         let out_batch = out.into_record_batch();
         assert_eq!(out_batch.num_rows(), 3);
         // first-occurrence wins
-        assert_eq!(
-            col_to_vec(&out_batch, 0),
-            vec![Some(1), Some(2), Some(3)]
-        );
+        assert_eq!(col_to_vec(&out_batch, 0), vec![Some(1), Some(2), Some(3)]);
     }
 
     #[test]
@@ -877,13 +892,8 @@ mod tests {
     /// holding signed-zero pairs must dedupe to one row.
     #[test]
     fn distinct_signed_zero_dedupes_to_one_row() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "f",
-            DataType::Float64,
-            false,
-        )]));
-        let arr: Arc<dyn Array> =
-            Arc::new(Float64Array::from(vec![0.0_f64, -0.0_f64, 0.0_f64]));
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![0.0_f64, -0.0_f64, 0.0_f64]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         // {+0.0, -0.0, +0.0} all collapse to the canonical +0.0 key, so
@@ -926,11 +936,7 @@ mod tests {
     /// different NaN payloads collapses them all into one output row.
     #[test]
     fn distinct_collapses_multiple_nan_payloads() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "f",
-            DataType::Float64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
         let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![
             f64::from_bits(0x7ff8_0000_0000_0001),
             f64::from_bits(0x7ff8_0000_0000_0002),
@@ -952,8 +958,7 @@ mod tests {
             Field::new("s", DataType::Utf8, false),
             Field::new("n", DataType::Int32, false),
         ]));
-        let s: Arc<dyn Array> =
-            Arc::new(StringArray::from(vec!["a", "b", "a", "a", "b"]));
+        let s: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "a", "a", "b"]));
         let n: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 1, 3, 2]));
         let batch = RecordBatch::try_new(schema, vec![s, n]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
@@ -1000,15 +1005,10 @@ mod tests {
             Field::new("s", DataType::Utf8, false),
         ]));
         // 5 genuinely distinct rows.
-        let i: Arc<dyn Array> =
-            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5]));
-        let f: Arc<dyn Array> = Arc::new(Float64Array::from(vec![
-            1.5_f64, 2.5, 3.5, 4.5, 5.5,
-        ]));
-        let b: Arc<dyn Array> =
-            Arc::new(BooleanArray::from(vec![true, false, true, false, true]));
-        let s: Arc<dyn Array> =
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"]));
+        let i: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5]));
+        let f: Arc<dyn Array> = Arc::new(Float64Array::from(vec![1.5_f64, 2.5, 3.5, 4.5, 5.5]));
+        let b: Arc<dyn Array> = Arc::new(BooleanArray::from(vec![true, false, true, false, true]));
+        let s: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"]));
         let batch = RecordBatch::try_new(schema, vec![i, f, b, s]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         assert_eq!(out.into_record_batch().num_rows(), 5);
@@ -1019,12 +1019,7 @@ mod tests {
     #[test]
     fn distinct_nan_dedupes_to_one_row() {
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
-        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![
-            f64::NAN,
-            1.0,
-            f64::NAN,
-            2.0,
-        ]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![f64::NAN, 1.0, f64::NAN, 2.0]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         let out_batch = out.into_record_batch();
@@ -1038,8 +1033,7 @@ mod tests {
     #[test]
     fn distinct_zero_signs() {
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
-        let arr: Arc<dyn Array> =
-            Arc::new(Float64Array::from(vec![0.0_f64, -0.0_f64, 0.0_f64]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![0.0_f64, -0.0_f64, 0.0_f64]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         let out_batch = out.into_record_batch();
@@ -1052,11 +1046,7 @@ mod tests {
     #[test]
     fn distinct_f32_nan_dedupes_to_one_row() {
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, false)]));
-        let arr: Arc<dyn Array> = Arc::new(Float32Array::from(vec![
-            f32::NAN,
-            f32::NAN,
-            1.0_f32,
-        ]));
+        let arr: Arc<dyn Array> = Arc::new(Float32Array::from(vec![f32::NAN, f32::NAN, 1.0_f32]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let out = execute_distinct(QueryHandle::from_record_batch(batch)).unwrap();
         assert_eq!(out.into_record_batch().num_rows(), 2);
@@ -1103,7 +1093,9 @@ mod tests {
         let input = QueryHandle::from_record_batch(batch);
         let result = execute_distinct_with_cap(input, 3);
         let err = match result {
-            Ok(_) => panic!("expected DISTINCT bound to be exceeded with cap=3 and 5 distinct rows"),
+            Ok(_) => {
+                panic!("expected DISTINCT bound to be exceeded with cap=3 and 5 distinct rows")
+            }
             Err(e) => e,
         };
         let msg = err.to_string();
@@ -1173,18 +1165,46 @@ mod tests {
         };
 
         // Unset → default.
-        with_env(None, DISTINCT_HOST_MAX_ROWS, "unset should fall back to default");
+        with_env(
+            None,
+            DISTINCT_HOST_MAX_ROWS,
+            "unset should fall back to default",
+        );
         // Empty / whitespace → default.
-        with_env(Some(""), DISTINCT_HOST_MAX_ROWS, "empty should fall back to default");
-        with_env(Some("   "), DISTINCT_HOST_MAX_ROWS, "whitespace should fall back to default");
+        with_env(
+            Some(""),
+            DISTINCT_HOST_MAX_ROWS,
+            "empty should fall back to default",
+        );
+        with_env(
+            Some("   "),
+            DISTINCT_HOST_MAX_ROWS,
+            "whitespace should fall back to default",
+        );
         // Unparseable → default (warn fires; we don't assert on the log).
-        with_env(Some("not-a-number"), DISTINCT_HOST_MAX_ROWS, "unparseable should fall back");
-        with_env(Some("-5"), DISTINCT_HOST_MAX_ROWS, "negative should fall back (usize parse fails)");
+        with_env(
+            Some("not-a-number"),
+            DISTINCT_HOST_MAX_ROWS,
+            "unparseable should fall back",
+        );
+        with_env(
+            Some("-5"),
+            DISTINCT_HOST_MAX_ROWS,
+            "negative should fall back (usize parse fails)",
+        );
         // Zero is explicitly rejected — would disable the cap entirely.
-        with_env(Some("0"), DISTINCT_HOST_MAX_ROWS, "zero should fall back to default");
+        with_env(
+            Some("0"),
+            DISTINCT_HOST_MAX_ROWS,
+            "zero should fall back to default",
+        );
         // Valid positive integer wins.
         with_env(Some("42"), 42, "valid positive integer should win");
-        with_env(Some("  100  "), 100, "leading/trailing whitespace should be trimmed");
+        with_env(
+            Some("  100  "),
+            100,
+            "leading/trailing whitespace should be trimmed",
+        );
     }
 
     /// Boolean dtype: only two possible values, plus optional NULLs.
@@ -1256,8 +1276,9 @@ mod tests {
         assert_ne!(key3, diff);
 
         // Wide key spills to heap but still matches the Vec relation.
-        let wide_vals: Vec<RowKeyValue> =
-            (0..ROW_KEY_INLINE as i32 + 2).map(RowKeyValue::I32).collect();
+        let wide_vals: Vec<RowKeyValue> = (0..ROW_KEY_INLINE as i32 + 2)
+            .map(RowKeyValue::I32)
+            .collect();
         let wide = RowKey::from_values(wide_vals.len(), wide_vals.iter().cloned());
         assert!(matches!(wide, RowKey::Heap(_)));
         assert_eq!(wide.as_slice(), wide_vals.as_slice());
@@ -1403,8 +1424,7 @@ mod tests {
         // NaN rows after the bare-IEEE device sort; the host path collapses
         // them to one).
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
-        let arr: Arc<dyn Array> =
-            Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN, f64::NAN]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN, f64::NAN]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         assert!(matches!(try_gpu_distinct(&batch), Ok(None)));
     }

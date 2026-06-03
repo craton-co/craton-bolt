@@ -111,9 +111,7 @@ fn registry() -> &'static Mutex<Option<ObserverHandle>> {
 /// trait object (rather than the crate-internal `PoolStatsObserver`
 /// alias) to keep the public signature self-describing and avoid
 /// leaking an alias through a `pub(crate)` module boundary.
-pub fn install_pool_stats_observer(
-    f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>,
-) {
+pub fn install_pool_stats_observer(f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>) {
     // `Box<dyn Fn>` → `Arc<dyn Fn>` so `notify_observers` can clone the
     // handle out of the slot and release the lock before invoking it.
     let handle: ObserverHandle = Arc::from(f);

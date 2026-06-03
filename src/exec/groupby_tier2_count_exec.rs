@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **COUNT(*) at Tier 2.1** — high-cardinality `SELECT key, COUNT(*) FROM x
 //! GROUP BY key` executor.
@@ -34,9 +34,7 @@ use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
-use crate::jit::{
-    partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule,
-};
+use crate::jit::{partition_kernel, partition_reduce_kernel_count, scatter_kernel, CudaModule};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
 use crate::plan::physical_plan::PhysicalPlan;
 
@@ -72,7 +70,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-            KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
+            KernelSpec::PartitionShmemStaging => {
+                partition_kernel::compile_partition_kernel_shmem_staging()?
+            }
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ReduceCount => {
                 // The single launch site (`execute_inner`) looks up
@@ -100,12 +100,8 @@ fn partition_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try the Tier-2.1 COUNT(*) fast path. `None` on any precondition miss.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -223,7 +219,8 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
     {
         let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
-        let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+        let mut cursors: GpuVec<u32> =
+            GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         let view_keys = keys_gpu.view();
@@ -262,8 +259,8 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
     let reduce_module = get_or_build_module(&KernelSpec::ReduceCount)?;
     let mut spill_counter: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
     {
-        let func = reduce_module
-            .function(partition_reduce_kernel_count::KERNEL_ENTRY_WITH_SPILL)?;
+        let func =
+            reduce_module.function(partition_reduce_kernel_count::KERNEL_ENTRY_WITH_SPILL)?;
 
         let view_keys = scatter_keys.view();
         let view_offsets = offsets_kp1_gpu.view();
@@ -352,9 +349,9 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {
@@ -452,7 +449,10 @@ mod tests {
         let n = 300_000;
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())) as arrow_array::ArrayRef],
+            vec![
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()))
+                    as arrow_array::ArrayRef,
+            ],
         )
         .unwrap();
         assert!(try_execute(&plan, &batch).is_none());
@@ -629,7 +629,10 @@ mod stage4_tests {
             table: "t".into(),
             pre: None,
             aggregate: AggregateSpec {
-                inputs: vec![ColumnIO { name: "k".into(), dtype: DataType::Int32 }],
+                inputs: vec![ColumnIO {
+                    name: "k".into(),
+                    dtype: DataType::Int32,
+                }],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
                 output_schema: Schema::new(vec![
@@ -639,9 +642,11 @@ mod stage4_tests {
                 input_has_validity: Vec::new(),
             },
         };
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("k", ArrowDataType::Int32, false),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Int32,
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef],

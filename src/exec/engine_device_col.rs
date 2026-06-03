@@ -514,12 +514,7 @@ mod tests {
     /// must recover the original negative value, not a huge positive one.
     #[test]
     fn negative_values_preserve_sign() {
-        let rows = [
-            -1i128,
-            -42,
-            i128::MIN,
-            -170_141_183_460_469_231_731i128,
-        ];
+        let rows = [-1i128, -42, i128::MIN, -170_141_183_460_469_231_731i128];
         let host = interleave(&rows);
         let arr = decimal128_from_interleaved(&host, rows.len(), None, 38, 0, "test").unwrap();
         for (i, &want) in rows.iter().enumerate() {

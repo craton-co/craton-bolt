@@ -27,9 +27,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::Engine;
@@ -226,8 +224,8 @@ fn engine_for_not_in(probe: Vec<Option<i32>>, set: Vec<Option<i32>>) -> Engine {
         ArrowDataType::Int32,
         true,
     )]));
-    let t = RecordBatch::try_new(t_schema, vec![Arc::new(Int32Array::from(probe))])
-        .expect("t batch");
+    let t =
+        RecordBatch::try_new(t_schema, vec![Arc::new(Int32Array::from(probe))]).expect("t batch");
     engine.register_table("t", t).expect("register t");
 
     let o_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -235,8 +233,8 @@ fn engine_for_not_in(probe: Vec<Option<i32>>, set: Vec<Option<i32>>) -> Engine {
         ArrowDataType::Int32,
         true,
     )]));
-    let o = RecordBatch::try_new(o_schema, vec![Arc::new(Int32Array::from(set))])
-        .expect("other batch");
+    let o =
+        RecordBatch::try_new(o_schema, vec![Arc::new(Int32Array::from(set))]).expect("other batch");
     engine.register_table("other", o).expect("register other");
     engine
 }
@@ -256,7 +254,11 @@ fn not_in_subquery_with_null_in_set_returns_zero_rows() {
         .sql("SELECT k FROM t WHERE k NOT IN (SELECT id FROM other)")
         .expect("NOT IN with NULL set");
     let out = h.record_batch();
-    assert_eq!(out.num_rows(), 0, "NULL in NOT IN set must exclude all rows");
+    assert_eq!(
+        out.num_rows(),
+        0,
+        "NULL in NOT IN set must exclude all rows"
+    );
 }
 
 /// `k NOT IN (SELECT id FROM other)` with a NULL-free set → normal semantics:
@@ -289,7 +291,10 @@ fn not_in_subquery_null_probe_excluded() {
         .expect("NOT IN null probe");
     let out = h.record_batch();
     let k = col_int32(out, 0);
-    let got: Vec<i32> = (0..k.len()).filter(|&i| !k.is_null(i)).map(|i| k.value(i)).collect();
+    let got: Vec<i32> = (0..k.len())
+        .filter(|&i| !k.is_null(i))
+        .map(|i| k.value(i))
+        .collect();
     assert_eq!(got, vec![7], "NULL probe must not pass NOT IN");
 }
 
@@ -326,7 +331,7 @@ fn two_key_count_excludes_nulls() {
     let n = 8usize;
     let k1: Int32Array = (0..n as i32).map(|i| i / 4).collect(); // 0,0,0,0,1,1,1,1
     let k2: Int32Array = (0..n as i32).map(|i| (i / 2) % 2).collect(); // 0,0,1,1,0,0,1,1
-    // v: NULL on odd indices → each 2-row group has exactly 1 non-null.
+                                                                       // v: NULL on odd indices → each 2-row group has exactly 1 non-null.
     let v: Int64Array = (0..n as i64)
         .map(|i| if i % 2 == 1 { None } else { Some(i) })
         .collect();
@@ -335,11 +340,8 @@ fn two_key_count_excludes_nulls() {
         ArrowField::new("k2", ArrowDataType::Int32, false),
         ArrowField::new("v", ArrowDataType::Int64, true),
     ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(k1), Arc::new(k2), Arc::new(v)],
-    )
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(k1), Arc::new(k2), Arc::new(v)]).expect("batch");
     engine.register_table("t", batch).expect("register");
 
     let h = engine
@@ -373,14 +375,12 @@ fn grouped_float_min_max_with_nan_matches_scalar() {
     // group 0: {1.0, NaN, 2.0}  → MIN=1.0, MAX=NaN (NaN largest)
     // group 1: {-3.0, 0.5}      → MIN=-3.0, MAX=0.5
     let k: Int32Array = Int32Array::from(vec![0, 0, 0, 1, 1]);
-    let v: Float64Array =
-        Float64Array::from(vec![1.0, f64::NAN, 2.0, -3.0, 0.5]);
+    let v: Float64Array = Float64Array::from(vec![1.0, f64::NAN, 2.0, -3.0, 0.5]);
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("k", ArrowDataType::Int32, false),
         ArrowField::new("v", ArrowDataType::Float64, false),
     ]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("batch");
     engine.register_table("t", batch).expect("register");
 
     let h = engine
@@ -393,7 +393,10 @@ fn grouped_float_min_max_with_nan_matches_scalar() {
 
     // group 0
     assert_eq!(mins.value(0), 1.0, "group 0 MIN ignores NaN");
-    assert!(maxs.value(0).is_nan(), "group 0 MAX is NaN (NaN-as-largest)");
+    assert!(
+        maxs.value(0).is_nan(),
+        "group 0 MAX is NaN (NaN-as-largest)"
+    );
     // group 1
     assert_eq!(mins.value(1), -3.0);
     assert_eq!(maxs.value(1), 0.5);
@@ -411,8 +414,7 @@ fn grouped_float_all_nan_group_min_max_are_nan() {
         ArrowField::new("k", ArrowDataType::Int32, false),
         ArrowField::new("v", ArrowDataType::Float64, false),
     ]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("batch");
     engine.register_table("t", batch).expect("register");
 
     let h = engine
@@ -444,8 +446,12 @@ fn multi_key_utf8_multibyte_sort() {
     let s1_vocab = ["café", "über", "café", "αβ", "über", "αβ"];
     let s2_vocab = ["x", "y", "z", "m", "a", "n"];
     let n = 16_384usize;
-    let s1: Vec<String> = (0..n).map(|i| s1_vocab[i % s1_vocab.len()].to_string()).collect();
-    let s2: Vec<String> = (0..n).map(|i| s2_vocab[i % s2_vocab.len()].to_string()).collect();
+    let s1: Vec<String> = (0..n)
+        .map(|i| s1_vocab[i % s1_vocab.len()].to_string())
+        .collect();
+    let s2: Vec<String> = (0..n)
+        .map(|i| s2_vocab[i % s2_vocab.len()].to_string())
+        .collect();
 
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("s1", ArrowDataType::Utf8, false),
@@ -510,8 +516,7 @@ fn all_null_group_key_collapses_to_one_group() {
         ArrowField::new("k", ArrowDataType::Int32, true),
         ArrowField::new("v", ArrowDataType::Int64, true),
     ]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("batch");
     engine.register_table("t", batch).expect("register");
 
     let h = engine
@@ -617,8 +622,7 @@ fn dict_registry_collision_via_union_is_correct() {
             ArrowDataType::Utf8,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals))])
-            .expect("batch")
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals))]).expect("batch")
     };
 
     // orders_us dictionary: {US, EU}; orders_apac dictionary: {JP, AU}.
@@ -640,7 +644,11 @@ fn dict_registry_collision_via_union_is_correct() {
     let col = col_str(out, 0);
     let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
     // Only the two US rows from orders_us; orders_apac has no "US".
-    assert_eq!(got, vec!["US", "US"], "collision fold must not corrupt results");
+    assert_eq!(
+        got,
+        vec!["US", "US"],
+        "collision fold must not corrupt results"
+    );
 }
 
 /// Control for item 7: same-named `region` column with IDENTICAL dictionaries
@@ -657,8 +665,7 @@ fn dict_registry_identical_dicts_via_union_still_correct() {
             ArrowDataType::Utf8,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals))])
-            .expect("batch")
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals))]).expect("batch")
     };
 
     engine

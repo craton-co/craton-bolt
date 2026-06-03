@@ -62,7 +62,10 @@ struct Fixture {
 }
 
 fn fixture(n_rows: usize, n_id1: i32, n_id2: i32, n_id3: i32, seed: u64) -> Fixture {
-    assert!(n_id1 > 0 && n_id2 > 0 && n_id3 > 0, "cardinalities must be positive");
+    assert!(
+        n_id1 > 0 && n_id2 > 0 && n_id3 > 0,
+        "cardinalities must be positive"
+    );
     let m1 = n_id1 as u64;
     let m2 = n_id2 as u64;
     let m3 = n_id3 as u64;
@@ -134,11 +137,17 @@ fn cpu_count_totals_are_consistent() {
 
     let single = cpu_naive_count_groupby(&f.id3);
     let total_single: i64 = single.iter().map(|&(_, c)| c).sum();
-    assert_eq!(total_single as usize, n_rows, "single-key counts must total n_rows");
+    assert_eq!(
+        total_single as usize, n_rows,
+        "single-key counts must total n_rows"
+    );
 
     let two = cpu_naive_count_groupby2(&f.id1, &f.id2);
     let total_two: i64 = two.iter().map(|&(_, _, c)| c).sum();
-    assert_eq!(total_two as usize, n_rows, "two-key counts must total n_rows");
+    assert_eq!(
+        total_two as usize, n_rows,
+        "two-key counts must total n_rows"
+    );
 
     // id3 cardinality should genuinely be high (Tier-2 regime), not collapsed.
     assert!(
@@ -159,9 +168,9 @@ fn cpu_count_totals_are_consistent() {
 /// COUNT(v1) == row count per group.
 #[cfg(test)]
 fn build_batch(f: &Fixture) -> arrow_array::RecordBatch {
-    use std::sync::Arc;
     use arrow_array::{Float64Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
 
     let id1: Int32Array = f.id1.iter().copied().collect();
     let id2: Int32Array = f.id2.iter().copied().collect();
@@ -173,12 +182,10 @@ fn build_batch(f: &Fixture) -> arrow_array::RecordBatch {
         ArrowField::new("id3", ArrowDataType::Int32, false),
         ArrowField::new("v1", ArrowDataType::Float64, false),
     ]));
-    RecordBatch::try_new(schema, vec![
-        Arc::new(id1),
-        Arc::new(id2),
-        Arc::new(id3),
-        Arc::new(v1),
-    ])
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(id1), Arc::new(id2), Arc::new(id3), Arc::new(v1)],
+    )
     .expect("build RecordBatch")
 }
 

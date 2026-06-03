@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Raw FFI bindings and thin safe wrappers around the CUDA Driver API.
 //!
@@ -146,12 +146,8 @@ extern "C" {
         stream: CUstream,
     ) -> CUresult;
     pub fn cuMemsetD8_v2(dst: CUdeviceptr, value: u8, count: usize) -> CUresult;
-    pub fn cuMemsetD8Async(
-        dst: CUdeviceptr,
-        value: u8,
-        count: usize,
-        stream: CUstream,
-    ) -> CUresult;
+    pub fn cuMemsetD8Async(dst: CUdeviceptr, value: u8, count: usize, stream: CUstream)
+        -> CUresult;
     pub fn cuGetErrorName(error: CUresult, str: *mut *const c_char) -> CUresult;
     pub fn cuGetErrorString(error: CUresult, str: *mut *const c_char) -> CUresult;
     pub fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
@@ -183,8 +179,12 @@ extern "C" {
     pub fn cuEventDestroy_v2(event: CUevent) -> CUresult;
     pub fn cuLaunchKernel(
         f: CUfunction,
-        grid_dim_x: c_uint, grid_dim_y: c_uint, grid_dim_z: c_uint,
-        block_dim_x: c_uint, block_dim_y: c_uint, block_dim_z: c_uint,
+        grid_dim_x: c_uint,
+        grid_dim_y: c_uint,
+        grid_dim_z: c_uint,
+        block_dim_x: c_uint,
+        block_dim_y: c_uint,
+        block_dim_z: c_uint,
         shared_mem_bytes: c_uint,
         stream: CUstream,
         kernel_params: *mut *mut c_void,
@@ -234,107 +234,215 @@ extern "C" {
 mod stubs {
     use super::*;
 
-    pub unsafe fn cuInit(_flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuDeviceGetCount(_count: *mut c_int) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuDeviceGet(_device: *mut CUdevice, _ordinal: c_int) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuDeviceGetName(_name: *mut c_char, _len: c_int, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuInit(_flags: c_uint) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuDeviceGetCount(_count: *mut c_int) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuDeviceGet(_device: *mut CUdevice, _ordinal: c_int) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuDeviceGetName(_name: *mut c_char, _len: c_int, _dev: CUdevice) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuDeviceGetAttribute(
         _pi: *mut c_int,
         _attrib: CUdevice_attribute,
         _dev: CUdevice,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuDeviceTotalMem_v2(_bytes: *mut usize, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuCtxCreate_v2(_pctx: *mut CUcontext, _flags: c_uint, _dev: CUdevice) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuCtxDestroy_v2(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuDeviceTotalMem_v2(_bytes: *mut usize, _dev: CUdevice) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuCtxCreate_v2(
+        _pctx: *mut CUcontext,
+        _flags: c_uint,
+        _dev: CUdevice,
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuCtxDestroy_v2(_ctx: CUcontext) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuCtxSetCurrent(_ctx: CUcontext) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     // Stage-4 (GJ): mirror of the production `cuCtxGetDevice` for stub builds.
-    pub unsafe fn cuCtxGetDevice(_device: *mut CUdevice) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuCtxGetDevice(_device: *mut CUdevice) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     // Stage 5 (M3L5): mirror of the production `cuCtxGetCurrent` for stub
     // builds. Pool-watcher only invokes this under the real CUDA backend;
     // the stub return path is exercised only by tests that explicitly
     // build `--features cuda-stub`.
-    pub unsafe fn cuCtxGetCurrent(_pctx: *mut CUcontext) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemAllocHost_v2(_pp: *mut *mut c_void, _bytesize: usize) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemHostAlloc(_pp: *mut *mut c_void, _bytesize: usize, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemFreeHost(_p: *mut c_void) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemcpyHtoD_v2(_dst: CUdeviceptr, _src: *const c_void, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemcpyDtoH_v2(_dst: *mut c_void, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemcpyDtoD_v2(_dst: CUdeviceptr, _src: CUdeviceptr, _bytes: usize) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuCtxGetCurrent(_pctx: *mut CUcontext) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemAlloc_v2(_dptr: *mut CUdeviceptr, _bytesize: usize) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemFree_v2(_dptr: CUdeviceptr) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemAllocHost_v2(_pp: *mut *mut c_void, _bytesize: usize) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemHostAlloc(
+        _pp: *mut *mut c_void,
+        _bytesize: usize,
+        _flags: c_uint,
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemFreeHost(_p: *mut c_void) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemcpyHtoD_v2(
+        _dst: CUdeviceptr,
+        _src: *const c_void,
+        _bytes: usize,
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemcpyDtoH_v2(_dst: *mut c_void, _src: CUdeviceptr, _bytes: usize) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemcpyDtoD_v2(_dst: CUdeviceptr, _src: CUdeviceptr, _bytes: usize) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuMemcpyHtoDAsync_v2(
         _dst: CUdeviceptr,
         _src: *const c_void,
         _bytecount: usize,
         _stream: CUstream,
-    ) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuMemcpyDtoHAsync_v2(
         _dst: *mut c_void,
         _src: CUdeviceptr,
         _bytecount: usize,
         _stream: CUstream,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemsetD8_v2(_dst: CUdeviceptr, _value: u8, _count: usize) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemsetD8_v2(_dst: CUdeviceptr, _value: u8, _count: usize) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuMemsetD8Async(
         _dst: CUdeviceptr,
         _value: u8,
         _count: usize,
         _stream: CUstream,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuGetErrorName(_error: CUresult, _str: *mut *const c_char) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuGetErrorString(_error: CUresult, _str: *mut *const c_char) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuModuleLoadData(_module: *mut CUmodule, _image: *const c_void) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuGetErrorName(_error: CUresult, _str: *mut *const c_char) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuGetErrorString(_error: CUresult, _str: *mut *const c_char) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuModuleLoadData(_module: *mut CUmodule, _image: *const c_void) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuModuleLoadDataEx(
         _module: *mut CUmodule,
         _image: *const c_void,
         _num_options: c_uint,
         _options: *mut i32,
         _option_values: *mut *mut c_void,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuModuleUnload(_module: CUmodule) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuModuleUnload(_module: CUmodule) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuModuleGetFunction(
         _func: *mut CUfunction,
         _module: CUmodule,
         _name: *const c_char,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuStreamCreate(_stream: *mut CUstream, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuStreamDestroy_v2(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuStreamSynchronize(_stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuCtxSynchronize() -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuStreamCreate(_stream: *mut CUstream, _flags: c_uint) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuStreamDestroy_v2(_stream: CUstream) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuStreamSynchronize(_stream: CUstream) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuCtxSynchronize() -> CUresult {
+        CUDA_ERROR_STUB
+    }
     // Event API stubs (deferred-free pool). Return the stub sentinel so
     // `check()` maps them to `BoltError::Unsupported("cuda-stub mode")`; the
     // deferred-free path treats a failed `cuEventCreate` as "events
     // unavailable" and falls back to the blanket per-stream sync.
-    pub unsafe fn cuEventCreate(_event: *mut CUevent, _flags: c_uint) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuEventRecord(_event: CUevent, _stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuEventQuery(_event: CUevent) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuEventSynchronize(_event: CUevent) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuEventDestroy_v2(_event: CUevent) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuEventCreate(_event: *mut CUevent, _flags: c_uint) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuEventRecord(_event: CUevent, _stream: CUstream) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuEventQuery(_event: CUevent) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuEventSynchronize(_event: CUevent) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuEventDestroy_v2(_event: CUevent) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuLaunchKernel(
         _f: CUfunction,
-        _grid_dim_x: c_uint, _grid_dim_y: c_uint, _grid_dim_z: c_uint,
-        _block_dim_x: c_uint, _block_dim_y: c_uint, _block_dim_z: c_uint,
+        _grid_dim_x: c_uint,
+        _grid_dim_y: c_uint,
+        _grid_dim_z: c_uint,
+        _block_dim_x: c_uint,
+        _block_dim_y: c_uint,
+        _block_dim_z: c_uint,
         _shared_mem_bytes: c_uint,
         _stream: CUstream,
         _kernel_params: *mut *mut c_void,
         _extra: *mut *mut c_void,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuMemGetInfo_v2(_free: *mut usize, _total: *mut usize) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuMemGetInfo_v2(_free: *mut usize, _total: *mut usize) -> CUresult {
+        CUDA_ERROR_STUB
+    }
 
     // Batch 6: cuGraph stub mirrors. Returning the stub sentinel so
     // `check()` maps every call to `BoltError::Unsupported("cuda-stub mode")`.
-    pub unsafe fn cuStreamBeginCapture_v2(_stream: CUstream, _mode: c_uint) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuStreamEndCapture(_stream: CUstream, _graph_out: *mut CUgraph) -> CUresult { CUDA_ERROR_STUB }
+    pub unsafe fn cuStreamBeginCapture_v2(_stream: CUstream, _mode: c_uint) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuStreamEndCapture(_stream: CUstream, _graph_out: *mut CUgraph) -> CUresult {
+        CUDA_ERROR_STUB
+    }
     pub unsafe fn cuGraphInstantiate_v2(
         _graph_exec_out: *mut CUgraphExec,
         _graph: CUgraph,
         _error_node: *mut c_void,
         _log_buffer: *mut c_char,
         _buffer_size: usize,
-    ) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuGraphLaunch(_graph_exec: CUgraphExec, _stream: CUstream) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuGraphExecDestroy(_graph_exec: CUgraphExec) -> CUresult { CUDA_ERROR_STUB }
-    pub unsafe fn cuGraphDestroy(_graph: CUgraph) -> CUresult { CUDA_ERROR_STUB }
+    ) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuGraphLaunch(_graph_exec: CUgraphExec, _stream: CUstream) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuGraphExecDestroy(_graph_exec: CUgraphExec) -> CUresult {
+        CUDA_ERROR_STUB
+    }
+    pub unsafe fn cuGraphDestroy(_graph: CUgraph) -> CUresult {
+        CUDA_ERROR_STUB
+    }
 }
 
 #[cfg(feature = "cuda-stub")]
@@ -367,10 +475,7 @@ pub fn check(code: CUresult) -> BoltResult<()> {
             format!("unknown CUDA error {}", code)
         }
     };
-    Err(BoltError::CudaWithCode {
-        code,
-        message: msg,
-    })
+    Err(BoltError::CudaWithCode { code, message: msg })
 }
 
 /// Successful-init latch. Stores `true` exactly once when `cuInit(0)`
@@ -568,7 +673,9 @@ impl CudaContext {
         // alloc / free / memcpy in the engine routes through that single
         // context — there is no parallel hand-rolled context to leak.
         crate::cuda::cudarc_backend::ensure_device(device_ordinal)?;
-        Ok(Self { raw: std::ptr::null_mut() })
+        Ok(Self {
+            raw: std::ptr::null_mut(),
+        })
     }
 
     /// Bind this context to the calling thread.
@@ -1073,7 +1180,11 @@ mod init_cache_tests {
     static FLAKY_CALLS: AtomicUsize = AtomicUsize::new(0);
     fn fake_flaky_3() -> CUresult {
         let n = FLAKY_CALLS.fetch_add(1, Ordering::SeqCst);
-        if n < 2 { 999 } else { CUDA_SUCCESS }
+        if n < 2 {
+            999
+        } else {
+            CUDA_SUCCESS
+        }
     }
 
     #[test]
@@ -1302,12 +1413,7 @@ pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
 
     #[cfg(not(feature = "cudarc"))]
     {
-        check(cuMemcpyDtoHAsync_v2(
-            dst as *mut c_void,
-            src,
-            bytes,
-            stream,
-        ))
+        check(cuMemcpyDtoHAsync_v2(dst as *mut c_void, src, bytes, stream))
     }
 }
 

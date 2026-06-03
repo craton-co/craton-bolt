@@ -60,11 +60,11 @@
 //! It trips if the composed optimizer passes ever change a query's answer on
 //! a real device.
 
+use craton_bolt::plan::logical_plan::JoinType;
+use craton_bolt::plan::optimizer::run_to_fixpoint;
 use craton_bolt::plan::{
     default_passes, parse_sql, DataType, Field, LogicalPlan, MemTableProvider, Schema,
 };
-use craton_bolt::plan::logical_plan::JoinType;
-use craton_bolt::plan::optimizer::run_to_fixpoint;
 
 // ---------------------------------------------------------------------------
 // Shared fixtures + helpers
@@ -217,7 +217,11 @@ fn left_join_does_not_push_right_side_predicate_below_join() {
         .unwrap_or_else(|| panic!("expected a LEFT join to survive in:\n{opt:#?}"));
     // The join must still be a LEFT join (not silently rewritten to INNER).
     if let LogicalPlan::Join {
-        join_type, filter, left, right, ..
+        join_type,
+        filter,
+        left,
+        right,
+        ..
     } = join
     {
         assert_eq!(
@@ -264,7 +268,10 @@ fn right_join_does_not_push_left_side_predicate_below_join() {
     let join = find_right_join(&opt)
         .unwrap_or_else(|| panic!("expected a RIGHT join to survive in:\n{opt:#?}"));
     if let LogicalPlan::Join {
-        join_type, filter, left, ..
+        join_type,
+        filter,
+        left,
+        ..
     } = join
     {
         assert_eq!(
@@ -477,10 +484,7 @@ fn try_run_and_normalize(
 /// Panicking wrapper used for the optimizer-ON engine, which (as the production
 /// path) must successfully execute every representative query.
 #[allow(dead_code)]
-fn run_and_normalize(
-    engine: &mut craton_bolt::Engine,
-    plan: &LogicalPlan,
-) -> Vec<Vec<Cell>> {
+fn run_and_normalize(engine: &mut craton_bolt::Engine, plan: &LogicalPlan) -> Vec<Vec<Cell>> {
     try_run_and_normalize(engine, plan).expect("run_logical_plan must succeed on a GPU host")
 }
 

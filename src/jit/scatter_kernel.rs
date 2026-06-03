@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Scatter kernel for Tier-2 hash-partitioned GROUP BY.
 //!
@@ -116,7 +116,7 @@ pub fn compile_scatter_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t.param .u64 {entry}_param_4,").map_err(write_err)?; // partition_cursors
     writeln!(ptx, "\t.param .u64 {entry}_param_5,").map_err(write_err)?; // out_keys
     writeln!(ptx, "\t.param .u64 {entry}_param_6,").map_err(write_err)?; // out_vals
-    writeln!(ptx, "\t.param .u32 {entry}_param_7").map_err(write_err)?;  // n_rows
+    writeln!(ptx, "\t.param .u32 {entry}_param_7").map_err(write_err)?; // n_rows
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 
@@ -289,7 +289,7 @@ pub fn compile_scatter_kernel_i32_to_i64() -> BoltResult<String> {
     writeln!(ptx, "\t.param .u64 {entry}_param_4,").map_err(write_err)?; // partition_cursors
     writeln!(ptx, "\t.param .u64 {entry}_param_5,").map_err(write_err)?; // out_keys (i32)
     writeln!(ptx, "\t.param .u64 {entry}_param_6,").map_err(write_err)?; // out_vals (i64)
-    writeln!(ptx, "\t.param .u32 {entry}_param_7").map_err(write_err)?;  // n_rows
+    writeln!(ptx, "\t.param .u32 {entry}_param_7").map_err(write_err)?; // n_rows
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 

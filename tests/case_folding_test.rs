@@ -45,19 +45,15 @@ fn upper_users_provider() -> MemTableProvider {
 /// `MyTable(MyCol)` with mixed-case names — used by the quoted-identifier
 /// case-preservation tests.
 fn mixed_case_provider() -> MemTableProvider {
-    let schema = Schema::new(vec![
-        Field::new("MyCol", DataType::Int32, false),
-    ]);
+    let schema = Schema::new(vec![Field::new("MyCol", DataType::Int32, false)]);
     MemTableProvider::new().with_table("MyTable", schema)
 }
 
 /// Smoke: parse + lower must succeed. Panics with the failure message if
 /// either step errors. Used by the positive tests below.
 fn parse_and_lower_ok(sql: &str, provider: &MemTableProvider) {
-    let plan = parse_sql(sql, provider)
-        .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"));
-    lower_physical(&plan)
-        .unwrap_or_else(|e| panic!("lower failed for {sql:?}: {e}"));
+    let plan = parse_sql(sql, provider).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"));
+    lower_physical(&plan).unwrap_or_else(|e| panic!("lower failed for {sql:?}: {e}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -252,14 +248,19 @@ fn ilike_matching_tags(strings: &[&str], values: &[i64], query: &str) -> Vec<i64
     engine
         .register_table("t", sv_batch(strings, values))
         .expect("register");
-    let h = engine.sql(query).unwrap_or_else(|e| panic!("execute {query:?}: {e}"));
+    let h = engine
+        .sql(query)
+        .unwrap_or_else(|e| panic!("execute {query:?}: {e}"));
     let out = h.record_batch();
     let v = out
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("v is Int64");
-    let mut got: Vec<i64> = (0..v.len()).map(|i| v.value(i)).filter(|x| *x != 0).collect();
+    let mut got: Vec<i64> = (0..v.len())
+        .map(|i| v.value(i))
+        .filter(|x| *x != 0)
+        .collect();
     got.sort();
     got
 }
@@ -284,10 +285,9 @@ fn ilike_patterns_parse_and_lower() {
         "SELECT v FROM t WHERE s ILIKE '%\u{0130}%'", // contains '%İ%'
         "SELECT v FROM t WHERE s ILIKE 'hello'",      // ASCII
     ] {
-        let plan = parse_sql(sql, &provider)
-            .unwrap_or_else(|e| panic!("parse failed for {sql}: {e}"));
-        lower_physical(&plan)
-            .unwrap_or_else(|e| panic!("lower failed for {sql}: {e}"));
+        let plan =
+            parse_sql(sql, &provider).unwrap_or_else(|e| panic!("parse failed for {sql}: {e}"));
+        lower_physical(&plan).unwrap_or_else(|e| panic!("lower failed for {sql}: {e}"));
     }
 }
 
@@ -392,7 +392,11 @@ fn ilike_prefix_suffix_contains_with_boundary_char() {
         &[1, 2, 3],
         "SELECT v FROM t WHERE s ILIKE '\u{0130}%'",
     );
-    assert_eq!(prefix, vec![1], "prefix `İ%` must match only the leading-İ row");
+    assert_eq!(
+        prefix,
+        vec![1],
+        "prefix `İ%` must match only the leading-İ row"
+    );
 
     // Suffix `%İb`: matches strings that end with `İb`.
     let s_end = format!("xyz{i}b"); // tag 1: ends with İb → match
@@ -403,7 +407,11 @@ fn ilike_prefix_suffix_contains_with_boundary_char() {
         &[1, 2, 3],
         "SELECT v FROM t WHERE s ILIKE '%\u{0130}b'",
     );
-    assert_eq!(suffix, vec![1], "suffix `%İb` must match only the trailing-İb row");
+    assert_eq!(
+        suffix,
+        vec![1],
+        "suffix `%İb` must match only the trailing-İb row"
+    );
 
     // Contains `%İ%`: matches strings with an `İ` anywhere.
     let c_lead = format!("{i}xyz"); // tag 1: leading İ → match

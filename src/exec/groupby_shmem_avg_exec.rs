@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory **AVG** executor (Tier 1 fast path, AVG flavour).
 //!
@@ -52,16 +52,14 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Float64Array, Int32Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 
 use crate::cuda::{GpuVec, PinnedHostBuffer};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
-use crate::jit::shmem_count_kernel::{
-    compile_shmem_count_kernel, KERNEL_ENTRY as COUNT_ENTRY,
-};
+use crate::jit::shmem_count_kernel::{compile_shmem_count_kernel, KERNEL_ENTRY as COUNT_ENTRY};
 use crate::jit::shmem_sum_kernel::{
     compile_shmem_sum_kernel, BLOCK_GROUPS, KERNEL_ENTRY as SUM_ENTRY,
 };
@@ -84,10 +82,7 @@ const MAX_AVG_AGGS: usize = 4;
 /// fast path. Returns `None` on any precondition miss — the caller MUST
 /// fall through to a safe path. `Some(Err(_))` is reserved for genuine
 /// GPU failures encountered *after* eligibility was committed to.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     // --- Plan-shape eligibility ------------------------------------------
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -176,9 +171,7 @@ pub fn try_execute(
     }
 
     // --- Commit ----------------------------------------------------------
-    Some(execute_inner(
-        plan, key_arr, &val_arrs, n_groups,
-    ))
+    Some(execute_inner(plan, key_arr, &val_arrs, n_groups))
 }
 
 /// Run the AVG fast path. Everything past this point is "we promised";
@@ -203,20 +196,16 @@ fn execute_inner(
     // SUM/COUNT launches skip PTX generation entirely. Namespaced by SUM
     // namespace (matches `groupby_shmem_exec`) for SUM and by our own
     // module path for COUNT.
-    let sum_module = module_cache::get_or_build_module(
-        module_path!(),
-        "shmem_sum".to_string(),
-        None,
-        || compile_shmem_sum_kernel(),
-    )?;
+    let sum_module =
+        module_cache::get_or_build_module(module_path!(), "shmem_sum".to_string(), None, || {
+            compile_shmem_sum_kernel()
+        })?;
     let sum_function = sum_module.function(SUM_ENTRY)?;
 
-    let count_module = module_cache::get_or_build_module(
-        module_path!(),
-        "shmem_count".to_string(),
-        None,
-        || compile_shmem_count_kernel(),
-    )?;
+    let count_module =
+        module_cache::get_or_build_module(module_path!(), "shmem_count".to_string(), None, || {
+            compile_shmem_count_kernel()
+        })?;
     let count_function = count_module.function(COUNT_ENTRY)?;
 
     // --- Launch params (shared between SUM and COUNT — same shape) -------
@@ -353,8 +342,7 @@ fn execute_inner(
         )?;
     }
     // Stage-5: pinned D2H for the count vector, no sync yet.
-    let mut pinned_counts: PinnedHostBuffer<u64> =
-        PinnedHostBuffer::<u64>::new(n_groups as usize)?;
+    let mut pinned_counts: PinnedHostBuffer<u64> = PinnedHostBuffer::<u64>::new(n_groups as usize)?;
     count_gpu.copy_to_async(pinned_counts.as_mut_slice(), stream.raw())?;
 
     // ====================================================================
@@ -372,10 +360,7 @@ fn execute_inner(
     // copies short-lived by collecting into Vec immediately so the
     // pinned pages can be released as soon as `pinned_sums` /
     // `pinned_counts` go out of scope at the end of this function.
-    let host_sums: Vec<Vec<f64>> = pinned_sums
-        .iter()
-        .map(|p| p.as_slice().to_vec())
-        .collect();
+    let host_sums: Vec<Vec<f64>> = pinned_sums.iter().map(|p| p.as_slice().to_vec()).collect();
     let host_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
 
     // After the sync the device output GpuVecs and pinned host buffers
@@ -461,7 +446,10 @@ fn build_empty_result(plan: &PhysicalPlan) -> BoltResult<RecordBatch> {
 // shared-mem executor carries its own copy; consolidating them is a
 // separate refactor (see `groupby_shmem_exec.rs` for the matching one).
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -497,8 +485,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Avg(Expr::Column("v".into()))],
@@ -526,7 +520,11 @@ mod stage4_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let avs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let avs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i) as usize;
             let expected = sums[k] / counts[k] as f64;
@@ -594,11 +592,26 @@ mod stage5_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v0".into(), dtype: DataType::Float64 },
-                    ColumnIO { name: "v1".into(), dtype: DataType::Float64 },
-                    ColumnIO { name: "v2".into(), dtype: DataType::Float64 },
-                    ColumnIO { name: "v3".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v0".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v1".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v2".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v3".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: (0..MAX_AVG_AGGS)
@@ -607,9 +620,8 @@ mod stage5_tests {
                 output_schema: Schema::new(
                     std::iter::once(Field::new("k", DataType::Int32, false))
                         .chain(
-                            (0..MAX_AVG_AGGS).map(|a| {
-                                Field::new(format!("avg_v{a}"), DataType::Float64, true)
-                            }),
+                            (0..MAX_AVG_AGGS)
+                                .map(|a| Field::new(format!("avg_v{a}"), DataType::Float64, true)),
                         )
                         .collect(),
                 ),
@@ -618,8 +630,7 @@ mod stage5_tests {
         };
 
         // Arrow batch with the 1 key column + 4 value columns.
-        let mut fields: Vec<ArrowField> =
-            vec![ArrowField::new("k", ArrowDataType::Int32, false)];
+        let mut fields: Vec<ArrowField> = vec![ArrowField::new("k", ArrowDataType::Int32, false)];
         for a in 0..MAX_AVG_AGGS {
             fields.push(ArrowField::new(
                 format!("v{a}"),
@@ -628,8 +639,7 @@ mod stage5_tests {
             ));
         }
         let schema = Arc::new(ArrowSchema::new(fields));
-        let mut columns: Vec<ArrayRef> =
-            vec![Arc::new(Int32Array::from(keys.clone())) as ArrayRef];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(keys.clone())) as ArrayRef];
         for col in &cols {
             columns.push(Arc::new(Float64Array::from(col.clone())) as ArrayRef);
         }
@@ -683,8 +693,14 @@ mod stage5_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Avg(Expr::Column("v".into()))],
@@ -713,7 +729,11 @@ mod stage5_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let avs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let avs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let g = ks.value(i) as usize;
             assert!((avs.value(i) - expected[0][g]).abs() < 1e-6);

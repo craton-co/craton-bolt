@@ -37,8 +37,8 @@
 use arrow_array::{Array, BooleanArray, StringArray};
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider,
-    PhysicalPlan, Schema,
+    lower_physical, parse_sql, DataType, Expr, Field, LogicalPlan, MemTableProvider, PhysicalPlan,
+    Schema,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,13 @@ fn s_provider() -> MemTableProvider {
 /// tests can write tidy `assert_eq!` calls.
 fn boolarr_to_vec(arr: &BooleanArray) -> Vec<Option<bool>> {
     (0..arr.len())
-        .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
         .collect()
 }
 
@@ -90,13 +96,7 @@ fn host_like_prefix_pattern() {
     let out = craton_bolt::exec::like::host_like(&arr, "foo%", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
-        vec![
-            Some(true),
-            Some(true),
-            Some(false),
-            Some(false),
-            Some(true),
-        ],
+        vec![Some(true), Some(true), Some(false), Some(false), Some(true),],
     );
 }
 
@@ -118,13 +118,7 @@ fn host_like_contains_pattern() {
     let out = craton_bolt::exec::like::host_like(&arr, "%foo%", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
-        vec![
-            Some(true),
-            Some(true),
-            Some(false),
-            Some(true),
-            Some(true),
-        ],
+        vec![Some(true), Some(true), Some(false), Some(true), Some(true),],
     );
 }
 
@@ -137,13 +131,7 @@ fn host_like_underscore_uses_generic_matcher() {
     let out = craton_bolt::exec::like::host_like(&arr, "f_o", None, false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
-        vec![
-            Some(true),
-            Some(true),
-            Some(false),
-            Some(false),
-            Some(true),
-        ],
+        vec![Some(true), Some(true), Some(false), Some(false), Some(true),],
     );
 }
 
@@ -174,11 +162,7 @@ fn host_like_not_like_inverts_and_preserves_nulls() {
 /// else (`_`, ESCAPE, interior `%`) stays on the host filter.
 #[test]
 fn like_lowers_to_gpu_string_like_filter() {
-    let plan = parse_sql(
-        "SELECT s FROM t WHERE s LIKE 'foo%'",
-        &s_provider(),
-    )
-    .expect("parse");
+    let plan = parse_sql("SELECT s FROM t WHERE s LIKE 'foo%'", &s_provider()).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
 
     // Walk past any outermost Project layer (SELECT-list rename).
@@ -202,11 +186,7 @@ fn like_lowers_to_gpu_string_like_filter() {
 /// to the GPU `StringLikeFilter` with `negated: true`.
 #[test]
 fn not_like_lowers_to_gpu_string_like_filter() {
-    let plan = parse_sql(
-        "SELECT s FROM t WHERE s NOT LIKE '%foo%'",
-        &s_provider(),
-    )
-    .expect("parse");
+    let plan = parse_sql("SELECT s FROM t WHERE s NOT LIKE '%foo%'", &s_provider()).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
     let inner = match &phys {
         PhysicalPlan::Project { input, .. } => input.as_ref(),
@@ -234,10 +214,9 @@ fn like_lowers_each_shape_to_expected_path() {
         "SELECT s FROM t WHERE s LIKE '%foo'",  // suffix
         "SELECT s FROM t WHERE s LIKE '%foo%'", // contains
     ] {
-        let plan = parse_sql(sql, &s_provider())
-            .unwrap_or_else(|e| panic!("parse failed for {sql}: {e}"));
-        let phys = lower_physical(&plan)
-            .unwrap_or_else(|e| panic!("lower failed for {sql}: {e}"));
+        let plan =
+            parse_sql(sql, &s_provider()).unwrap_or_else(|e| panic!("parse failed for {sql}: {e}"));
+        let phys = lower_physical(&plan).unwrap_or_else(|e| panic!("lower failed for {sql}: {e}"));
         let inner = match &phys {
             PhysicalPlan::Project { input, .. } => input.as_ref(),
             other => other,
@@ -248,8 +227,7 @@ fn like_lowers_each_shape_to_expected_path() {
         );
     }
     // `_` forces the host fallback.
-    let plan = parse_sql("SELECT s FROM t WHERE s LIKE 'f_o'", &s_provider())
-        .expect("parse");
+    let plan = parse_sql("SELECT s FROM t WHERE s LIKE 'f_o'", &s_provider()).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
     let inner = match &phys {
         PhysicalPlan::Project { input, .. } => input.as_ref(),
@@ -290,7 +268,9 @@ fn like_frontend_surface() {
         other => panic!("expected Filter, got {other:?}"),
     };
     match predicate {
-        Expr::Like { pattern, escape, .. } => {
+        Expr::Like {
+            pattern, escape, ..
+        } => {
             assert_eq!(pattern, r"a\_b");
             assert_eq!(*escape, Some('\\'));
         }
@@ -309,8 +289,7 @@ fn host_like_with_escape_matches_literal_percent() {
         Some("axb"), // unescaped % would match, escaped does not
         None,        // NULL stays NULL
     ]);
-    let out =
-        craton_bolt::exec::like::host_like(&arr, r"a\%b", Some('\\'), false).expect("ok");
+    let out = craton_bolt::exec::like::host_like(&arr, r"a\%b", Some('\\'), false).expect("ok");
     assert_eq!(
         boolarr_to_vec(&out),
         vec![Some(true), Some(false), Some(false), None],
@@ -324,11 +303,7 @@ fn host_like_with_escape_matches_literal_percent() {
 /// rejection).
 #[test]
 fn like_predicate_is_not_folded_into_projection_kernel() {
-    let plan = parse_sql(
-        "SELECT s FROM t WHERE s LIKE 'foo%'",
-        &s_provider(),
-    )
-    .expect("parse");
+    let plan = parse_sql("SELECT s FROM t WHERE s LIKE 'foo%'", &s_provider()).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
     // Walk down through any Project layers; assert we hit a Filter
     // before any Projection (which would mean LIKE got folded into the
@@ -371,8 +346,7 @@ fn like_predicate_is_not_folded_into_projection_kernel() {
                 let _ = kernel; // structural assertion is the routing above.
                 true
             }
-            PhysicalPlan::Filter { input, .. }
-            | PhysicalPlan::Project { input, .. } => walk(input),
+            PhysicalPlan::Filter { input, .. } | PhysicalPlan::Project { input, .. } => walk(input),
             _ => true,
         }
     }
@@ -386,11 +360,7 @@ fn like_predicate_is_not_folded_into_projection_kernel() {
 /// rather than silently dropping rows.
 #[test]
 fn lowering_preserves_pattern_verbatim() {
-    let plan = parse_sql(
-        "SELECT s FROM t WHERE s LIKE '_b%'",
-        &s_provider(),
-    )
-    .unwrap();
+    let plan = parse_sql("SELECT s FROM t WHERE s LIKE '_b%'", &s_provider()).unwrap();
     let phys = lower_physical(&plan).unwrap();
     let inner = match &phys {
         PhysicalPlan::Project { input, .. } => input.as_ref(),

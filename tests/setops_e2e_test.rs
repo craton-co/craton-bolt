@@ -70,8 +70,8 @@ fn register_int32(engine: &mut Engine, name: &str, vals: Vec<Option<i32>>) {
         ArrowDataType::Int32,
         true,
     )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vals))])
-        .expect("int32 batch");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vals))]).expect("int32 batch");
     engine.register_table(name, batch).expect("register");
 }
 
@@ -86,7 +86,13 @@ fn sorted_int32_rows(batch: &RecordBatch) -> Vec<Option<i32>> {
         .downcast_ref::<Int32Array>()
         .expect("Int32 column");
     let mut rows: Vec<Option<i32>> = (0..arr.len())
-        .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
         .collect();
     // None < Some(_) under the derived Ord, giving a stable canonical multiset.
     rows.sort();
@@ -239,7 +245,11 @@ fn except_set_drops_any_present_right_key() {
 #[ignore = "gpu:e2e"]
 fn intersect_all_keeps_min_multiplicity() {
     let mut engine = engine_with_int32("l", vec![Some(1), Some(5), Some(5), Some(5), Some(8)]);
-    register_int32(&mut engine, "r", vec![Some(5), Some(5), Some(8), Some(8), Some(9)]);
+    register_int32(
+        &mut engine,
+        "r",
+        vec![Some(5), Some(5), Some(8), Some(8), Some(9)],
+    );
 
     let h = engine
         .sql("SELECT a FROM l INTERSECT ALL SELECT a FROM r")
@@ -259,7 +269,11 @@ fn intersect_all_keeps_min_multiplicity() {
 #[ignore = "gpu:e2e"]
 fn intersect_set_keeps_common_keys_once() {
     let mut engine = engine_with_int32("l", vec![Some(1), Some(5), Some(5), Some(5), Some(8)]);
-    register_int32(&mut engine, "r", vec![Some(5), Some(5), Some(8), Some(8), Some(9)]);
+    register_int32(
+        &mut engine,
+        "r",
+        vec![Some(5), Some(5), Some(8), Some(8), Some(9)],
+    );
 
     let h = engine
         .sql("SELECT a FROM l INTERSECT SELECT a FROM r")
@@ -356,7 +370,10 @@ fn register_str_int(engine: &mut Engine, name: &str, rows: Vec<(&str, i32)>) {
     let n: Vec<i32> = rows.iter().map(|(_, n)| *n).collect();
     let batch = RecordBatch::try_new(
         schema,
-        vec![Arc::new(StringArray::from(s)), Arc::new(Int32Array::from(n))],
+        vec![
+            Arc::new(StringArray::from(s)),
+            Arc::new(Int32Array::from(n)),
+        ],
     )
     .expect("str/int batch");
     engine.register_table(name, batch).expect("register");

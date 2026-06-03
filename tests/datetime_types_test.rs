@@ -18,9 +18,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Date32Array, Int32Array, RecordBatch, TimestampNanosecondArray,
-};
+use arrow_array::{Date32Array, Int32Array, RecordBatch, TimestampNanosecondArray};
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     TimeUnit as ArrowTimeUnit,
@@ -64,11 +62,7 @@ fn datetime_record_batch() -> RecordBatch {
             true,
         ),
     ]));
-    RecordBatch::try_new(
-        arrow_schema,
-        vec![Arc::new(id), Arc::new(d), Arc::new(ts)],
-    )
-    .unwrap()
+    RecordBatch::try_new(arrow_schema, vec![Arc::new(id), Arc::new(d), Arc::new(ts)]).unwrap()
 }
 
 /// `byte_width()` must declare 4 for Date32 (i32 days) and 8 for any
@@ -166,8 +160,7 @@ fn select_round_trips_date32_and_timestamp_schema() {
 #[test]
 fn filter_then_select_preserves_datetime_dtypes() {
     let provider = MemTableProvider::new().with_table("events", datetime_schema());
-    let plan = parse_sql("SELECT id, d, ts FROM events WHERE id > 0", &provider)
-        .expect("parse");
+    let plan = parse_sql("SELECT id, d, ts FROM events WHERE id > 0", &provider).expect("parse");
     let s = plan.schema().expect("schema");
     let dtypes: Vec<&DataType> = s.fields.iter().map(|f| &f.dtype).collect();
     assert_eq!(
@@ -201,7 +194,11 @@ fn sql_date_literal_parses_to_date32() {
     // The two SELECT items are aliased; peel through `Alias`.
     let epoch_lit = unwrap_alias_literal(&exprs[0]);
     let newyear_lit = unwrap_alias_literal(&exprs[1]);
-    assert_eq!(epoch_lit, &Literal::Date32(0), "DATE '1970-01-01' must be day 0");
+    assert_eq!(
+        epoch_lit,
+        &Literal::Date32(0),
+        "DATE '1970-01-01' must be day 0"
+    );
     assert_eq!(
         newyear_lit,
         &Literal::Date32(19_723),

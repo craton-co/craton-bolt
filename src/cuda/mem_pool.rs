@@ -205,9 +205,9 @@
 //! The pool depends on a live CUDA context being current on the calling
 //! thread — same precondition as the bare `cuMemAlloc` path it replaces.
 
-use std::collections::{BTreeMap, VecDeque};
 #[cfg(feature = "pool-sharded")]
 use std::collections::HashMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -426,10 +426,7 @@ pub(crate) mod ctx_binder {
     /// invalidated the context in the window and we must NOT store — doing so
     /// would resurrect a context that is being / has been destroyed. Returns
     /// `true` if the capture committed.
-    pub(crate) fn capture_owning_ctx(
-        ctx: *mut std::ffi::c_void,
-        observed_epoch: u64,
-    ) -> bool {
+    pub(crate) fn capture_owning_ctx(ctx: *mut std::ffi::c_void, observed_epoch: u64) -> bool {
         if ctx.is_null() {
             return false;
         }
@@ -1018,8 +1015,7 @@ unsafe fn driver_free_default_backend(ptr: CUdeviceptr) -> BoltResult<()> {
         // via the returned error if the free itself didn't already fail.
         // SAFETY: binding the null context is always valid (it unsets the
         // current context, the state this thread was in on entry).
-        let restore_result =
-            unsafe { cuda_sys::ctx_set_current(std::ptr::null_mut()) };
+        let restore_result = unsafe { cuda_sys::ctx_set_current(std::ptr::null_mut()) };
         free_result.and(restore_result)
     })
 }
@@ -1242,11 +1238,11 @@ impl DeviceMemPool {
     /// `fetch_update` itself never returns `Err`.
     #[inline]
     fn sub_total_saturating(&self, n: usize) {
-        let _ = self.total_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |cur| Some(cur.saturating_sub(n)),
-        );
+        let _ = self
+            .total_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(n))
+            });
     }
 
     // ---- Sharded LRU-index helpers (PERF P-1) ----
@@ -1265,13 +1261,7 @@ impl DeviceMemPool {
     /// *inner* lock of the bucket-then-lru order — same discipline as
     /// the pre-P-1 single-mutex design, just on a sharded mutex.
     #[inline]
-    fn lru_insert(
-        &self,
-        size_class: usize,
-        inserted: Instant,
-        tick: u64,
-        ptr: CUdeviceptr,
-    ) {
+    fn lru_insert(&self, size_class: usize, inserted: Instant, tick: u64, ptr: CUdeviceptr) {
         self.lru_index[lru_shard_of(size_class)]
             .lock()
             .insert((inserted, tick), (size_class, ptr));
@@ -1312,9 +1302,7 @@ impl DeviceMemPool {
     /// retrying the scan if that shard drained). The popped entry's
     /// `size_class` is intrinsic to the block, so the caller can still
     /// route to the correct bucket.
-    fn lru_pop_global_oldest(
-        &self,
-    ) -> Option<((Instant, u64), (usize, CUdeviceptr))> {
+    fn lru_pop_global_oldest(&self) -> Option<((Instant, u64), (usize, CUdeviceptr))> {
         loop {
             // Pass 1: peek every shard's oldest key, one shard lock at a
             // time (never two at once), and remember which shard owns the
@@ -1627,10 +1615,7 @@ impl DeviceMemPool {
     /// `Some(Err(..))` if the retry failed with a *non-OOM* error (which we
     /// surface immediately rather than spinning the eviction loop).
     #[inline]
-    fn try_retry_alloc(
-        &self,
-        alloc_bytes: usize,
-    ) -> Option<BoltResult<(CUdeviceptr, usize)>> {
+    fn try_retry_alloc(&self, alloc_bytes: usize) -> Option<BoltResult<(CUdeviceptr, usize)>> {
         match driver_mem_alloc(alloc_bytes) {
             Ok(ptr) => {
                 OOM_RECOVERY_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1778,8 +1763,7 @@ impl DeviceMemPool {
             .total_bytes
             .load(Ordering::Acquire)
             .saturating_add(alloc_bytes);
-        let fits_total = alloc_bytes <= self.max_pooled_bytes
-            && projected <= self.max_pooled_bytes;
+        let fits_total = alloc_bytes <= self.max_pooled_bytes && projected <= self.max_pooled_bytes;
         if fits_bucket && fits_total {
             let inserted = Instant::now();
             let tick = self.next_tick.fetch_add(1, Ordering::Relaxed);
@@ -1859,16 +1843,15 @@ impl DeviceMemPool {
             // can react after releasing the bucket lock.
             enum Outcome {
                 ExactHit(CUdeviceptr),
-                Approx { block: PooledBlock, size_class: usize },
+                Approx {
+                    block: PooledBlock,
+                    size_class: usize,
+                },
                 BucketEmpty,
             }
             let outcome = self.with_bucket(size_class, |bucket| {
                 // First try to remove the exact ptr the LRU pointed to.
-                if let Some(pos) = bucket
-                    .blocks
-                    .iter()
-                    .position(|b| b.ptr == target_ptr)
-                {
+                if let Some(pos) = bucket.blocks.iter().position(|b| b.ptr == target_ptr) {
                     let block = bucket.blocks.remove(pos).expect("position checked");
                     return Outcome::ExactHit(block.ptr);
                 }
@@ -1952,9 +1935,7 @@ impl DeviceMemPool {
         // same walk — preserving the original two-pass code's
         // "try literally any non-empty bucket" last-ditch guarantee.
         let primary = best_key.into_iter();
-        let secondary = non_empty
-            .into_iter()
-            .filter(|k| Some(*k) != best_key);
+        let secondary = non_empty.into_iter().filter(|k| Some(*k) != best_key);
         for key in primary.chain(secondary) {
             let popped = self.with_bucket(key, |bucket| bucket.blocks.pop_front());
             if let Some(Some(block)) = popped {
@@ -3618,9 +3599,9 @@ mod tests {
         // Allocate a fresh size class so the request misses the pool and
         // routes to the (now OOM-injected) driver path.
         let new_size = 4096usize;
-        let (ptr, ab) = pool.alloc(new_size).expect(
-            "OOM recovery should have trimmed headroom and retried successfully",
-        );
+        let (ptr, ab) = pool
+            .alloc(new_size)
+            .expect("OOM recovery should have trimmed headroom and retried successfully");
         assert!(ptr != 0);
         assert_eq!(ab, bucket_size(new_size));
 
@@ -3812,9 +3793,8 @@ mod tests {
         // fragile prefix matcher is gone. (Even if some upstream code
         // hands us a string that *looks* like "CUDA driver error 2",
         // it's no longer interpreted as OOM.)
-        let legacy = crate::error::BoltError::Cuda(
-            "CUDA driver error 2: out of memory".to_string(),
-        );
+        let legacy =
+            crate::error::BoltError::Cuda("CUDA driver error 2: out of memory".to_string());
         assert!(
             !is_oom_error(&legacy),
             "legacy Cuda(String) variant must no longer be OOM-matched"

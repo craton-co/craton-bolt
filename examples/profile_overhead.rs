@@ -29,9 +29,18 @@ const ITERS: usize = 30;
 const QUERIES: &[(&str, &str)] = &[
     ("c1_fma_sum", "SELECT SUM(a*b + c*d) FROM x"),
     ("c2_poly4_sum", "SELECT SUM(a*a*a*a - a*a*a + a*a) FROM x"),
-    ("c3_sphere_filter", "SELECT SUM(a) FROM x WHERE a*a + b*b + c*c < 1.0"),
-    ("c4_weighted_sum", "SELECT SUM(a*0.4 + b*0.3 + c*0.2 + d*0.1) FROM x"),
-    ("c5_filtered_fma", "SELECT SUM(a*b) FROM x WHERE c*c + d*d < 0.5"),
+    (
+        "c3_sphere_filter",
+        "SELECT SUM(a) FROM x WHERE a*a + b*b + c*c < 1.0",
+    ),
+    (
+        "c4_weighted_sum",
+        "SELECT SUM(a*0.4 + b*0.3 + c*0.2 + d*0.1) FROM x",
+    ),
+    (
+        "c5_filtered_fma",
+        "SELECT SUM(a*b) FROM x WHERE c*c + d*d < 0.5",
+    ),
 ];
 
 #[inline]

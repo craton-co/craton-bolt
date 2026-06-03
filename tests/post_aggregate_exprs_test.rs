@@ -110,8 +110,7 @@ fn project_exprs(plan: &LogicalPlan) -> Vec<Expr> {
 
 #[test]
 fn sum_plus_literal() {
-    let plan =
-        parse_sql("SELECT SUM(price) + 1 FROM t", &provider()).expect("plan");
+    let plan = parse_sql("SELECT SUM(price) + 1 FROM t", &provider()).expect("plan");
 
     // Single feed aggregate `SUM(price)`.
     let aggs = aggregates_of(&plan);
@@ -126,7 +125,11 @@ fn sum_plus_literal() {
     let proj = project_exprs(&plan);
     assert_eq!(proj.len(), 1);
     match &proj[0] {
-        Expr::Binary { op: BinaryOp::Add, left, right } => {
+        Expr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
             assert!(
                 matches!(left.as_ref(), Expr::Column(n) if n == "sum_price"),
                 "left side should be Column(sum_price), got {left:?}"
@@ -148,8 +151,7 @@ fn sum_plus_literal() {
 
 #[test]
 fn avg_times_literal() {
-    let plan =
-        parse_sql("SELECT AVG(qty) * 2 FROM t", &provider()).expect("plan");
+    let plan = parse_sql("SELECT AVG(qty) * 2 FROM t", &provider()).expect("plan");
 
     let aggs = aggregates_of(&plan);
     assert_eq!(aggs.len(), 1);
@@ -162,7 +164,11 @@ fn avg_times_literal() {
     let proj = project_exprs(&plan);
     assert_eq!(proj.len(), 1);
     match &proj[0] {
-        Expr::Binary { op: BinaryOp::Mul, left, right } => {
+        Expr::Binary {
+            op: BinaryOp::Mul,
+            left,
+            right,
+        } => {
             assert!(
                 matches!(left.as_ref(), Expr::Column(n) if n == "avg_qty"),
                 "left should be Column(avg_qty), got {left:?}"
@@ -182,8 +188,7 @@ fn avg_times_literal() {
 
 #[test]
 fn two_aggregates_in_one_expression() {
-    let plan =
-        parse_sql("SELECT (SUM(a) + SUM(b)) / 2 FROM t", &provider()).expect("plan");
+    let plan = parse_sql("SELECT (SUM(a) + SUM(b)) / 2 FROM t", &provider()).expect("plan");
 
     let aggs = aggregates_of(&plan);
     assert_eq!(
@@ -203,10 +208,7 @@ fn two_aggregates_in_one_expression() {
             left,
             right,
         } => {
-            assert!(matches!(
-                right.as_ref(),
-                Expr::Literal(Literal::Int64(2))
-            ));
+            assert!(matches!(right.as_ref(), Expr::Literal(Literal::Int64(2))));
             match left.as_ref() {
                 Expr::Binary {
                     op: BinaryOp::Add,
@@ -239,8 +241,7 @@ fn computed_projection_with_alias() {
     // expression (sqlparser parses this as ExprWithAlias { expr: BinaryOp,
     // alias: total }). The output column must be named `total`, not
     // `__expr_0`.
-    let plan =
-        parse_sql("SELECT SUM(x) + 1 AS total FROM t", &provider()).expect("plan");
+    let plan = parse_sql("SELECT SUM(x) + 1 AS total FROM t", &provider()).expect("plan");
 
     let proj = project_exprs(&plan);
     assert_eq!(proj.len(), 1);
@@ -250,7 +251,10 @@ fn computed_projection_with_alias() {
             // Inner is the SUM(x) + 1 binary tree.
             assert!(matches!(
                 inner.as_ref(),
-                Expr::Binary { op: BinaryOp::Add, .. }
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
             ));
         }
         other => panic!("expected Alias(.., \"total\"), got {other:?}"),
@@ -271,8 +275,7 @@ fn mixed_bare_and_computed_in_select() {
     // `SELECT SUM(x), SUM(x) + 1 FROM t` — the bare aggregate appends a
     // SUM(x) feed; the computed expression dedups against the existing
     // sum_x output (so we get exactly one feed aggregate).
-    let plan =
-        parse_sql("SELECT SUM(x), SUM(x) + 1 FROM t", &provider()).expect("plan");
+    let plan = parse_sql("SELECT SUM(x), SUM(x) + 1 FROM t", &provider()).expect("plan");
 
     let aggs = aggregates_of(&plan);
     assert_eq!(
@@ -297,10 +300,7 @@ fn mixed_bare_and_computed_in_select() {
             right,
         } => {
             assert!(matches!(left.as_ref(), Expr::Column(n) if n == "sum_x"));
-            assert!(matches!(
-                right.as_ref(),
-                Expr::Literal(Literal::Int64(1))
-            ));
+            assert!(matches!(right.as_ref(), Expr::Literal(Literal::Int64(1))));
         }
         other => panic!("expected Add for second proj, got {other:?}"),
     }
@@ -311,8 +311,7 @@ fn mixed_bare_and_computed_in_select() {
 #[test]
 fn deduplicates_repeated_aggregate() {
     // `SUM(x) + SUM(x)` — only one feed aggregate emitted.
-    let plan =
-        parse_sql("SELECT SUM(x) + SUM(x) FROM t", &provider()).expect("plan");
+    let plan = parse_sql("SELECT SUM(x) + SUM(x) FROM t", &provider()).expect("plan");
 
     let aggs = aggregates_of(&plan);
     assert_eq!(
@@ -381,10 +380,7 @@ fn having_works_with_post_aggregate_select() {
             right,
         } => {
             assert!(matches!(left.as_ref(), Expr::Column(n) if n == "sum_x"));
-            assert!(matches!(
-                right.as_ref(),
-                Expr::Literal(Literal::Int64(10))
-            ));
+            assert!(matches!(right.as_ref(), Expr::Literal(Literal::Int64(10))));
         }
         other => panic!("expected `sum_x > 10` HAVING predicate, got {other:?}"),
     }
@@ -425,10 +421,7 @@ fn group_by_with_post_aggregate_scalar() {
                     right,
                 } => {
                     assert!(matches!(left.as_ref(), Expr::Column(n) if n == "sum_x"));
-                    assert!(matches!(
-                        right.as_ref(),
-                        Expr::Literal(Literal::Int64(2))
-                    ));
+                    assert!(matches!(right.as_ref(), Expr::Literal(Literal::Int64(2))));
                 }
                 other => panic!("expected Mul inside Alias, got {other:?}"),
             }

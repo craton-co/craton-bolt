@@ -34,12 +34,8 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Decimal128Array, RecordBatch};
-use arrow_schema::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-};
-use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
-};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use craton_bolt::plan::{lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema};
 use craton_bolt::{BoltError, Engine};
 
 /// Build a `Schema` with a `Decimal128(18, 2)` value column alongside an
@@ -82,7 +78,10 @@ fn decimal128_schema_registers_and_roundtrips() {
     assert_eq!(amount.dtype, DataType::Decimal128(18, 2));
     assert!(amount.nullable);
 
-    assert!(amount.dtype.is_decimal(), "Decimal128 must report is_decimal");
+    assert!(
+        amount.dtype.is_decimal(),
+        "Decimal128 must report is_decimal"
+    );
     assert_eq!(
         amount.dtype.byte_width(),
         Some(16),
@@ -116,8 +115,8 @@ fn select_decimal_column_lowers_in_v07() {
     // v0.7 sub-task B: the physical lowerer accepts the bare-column
     // SELECT and produces a Projection plan whose output schema preserves
     // the source dtype.
-    let phys = lower_physical(&plan)
-        .expect("physical lowering of a Decimal SELECT must succeed in v0.7");
+    let phys =
+        lower_physical(&plan).expect("physical lowering of a Decimal SELECT must succeed in v0.7");
     let out = phys.output_schema();
     assert_eq!(out.fields.len(), 1);
     assert_eq!(out.fields[0].dtype, DataType::Decimal128(18, 2));
@@ -129,10 +128,9 @@ fn select_decimal_column_lowers_in_v07() {
 #[test]
 fn select_non_decimal_column_still_lowers() {
     let provider = provider_with_decimal();
-    let plan = parse_sql("SELECT id FROM t", &provider)
-        .expect("SELECT of an Int32 column must parse");
-    let _ = lower_physical(&plan)
-        .expect("physical lowering of a non-Decimal SELECT must succeed");
+    let plan =
+        parse_sql("SELECT id FROM t", &provider).expect("SELECT of an Int32 column must parse");
+    let _ = lower_physical(&plan).expect("physical lowering of a non-Decimal SELECT must succeed");
 }
 
 // ---- 3. CAST(int AS DECIMAL(18, 2)) ----------------------------------------
@@ -163,15 +161,11 @@ fn cast_int_to_decimal_parses_then_rejects_at_lower() {
         // find the source of the error.
         BoltError::Type(msg) | BoltError::Sql(msg) => {
             assert!(
-                msg.contains("CAST")
-                    || msg.contains("DECIMAL")
-                    || msg.contains("Decimal128"),
+                msg.contains("CAST") || msg.contains("DECIMAL") || msg.contains("Decimal128"),
                 "CAST rejection should still mention CAST/DECIMAL; got: {msg}",
             );
         }
-        other => panic!(
-            "expected BoltError::Plan/Type/Sql naming CAST/Decimal128, got {other:?}"
-        ),
+        other => panic!("expected BoltError::Plan/Type/Sql naming CAST/Decimal128, got {other:?}"),
     }
 }
 
@@ -186,8 +180,7 @@ fn cast_to_primitive_lowers_in_v07() {
     let provider = provider_with_decimal();
     let plan = parse_sql("SELECT CAST(id AS BIGINT) FROM t", &provider)
         .expect("CAST(Int32 AS BIGINT) must parse + type-check");
-    lower_physical(&plan)
-        .expect("CAST(Int32 AS BIGINT) must lower cleanly in v0.7 GPU codegen");
+    lower_physical(&plan).expect("CAST(Int32 AS BIGINT) must lower cleanly in v0.7 GPU codegen");
 }
 
 // ---- 4. Decimal128 arithmetic (v0.7 sub-task B) ----------------------------
@@ -218,8 +211,7 @@ fn decimal128_add_two_columns_lowers_in_v07() {
     let provider = provider_with_two_decimals();
     let plan = parse_sql("SELECT x + y FROM d", &provider)
         .expect("Decimal128 + Decimal128 must parse + type-check");
-    let phys = lower_physical(&plan)
-        .expect("Decimal128 + Decimal128 must lower in v0.7");
+    let phys = lower_physical(&plan).expect("Decimal128 + Decimal128 must lower in v0.7");
     let out = phys.output_schema();
     assert_eq!(out.fields.len(), 1);
     // max(10, 12) + 1 = 13, scale unchanged.
@@ -359,8 +351,12 @@ fn sum_decimal128_basic() {
     let expected: i128 = 123 - 456 + 789 + 1 + 10_000;
 
     let mut engine = Engine::new().expect("engine");
-    engine.register_table("t", decimal_batch(arr)).expect("register");
-    let handle = engine.sql("SELECT SUM(d) FROM t").expect("SUM(Decimal) must execute");
+    engine
+        .register_table("t", decimal_batch(arr))
+        .expect("register");
+    let handle = engine
+        .sql("SELECT SUM(d) FROM t")
+        .expect("SUM(Decimal) must execute");
     let out = handle.record_batch();
     assert_eq!(out.num_rows(), 1, "scalar SUM is a single-row result");
 
@@ -397,8 +393,12 @@ fn sum_decimal128_skips_nulls() {
     let expected: i128 = 100 - 25 + 75;
 
     let mut engine = Engine::new().expect("engine");
-    engine.register_table("t", decimal_batch(arr)).expect("register");
-    let handle = engine.sql("SELECT SUM(d) FROM t").expect("SUM(Decimal) must execute");
+    engine
+        .register_table("t", decimal_batch(arr))
+        .expect("register");
+    let handle = engine
+        .sql("SELECT SUM(d) FROM t")
+        .expect("SUM(Decimal) must execute");
     let out = handle.record_batch();
 
     let arr = out
@@ -427,7 +427,9 @@ fn sum_decimal128_overflow_errors() {
         .expect("10^38 - 1 fits at precision 38");
 
     let mut engine = Engine::new().expect("engine");
-    engine.register_table("t", decimal_batch(arr)).expect("register");
+    engine
+        .register_table("t", decimal_batch(arr))
+        .expect("register");
     let err = engine
         .sql("SELECT SUM(d) FROM t")
         .err()
@@ -475,8 +477,7 @@ fn decimal128_eq_two_matching_columns_lowers_in_v07() {
     let provider = provider_with_matching_decimals_and_bigint();
     let plan = parse_sql("SELECT d1 FROM t WHERE d1 = d2", &provider)
         .expect("Decimal128 = Decimal128 must parse + type-check");
-    lower_physical(&plan)
-        .expect("WHERE d1 = d2 must lower in v0.7 (Op::Cmp128 wired)");
+    lower_physical(&plan).expect("WHERE d1 = d2 must lower in v0.7 (Op::Cmp128 wired)");
 }
 
 /// `WHERE d1 < d2` lowers cleanly. The PTX layer emits the
@@ -488,8 +489,7 @@ fn decimal128_lt_two_matching_columns_lowers_in_v07() {
     let provider = provider_with_matching_decimals_and_bigint();
     let plan = parse_sql("SELECT d1 FROM t WHERE d1 < d2", &provider)
         .expect("Decimal128 < Decimal128 must parse + type-check");
-    lower_physical(&plan)
-        .expect("WHERE d1 < d2 must lower in v0.7 (Op::Cmp128 wired)");
+    lower_physical(&plan).expect("WHERE d1 < d2 must lower in v0.7 (Op::Cmp128 wired)");
 }
 
 /// Every comparison operator (`=`, `!=`, `<`, `>`, `<=`, `>=`) lowers
@@ -502,9 +502,8 @@ fn decimal128_all_comparison_ops_lower_in_v07() {
         let sql = format!("SELECT d1 FROM t WHERE d1 {op} d2");
         let plan = parse_sql(&sql, &provider)
             .unwrap_or_else(|e| panic!("`{sql}` must parse + type-check, got: {e}"));
-        lower_physical(&plan).unwrap_or_else(|e| {
-            panic!("`{sql}` must lower in v0.7 (Op::Cmp128 wired), got: {e}")
-        });
+        lower_physical(&plan)
+            .unwrap_or_else(|e| panic!("`{sql}` must lower in v0.7 (Op::Cmp128 wired), got: {e}"));
     }
 }
 
@@ -520,9 +519,8 @@ fn decimal128_eq_bigint_rejects_in_v07() {
     let msg = match r {
         Ok(plan) => format!(
             "{}",
-            lower_physical(&plan).expect_err(
-                "Decimal128 = BIGINT must reject (no auto-coerce path)"
-            )
+            lower_physical(&plan)
+                .expect_err("Decimal128 = BIGINT must reject (no auto-coerce path)")
         ),
         Err(e) => format!("{e}"),
     };
@@ -559,9 +557,7 @@ fn decimal128_eq_mismatched_scale_rejected_in_v07() {
     let msg = match r {
         Ok(plan) => format!(
             "{}",
-            lower_physical(&plan).expect_err(
-                "Decimal128 cmp with mismatched scale must reject"
-            )
+            lower_physical(&plan).expect_err("Decimal128 cmp with mismatched scale must reject")
         ),
         Err(e) => format!("{e}"),
     };

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side string dictionary paired with on-device **i64** indices.
 //!
@@ -210,7 +210,10 @@ impl DictionaryColumnI64 {
     /// i64 sibling of
     /// [`crate::cuda::dictionary::DictionaryColumn::insertion_rank`].
     pub fn insertion_rank(&self, probe: &str) -> usize {
-        self.dictionary.iter().filter(|d| d.as_str() < probe).count()
+        self.dictionary
+            .iter()
+            .filter(|d| d.as_str() < probe)
+            .count()
     }
 
     /// GPU indices (as `i64`) of every dictionary entry satisfying
@@ -362,10 +365,7 @@ impl DictionaryColumnI64 {
     /// must not use this — use [`Self::from_string_array`] or
     /// [`Self::from_i32`] instead.
     #[cfg(test)]
-    pub(crate) fn new_host_only(
-        dictionary: Vec<String>,
-        n_rows: usize,
-    ) -> BoltResult<Self> {
+    pub(crate) fn new_host_only(dictionary: Vec<String>, n_rows: usize) -> BoltResult<Self> {
         Ok(Self {
             dictionary,
             indices: GpuVec::<i64>::empty(),
@@ -377,9 +377,7 @@ impl DictionaryColumnI64 {
     /// [`Self::from_string_array`] without the device upload. See the i32
     /// sibling's `dedupe_for_test` for rationale.
     #[cfg(test)]
-    pub(crate) fn dedupe_for_test<'a, I>(
-        rows: I,
-    ) -> BoltResult<(Vec<String>, Vec<i64>)>
+    pub(crate) fn dedupe_for_test<'a, I>(rows: I) -> BoltResult<(Vec<String>, Vec<i64>)>
     where
         I: IntoIterator<Item = Option<&'a str>>,
     {
@@ -512,8 +510,7 @@ mod tests {
             "jp".to_string(),
         ];
         let i32_col = DictionaryColumn::new_host_only(dict.clone(), 0);
-        let i64_col = DictionaryColumnI64::new_host_only(dict, 0)
-            .expect("host-only constructor");
+        let i64_col = DictionaryColumnI64::new_host_only(dict, 0).expect("host-only constructor");
 
         let queries = ["jp", "missing", "us", "fr", "", "uk"];
         let got_i32 = i32_col.index_of_many(&queries);
@@ -539,8 +536,7 @@ mod tests {
 
     #[test]
     fn index_of_many_on_empty_dictionary_is_all_none() {
-        let col = DictionaryColumnI64::new_host_only(Vec::new(), 0)
-            .expect("host-only constructor");
+        let col = DictionaryColumnI64::new_host_only(Vec::new(), 0).expect("host-only constructor");
         let got = col.index_of_many(&["x", "y"]);
         assert_eq!(got, vec![None, None]);
     }
@@ -548,8 +544,7 @@ mod tests {
     #[test]
     fn index_of_many_with_empty_query_is_empty() {
         let dict = vec!["a".to_string()];
-        let col = DictionaryColumnI64::new_host_only(dict, 0)
-            .expect("host-only constructor");
+        let col = DictionaryColumnI64::new_host_only(dict, 0).expect("host-only constructor");
         let got = col.index_of_many(&[]);
         assert!(got.is_empty());
     }
@@ -571,20 +566,22 @@ mod tests {
         let pool: Vec<String> = (0..DISTINCT).map(|i| format!("v_{i}")).collect();
         let rows = (0..ROWS).map(|r| Some(pool[r % DISTINCT].as_str()));
 
-        let (dictionary, indices) =
-            DictionaryColumnI64::dedupe_for_test(rows).expect("dedupe");
+        let (dictionary, indices) = DictionaryColumnI64::dedupe_for_test(rows).expect("dedupe");
 
         assert_eq!(dictionary.len(), DISTINCT);
         let mut sorted_pool = pool.clone();
         sorted_pool.sort();
-        assert_eq!(dictionary, sorted_pool, "dictionary must be byte-lex sorted");
+        assert_eq!(
+            dictionary, sorted_pool,
+            "dictionary must be byte-lex sorted"
+        );
         for w in dictionary.windows(2) {
             assert!(w[0] < w[1], "dictionary must be strictly lex-increasing");
         }
         assert_eq!(indices.len(), ROWS);
 
-        let col = DictionaryColumnI64::new_host_only(dictionary, ROWS)
-            .expect("host-only constructor");
+        let col =
+            DictionaryColumnI64::new_host_only(dictionary, ROWS).expect("host-only constructor");
         // Each row index decodes back to its original string (remap consistency).
         for (r, &idx) in indices.iter().enumerate() {
             assert!(idx >= 1, "row {r} must have a non-NULL index, got {idx}");
@@ -616,8 +613,7 @@ mod tests {
             "mango".to_string(),
         ];
         let i32_col = DictionaryColumn::new_host_only(dict.clone(), 0);
-        let i64_col = DictionaryColumnI64::new_host_only(dict, 0)
-            .expect("host-only constructor");
+        let i64_col = DictionaryColumnI64::new_host_only(dict, 0).expect("host-only constructor");
 
         // Ranks are integer positions — identical across widths.
         assert_eq!(i32_col.collation_ranks(), i64_col.collation_ranks());
@@ -659,8 +655,7 @@ mod tests {
     #[ignore = "gpu:string"]
     fn from_string_array_round_trip() {
         let input = StringArray::from(vec![Some("us"), None, Some("uk"), Some("us")]);
-        let col = DictionaryColumnI64::from_string_array(&input)
-            .expect("encode should succeed");
+        let col = DictionaryColumnI64::from_string_array(&input).expect("encode should succeed");
         let decoded = col.to_string_array().expect("decode should succeed");
 
         assert_eq!(decoded.len(), input.len());

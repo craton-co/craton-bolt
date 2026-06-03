@@ -79,17 +79,17 @@
 //! regardless of whether the GPU or host path runs and regardless of input
 //! size.
 
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
 
+use arrow::compute::take;
+use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow_array::types::{Int32Type, Int64Type};
-use arrow::compute::take;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
@@ -101,13 +101,13 @@ use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::sort_kernel::{
-    compile_sort_kernel_spec, sort_kernel_entry_spec, KeyDesc, SortDirection,
-    SortKernelSpec, SortLayout, MAX_SORT_KEYS, SORT_BLOCK_SIZE,
+    compile_sort_kernel_spec, sort_kernel_entry_spec, KeyDesc, SortDirection, SortKernelSpec,
+    SortLayout, MAX_SORT_KEYS, SORT_BLOCK_SIZE,
 };
 use crate::jit::sort_kernel_radix::{
-    compile_radix_histogram, compile_radix_scatter_with_indices,
-    radix_histogram_entry, radix_scatter_with_indices_entry, radix_steps_for,
-    radix_supports_dtype, RADIX_BLOCK_SIZE, RADIX_BUCKETS,
+    compile_radix_histogram, compile_radix_scatter_with_indices, radix_histogram_entry,
+    radix_scatter_with_indices_entry, radix_steps_for, radix_supports_dtype, RADIX_BLOCK_SIZE,
+    RADIX_BUCKETS,
 };
 use crate::plan::logical_plan::DataType;
 use crate::plan::physical_plan::{RadixSortKernelSpec, RadixSortPass};
@@ -449,9 +449,7 @@ where
         .values()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            BoltError::Other("gpu_sort: dictionary values are not Utf8".into())
-        })?;
+        .ok_or_else(|| BoltError::Other("gpu_sort: dictionary values are not Utf8".into()))?;
 
     // Lex-rank remap over the distinct dictionary values. `remap[k]` is the
     // rank of `values[k]` in lex order, so a numeric ASC sort of the ranks
@@ -994,9 +992,7 @@ pub fn sort_indices_on_gpu_radix(
 ///
 /// After every key is processed, the final permutation is the lexico-
 /// graphic sort across all keys with each key's per-direction order.
-pub fn sort_indices_on_gpu_radix_multi(
-    keys: &[GpuSortKey<'_>],
-) -> BoltResult<Option<UInt32Array>> {
+pub fn sort_indices_on_gpu_radix_multi(keys: &[GpuSortKey<'_>]) -> BoltResult<Option<UInt32Array>> {
     if !radix_dispatch_predicate_multi(keys) {
         return Ok(None);
     }
@@ -1228,9 +1224,7 @@ fn compute_block_offsets(
         let row = &block_hist[b * buckets..b * buckets + buckets];
         for d in 0..buckets {
             digit_total[d] = digit_total[d].checked_add(row[d]).ok_or_else(|| {
-                BoltError::Other(
-                    "radix block histogram digit total overflowed u32".into(),
-                )
+                BoltError::Other("radix block histogram digit total overflowed u32".into())
             })?;
         }
     }
@@ -1252,11 +1246,11 @@ fn compute_block_offsets(
         let mut running = digit_base[d];
         for b in 0..num_blocks {
             block_offsets[b * buckets + d] = running;
-            running = running.checked_add(block_hist[b * buckets + d]).ok_or_else(|| {
-                BoltError::Other(
-                    "radix per-block offset prefix overflowed u32".into(),
-                )
-            })?;
+            running = running
+                .checked_add(block_hist[b * buckets + d])
+                .ok_or_else(|| {
+                    BoltError::Other("radix per-block offset prefix overflowed u32".into())
+                })?;
         }
     }
     Ok(())
@@ -1379,10 +1373,8 @@ fn run_radix_pipeline_i32(
     // copy). The contents are fully overwritten each pass (the D2H fills
     // `hist_host`, `compute_block_offsets` rewrites `offsets_host` from index
     // 0), so carrying stale bytes across passes is benign.
-    let mut hist_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
-    let mut offsets_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut hist_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut offsets_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
 
     // ----- per-pass loop: histogram → host-scan → scatter -------------
     for step in 0..radix_steps {
@@ -1400,17 +1392,12 @@ fn run_radix_pipeline_i32(
         // SAFETY: hist_dev was allocated with `zeros(block_hist_len)`, so the
         // underlying allocation has at least block_hist_len u32 entries; we zero
         // exactly that many bytes.
-        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+        unsafe {
+            cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?;
+        }
 
         launch_radix_histogram(
-            &hist_fn,
-            &keys_ping,
-            &hist_dev,
-            n_rows_u32,
-            shift,
-            grid_x,
-            block_size,
-            &stream,
+            &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
         )?;
 
         // PERF (radix round-trip): D2H the per-block-per-digit histogram as an
@@ -1573,28 +1560,21 @@ fn run_radix_pipeline_i64(
     // and use page-locked memory so the per-pass D2H/H2D run as real async DMAs
     // on the sort stream. Contents are fully overwritten each pass, so stale
     // carry-over is benign.
-    let mut hist_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
-    let mut offsets_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut hist_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut offsets_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
 
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
 
         let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
         // SAFETY: hist_dev was allocated with block_hist_len u32 entries.
-        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+        unsafe {
+            cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?;
+        }
         let _ = hist_bytes;
 
         launch_radix_histogram_i64(
-            &hist_fn,
-            &keys_ping,
-            &hist_dev,
-            n_rows_u32,
-            shift,
-            grid_x,
-            block_size,
-            &stream,
+            &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
         )?;
 
         // PERF (radix round-trip): async D2H of the per-block histogram +
@@ -1728,17 +1708,17 @@ fn run_radix_pipeline_f32(
     )?;
     let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
 
-    let mut hist_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
-    let mut offsets_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut hist_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut offsets_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
 
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
 
         let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
         // SAFETY: hist_dev was allocated with block_hist_len u32 entries.
-        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+        unsafe {
+            cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?;
+        }
 
         launch_radix_histogram_u32(
             &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
@@ -1748,24 +1728,43 @@ fn run_radix_pipeline_f32(
         // for block_hist_len u32s; pages stay live until the sync retires the DMA.
         unsafe {
             cuda_sys::memcpy_d2h_async::<u32>(
-                hist_host.as_mut_ptr(), hist_dev.device_ptr(), block_hist_len, stream.raw(),
+                hist_host.as_mut_ptr(),
+                hist_dev.device_ptr(),
+                block_hist_len,
+                stream.raw(),
             )?;
         }
         stream.synchronize()?;
 
-        compute_block_offsets(hist_host.as_slice(), grid_x as usize, offsets_host.as_mut_slice())?;
+        compute_block_offsets(
+            hist_host.as_slice(),
+            grid_x as usize,
+            offsets_host.as_mut_slice(),
+        )?;
 
         // SAFETY: offsets_dev has block_hist_len u32 entries; pinned source
         // outlives the loop and is fenced by the post-loop synchronize.
         unsafe {
             cuda_sys::memcpy_h2d_async::<u32>(
-                offsets_dev.device_ptr(), offsets_host.as_ptr(), block_hist_len, stream.raw(),
+                offsets_dev.device_ptr(),
+                offsets_host.as_ptr(),
+                block_hist_len,
+                stream.raw(),
             )?;
         }
 
         launch_radix_scatter_with_indices_u32(
-            &scatter_fn, &keys_ping, &keys_pong, &idx_ping, &idx_pong, &offsets_dev,
-            n_rows_u32, shift, grid_x, block_size, &stream,
+            &scatter_fn,
+            &keys_ping,
+            &keys_pong,
+            &idx_ping,
+            &idx_pong,
+            &offsets_dev,
+            n_rows_u32,
+            shift,
+            grid_x,
+            block_size,
+            &stream,
         )?;
 
         std::mem::swap(&mut keys_ping, &mut keys_pong);
@@ -1835,17 +1834,17 @@ fn run_radix_pipeline_f64(
     )?;
     let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
 
-    let mut hist_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
-    let mut offsets_host: PinnedHostBuffer<u32> =
-        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut hist_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut offsets_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
 
     for step in 0..radix_steps {
         let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
 
         let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
         // SAFETY: hist_dev was allocated with block_hist_len u32 entries.
-        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+        unsafe {
+            cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?;
+        }
 
         launch_radix_histogram_u64(
             &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
@@ -1854,23 +1853,42 @@ fn run_radix_pipeline_f64(
         // SAFETY: see the f32 mirror.
         unsafe {
             cuda_sys::memcpy_d2h_async::<u32>(
-                hist_host.as_mut_ptr(), hist_dev.device_ptr(), block_hist_len, stream.raw(),
+                hist_host.as_mut_ptr(),
+                hist_dev.device_ptr(),
+                block_hist_len,
+                stream.raw(),
             )?;
         }
         stream.synchronize()?;
 
-        compute_block_offsets(hist_host.as_slice(), grid_x as usize, offsets_host.as_mut_slice())?;
+        compute_block_offsets(
+            hist_host.as_slice(),
+            grid_x as usize,
+            offsets_host.as_mut_slice(),
+        )?;
 
         // SAFETY: see the f32 mirror.
         unsafe {
             cuda_sys::memcpy_h2d_async::<u32>(
-                offsets_dev.device_ptr(), offsets_host.as_ptr(), block_hist_len, stream.raw(),
+                offsets_dev.device_ptr(),
+                offsets_host.as_ptr(),
+                block_hist_len,
+                stream.raw(),
             )?;
         }
 
         launch_radix_scatter_with_indices_u64(
-            &scatter_fn, &keys_ping, &keys_pong, &idx_ping, &idx_pong, &offsets_dev,
-            n_rows_u32, shift, grid_x, block_size, &stream,
+            &scatter_fn,
+            &keys_ping,
+            &keys_pong,
+            &idx_ping,
+            &idx_pong,
+            &offsets_dev,
+            n_rows_u32,
+            shift,
+            grid_x,
+            block_size,
+            &stream,
         )?;
 
         std::mem::swap(&mut keys_ping, &mut keys_pong);
@@ -1924,8 +1942,12 @@ fn launch_radix_histogram(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -1961,8 +1983,12 @@ fn launch_radix_histogram_i64(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2009,8 +2035,12 @@ fn launch_radix_scatter_with_indices(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2055,8 +2085,12 @@ fn launch_radix_scatter_with_indices_i64(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2096,8 +2130,12 @@ fn launch_radix_histogram_u32(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2134,8 +2172,12 @@ fn launch_radix_histogram_u64(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2183,8 +2225,12 @@ fn launch_radix_scatter_with_indices_u32(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2230,8 +2276,12 @@ fn launch_radix_scatter_with_indices_u64(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
-            grid_x, 1, 1,
-            block_size, 1, 1,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2626,19 +2676,11 @@ pub fn sort_indices_on_gpu_multi<'a>(
                                 let mut params: Vec<*mut c_void> =
                                     Vec::with_capacity(MAX_SORT_KEYS * 2 + 5);
                                 for i in 0..MAX_SORT_KEYS {
-                                    params.push(
-                                        &mut kp[i] as *mut CUdeviceptr as *mut c_void,
-                                    );
-                                    params.push(
-                                        &mut vp[i] as *mut CUdeviceptr as *mut c_void,
-                                    );
+                                    params.push(&mut kp[i] as *mut CUdeviceptr as *mut c_void);
+                                    params.push(&mut vp[i] as *mut CUdeviceptr as *mut c_void);
                                 }
-                                params.push(
-                                    &mut indices_ptr as *mut CUdeviceptr as *mut c_void,
-                                );
-                                params.push(
-                                    &mut is_padded_ptr as *mut CUdeviceptr as *mut c_void,
-                                );
+                                params.push(&mut indices_ptr as *mut CUdeviceptr as *mut c_void);
+                                params.push(&mut is_padded_ptr as *mut CUdeviceptr as *mut c_void);
                                 params.push(&mut p_n_pow2 as *mut u32 as *mut c_void);
                                 params.push(&mut p_stage as *mut u32 as *mut c_void);
                                 params.push(&mut p_mask as *mut u32 as *mut c_void);
@@ -2959,11 +3001,9 @@ mod tests {
         let idx = build_inline_dict_indices(&sa);
         // Pair (idx, original_position) and sort by idx; the resulting row
         // order must match the row order from sorting `inputs` directly.
-        let mut by_idx: Vec<(i32, usize)> =
-            idx.iter().copied().zip(0..inputs.len()).collect();
+        let mut by_idx: Vec<(i32, usize)> = idx.iter().copied().zip(0..inputs.len()).collect();
         by_idx.sort_by_key(|p| p.0);
-        let mut by_str: Vec<(&str, usize)> =
-            inputs.iter().copied().zip(0..inputs.len()).collect();
+        let mut by_str: Vec<(&str, usize)> = inputs.iter().copied().zip(0..inputs.len()).collect();
         by_str.sort_by_key(|p| p.0);
         assert_eq!(
             by_idx.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
@@ -2993,7 +3033,7 @@ mod tests {
         let n_pow2 = 8;
         let bm = build_is_padded(n_rows, n_pow2);
         assert_eq!(bm.len(), 1); // ceil(8/8) = 1 byte
-        // bits 0..5 = 0 (real); bits 5..8 = 1 (padded). 0b1110_0000 = 0xE0.
+                                 // bits 0..5 = 0 (real); bits 5..8 = 1 (padded). 0b1110_0000 = 0xE0.
         assert_eq!(bm[0], 0xE0);
     }
 
@@ -3052,8 +3092,7 @@ mod tests {
             }];
             match sort_indices_on_gpu_multi(&keys) {
                 Ok(Some((_l, perm))) => {
-                    let sorted: Vec<i32> =
-                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
                     if sorted.windows(2).any(|w| w[0] < w[1]) {
                         failures.push("int32/DESC/no-pad: non-monotonic".into());
                     }
@@ -3075,8 +3114,7 @@ mod tests {
             }];
             match sort_indices_on_gpu_multi(&keys) {
                 Ok(Some((_l, perm))) => {
-                    let sorted: Vec<i64> =
-                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    let sorted: Vec<i64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
                     if sorted.windows(2).any(|w| w[0] > w[1]) {
                         failures.push("int64/ASC/no-pad: non-monotonic".into());
                     }
@@ -3098,8 +3136,7 @@ mod tests {
             }];
             match sort_indices_on_gpu_multi(&keys) {
                 Ok(Some((_l, perm))) => {
-                    let sorted: Vec<f64> =
-                        (0..n).map(|i| values[perm.value(i) as usize]).collect();
+                    let sorted: Vec<f64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
                     if sorted.windows(2).any(|w| w[0] > w[1]) {
                         failures.push("float64/ASC/no-pad: non-monotonic".into());
                     }
@@ -3157,7 +3194,9 @@ mod tests {
         // simple Fisher-Yates with a fixed seed
         let mut rng_state: u64 = 0xdeadbeef;
         for i in (1..n).rev() {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = (rng_state as usize) % (i + 1);
             values.swap(i, j);
         }
@@ -3235,12 +3274,7 @@ mod tests {
 
         let sorted: Vec<f64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
         for w in sorted.windows(2) {
-            assert!(
-                w[0] <= w[1],
-                "ASC float non-monotonic: {} > {}",
-                w[0],
-                w[1]
-            );
+            assert!(w[0] <= w[1], "ASC float non-monotonic: {} > {}", w[0], w[1]);
         }
     }
 
@@ -3283,16 +3317,8 @@ mod tests {
         .expect("non-fallback path on int32 batch");
         assert_eq!(out.num_rows(), n);
 
-        let k_sorted = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let v_sorted = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        let k_sorted = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let v_sorted = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
 
         for i in 0..n {
             assert_eq!(
@@ -3331,14 +3357,9 @@ mod tests {
         }
         let arr = Int32Array::from(values.clone());
 
-        let perm = sort_indices_on_gpu_radix(
-            &arr,
-            DataType::Int32,
-            SortDirection::Asc,
-            false,
-        )
-        .expect("gpu radix sort")
-        .expect("non-fallback on int32 asc no-null");
+        let perm = sort_indices_on_gpu_radix(&arr, DataType::Int32, SortDirection::Asc, false)
+            .expect("gpu radix sort")
+            .expect("non-fallback on int32 asc no-null");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -3363,24 +3384,14 @@ mod tests {
             .collect();
         let arr = Int64Array::from(values.clone());
 
-        let perm = sort_indices_on_gpu_radix(
-            &arr,
-            DataType::Int64,
-            SortDirection::Asc,
-            false,
-        )
-        .expect("gpu radix sort i64")
-        .expect("non-fallback on int64 asc no-null");
+        let perm = sort_indices_on_gpu_radix(&arr, DataType::Int64, SortDirection::Asc, false)
+            .expect("gpu radix sort i64")
+            .expect("non-fallback on int64 asc no-null");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<i64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
         for w in sorted.windows(2) {
-            assert!(
-                w[0] <= w[1],
-                "radix i64 non-monotonic: {} > {}",
-                w[0],
-                w[1]
-            );
+            assert!(w[0] <= w[1], "radix i64 non-monotonic: {} > {}", w[0], w[1]);
         }
         let mut expected = values.clone();
         expected.sort();
@@ -3413,14 +3424,9 @@ mod tests {
         }
         let arr = Float32Array::from(values.clone());
 
-        let perm = sort_indices_on_gpu_radix(
-            &arr,
-            DataType::Float32,
-            SortDirection::Asc,
-            false,
-        )
-        .expect("gpu radix sort f32")
-        .expect("non-fallback on float32 asc no-null");
+        let perm = sort_indices_on_gpu_radix(&arr, DataType::Float32, SortDirection::Asc, false)
+            .expect("gpu radix sort f32")
+            .expect("non-fallback on float32 asc no-null");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<f32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -3432,12 +3438,7 @@ mod tests {
                 // here there's exactly one, so it must be the last element.
                 assert!(w[1].is_nan(), "non-NaN value sorted after a NaN");
             } else if !w[1].is_nan() {
-                assert!(
-                    w[0] <= w[1],
-                    "radix f32 non-monotonic: {} > {}",
-                    w[0],
-                    w[1]
-                );
+                assert!(w[0] <= w[1], "radix f32 non-monotonic: {} > {}", w[0], w[1]);
             }
         }
         assert!(
@@ -3468,14 +3469,9 @@ mod tests {
         }
         let arr = Float64Array::from(values.clone());
 
-        let perm = sort_indices_on_gpu_radix(
-            &arr,
-            DataType::Float64,
-            SortDirection::Asc,
-            false,
-        )
-        .expect("gpu radix sort f64")
-        .expect("non-fallback on float64 asc no-null");
+        let perm = sort_indices_on_gpu_radix(&arr, DataType::Float64, SortDirection::Asc, false)
+            .expect("gpu radix sort f64")
+            .expect("non-fallback on float64 asc no-null");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<f64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -3483,12 +3479,7 @@ mod tests {
             if w[0].is_nan() {
                 assert!(w[1].is_nan(), "non-NaN value sorted after a NaN");
             } else if !w[1].is_nan() {
-                assert!(
-                    w[0] <= w[1],
-                    "radix f64 non-monotonic: {} > {}",
-                    w[0],
-                    w[1]
-                );
+                assert!(w[0] <= w[1], "radix f64 non-monotonic: {} > {}", w[0], w[1]);
             }
         }
         assert!(sorted[n - 1].is_nan(), "NaN must sort last for ASC");
@@ -3514,14 +3505,9 @@ mod tests {
         }
         let arr = Int32Array::from(values.clone());
 
-        let perm = sort_indices_on_gpu_radix(
-            &arr,
-            DataType::Int32,
-            SortDirection::Desc,
-            false,
-        )
-        .expect("gpu radix sort desc")
-        .expect("non-fallback on int32 desc no-null");
+        let perm = sort_indices_on_gpu_radix(&arr, DataType::Int32, SortDirection::Desc, false)
+            .expect("gpu radix sort desc")
+            .expect("non-fallback on int32 desc no-null");
         assert_eq!(perm.len(), n);
 
         let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
@@ -3620,13 +3606,20 @@ mod tests {
                 assert!(
                     key_a[ia] < key_a[ib],
                     "primary ASC violated: a[{}]={} > a[{}]={}",
-                    w, key_a[ia], w + 1, key_a[ib],
+                    w,
+                    key_a[ia],
+                    w + 1,
+                    key_a[ib],
                 );
             } else {
                 assert!(
                     key_b[ia] >= key_b[ib],
                     "secondary DESC violated on tie a={}: b[{}]={} < b[{}]={}",
-                    key_a[ia], w, key_b[ia], w + 1, key_b[ib],
+                    key_a[ia],
+                    w,
+                    key_b[ia],
+                    w + 1,
+                    key_b[ib],
                 );
             }
         }
@@ -4073,8 +4066,8 @@ mod tests {
         // threshold. Other low-cardinality layouts (random shuffle) would
         // sample a few distinct values; either way the ratio stays low.
         let alphabet = [
-            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-            "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
         ];
         let strings: Vec<&str> = (0..n).map(|i| alphabet[i % alphabet.len()]).collect();
         let sa = StringArray::from(strings);
@@ -4096,8 +4089,7 @@ mod tests {
     #[test]
     fn empty_utf8_does_not_trip_gate() {
         let sa = StringArray::from(Vec::<&str>::new());
-        let res = host_values_for_key(&sa, DataType::Int32)
-            .expect("empty Utf8 must not error");
+        let res = host_values_for_key(&sa, DataType::Int32).expect("empty Utf8 must not error");
         let values = res.expect("empty Utf8 must NOT trip the high-cardinality gate");
         assert!(matches!(values, HostKeyValues::I32(_)));
     }

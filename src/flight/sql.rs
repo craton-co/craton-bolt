@@ -171,9 +171,7 @@ fn statement_sql(command: FlightSqlCommand) -> Result<String, Status> {
 
 /// Lock the shared engine, mapping a poisoned mutex to an `INTERNAL`
 /// [`Status`] instead of panicking inside a gRPC handler.
-fn lock_engine(
-    engine: &Arc<Mutex<Engine>>,
-) -> Result<std::sync::MutexGuard<'_, Engine>, Status> {
+fn lock_engine(engine: &Arc<Mutex<Engine>>) -> Result<std::sync::MutexGuard<'_, Engine>, Status> {
     engine
         .lock()
         .map_err(|_| Status::internal("query engine mutex poisoned"))
@@ -220,10 +218,7 @@ pub fn execute_flight_command(
 /// so we execute the query once to recover the result Arrow schema. (TODO: a
 /// plan-only schema path to avoid executing twice across
 /// `get_schema` + `do_get`.)
-pub fn schema_for_command(
-    engine: &Arc<Mutex<Engine>>,
-    cmd: &[u8],
-) -> Result<SchemaRef, Status> {
+pub fn schema_for_command(engine: &Arc<Mutex<Engine>>, cmd: &[u8]) -> Result<SchemaRef, Status> {
     let command = decode_command(cmd)?;
     let sql = statement_sql(command)?;
 
@@ -281,10 +276,9 @@ mod tests {
 
     #[test]
     fn statement_sql_rejects_prepared() {
-        let command =
-            FlightSqlCommand::PreparedStatementQuery(CommandPreparedStatementQuery {
-                prepared_statement_handle: prost::bytes::Bytes::new(),
-            });
+        let command = FlightSqlCommand::PreparedStatementQuery(CommandPreparedStatementQuery {
+            prepared_statement_handle: prost::bytes::Bytes::new(),
+        });
         assert_eq!(
             statement_sql(command).unwrap_err().code(),
             tonic::Code::Unimplemented

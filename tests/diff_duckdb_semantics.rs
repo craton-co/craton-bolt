@@ -385,15 +385,15 @@ fn not_in_tables(probe: Vec<Option<i32>>, set: Vec<Option<i32>>) -> Vec<TableSpe
         ArrowDataType::Int32,
         true,
     )]));
-    let t = RecordBatch::try_new(t_schema, vec![Arc::new(Int32Array::from(probe))])
-        .expect("t batch");
+    let t =
+        RecordBatch::try_new(t_schema, vec![Arc::new(Int32Array::from(probe))]).expect("t batch");
     let o_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "id",
         ArrowDataType::Int32,
         true,
     )]));
-    let o = RecordBatch::try_new(o_schema, vec![Arc::new(Int32Array::from(set))])
-        .expect("other batch");
+    let o =
+        RecordBatch::try_new(o_schema, vec![Arc::new(Int32Array::from(set))]).expect("other batch");
     vec![
         TableSpec {
             name: "t",
@@ -503,9 +503,8 @@ fn diff_two_key_count_with_nulls() {
         ArrowField::new("k2", ArrowDataType::Int32, false),
         ArrowField::new("v", ArrowDataType::Int64, true),
     ]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(k1), Arc::new(k2), Arc::new(v)])
-            .expect("two-key count batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(k1), Arc::new(k2), Arc::new(v)])
+        .expect("two-key count batch");
     diff_query(
         "diff_two_key_count_with_nulls",
         "SELECT k1, k2, COUNT(v) FROM t GROUP BY k1, k2",
@@ -535,8 +534,7 @@ fn diff_grouped_min_max_with_nan() {
         ArrowField::new("k", ArrowDataType::Int32, false),
         ArrowField::new("v", ArrowDataType::Float64, false),
     ]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("nan batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("nan batch");
     diff_query(
         "diff_grouped_min_max_with_nan",
         "SELECT k, MIN(v), MAX(v) FROM t GROUP BY k",

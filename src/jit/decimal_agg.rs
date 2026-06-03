@@ -204,7 +204,7 @@ pub fn compile_decimal_sum_kernel() -> BoltResult<String> {
         .map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u64 %rd14, [%rd12];").map_err(write_err)?; // neigh lo
         writeln!(ptx, "\tld.shared.u64 %rd15, [%rd13];").map_err(write_err)?; // neigh hi
-        // 128-bit add: lo with carry-out, hi with carry-in.
+                                                                              // 128-bit add: lo with carry-out, hi with carry-in.
         writeln!(ptx, "\tadd.cc.u64 %rd16, %rd10, %rd14;").map_err(write_err)?;
         writeln!(ptx, "\taddc.u64 %rd17, %rd11, %rd15;").map_err(write_err)?;
         // Store the combined value back into own slot.
@@ -377,10 +377,18 @@ fn emit_dec_minmax_combine(
     //   pred = pred || eq
     writeln!(ptx, "\tor.pred {}, {}, {};", pred_reg, pred_reg, eq_reg).map_err(write_err)?;
     // Select each half: neighbour when pred, running otherwise.
-    writeln!(ptx, "\tselp.b64 {}, {}, {}, {};", dst_lo, n_lo, o_lo, pred_reg)
-        .map_err(write_err)?;
-    writeln!(ptx, "\tselp.b64 {}, {}, {}, {};", dst_hi, n_hi, o_hi, pred_reg)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tselp.b64 {}, {}, {}, {};",
+        dst_lo, n_lo, o_lo, pred_reg
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tselp.b64 {}, {}, {}, {};",
+        dst_hi, n_hi, o_hi, pred_reg
+    )
+    .map_err(write_err)?;
     Ok(())
 }
 
@@ -435,10 +443,18 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
     writeln!(ptx, ".address_size 64").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
-    writeln!(ptx, ".shared .align 8 .b8 sdata_lo[{n}];", n = half_shared_bytes)
-        .map_err(write_err)?;
-    writeln!(ptx, ".shared .align 8 .b8 sdata_hi[{n}];", n = half_shared_bytes)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 8 .b8 sdata_lo[{n}];",
+        n = half_shared_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        ".shared .align 8 .b8 sdata_hi[{n}];",
+        n = half_shared_bytes
+    )
+    .map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
     writeln!(ptx, ".visible .entry {}(", entry).map_err(write_err)?;
@@ -468,8 +484,12 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DEC_LOAD_IDENTITY;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd3, %r3, {bytes};", bytes = DECIMAL_ELEM_BYTES)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd3, %r3, {bytes};",
+        bytes = DECIMAL_ELEM_BYTES
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd4, %rd0, %rd3;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.nc.u64 %rd1, [%rd4];").map_err(write_err)?;
     writeln!(ptx, "\tld.global.nc.u64 %rd2, [%rd4+8];").map_err(write_err)?;
@@ -495,18 +515,38 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
     for &stride in &phase1_strides {
         let neighbor_pred = format!("%p{}", 1 + (step % 4));
         let stride_bytes = stride as usize * 8;
-        writeln!(ptx, "\tsetp.lt.s32 {pred}, %r2, {stride};", pred = neighbor_pred, stride = stride)
-            .map_err(write_err)?;
-        writeln!(ptx, "\t@!{pred} bra DEC_SKIP_ADD_{step};", pred = neighbor_pred, step = step)
-            .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tsetp.lt.s32 {pred}, %r2, {stride};",
+            pred = neighbor_pred,
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\t@!{pred} bra DEC_SKIP_ADD_{step};",
+            pred = neighbor_pred,
+            step = step
+        )
+        .map_err(write_err)?;
         // Load own (lo,hi) and neighbour (lo,hi).
         writeln!(ptx, "\tld.shared.u64 %rd10, [%rd7];").map_err(write_err)?; // own lo
         writeln!(ptx, "\tld.shared.u64 %rd11, [%rd9];").map_err(write_err)?; // own hi
-        writeln!(ptx, "\tadd.s64 %rd12, %rd7, {offset};", offset = stride_bytes).map_err(write_err)?;
-        writeln!(ptx, "\tadd.s64 %rd13, %rd9, {offset};", offset = stride_bytes).map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tadd.s64 %rd12, %rd7, {offset};",
+            offset = stride_bytes
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tadd.s64 %rd13, %rd9, {offset};",
+            offset = stride_bytes
+        )
+        .map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u64 %rd14, [%rd12];").map_err(write_err)?; // neigh lo
         writeln!(ptx, "\tld.shared.u64 %rd15, [%rd13];").map_err(write_err)?; // neigh hi
-        // 128-bit compare-and-select: combine neighbour into own → %rd16/%rd17.
+                                                                              // 128-bit compare-and-select: combine neighbour into own → %rd16/%rd17.
         emit_dec_minmax_combine(
             &mut ptx, which, "%p5", "%p6", "%rd14", "%rd15", "%rd10", "%rd11", "%rd16", "%rd17",
         )?;
@@ -529,17 +569,33 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
     for &stride in &[16i32, 8, 4, 2, 1] {
         // Shuffle the lo half: split into two b32, shfl each, recombine.
         writeln!(ptx, "\tmov.b64 {{%r10, %r11}}, %rd20;").map_err(write_err)?;
-        writeln!(ptx, "\tshfl.sync.down.b32 %r12, %r10, {stride}, 0x1f, 0xffffffff;", stride = stride)
-            .map_err(write_err)?;
-        writeln!(ptx, "\tshfl.sync.down.b32 %r13, %r11, {stride}, 0x1f, 0xffffffff;", stride = stride)
-            .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r12, %r10, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r13, %r11, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
         writeln!(ptx, "\tmov.b64 %rd22, {{%r12, %r13}};").map_err(write_err)?;
         // Shuffle the hi half.
         writeln!(ptx, "\tmov.b64 {{%r14, %r15}}, %rd21;").map_err(write_err)?;
-        writeln!(ptx, "\tshfl.sync.down.b32 %r16, %r14, {stride}, 0x1f, 0xffffffff;", stride = stride)
-            .map_err(write_err)?;
-        writeln!(ptx, "\tshfl.sync.down.b32 %r17, %r15, {stride}, 0x1f, 0xffffffff;", stride = stride)
-            .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r16, %r14, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tshfl.sync.down.b32 %r17, %r15, {stride}, 0x1f, 0xffffffff;",
+            stride = stride
+        )
+        .map_err(write_err)?;
         writeln!(ptx, "\tmov.b64 %rd23, {{%r16, %r17}};").map_err(write_err)?;
         // 128-bit compare-and-select of the shuffled neighbour into the running
         // value (%rd20/%rd21). Result written back in place.
@@ -553,8 +609,12 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
     writeln!(ptx, "\t@%p5 bra DEC_DONE;").map_err(write_err)?;
     writeln!(ptx, "\tld.param.u64 %rd30, [{}_param_1];", entry).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd30, %rd30;").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.u32 %rd31, %r0, {bytes};", bytes = DECIMAL_ELEM_BYTES)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd31, %r0, {bytes};",
+        bytes = DECIMAL_ELEM_BYTES
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd32, %rd30, %rd31;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u64 [%rd32], %rd20;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u64 [%rd32+8], %rd21;").map_err(write_err)?;
@@ -606,12 +666,18 @@ mod tests {
     #[test]
     fn loads_and_stores_two_halves() {
         let ptx = compile_decimal_sum_kernel().unwrap();
-        assert!(ptx.contains("ld.global.nc.u64 %rd1, [%rd4];"), "lo load missing");
+        assert!(
+            ptx.contains("ld.global.nc.u64 %rd1, [%rd4];"),
+            "lo load missing"
+        );
         assert!(
             ptx.contains("ld.global.nc.u64 %rd2, [%rd4+8];"),
             "hi load (at +8) missing"
         );
-        assert!(ptx.contains("st.global.u64 [%rd32], %rd20;"), "lo store missing");
+        assert!(
+            ptx.contains("st.global.u64 [%rd32], %rd20;"),
+            "lo store missing"
+        );
         assert!(
             ptx.contains("st.global.u64 [%rd32+8], %rd21;"),
             "hi store (at +8) missing"
@@ -672,9 +738,18 @@ mod tests {
     fn minmax_uses_compare_and_select_not_add() {
         let min = compile_decimal_minmax_kernel(DecimalMinMax::Min).unwrap();
         // MIN: neighbour wins when strictly less → lt on both halves.
-        assert!(min.contains("setp.lt.s64"), "MIN hi-half signed-lt missing:\n{min}");
-        assert!(min.contains("setp.lt.u64"), "MIN lo-half unsigned-lt missing:\n{min}");
-        assert!(min.contains("selp.b64"), "MIN must select via selp.b64:\n{min}");
+        assert!(
+            min.contains("setp.lt.s64"),
+            "MIN hi-half signed-lt missing:\n{min}"
+        );
+        assert!(
+            min.contains("setp.lt.u64"),
+            "MIN lo-half unsigned-lt missing:\n{min}"
+        );
+        assert!(
+            min.contains("selp.b64"),
+            "MIN must select via selp.b64:\n{min}"
+        );
         assert!(
             !min.contains("add.cc.u64") && !min.contains("addc.u64"),
             "MIN must NOT emit carry-chain add (that is SUM):\n{min}"
@@ -682,9 +757,18 @@ mod tests {
 
         let max = compile_decimal_minmax_kernel(DecimalMinMax::Max).unwrap();
         // MAX: neighbour wins when strictly greater → gt on both halves.
-        assert!(max.contains("setp.gt.s64"), "MAX hi-half signed-gt missing:\n{max}");
-        assert!(max.contains("setp.gt.u64"), "MAX lo-half unsigned-gt missing:\n{max}");
-        assert!(max.contains("selp.b64"), "MAX must select via selp.b64:\n{max}");
+        assert!(
+            max.contains("setp.gt.s64"),
+            "MAX hi-half signed-gt missing:\n{max}"
+        );
+        assert!(
+            max.contains("setp.gt.u64"),
+            "MAX lo-half unsigned-gt missing:\n{max}"
+        );
+        assert!(
+            max.contains("selp.b64"),
+            "MAX must select via selp.b64:\n{max}"
+        );
         assert!(
             !max.contains("add.cc.u64") && !max.contains("addc.u64"),
             "MAX must NOT emit carry-chain add:\n{max}"
@@ -737,18 +821,36 @@ mod tests {
     #[test]
     fn minmax_loads_and_stores_two_halves() {
         let ptx = compile_decimal_minmax_kernel(DecimalMinMax::Min).unwrap();
-        assert!(ptx.contains("ld.global.nc.u64 %rd1, [%rd4];"), "lo load missing:\n{ptx}");
-        assert!(ptx.contains("ld.global.nc.u64 %rd2, [%rd4+8];"), "hi load (+8) missing:\n{ptx}");
-        assert!(ptx.contains("st.global.u64 [%rd32], %rd20;"), "lo store missing:\n{ptx}");
-        assert!(ptx.contains("st.global.u64 [%rd32+8], %rd21;"), "hi store (+8) missing:\n{ptx}");
+        assert!(
+            ptx.contains("ld.global.nc.u64 %rd1, [%rd4];"),
+            "lo load missing:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("ld.global.nc.u64 %rd2, [%rd4+8];"),
+            "hi load (+8) missing:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.u64 [%rd32], %rd20;"),
+            "lo store missing:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.u64 [%rd32+8], %rd21;"),
+            "hi store (+8) missing:\n{ptx}"
+        );
     }
 
     /// Two-phase shape (bar.sync tree + warp shuffle) carries over to MIN/MAX.
     #[test]
     fn minmax_emits_two_phase_reduction() {
         let ptx = compile_decimal_minmax_kernel(DecimalMinMax::Max).unwrap();
-        assert!(ptx.contains("bar.sync 0;"), "phase-1 needs bar.sync:\n{ptx}");
-        assert!(ptx.contains("shfl.sync.down.b32"), "phase-2 needs warp-shuffle:\n{ptx}");
+        assert!(
+            ptx.contains("bar.sync 0;"),
+            "phase-1 needs bar.sync:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("shfl.sync.down.b32"),
+            "phase-2 needs warp-shuffle:\n{ptx}"
+        );
     }
 
     /// MIN and MAX must produce DISTINCT entry points (the host launcher picks

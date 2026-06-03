@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA_STUB");
@@ -134,7 +134,8 @@ fn main() {
                     None => (0, 0),
                 }
             }
-            let base_dir = std::path::Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+            let base_dir =
+                std::path::Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
             if base_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(base_dir) {
                     let mut entries: Vec<_> = entries.flatten().collect();

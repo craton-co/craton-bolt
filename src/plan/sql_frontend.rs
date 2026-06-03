@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! SQL frontend: parses a SQL string into a `LogicalPlan` against a `TableProvider`.
 
@@ -11,10 +11,9 @@ use parking_lot::Mutex;
 use sqlparser::ast::{
     BinaryOperator, CastFormat as SqlCastFormat, CastKind, DataType as SqlDataType, Distinct,
     Expr as SqlExpr, Fetch, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident,
-    JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, Offset, OrderByExpr, Query, Select,
-    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Top, TopQuantity,
-    UnaryOperator, Value, WindowSpec,
+    GroupByWithModifier, Ident, JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, Offset,
+    OrderByExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    TableFactor, Top, TopQuantity, UnaryOperator, Value, WindowSpec,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -417,8 +416,7 @@ impl<'a> NameResolver<'a> {
     fn resolve_compound(&self, qualifier: &str, col: &str) -> BoltResult<String> {
         let qualifier_lc = !qualifier.chars().any(|c| c.is_ascii_uppercase());
         let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
-        let candidates: Vec<&str> =
-            self.tables.iter().map(|t| t.name.as_str()).collect();
+        let candidates: Vec<&str> = self.tables.iter().map(|t| t.name.as_str()).collect();
         let candidate_msg = if candidates.is_empty() {
             "no tables in scope".to_string()
         } else {
@@ -481,15 +479,11 @@ impl<'a> NameResolver<'a> {
     /// whole left relation.
     ///
     /// Uses the same case-folding convention as [`Self::resolve_compound`].
-    fn resolve_correlation(
-        &self,
-        corr: &crate::plan::subquery::CorrRef,
-    ) -> BoltResult<usize> {
+    fn resolve_correlation(&self, corr: &crate::plan::subquery::CorrRef) -> BoltResult<usize> {
         // The output index of a column = the count of all output columns in
         // earlier scopes + its position within its own scope.
-        let scope_base = |scope_i: usize| -> usize {
-            self.tables[..scope_i].iter().map(|t| t.cols.len()).sum()
-        };
+        let scope_base =
+            |scope_i: usize| -> usize { self.tables[..scope_i].iter().map(|t| t.cols.len()).sum() };
         match &corr.qualifier {
             Some(q) => {
                 let q_lc = !q.chars().any(|c| c.is_ascii_uppercase());
@@ -505,9 +499,7 @@ impl<'a> NameResolver<'a> {
                             .iter()
                             .position(|t| t.name.eq_ignore_ascii_case(q))
                     })
-                    .ok_or_else(|| {
-                        BoltError::Sql(format!("unknown table qualifier '{q}'"))
-                    })?;
+                    .ok_or_else(|| BoltError::Sql(format!("unknown table qualifier '{q}'")))?;
                 let col_lc = !corr.column.chars().any(|c| c.is_ascii_uppercase());
                 let scope = &self.tables[scope_i];
                 let pos = scope
@@ -524,10 +516,7 @@ impl<'a> NameResolver<'a> {
                             .position(|c| c.original.eq_ignore_ascii_case(&corr.column))
                     })
                     .ok_or_else(|| {
-                        BoltError::Sql(format!(
-                            "unknown column '{}' in table '{q}'",
-                            corr.column
-                        ))
+                        BoltError::Sql(format!("unknown column '{}' in table '{q}'", corr.column))
                     })?;
                 Ok(scope_base(scope_i) + pos)
             }
@@ -562,11 +551,7 @@ impl<'a> NameResolver<'a> {
     fn outer_column_names(&self) -> std::collections::HashSet<String> {
         self.tables
             .iter()
-            .flat_map(|t| {
-                t.cols
-                    .iter()
-                    .map(|c| c.original.to_ascii_lowercase())
-            })
+            .flat_map(|t| t.cols.iter().map(|c| c.original.to_ascii_lowercase()))
             .collect()
     }
 }
@@ -1754,7 +1739,9 @@ fn lower_values_relation(
     }
     let n_cols = values.rows[0].len();
     if n_cols == 0 {
-        return Err(BoltError::Sql("VALUES row must have at least one column".into()));
+        return Err(BoltError::Sql(
+            "VALUES row must have at least one column".into(),
+        ));
     }
     enforce_values_row_cap(values.rows.len(), values_max_rows())?;
 
@@ -1886,7 +1873,10 @@ fn plan_values_query_inner(
         let order_by = match &query.order_by {
             Some(ob) => lower_order_by(
                 &ob.exprs,
-                SubqueryCtx { provider, ctes: &ctes },
+                SubqueryCtx {
+                    provider,
+                    ctes: &ctes,
+                },
             )
             .and_then(|sorts| {
                 // Type-check the sort refs against the relation schema.
@@ -2398,7 +2388,10 @@ fn lower_bare_limit(query: &Query) -> BoltResult<Option<(usize, usize)>> {
         None => None,
     };
     if limit_value.is_some() || offset_value.is_some() {
-        Ok(Some((limit_value.unwrap_or(usize::MAX), offset_value.unwrap_or(0))))
+        Ok(Some((
+            limit_value.unwrap_or(usize::MAX),
+            offset_value.unwrap_or(0),
+        )))
     } else {
         Ok(None)
     }
@@ -2570,9 +2563,8 @@ fn plan_distinct_on_inner(
     // query's ORDER BY) through the ordinary `plan_query`.
     let mut base_select = select.clone();
     base_select.distinct = None;
-    let mut new_projection: Vec<SelectItem> = Vec::with_capacity(
-        key_names.len() + base_select.projection.len(),
-    );
+    let mut new_projection: Vec<SelectItem> =
+        Vec::with_capacity(key_names.len() + base_select.projection.len());
     for (i, k) in key_exprs.iter().enumerate() {
         new_projection.push(SelectItem::ExprWithAlias {
             expr: k.clone(),
@@ -2898,8 +2890,7 @@ pub fn plan_count_distinct_groupby(
     // column is the last (at `cd_index`).
     let group_key_fields: Vec<crate::plan::logical_plan::Field> =
         base_schema.fields[..cd_index].to_vec();
-    let group_key_names: Vec<String> =
-        group_key_fields.iter().map(|f| f.name.clone()).collect();
+    let group_key_names: Vec<String> = group_key_fields.iter().map(|f| f.name.clone()).collect();
 
     // Result schema: group-key fields (carried through), then the Int64 count.
     // The count is non-nullable (COUNT never produces SQL NULL).
@@ -2983,14 +2974,12 @@ fn build_count_distinct_post_plan(
             provider,
             ctes: &ctes,
         });
-        resolver.push_base(COUNT_DISTINCT_GROUPBY_RESULT_TABLE.to_string(), result_schema);
-        let predicate = lower_having_over_count_distinct(
-            having_sql,
-            distinct_arg,
-            &resolver,
-            count_alias,
-            0,
-        )?;
+        resolver.push_base(
+            COUNT_DISTINCT_GROUPBY_RESULT_TABLE.to_string(),
+            result_schema,
+        );
+        let predicate =
+            lower_having_over_count_distinct(having_sql, distinct_arg, &resolver, count_alias, 0)?;
         validate_having_columns(&predicate, result_schema)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
@@ -3377,9 +3366,10 @@ pub fn plan_multi_agg_groupby(
     // Every declared GROUP BY key must be projected (the host base is built
     // from the SELECTed group-key columns).
     for g in &parsed_group_by.all_cols {
-        let projected = items.iter().zip(classified.iter()).any(|((e, _), c)| {
-            matches!(c, CdSelectItem::GroupKey) && e == g
-        });
+        let projected = items
+            .iter()
+            .zip(classified.iter())
+            .any(|((e, _), c)| matches!(c, CdSelectItem::GroupKey) && e == g);
         if !projected {
             return Ok(None);
         }
@@ -3442,8 +3432,7 @@ pub fn plan_multi_agg_groupby(
     // Group-key names / fields are the leading `n_keys` base fields.
     let group_key_fields: Vec<crate::plan::logical_plan::Field> =
         base_schema.fields[..n_keys].to_vec();
-    let group_key_names: Vec<String> =
-        group_key_fields.iter().map(|f| f.name.clone()).collect();
+    let group_key_names: Vec<String> = group_key_fields.iter().map(|f| f.name.clone()).collect();
 
     // Result schema, in SELECT (output_layout) order. Group keys carry their
     // base dtype; aggregates carry the dtype the host produces.
@@ -3492,9 +3481,7 @@ fn multi_agg_output_type(
         CdAgg::Avg { .. } => (DataType::Float64, true),
         // SUM / MIN / MAX preserve the input dtype, nullable (empty / all-NULL
         // group yields NULL — matching the scalar host aggregate semantics).
-        CdAgg::Sum { .. } | CdAgg::Min { .. } | CdAgg::Max { .. } => {
-            (input_field.dtype, true)
-        }
+        CdAgg::Sum { .. } | CdAgg::Min { .. } | CdAgg::Max { .. } => (input_field.dtype, true),
     })
 }
 
@@ -4238,38 +4225,41 @@ fn plan_correlated_where_query(
     let corr_conjunct = conjuncts[corr_idx];
 
     // --- Classify the correlated conjunct + capture its template subquery. ---
-    let (kind, template): (CorrWhereKind, &Query) = if let Some((subq, negated)) =
-        as_exists(corr_conjunct)
-    {
-        (
-            if negated { CorrWhereKind::NotExists } else { CorrWhereKind::Exists },
-            subq,
-        )
-    } else {
-        // Scalar-compare conjunct: it must carry EXACTLY ONE direct subquery
-        // (the correlated scalar). More than one direct subquery in the same
-        // conjunct (e.g. `(SELECT ..) > (SELECT ..)`) is out of scope.
-        if count_direct_subqueries(corr_conjunct) != 1 {
-            return Err(BoltError::Sql(
-                "unsupported: correlated WHERE conjunct with more than one \
+    let (kind, template): (CorrWhereKind, &Query) =
+        if let Some((subq, negated)) = as_exists(corr_conjunct) {
+            (
+                if negated {
+                    CorrWhereKind::NotExists
+                } else {
+                    CorrWhereKind::Exists
+                },
+                subq,
+            )
+        } else {
+            // Scalar-compare conjunct: it must carry EXACTLY ONE direct subquery
+            // (the correlated scalar). More than one direct subquery in the same
+            // conjunct (e.g. `(SELECT ..) > (SELECT ..)`) is out of scope.
+            if count_direct_subqueries(corr_conjunct) != 1 {
+                return Err(BoltError::Sql(
+                    "unsupported: correlated WHERE conjunct with more than one \
                  subquery (a single correlated scalar subquery per conjunct is \
                  supported)"
-                    .into(),
-            ));
-        }
-        let subq = direct_scalar_subqueries(corr_conjunct)
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                BoltError::Sql(
-                    "unsupported: correlated WHERE subquery shape (expected a \
+                        .into(),
+                ));
+            }
+            let subq = direct_scalar_subqueries(corr_conjunct)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    BoltError::Sql(
+                        "unsupported: correlated WHERE subquery shape (expected a \
                      correlated EXISTS / NOT EXISTS or a scalar comparison \
                      carrying a correlated scalar subquery)"
-                        .into(),
-                )
-            })?;
-        (CorrWhereKind::Scalar, subq)
-    };
+                            .into(),
+                    )
+                })?;
+            (CorrWhereKind::Scalar, subq)
+        };
 
     // --- Apply every ORDINARY (non-correlated) conjunct as a normal Filter on
     // the outer plan. We rebuild a single AND of them and lower it against the
@@ -4321,7 +4311,11 @@ fn plan_correlated_where_query(
             ))
         })?;
         let synth = format!("{LATERAL_CORR_COL_PREFIX}{i}");
-        outer_fields.push(Field::new(synth.clone(), left_schema.fields[li].dtype, true));
+        outer_fields.push(Field::new(
+            synth.clone(),
+            left_schema.fields[li].dtype,
+            true,
+        ));
         corr_left_indices.push(li);
         corr_to_synth.push((corr.clone(), synth));
     }
@@ -4533,7 +4527,9 @@ fn build_corr_where_post(
     }];
     rewrite_refs_in_select(&mut out_select, &map)?;
 
-    let result_provider = CorrWhereResultProvider { schema: left_schema };
+    let result_provider = CorrWhereResultProvider {
+        schema: left_schema,
+    };
     let ctes = CteScope::new();
     let mut plan = plan_select(&out_select, &result_provider, &ctes, 1)?;
 
@@ -4852,7 +4848,8 @@ struct LateralResultProvider<'a> {
 }
 impl TableProvider for LateralResultProvider<'_> {
     fn schema(&self, name: &str) -> BoltResult<Schema> {
-        if name == LATERAL_APPLY_RESULT_TABLE || name.eq_ignore_ascii_case(LATERAL_APPLY_RESULT_TABLE)
+        if name == LATERAL_APPLY_RESULT_TABLE
+            || name.eq_ignore_ascii_case(LATERAL_APPLY_RESULT_TABLE)
         {
             return Ok(self.schema.clone());
         }
@@ -4894,7 +4891,9 @@ impl LateralRefMap {
                     (q.clone(), c.original.to_ascii_lowercase()),
                     c.output.clone(),
                 );
-                *bare_counts.entry(c.original.to_ascii_lowercase()).or_insert(0) += 1;
+                *bare_counts
+                    .entry(c.original.to_ascii_lowercase())
+                    .or_insert(0) += 1;
                 bare.insert(c.original.to_ascii_lowercase(), c.output.clone());
             }
         }
@@ -4975,8 +4974,7 @@ fn rewrite_correlations_in_setexpr(
             let select = s.as_mut();
             for item in &mut select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(e)
-                    | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                         rewrite_corr_expr(e, corr_to_synth, depth + 1)?;
                     }
                     _ => {}
@@ -5356,13 +5354,7 @@ fn plan_single_recursive_query(
     let column_aliases: Option<Vec<String>> = if cte.alias.columns.is_empty() {
         None
     } else {
-        Some(
-            cte.alias
-                .columns
-                .iter()
-                .map(ident_to_name)
-                .collect(),
-        )
+        Some(cte.alias.columns.iter().map(ident_to_name).collect())
     };
 
     // The body must be a top-level UNION / UNION ALL: anchor on the left,
@@ -5851,8 +5843,7 @@ fn count_set_expr_table_refs(expr: &SetExpr, target: &str) -> usize {
             .sum(),
         SetExpr::Query(q) => count_set_expr_table_refs(q.body.as_ref(), target),
         SetExpr::SetOperation { left, right, .. } => {
-            count_set_expr_table_refs(left, target)
-                + count_set_expr_table_refs(right, target)
+            count_set_expr_table_refs(left, target) + count_set_expr_table_refs(right, target)
         }
         _ => 0,
     }
@@ -5980,9 +5971,10 @@ fn plan_query(
     // `WITH TIES` and a TOP combined with LIMIT/FETCH are rejected precisely by
     // `top_limit_value`.
     let top_value = match query.body.as_ref() {
-        SetExpr::Select(s) => {
-            top_limit_value(s.top.as_ref(), query.limit.is_some() || query.fetch.is_some())?
-        }
+        SetExpr::Select(s) => top_limit_value(
+            s.top.as_ref(),
+            query.limit.is_some() || query.fetch.is_some(),
+        )?,
         _ => None,
     };
     // FOR UPDATE / FOR SHARE: row-level locking is a no-op for this read-only
@@ -6089,9 +6081,7 @@ fn lower_set_expr(
                 SetQuantifier::ByName
                 | SetQuantifier::AllByName
                 | SetQuantifier::DistinctByName => {
-                    return Err(BoltError::Sql(format!(
-                        "unsupported: {op} BY NAME"
-                    )));
+                    return Err(BoltError::Sql(format!("unsupported: {op} BY NAME")));
                 }
             };
             match op {
@@ -6296,9 +6286,7 @@ fn collect_union_branches(
             SetQuantifier::All => false,
             SetQuantifier::Distinct | SetQuantifier::None => true,
             // Non-flattening cases — fall through to a non-flat lower.
-            SetQuantifier::ByName
-            | SetQuantifier::AllByName
-            | SetQuantifier::DistinctByName => {
+            SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName => {
                 out.push(lower_set_expr(expr, provider, ctes, depth + 1)?);
                 return Ok(());
             }
@@ -6316,10 +6304,7 @@ fn collect_union_branches(
 /// Lower a list of `OrderByExpr` into our `SortExpr`s. The default sort
 /// direction is ASC; the default NULL placement follows SQL convention
 /// (NULLS FIRST for ASC, NULLS LAST for DESC) when the user omits it.
-fn lower_order_by(
-    exprs: &[OrderByExpr],
-    ctx: SubqueryCtx<'_>,
-) -> BoltResult<Vec<SortExpr>> {
+fn lower_order_by(exprs: &[OrderByExpr], ctx: SubqueryCtx<'_>) -> BoltResult<Vec<SortExpr>> {
     // ORDER BY runs outside the FROM-tree (after projection), so no table
     // qualifiers are in scope. We pass a resolver with no table scopes; bare
     // identifiers still lower as column refs against the post-projection
@@ -6347,9 +6332,7 @@ fn lower_order_by(
     } in exprs
     {
         if with_fill.is_some() {
-            return Err(BoltError::Sql(
-                "unsupported: ORDER BY ... WITH FILL".into(),
-            ));
+            return Err(BoltError::Sql("unsupported: ORDER BY ... WITH FILL".into()));
         }
         let descending = match asc {
             Some(true) | None => false,
@@ -6389,10 +6372,7 @@ fn lower_order_by(
 ///   * a `FETCH` alongside a `LIMIT` keyword (`has_limit_keyword`) — two row
 ///     limits on one query are ambiguous, so we reject rather than silently
 ///     pick one.
-fn fetch_limit_value(
-    fetch: Option<&Fetch>,
-    has_limit_keyword: bool,
-) -> BoltResult<Option<usize>> {
+fn fetch_limit_value(fetch: Option<&Fetch>, has_limit_keyword: bool) -> BoltResult<Option<usize>> {
     let fetch = match fetch {
         Some(f) => f,
         None => return Ok(None),
@@ -6460,10 +6440,11 @@ fn top_limit_value(top: Option<&Top>, has_other_limit: bool) -> BoltResult<Optio
         ));
     }
     match &top.quantity {
-        Some(TopQuantity::Constant(n)) => Ok(Some(
-            usize::try_from(*n)
-                .map_err(|_| BoltError::Sql(format!("TOP value {n} exceeds usize range")))?,
-        )),
+        Some(TopQuantity::Constant(n)) => {
+            Ok(Some(usize::try_from(*n).map_err(|_| {
+                BoltError::Sql(format!("TOP value {n} exceeds usize range"))
+            })?))
+        }
         Some(TopQuantity::Expr(e)) => Ok(Some(usize_from_literal(e, "TOP")?)),
         // `SELECT TOP ... ` with no quantity is not valid T-SQL; treat a
         // missing count defensively as "no limit" rather than erroring.
@@ -6480,9 +6461,9 @@ fn usize_from_literal(e: &SqlExpr, kind: &str) -> BoltResult<usize> {
             )));
         }
     };
-    let parsed: i64 = value.parse().map_err(|_| {
-        BoltError::Sql(format!("{kind} value '{value}' is not a valid integer"))
-    })?;
+    let parsed: i64 = value
+        .parse()
+        .map_err(|_| BoltError::Sql(format!("{kind} value '{value}' is not a valid integer")))?;
     if parsed < 0 {
         return Err(BoltError::Sql(format!(
             "{kind} value must be non-negative, got {parsed}"
@@ -6602,9 +6583,12 @@ fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
     // construct. If so it must be the *sole* item (mixing
     // `GROUP BY a, ROLLUP(b, c)` is valid SQL but adds combinatorial
     // bookkeeping we do not implement yet — reject precisely).
-    let has_super = exprs
-        .iter()
-        .any(|e| matches!(e, SqlExpr::Rollup(_) | SqlExpr::Cube(_) | SqlExpr::GroupingSets(_)));
+    let has_super = exprs.iter().any(|e| {
+        matches!(
+            e,
+            SqlExpr::Rollup(_) | SqlExpr::Cube(_) | SqlExpr::GroupingSets(_)
+        )
+    });
 
     if let Some(m) = trailing_modifier {
         if has_super {
@@ -6745,7 +6729,10 @@ fn parse_group_by(group_by: &GroupByExpr) -> BoltResult<ParsedGroupBy> {
     // the (order-insensitive) column multiset.
     let mut deduped: Vec<Vec<SqlExpr>> = Vec::with_capacity(sets.len());
     for set in sets {
-        if !deduped.iter().any(|existing| grouping_sets_eq(existing, &set)) {
+        if !deduped
+            .iter()
+            .any(|existing| grouping_sets_eq(existing, &set))
+        {
             deduped.push(set);
         }
     }
@@ -6839,7 +6826,10 @@ fn parse_trailing_modifier(
     // TOTALS over an empty GROUP BY collapses {(), ()} to {()}).
     let mut deduped: Vec<Vec<SqlExpr>> = Vec::with_capacity(sets.len());
     for set in sets {
-        if !deduped.iter().any(|existing| grouping_sets_eq(existing, &set)) {
+        if !deduped
+            .iter()
+            .any(|existing| grouping_sets_eq(existing, &set))
+        {
             deduped.push(set);
         }
     }
@@ -6979,9 +6969,7 @@ fn try_grouping_indicator(e: &SqlExpr) -> BoltResult<Option<Vec<&SqlExpr>>> {
     // malformed GROUPING(...) surfaces a precise message instead of being
     // silently mis-parsed.
     if !matches!(f.parameters, FunctionArguments::None) {
-        return Err(BoltError::Sql(
-            "unsupported: parametric GROUPING()".into(),
-        ));
+        return Err(BoltError::Sql("unsupported: parametric GROUPING()".into()));
     }
     if f.over.is_some() {
         return Err(BoltError::Sql("unsupported: OVER on GROUPING()".into()));
@@ -7435,9 +7423,8 @@ fn plan_select(
             // Re-project to honour any SELECT alias on the result column,
             // matching the post-aggregate Project the ordinary aggregate path
             // builds (so downstream stages see the user-friendly name).
-            let out_name = aggregate_output_name(&AggregateExpr::Count(Expr::Literal(
-                Literal::Int64(1),
-            )));
+            let out_name =
+                aggregate_output_name(&AggregateExpr::Count(Expr::Literal(Literal::Int64(1))));
             let col_ref = Expr::Column(out_name.clone());
             let proj = match alias {
                 Some(a) => col_ref.alias(a.clone()),
@@ -7463,13 +7450,8 @@ fn plan_select(
                     Some(a) => a.clone(),
                     None => out_name.clone(),
                 };
-                let predicate = lower_having_over_count_distinct(
-                    having_sql,
-                    inner,
-                    &resolver,
-                    &proj_name,
-                    0,
-                )?;
+                let predicate =
+                    lower_having_over_count_distinct(having_sql, inner, &resolver, &proj_name, 0)?;
                 // Type-check / column-validate against the Project's schema so a
                 // malformed HAVING surfaces here rather than at execution.
                 let project_schema = plan.schema()?;
@@ -7698,7 +7680,11 @@ fn plan_select(
         // so this map is computed once.
         let mut having_agg_aliases: HashMap<String, String> = HashMap::new();
         for src in &select_sources {
-            if let SelectSource::Aggregate { index, alias: Some(a) } = src {
+            if let SelectSource::Aggregate {
+                index,
+                alias: Some(a),
+            } = src
+            {
                 having_agg_aliases.insert(aggregate_output_name(&aggregates[*index]), a.clone());
             }
         }
@@ -7716,7 +7702,10 @@ fn plan_select(
             // The Aggregate's GROUP BY list is exactly the active columns, in
             // their order within `all_group_by` (so `group_key_output_name`'s
             // positional `__group_{i}` placeholders are stable per branch).
-            let group_by: Vec<Expr> = active_cols.iter().map(|&i| all_group_by[i].clone()).collect();
+            let group_by: Vec<Expr> = active_cols
+                .iter()
+                .map(|&i| all_group_by[i].clone())
+                .collect();
             let aggregate_plan = LogicalPlan::Aggregate {
                 input: Box::new(base),
                 group_by,
@@ -7895,7 +7884,7 @@ fn plan_select(
         // group set and returns the synthesized output column name. Shared by
         // the SELECT-item pass and the QUALIFY pass so a window function used
         // only in QUALIFY materializes a hidden column the same way.
-        let mut add_window =
+        let add_window =
             |pw: ParsedWindow, window_groups: &mut Vec<WindowGroup>, next_id: &mut usize| {
                 let out_name = format!("__window_{next_id}");
                 *next_id += 1;
@@ -8219,25 +8208,21 @@ fn lower_table_factor(
 /// * `Ok(false)` — not present on the left side at all.
 /// * `Err(_)`    — present in more than one left table (ambiguous), so a
 ///   USING / NATURAL column cannot be unambiguously resolved.
-fn left_join_column_present(
-    resolver: &NameResolver<'_>,
-    col: &str,
-) -> BoltResult<bool> {
+fn left_join_column_present(resolver: &NameResolver<'_>, col: &str) -> BoltResult<bool> {
     let col_lc = !col.chars().any(|c| c.is_ascii_uppercase());
     // All scopes left of the RHS (which is always the last pushed scope).
     let left_scopes = &resolver.tables[..resolver.tables.len() - 1];
     let mut hits = 0usize;
     for scope in left_scopes {
-        let matched = scope
-            .cols
-            .iter()
-            .find(|c| c.original == col)
-            .or_else(|| {
-                if !col_lc {
-                    return None;
-                }
-                scope.cols.iter().find(|c| c.original.eq_ignore_ascii_case(col))
-            });
+        let matched = scope.cols.iter().find(|c| c.original == col).or_else(|| {
+            if !col_lc {
+                return None;
+            }
+            scope
+                .cols
+                .iter()
+                .find(|c| c.original.eq_ignore_ascii_case(col))
+        });
         if matched.is_some() {
             hits += 1;
         }
@@ -8327,9 +8312,7 @@ fn desugar_using_columns(
 /// would silently degenerate to a CROSS join, which is almost never the
 /// intent), as is one whose common column is ambiguous on the left (surfaced
 /// by [`left_join_column_present`]).
-fn desugar_natural_columns(
-    resolver: &NameResolver<'_>,
-) -> BoltResult<Vec<(Expr, Expr)>> {
+fn desugar_natural_columns(resolver: &NameResolver<'_>) -> BoltResult<Vec<(Expr, Expr)>> {
     // Snapshot the RHS column names first so we don't hold a borrow of
     // `resolver` across the `left_join_column_present` calls below.
     let rhs_cols: Vec<String> = resolver
@@ -8832,22 +8815,29 @@ fn try_aggregate(
     // to the canonical `STDDEV_SAMP` spelling before the variant match below
     // so there is exactly one downstream representation per aggregate.
     let kind = match fname.as_str() {
-        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
-        | "VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => fname,
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "VAR_POP" | "VAR_SAMP" | "STDDEV_POP"
+        | "STDDEV_SAMP" => fname,
         "VARIANCE" => "VAR_SAMP".to_string(),
         "STDDEV" => "STDDEV_SAMP".to_string(),
         _ => {
             // Surface "did you mean...?" hint for near-miss aggregate names
             // before falling through to scalar-function rejection downstream.
             const KNOWN_AGGREGATES: &[&str] = &[
-                "COUNT", "SUM", "MIN", "MAX", "AVG",
-                "VAR_POP", "VAR_SAMP", "VARIANCE",
-                "STDDEV_POP", "STDDEV_SAMP", "STDDEV",
+                "COUNT",
+                "SUM",
+                "MIN",
+                "MAX",
+                "AVG",
+                "VAR_POP",
+                "VAR_SAMP",
+                "VARIANCE",
+                "STDDEV_POP",
+                "STDDEV_SAMP",
+                "STDDEV",
             ];
-            if let Some(hint) = crate::plan::suggest::closest_match(
-                &fname,
-                KNOWN_AGGREGATES.iter().copied(),
-            ) {
+            if let Some(hint) =
+                crate::plan::suggest::closest_match(&fname, KNOWN_AGGREGATES.iter().copied())
+            {
                 let original = &func.name.0[0].value;
                 return Err(BoltError::Sql(format!(
                     "unknown function '{original}' (did you mean '{hint}'?)"
@@ -9413,9 +9403,7 @@ fn window_specs_eq(
         return false;
     }
     a_order.iter().zip(b_order).all(|(x, y)| {
-        x.descending == y.descending
-            && x.nulls_first == y.nulls_first
-            && expr_eq(&x.expr, &y.expr)
+        x.descending == y.descending && x.nulls_first == y.nulls_first && expr_eq(&x.expr, &y.expr)
     })
 }
 
@@ -9481,10 +9469,7 @@ fn sql_expr_contains_window(
 /// executor only implements the default `RANGE UNBOUNDED PRECEDING AND
 /// CURRENT ROW` frame, so an explicit exotic frame must error rather than be
 /// silently mis-evaluated.
-fn reject_non_default_frame(
-    frame: &sqlparser::ast::WindowFrame,
-    fname: &str,
-) -> BoltResult<()> {
+fn reject_non_default_frame(frame: &sqlparser::ast::WindowFrame, fname: &str) -> BoltResult<()> {
     // Units may be ROWS or RANGE; both collapse to the same default-frame
     // behaviour here because the only start bound we accept is UNBOUNDED
     // PRECEDING (under which ROWS and RANGE agree). GROUPS is rejected.
@@ -9552,10 +9537,7 @@ fn lower_window_order_by(
 
 /// Reject arguments on an argument-less ranking window function
 /// (`ROW_NUMBER`, `RANK`, `DENSE_RANK`).
-fn reject_window_args(
-    func: &sqlparser::ast::Function,
-    name: &str,
-) -> BoltResult<()> {
+fn reject_window_args(func: &sqlparser::ast::Function, name: &str) -> BoltResult<()> {
     let empty = match &func.args {
         FunctionArguments::None => true,
         FunctionArguments::List(list) => list.args.is_empty(),
@@ -9717,9 +9699,7 @@ fn try_string_scalar_fn(
         )));
     }
     if !matches!(func.parameters, FunctionArguments::None) {
-        return Err(BoltError::Sql(format!(
-            "unsupported: parametric {name}"
-        )));
+        return Err(BoltError::Sql(format!("unsupported: parametric {name}")));
     }
 
     let arg_list = match &func.args {
@@ -9783,10 +9763,8 @@ fn contains_aggregate(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) ->
         return Ok(true);
     }
     match e {
-        SqlExpr::BinaryOp { left, right, .. } => Ok(
-            contains_aggregate(left, resolver, depth + 1)?
-                || contains_aggregate(right, resolver, depth + 1)?,
-        ),
+        SqlExpr::BinaryOp { left, right, .. } => Ok(contains_aggregate(left, resolver, depth + 1)?
+            || contains_aggregate(right, resolver, depth + 1)?),
         SqlExpr::UnaryOp { expr, .. } => contains_aggregate(expr, resolver, depth + 1),
         // `IS NULL` / `IS NOT NULL` carry an operand expression that may
         // itself contain an aggregate (e.g. `HAVING SUM(v) IS NOT NULL`).
@@ -9968,8 +9946,7 @@ fn extract_and_rewrite_aggregates(
                 // aggregate call nested under the unary minus
                 // (`-SUM(v)`). Lower the operand recursively then negate
                 // structurally as `0 - operand`.
-                let inner =
-                    extract_and_rewrite_aggregates(expr, resolver, aggregates, depth + 1)?;
+                let inner = extract_and_rewrite_aggregates(expr, resolver, aggregates, depth + 1)?;
                 Ok(Expr::Binary {
                     op: BinaryOp::Sub,
                     left: Box::new(Expr::Literal(Literal::Int64(0))),
@@ -9981,16 +9958,14 @@ fn extract_and_rewrite_aggregates(
             ))),
         },
         SqlExpr::IsNull(inner) => {
-            let operand =
-                extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)?;
+            let operand = extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNull,
                 operand: Box::new(operand),
             })
         }
         SqlExpr::IsNotNull(inner) => {
-            let operand =
-                extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)?;
+            let operand = extract_and_rewrite_aggregates(inner, resolver, aggregates, depth + 1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(operand),
@@ -10115,8 +10090,7 @@ fn lower_expr_in_having(
             };
             let mut acc: Option<Expr> = None;
             for item in list {
-                let item_lowered =
-                    lower_expr_in_having(item, resolver, agg_aliases, depth + 1)?;
+                let item_lowered = lower_expr_in_having(item, resolver, agg_aliases, depth + 1)?;
                 let cmp = Expr::Binary {
                     op: cmp_op,
                     left: Box::new(lowered_expr.clone()),
@@ -10322,9 +10296,13 @@ fn lower_having_over_count_distinct(
         ));
     }
     match e {
-        SqlExpr::Nested(inner) => {
-            lower_having_over_count_distinct(inner, select_inner, resolver, count_out_name, depth + 1)
-        }
+        SqlExpr::Nested(inner) => lower_having_over_count_distinct(
+            inner,
+            select_inner,
+            resolver,
+            count_out_name,
+            depth + 1,
+        ),
         SqlExpr::BinaryOp { left, op, right } => {
             let lop = lower_binary_op(op)?;
             let l = lower_having_over_count_distinct(
@@ -10649,9 +10627,11 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
         // `<expr> [NOT] IN (v1, v2, ...)` — desugared into an OR/AND chain
         // of element-wise equalities/inequalities so existing comparison and
         // boolean codegen handles it without a new operator.
-        SqlExpr::InList { expr, list, negated } => {
-            lower_in_list(expr, list, *negated, resolver, depth + 1)
-        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => lower_in_list(expr, list, *negated, resolver, depth + 1),
         // Uncorrelated scalar subquery: `(SELECT max(y) FROM t2)`. Lower the
         // subquery to its own `LogicalPlan` (rejecting correlation) and wrap
         // it in `Expr::ScalarSubquery`. Type-checking (single output column)
@@ -10746,9 +10726,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             escape_char,
         } => {
             if *any {
-                return Err(BoltError::Sql(
-                    "unsupported: LIKE ANY (...)".into(),
-                ));
+                return Err(BoltError::Sql("unsupported: LIKE ANY (...)".into()));
             }
             // sqlparser hands us the ESCAPE clause as an `Option<String>`
             // (the literal text between the quotes). Standard SQL requires
@@ -10800,9 +10778,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             escape_char,
         } => {
             if *any {
-                return Err(BoltError::Sql(
-                    "unsupported: ILIKE ANY (...)".into(),
-                ));
+                return Err(BoltError::Sql("unsupported: ILIKE ANY (...)".into()));
             }
             let escape: Option<char> = match escape_char.as_deref() {
                 None => None,
@@ -11006,9 +10982,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 ))),
             }
         }
-        other => Err(BoltError::Sql(format!(
-            "unsupported expression: {other}"
-        ))),
+        other => Err(BoltError::Sql(format!("unsupported expression: {other}"))),
     }
 }
 
@@ -11158,11 +11132,7 @@ fn lower_coalesce(
 /// SQL `NULLIF` is strictly binary; any other arity is rejected at parse
 /// time so the user gets a clean error instead of a confusing type-check
 /// failure later.
-fn lower_nullif(
-    args: &[&SqlExpr],
-    resolver: &NameResolver<'_>,
-    depth: usize,
-) -> BoltResult<Expr> {
+fn lower_nullif(args: &[&SqlExpr], resolver: &NameResolver<'_>, depth: usize) -> BoltResult<Expr> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
@@ -11398,9 +11368,7 @@ fn lower_cast_format(
         // Timestamp FORMAT parses into a naive nanosecond timestamp (matching
         // the `TIMESTAMP '...'` literal path); timezone info on the type is
         // not modelled here.
-        SqlDataType::Timestamp(_, _) => {
-            (DataType::Timestamp(TimeUnit::Nanosecond, None), false)
-        }
+        SqlDataType::Timestamp(_, _) => (DataType::Timestamp(TimeUnit::Nanosecond, None), false),
         other => {
             return Err(BoltError::Sql(format!(
                 "CAST(... FORMAT ...) target type must be VARCHAR/TEXT (format) or \
@@ -11538,15 +11506,10 @@ fn lower_cast_data_type(t: &SqlDataType) -> BoltResult<DataType> {
 /// `BoltError::Sql` with the offending text.
 fn parse_date_literal(s: &str) -> BoltResult<Expr> {
     let s = s.trim();
-    let (y, m, d) = parse_ymd(s).ok_or_else(|| {
-        BoltError::Sql(format!(
-            "DATE literal must be 'YYYY-MM-DD', got '{s}'"
-        ))
-    })?;
+    let (y, m, d) = parse_ymd(s)
+        .ok_or_else(|| BoltError::Sql(format!("DATE literal must be 'YYYY-MM-DD', got '{s}'")))?;
     let days = days_since_epoch(y, m, d).ok_or_else(|| {
-        BoltError::Sql(format!(
-            "DATE literal '{s}' is out of the supported range"
-        ))
+        BoltError::Sql(format!("DATE literal '{s}' is out of the supported range"))
     })?;
     Ok(Expr::Literal(Literal::Date32(days)))
 }
@@ -11577,16 +11540,13 @@ fn parse_timestamp_literal(s: &str) -> BoltResult<Expr> {
             "TIMESTAMP literal '{s}' has malformed time component"
         ))
     })?;
-    let days = days_since_epoch(y, m, d).ok_or_else(|| {
-        BoltError::Sql(format!("TIMESTAMP literal '{s}' is out of range"))
-    })?;
+    let days = days_since_epoch(y, m, d)
+        .ok_or_else(|| BoltError::Sql(format!("TIMESTAMP literal '{s}' is out of range")))?;
     let seconds_in_day = (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
     let total_seconds = (days as i64)
         .checked_mul(86_400)
         .and_then(|d| d.checked_add(seconds_in_day))
-        .ok_or_else(|| {
-            BoltError::Sql(format!("TIMESTAMP literal '{s}' overflows i64 seconds"))
-        })?;
+        .ok_or_else(|| BoltError::Sql(format!("TIMESTAMP literal '{s}' overflows i64 seconds")))?;
     let ticks = total_seconds
         .checked_mul(1_000_000_000)
         .and_then(|t| t.checked_add(nanos as i64))
@@ -11773,10 +11733,7 @@ mod date_validation_tests {
         // 2000 is divisible by 400 -> leap.
         assert_eq!(parse_ymd("2000-02-29"), Some((2000, 2, 29)));
         // 1900 is divisible by 100 but not 400 -> NOT leap.
-        assert!(
-            parse_ymd("1900-02-29").is_none(),
-            "1900 is not a leap year"
-        );
+        assert!(parse_ymd("1900-02-29").is_none(), "1900 is not a leap year");
     }
 
     #[test]
@@ -11808,10 +11765,7 @@ mod date_validation_tests {
             "year past MAX_SUPPORTED_YEAR must be rejected"
         );
         // The boundary years themselves do not panic.
-        assert_eq!(
-            parse_ymd("-999999-01-01"),
-            Some((MIN_SUPPORTED_YEAR, 1, 1))
-        );
+        assert_eq!(parse_ymd("-999999-01-01"), Some((MIN_SUPPORTED_YEAR, 1, 1)));
     }
 
     #[test]
@@ -11865,7 +11819,11 @@ mod cast_format_pattern_tests {
     fn hh_and_hh24_both_map_to_hour24() {
         assert_eq!(
             parse_cast_format_pattern("HH:MI").unwrap(),
-            vec![FormatToken::Hour24, FormatToken::Literal(':'), FormatToken::Minute]
+            vec![
+                FormatToken::Hour24,
+                FormatToken::Literal(':'),
+                FormatToken::Minute
+            ]
         );
         assert_eq!(
             parse_cast_format_pattern("HH24").unwrap(),
@@ -12348,9 +12306,8 @@ mod plan_cache_tests {
         let sql = "SELECT a FROM t1";
         let _plan_pre = parse(sql, &p).expect("plan against full provider");
         assert!(p.unregister_table("t1"), "t1 was present");
-        let err = parse(sql, &p).expect_err(
-            "post-mutation parse must reach the lowerer and surface the schema error",
-        );
+        let err = parse(sql, &p)
+            .expect_err("post-mutation parse must reach the lowerer and surface the schema error");
         let msg = format!("{err}");
         assert!(
             msg.contains("unknown table"),
@@ -12661,8 +12618,7 @@ mod wave7_tests {
     }
 
     fn tp_lp(sql: &str) -> LogicalPlan {
-        parse(sql, &temporal_provider())
-            .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+        parse(sql, &temporal_provider()).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
     }
 
     /// `CAST(d AS VARCHAR FORMAT 'YYYY-MM-DD')` lowers to `Expr::CastFormat`
@@ -12693,7 +12649,9 @@ mod wave7_tests {
     fn cast_format_string_to_date_lowers() {
         let plan = tp_lp("SELECT CAST(s AS DATE FORMAT 'YYYY-MM-DD') FROM tt");
         match nth_proj_expr(&plan, 0) {
-            Expr::CastFormat { target, to_text, .. } => {
+            Expr::CastFormat {
+                target, to_text, ..
+            } => {
                 assert!(!to_text, "string→temporal must set to_text = false");
                 assert_eq!(target, DataType::Date32);
             }
@@ -12909,11 +12867,7 @@ mod wave7_tests {
         let plan = lp("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.a");
         match plan {
             LogicalPlan::Project { input, .. } => match *input {
-                LogicalPlan::Join {
-                    join_type,
-                    on,
-                    ..
-                } => {
+                LogicalPlan::Join { join_type, on, .. } => {
                     assert_eq!(join_type, JoinType::Inner);
                     assert_eq!(on.len(), 1);
                 }
@@ -12941,11 +12895,8 @@ mod wave7_tests {
         // v0.6: non-equi predicates no longer error at the planner. They
         // route through the residual `filter` slot on `LogicalPlan::Join`,
         // and the executor switches to the nested-loop fallback.
-        let plan = parse(
-            "SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.a",
-            &provider(),
-        )
-        .expect("non-equi JOIN must parse in v0.6");
+        let plan = parse("SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.a", &provider())
+            .expect("non-equi JOIN must parse in v0.6");
         // Walk past the outer wildcard Project to the Join.
         let join_plan = match &plan {
             LogicalPlan::Project { input, .. } => input.as_ref(),
@@ -12992,9 +12943,7 @@ mod wave7_tests {
             other => other,
         };
         let (join_type, schema) = match join_plan {
-            LogicalPlan::Join {
-                join_type, ..
-            } => (*join_type, join_plan.schema().unwrap()),
+            LogicalPlan::Join { join_type, .. } => (*join_type, join_plan.schema().unwrap()),
             other => panic!("expected Join, got {other:?}"),
         };
         assert_eq!(join_type, JoinType::LeftOuter);
@@ -13006,9 +12955,15 @@ mod wave7_tests {
         assert!(!schema.fields[0].nullable, "left 'a' keeps nullable=false");
         assert_eq!(schema.fields[1].name, "b");
         assert_eq!(schema.fields[2].name, "right.a");
-        assert!(schema.fields[2].nullable, "LEFT JOIN: right 'a' is nullable");
+        assert!(
+            schema.fields[2].nullable,
+            "LEFT JOIN: right 'a' is nullable"
+        );
         assert_eq!(schema.fields[3].name, "c");
-        assert!(schema.fields[3].nullable, "LEFT JOIN: right 'c' is nullable");
+        assert!(
+            schema.fields[3].nullable,
+            "LEFT JOIN: right 'c' is nullable"
+        );
     }
 
     #[test]
@@ -13019,15 +12974,19 @@ mod wave7_tests {
             other => other,
         };
         let (join_type, schema) = match join_plan {
-            LogicalPlan::Join { join_type, .. } => {
-                (*join_type, join_plan.schema().unwrap())
-            }
+            LogicalPlan::Join { join_type, .. } => (*join_type, join_plan.schema().unwrap()),
             other => panic!("expected Join, got {other:?}"),
         };
         assert_eq!(join_type, JoinType::RightOuter);
         // Left fields become nullable; right fields keep their original.
-        assert!(schema.fields[0].nullable, "RIGHT JOIN: left 'a' is nullable");
-        assert!(schema.fields[1].nullable, "RIGHT JOIN: left 'b' is nullable");
+        assert!(
+            schema.fields[0].nullable,
+            "RIGHT JOIN: left 'a' is nullable"
+        );
+        assert!(
+            schema.fields[1].nullable,
+            "RIGHT JOIN: left 'b' is nullable"
+        );
         assert!(
             !schema.fields[2].nullable,
             "RIGHT JOIN: right 'a' keeps original nullable=false"
@@ -13042,9 +13001,7 @@ mod wave7_tests {
             other => other,
         };
         let (join_type, schema) = match join_plan {
-            LogicalPlan::Join { join_type, .. } => {
-                (*join_type, join_plan.schema().unwrap())
-            }
+            LogicalPlan::Join { join_type, .. } => (*join_type, join_plan.schema().unwrap()),
             other => panic!("expected Join, got {other:?}"),
         };
         assert_eq!(join_type, JoinType::FullOuter);
@@ -13083,7 +13040,10 @@ mod wave7_tests {
         };
         match join_plan {
             LogicalPlan::Join {
-                join_type, on, filter, ..
+                join_type,
+                on,
+                filter,
+                ..
             } => {
                 assert_eq!(*join_type, JoinType::Cross);
                 assert!(on.is_empty(), "comma FROM has no ON predicate");
@@ -13119,7 +13079,9 @@ mod wave7_tests {
         };
         // Top join: (… ) CROSS JOIN t3.
         match top {
-            LogicalPlan::Join { join_type, left, .. } => {
+            LogicalPlan::Join {
+                join_type, left, ..
+            } => {
                 assert_eq!(*join_type, JoinType::Cross);
                 // Left child is itself a CROSS join (t1 CROSS JOIN t2).
                 match left.as_ref() {
@@ -13153,7 +13115,13 @@ mod wave7_tests {
             LogicalPlan::Filter { input, predicate } => {
                 // The WHERE equality is preserved as the Filter predicate.
                 assert!(
-                    matches!(predicate, Expr::Binary { op: BinaryOp::Eq, .. }),
+                    matches!(
+                        predicate,
+                        Expr::Binary {
+                            op: BinaryOp::Eq,
+                            ..
+                        }
+                    ),
                     "expected an equality predicate, got {predicate:?}"
                 );
                 input.as_ref()
@@ -13161,7 +13129,12 @@ mod wave7_tests {
             other => panic!("expected Filter over the join, got {other:?}"),
         };
         match join {
-            LogicalPlan::Join { join_type, on, filter, .. } => {
+            LogicalPlan::Join {
+                join_type,
+                on,
+                filter,
+                ..
+            } => {
                 assert_eq!(*join_type, JoinType::Cross);
                 assert!(on.is_empty() && filter.is_none(), "pre-optimization Cross");
             }
@@ -13265,9 +13238,7 @@ mod wave7_tests {
         // The middle slot is the table qualifier; the leading schema part is
         // dropped. `cat.t2.a` resolves to the post-join-rename `right.a`,
         // exactly as the two-part `t2.a` would.
-        let plan = lp(
-            "SELECT cat.t1.a, cat.t2.a FROM t1 INNER JOIN t2 ON t1.a = t2.a",
-        );
+        let plan = lp("SELECT cat.t1.a, cat.t2.a FROM t1 INNER JOIN t2 ON t1.a = t2.a");
         match plan {
             LogicalPlan::Project { exprs, .. } => match (&exprs[0], &exprs[1]) {
                 (Expr::Column(left), Expr::Column(right)) => {
@@ -13296,8 +13267,8 @@ mod wave7_tests {
     #[test]
     fn four_part_column_ref_rejected_as_deeply_qualified() {
         // No second namespace level to fold a 4-part reference into.
-        let err = parse("SELECT a.b.c.d FROM t1", &provider())
-            .expect_err("4-part reference must error");
+        let err =
+            parse("SELECT a.b.c.d FROM t1", &provider()).expect_err("4-part reference must error");
         let msg = format!("{err}");
         assert!(
             msg.contains("deeply qualified"),
@@ -13375,10 +13346,7 @@ mod wave7_tests {
     #[test]
     fn having_no_alias_succeeds() {
         let prov = having_provider();
-        let plan = lp_with(
-            "SELECT SUM(v) FROM t GROUP BY k HAVING SUM(v) > 10",
-            &prov,
-        );
+        let plan = lp_with("SELECT SUM(v) FROM t GROUP BY k HAVING SUM(v) > 10", &prov);
         match plan {
             LogicalPlan::Filter { input, predicate } => {
                 assert!(
@@ -13672,9 +13640,7 @@ mod wave7_tests {
     /// `Window` node with two output exprs.
     #[test]
     fn window_shared_spec_collapses() {
-        let plan = lp(
-            "SELECT RANK() OVER (ORDER BY b), DENSE_RANK() OVER (ORDER BY b) FROM t1",
-        );
+        let plan = lp("SELECT RANK() OVER (ORDER BY b), DENSE_RANK() OVER (ORDER BY b) FROM t1");
         let input = match plan {
             LogicalPlan::Project { input, .. } => input,
             other => panic!("expected Project, got {other:?}"),
@@ -13799,8 +13765,7 @@ mod wave7_tests {
     /// Distinct over Filter over Project.
     #[test]
     fn having_and_select_distinct_stack_over_count_distinct() {
-        let plan =
-            lp("SELECT DISTINCT COUNT(DISTINCT a) FROM t1 HAVING COUNT(DISTINCT a) >= 1");
+        let plan = lp("SELECT DISTINCT COUNT(DISTINCT a) FROM t1 HAVING COUNT(DISTINCT a) >= 1");
         match &plan {
             LogicalPlan::Distinct { input } => {
                 assert!(
@@ -13837,11 +13802,8 @@ mod wave7_tests {
     /// Must be a clean `Err`, no panic.
     #[test]
     fn count_distinct_with_group_by_is_rejected_cleanly() {
-        let err = parse(
-            "SELECT COUNT(DISTINCT b) FROM t1 GROUP BY a",
-            &provider(),
-        )
-        .expect_err("COUNT(DISTINCT) with GROUP BY must be rejected on the parse path");
+        let err = parse("SELECT COUNT(DISTINCT b) FROM t1 GROUP BY a", &provider())
+            .expect_err("COUNT(DISTINCT) with GROUP BY must be rejected on the parse path");
         let msg = format!("{err}");
         assert!(
             msg.contains("GROUP BY"),
@@ -13853,11 +13815,8 @@ mod wave7_tests {
     /// cleanly (the sole-item restriction is unchanged).
     #[test]
     fn count_distinct_with_extra_select_item_is_rejected_cleanly() {
-        let err = parse(
-            "SELECT a, COUNT(DISTINCT b) FROM t1",
-            &provider(),
-        )
-        .expect_err("COUNT(DISTINCT) alongside another item must be rejected");
+        let err = parse("SELECT a, COUNT(DISTINCT b) FROM t1", &provider())
+            .expect_err("COUNT(DISTINCT) alongside another item must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("sole SELECT item"),
@@ -14082,7 +14041,10 @@ mod wave7_tests {
             .collect();
         pairs.sort_unstable();
         assert_eq!(pairs, vec![(0, 1), (1, 0)]);
-        assert!(plan.schema().is_ok(), "GROUPING union schema must recompute");
+        assert!(
+            plan.schema().is_ok(),
+            "GROUPING union schema must recompute"
+        );
     }
 
     #[test]
@@ -14203,14 +14165,15 @@ mod wave7_tests {
     fn group_by_all_collects_non_aggregate_keys() {
         // GROUP BY ALL with one aggregate -> group by the single non-aggregate
         // column `k`; plain (non-super) single-branch Aggregate.
-        let plan = lp_with(
-            "SELECT k, SUM(v) FROM t GROUP BY ALL",
-            &having_provider(),
-        );
+        let plan = lp_with("SELECT k, SUM(v) FROM t GROUP BY ALL", &having_provider());
         // Not a UNION (plain group-by fast path); end is Project(Aggregate(..)).
         match &plan {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
-                LogicalPlan::Aggregate { group_by, aggregates, .. } => {
+                LogicalPlan::Aggregate {
+                    group_by,
+                    aggregates,
+                    ..
+                } => {
                     assert_eq!(group_by.len(), 1, "GROUP BY ALL groups by `k`");
                     assert_eq!(aggregates.len(), 1, "one SUM aggregate");
                 }
@@ -14249,7 +14212,11 @@ mod wave7_tests {
         );
         match &plan {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
-                LogicalPlan::Aggregate { group_by, aggregates, .. } => {
+                LogicalPlan::Aggregate {
+                    group_by,
+                    aggregates,
+                    ..
+                } => {
                     assert_eq!(group_by.len(), 2, "groups by both selected columns");
                     assert!(aggregates.is_empty(), "no aggregates");
                 }
@@ -14302,10 +14269,7 @@ mod wave7_tests {
     fn plain_group_by_unaffected_by_f2_refactor() {
         // A plain GROUP BY must still lower to a single Project(Aggregate(...)),
         // NOT a Union, and a bare group key stays a bare Column (no alias).
-        let plan = lp_with(
-            "SELECT k, SUM(v) FROM t GROUP BY k",
-            &having_provider(),
-        );
+        let plan = lp_with("SELECT k, SUM(v) FROM t GROUP BY k", &having_provider());
         match &plan {
             LogicalPlan::Project { input, exprs } => {
                 assert!(matches!(input.as_ref(), LogicalPlan::Aggregate { .. }));
@@ -14403,11 +14367,7 @@ mod like_tests {
 
     #[test]
     fn parse_not_like_sets_negated_flag() {
-        let plan = parse(
-            "SELECT s FROM t WHERE s NOT LIKE 'foo%'",
-            &s_provider(),
-        )
-        .unwrap();
+        let plan = parse("SELECT s FROM t WHERE s NOT LIKE 'foo%'", &s_provider()).unwrap();
         match predicate(&plan) {
             Expr::Like {
                 pattern, negated, ..
@@ -14434,11 +14394,8 @@ mod like_tests {
     #[test]
     fn parse_like_with_variable_pattern_rejected() {
         // Pattern must be a string literal — a column ref is not allowed.
-        let err = parse(
-            "SELECT s FROM t WHERE s LIKE s",
-            &s_provider(),
-        )
-        .expect_err("variable LIKE pattern must reject");
+        let err = parse("SELECT s FROM t WHERE s LIKE s", &s_provider())
+            .expect_err("variable LIKE pattern must reject");
         let msg = format!("{err}");
         assert!(
             msg.contains("LIKE pattern must be a string literal constant"),
@@ -14560,7 +14517,10 @@ mod like_tests {
             } => {
                 assert_eq!(pattern, "%bar");
                 assert!(*negated, "NOT ILIKE must set negated=true");
-                assert!(*case_insensitive, "NOT ILIKE must set case_insensitive=true");
+                assert!(
+                    *case_insensitive,
+                    "NOT ILIKE must set case_insensitive=true"
+                );
             }
             other => panic!("expected Expr::Like, got {other:?}"),
         }
@@ -14625,8 +14585,7 @@ mod string_fn_tests {
 
     #[test]
     fn trim_default_is_both() {
-        let plan =
-            parse("SELECT TRIM(s) FROM t", &s_provider()).expect("TRIM(s) must parse");
+        let plan = parse("SELECT TRIM(s) FROM t", &s_provider()).expect("TRIM(s) must parse");
         match first_select_expr(&plan) {
             Expr::ScalarFn { kind, args } => {
                 assert_eq!(kind, ScalarFnKind::TrimBoth);
@@ -14663,7 +14622,10 @@ mod string_fn_tests {
                 "SELECT TRIM(TRAILING 'x' FROM s) FROM t",
                 ScalarFnKind::TrimTrailing,
             ),
-            ("SELECT TRIM(BOTH 'x' FROM s) FROM t", ScalarFnKind::TrimBoth),
+            (
+                "SELECT TRIM(BOTH 'x' FROM s) FROM t",
+                ScalarFnKind::TrimBoth,
+            ),
         ] {
             let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
             match first_select_expr(&plan) {
@@ -14720,10 +14682,7 @@ mod string_fn_tests {
         // Utf8 scan now lower to PhysicalPlan::StringProject (host-realized
         // two-pass producer). A custom-chars TRIM (`TRIM(<chars> FROM col)`)
         // is still out of scope and falls back to the host PhysicalPlan::Project.
-        let string_project_cases = [
-            "SELECT SUBSTRING(s, 2, 3) FROM t",
-            "SELECT TRIM(s) FROM t",
-        ];
+        let string_project_cases = ["SELECT SUBSTRING(s, 2, 3) FROM t", "SELECT TRIM(s) FROM t"];
         for sql in string_project_cases {
             let plan = parse(sql, &s_provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
             let phys = lower(&plan).unwrap_or_else(|e| panic!("lower {sql}: {e}"));
@@ -14783,18 +14742,18 @@ mod string_fn_tests {
 
     #[test]
     fn octet_length_parses() {
-        assert_scalar_fn("SELECT OCTET_LENGTH(s) FROM t", ScalarFnKind::OctetLength, 1);
+        assert_scalar_fn(
+            "SELECT OCTET_LENGTH(s) FROM t",
+            ScalarFnKind::OctetLength,
+            1,
+        );
     }
 
     #[test]
     fn char_length_synonyms_lower_to_length() {
         // CHAR_LENGTH and CHARACTER_LENGTH are synonyms for character LENGTH.
         assert_scalar_fn("SELECT CHAR_LENGTH(s) FROM t", ScalarFnKind::Length, 1);
-        assert_scalar_fn(
-            "SELECT CHARACTER_LENGTH(s) FROM t",
-            ScalarFnKind::Length,
-            1,
-        );
+        assert_scalar_fn("SELECT CHARACTER_LENGTH(s) FROM t", ScalarFnKind::Length, 1);
     }
 
     #[test]
@@ -14825,7 +14784,11 @@ mod string_fn_tests {
 
     #[test]
     fn replace_parses() {
-        assert_scalar_fn("SELECT REPLACE(s, 'a', 'b') FROM t", ScalarFnKind::Replace, 3);
+        assert_scalar_fn(
+            "SELECT REPLACE(s, 'a', 'b') FROM t",
+            ScalarFnKind::Replace,
+            3,
+        );
     }
 
     #[test]
@@ -14849,7 +14812,11 @@ mod string_fn_tests {
     #[test]
     fn case_insensitive_function_names() {
         // SQL identifiers are case-insensitive: lower-case spellings work.
-        assert_scalar_fn("SELECT octet_length(s) FROM t", ScalarFnKind::OctetLength, 1);
+        assert_scalar_fn(
+            "SELECT octet_length(s) FROM t",
+            ScalarFnKind::OctetLength,
+            1,
+        );
         assert_scalar_fn("SELECT reverse(s) FROM t", ScalarFnKind::Reverse, 1);
     }
 
@@ -14890,7 +14857,9 @@ mod string_fn_tests {
     #[test]
     fn octet_length_type_error_on_non_utf8() {
         let plan = parse("SELECT OCTET_LENGTH(v) FROM t", &s_provider()).unwrap();
-        let err = plan.schema().expect_err("OCTET_LENGTH(Int64) must type-error");
+        let err = plan
+            .schema()
+            .expect_err("OCTET_LENGTH(Int64) must type-error");
         let msg = format!("{err}");
         assert!(
             msg.contains("OCTET_LENGTH") && msg.contains("Utf8"),
@@ -14948,8 +14917,7 @@ mod root_setop_schema_tests {
 
     /// Parse + unwrap helper for the positive F12 tests.
     fn lp(sql: &str) -> LogicalPlan {
-        parse(sql, &f12_provider())
-            .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+        parse(sql, &f12_provider()).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
     }
 
     #[test]
@@ -15239,8 +15207,8 @@ mod setop_coercion_tests {
 
     /// dtype of the single output column of a successfully-parsed plan.
     fn col0_dtype(sql: &str) -> DataType {
-        let plan = parse(sql, &provider())
-            .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"));
+        let plan =
+            parse(sql, &provider()).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"));
         plan.schema()
             .unwrap_or_else(|e| panic!("schema recompute failed for {sql:?}: {e}"))
             .fields[0]
@@ -15343,15 +15311,15 @@ mod setop_coercion_tests {
         for (sql, op) in [
             ("SELECT x FROM i32t UNION SELECT x FROM strt", "UNION"),
             ("SELECT x FROM i32t EXCEPT SELECT x FROM strt", "EXCEPT"),
-            ("SELECT x FROM i32t INTERSECT SELECT x FROM strt", "INTERSECT"),
+            (
+                "SELECT x FROM i32t INTERSECT SELECT x FROM strt",
+                "INTERSECT",
+            ),
         ] {
-            let err = parse(sql, &provider())
-                .expect_err("incompatible-type set-op must be rejected");
+            let err =
+                parse(sql, &provider()).expect_err("incompatible-type set-op must be rejected");
             let msg = err.to_string();
-            assert!(
-                msg.contains(op),
-                "expected error naming {op}, got: {msg}"
-            );
+            assert!(msg.contains(op), "expected error naming {op}, got: {msg}");
             assert!(
                 msg.contains("incompatible"),
                 "expected 'incompatible' in error, got: {msg}"
@@ -15468,7 +15436,11 @@ mod recursive_cte_tests {
         let mentions_seq = matches!(&rec.recursive, LogicalPlan::Project { input, .. }
             if matches!(input.as_ref(), LogicalPlan::Filter { input, .. }
                 if matches!(input.as_ref(), LogicalPlan::Scan { table, .. } if table == "seq")));
-        assert!(mentions_seq, "recursive term must scan the CTE: {:?}", rec.recursive);
+        assert!(
+            mentions_seq,
+            "recursive term must scan the CTE: {:?}",
+            rec.recursive
+        );
     }
 
     /// Plain `UNION` (distinct) is recognised and clears `all`.
@@ -15678,7 +15650,10 @@ mod recursive_cte_tests {
         // `seed` is non-recursive; `walk` is recursive and references `seed`.
         let seed = sys.ctes.iter().find(|c| c.name == "seed").unwrap();
         let walk = sys.ctes.iter().find(|c| c.name == "walk").unwrap();
-        assert!(seed.recursive.is_none(), "plain member has no recursive term");
+        assert!(
+            seed.recursive.is_none(),
+            "plain member has no recursive term"
+        );
         assert!(walk.recursive.is_some(), "walk recurses");
     }
 }
@@ -15732,10 +15707,9 @@ mod count_distinct_groupby_tests {
 
     #[test]
     fn supported_with_alias_uses_alias() {
-        let cd = detect(
-            "SELECT region, COUNT(DISTINCT customer) AS uniq FROM sales GROUP BY region",
-        )
-        .expect("aliased count must be recognised");
+        let cd =
+            detect("SELECT region, COUNT(DISTINCT customer) AS uniq FROM sales GROUP BY region")
+                .expect("aliased count must be recognised");
         assert_eq!(cd.count_alias, "uniq");
         assert_eq!(cd.result_schema.fields[1].name, "uniq");
     }
@@ -15747,7 +15721,10 @@ mod count_distinct_groupby_tests {
              GROUP BY region, amount",
         )
         .expect("multi-key shape must be recognised");
-        assert_eq!(cd.group_key_names, vec!["region".to_string(), "amount".to_string()]);
+        assert_eq!(
+            cd.group_key_names,
+            vec!["region".to_string(), "amount".to_string()]
+        );
         assert_eq!(cd.result_schema.fields.len(), 3);
     }
 
@@ -15763,7 +15740,10 @@ mod count_distinct_groupby_tests {
         // HAVING/ORDER BY/LIMIT produce a post-plan.
         let post = cd.post.expect("HAVING/ORDER BY/LIMIT ⇒ post-plan present");
         // Outermost post node is the Limit.
-        assert!(matches!(post, LogicalPlan::Limit { .. }), "post root = Limit, got {post:?}");
+        assert!(
+            matches!(post, LogicalPlan::Limit { .. }),
+            "post root = Limit, got {post:?}"
+        );
     }
 
     #[test]
@@ -15904,20 +15884,18 @@ mod multi_agg_groupby_tests {
     /// generalized detector declines it (`None`).
     #[test]
     fn single_sole_count_distinct_defers() {
-        assert!(detect(
-            "SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY region"
-        )
-        .is_none());
+        assert!(
+            detect("SELECT region, COUNT(DISTINCT customer) FROM sales GROUP BY region").is_none()
+        );
     }
 
     /// An ordinary GROUP BY with no COUNT(DISTINCT) is not ours.
     #[test]
     fn no_count_distinct_falls_through() {
         assert!(detect("SELECT region, SUM(amount) FROM sales GROUP BY region").is_none());
-        assert!(detect(
-            "SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region"
-        )
-        .is_none());
+        assert!(
+            detect("SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region").is_none()
+        );
     }
 
     /// A non-host-computable aggregate alongside COUNT(DISTINCT) is a precise
@@ -15931,8 +15909,10 @@ mod multi_agg_groupby_tests {
         )
         .expect_err("VAR_POP under GROUP BY must be rejected precisely");
         let msg = format!("{err}");
-        assert!(msg.contains("var_pop") || msg.contains("VAR_POP") || msg.contains("unsupported"),
-            "expected an unsupported-aggregate message, got: {msg}");
+        assert!(
+            msg.contains("var_pop") || msg.contains("VAR_POP") || msg.contains("unsupported"),
+            "expected an unsupported-aggregate message, got: {msg}"
+        );
     }
 
     /// HAVING / ORDER BY / LIMIT produce a post-plan (outermost = Limit).
@@ -15945,7 +15925,10 @@ mod multi_agg_groupby_tests {
         )
         .expect("must be recognised");
         let post = cd.post.expect("HAVING/ORDER BY/LIMIT ⇒ post-plan");
-        assert!(matches!(post, LogicalPlan::Limit { .. }), "post root = Limit, got {post:?}");
+        assert!(
+            matches!(post, LogicalPlan::Limit { .. }),
+            "post root = Limit, got {post:?}"
+        );
     }
 
     /// A super-aggregate / SELECT DISTINCT / set-op / CTE falls through.
@@ -16037,7 +16020,10 @@ mod clause_acceptance_tests {
     #[test]
     fn fetch_with_ties_rejected_cleanly() {
         let msg = err("SELECT k FROM t ORDER BY k FETCH FIRST 5 ROWS WITH TIES");
-        assert!(msg.contains("WITH TIES"), "message must name WITH TIES: {msg}");
+        assert!(
+            msg.contains("WITH TIES"),
+            "message must name WITH TIES: {msg}"
+        );
     }
 
     #[test]
@@ -16091,7 +16077,10 @@ mod clause_acceptance_tests {
     #[test]
     fn top_with_ties_rejected_cleanly() {
         let msg = err("SELECT TOP 3 WITH TIES k FROM t ORDER BY k");
-        assert!(msg.contains("WITH TIES"), "message must name WITH TIES: {msg}");
+        assert!(
+            msg.contains("WITH TIES"),
+            "message must name WITH TIES: {msg}"
+        );
     }
 
     #[test]
@@ -16137,7 +16126,10 @@ mod clause_acceptance_tests {
                     assert!(
                         matches!(
                             predicate,
-                            Expr::Binary { op: BinaryOp::Gt, .. }
+                            Expr::Binary {
+                                op: BinaryOp::Gt,
+                                ..
+                            }
                         ),
                         "PREWHERE-only predicate must be the comparison itself"
                     );
@@ -16157,7 +16149,10 @@ mod clause_acceptance_tests {
                     assert!(
                         matches!(
                             predicate,
-                            Expr::Binary { op: BinaryOp::And, .. }
+                            Expr::Binary {
+                                op: BinaryOp::And,
+                                ..
+                            }
                         ),
                         "PREWHERE AND WHERE must fold into a conjunction, got {predicate:?}"
                     );
@@ -16178,9 +16173,7 @@ mod clause_acceptance_tests {
             "SELECT ROW_NUMBER() OVER w AS rn FROM t \
              WINDOW w AS (PARTITION BY g ORDER BY v)",
         );
-        let inline = plan(
-            "SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
-        );
+        let inline = plan("SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t");
         assert_eq!(
             format!("{named:?}"),
             format!("{inline:?}"),
@@ -16196,19 +16189,15 @@ mod clause_acceptance_tests {
             "SELECT ROW_NUMBER() OVER (w ORDER BY v) AS rn FROM t \
              WINDOW w AS (PARTITION BY g)",
         );
-        let inline = plan(
-            "SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
-        );
+        let inline = plan("SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t");
         assert_eq!(format!("{extended:?}"), format!("{inline:?}"));
     }
 
     /// Re-stating PARTITION BY in the extension form is rejected precisely.
     #[test]
     fn named_window_extension_repartition_rejected() {
-        let msg = err(
-            "SELECT ROW_NUMBER() OVER (w PARTITION BY k) AS rn FROM t \
-             WINDOW w AS (PARTITION BY g)",
-        );
+        let msg = err("SELECT ROW_NUMBER() OVER (w PARTITION BY k) AS rn FROM t \
+             WINDOW w AS (PARTITION BY g)");
         assert!(
             msg.contains("PARTITION BY"),
             "extension may not re-state PARTITION BY: {msg}"
@@ -16296,9 +16285,7 @@ mod clause_acceptance_tests {
 
     #[test]
     fn connect_by_rejection_explains_recursion() {
-        let msg = err(
-            "SELECT k FROM t START WITH k = 1 CONNECT BY PRIOR k = v",
-        );
+        let msg = err("SELECT k FROM t START WITH k = 1 CONNECT BY PRIOR k = v");
         assert!(
             msg.contains("CONNECT BY") && msg.contains("RECURSIVE"),
             "CONNECT BY message must point at WITH RECURSIVE: {msg}"
@@ -16371,7 +16358,10 @@ mod values_and_distinct_on_tests {
         assert_eq!(vp.relation.schema.fields[0].dtype, DataType::Int64);
         // Both cells coerced to Int64.
         assert!(matches!(vp.relation.rows[0][0], Literal::Int64(1)));
-        assert!(matches!(vp.relation.rows[1][0], Literal::Int64(5_000_000_000)));
+        assert!(matches!(
+            vp.relation.rows[1][0],
+            Literal::Int64(5_000_000_000)
+        ));
     }
 
     #[test]
@@ -16403,7 +16393,10 @@ mod values_and_distinct_on_tests {
     #[test]
     fn ragged_rows_rejected() {
         let msg = values_err("VALUES (1, 2), (3)");
-        assert!(msg.contains("ragged"), "ragged rows must be rejected: {msg}");
+        assert!(
+            msg.contains("ragged"),
+            "ragged rows must be rejected: {msg}"
+        );
     }
 
     #[test]
@@ -16413,7 +16406,10 @@ mod values_and_distinct_on_tests {
         let msg = enforce_values_row_cap(3, 2)
             .expect_err("cap must be exceeded")
             .to_string();
-        assert!(msg.contains("cap"), "row-cap error must mention the cap: {msg}");
+        assert!(
+            msg.contains("cap"),
+            "row-cap error must mention the cap: {msg}"
+        );
     }
 
     #[test]
@@ -16486,7 +16482,7 @@ mod values_and_distinct_on_tests {
         // Step that overshoots stop (last value <= stop).
         assert_eq!(generate_series_row_count(1, 10, 3).unwrap(), 4); // 1,4,7,10
         assert_eq!(generate_series_row_count(1, 9, 3).unwrap(), 3); // 1,4,7
-        // Descending.
+                                                                    // Descending.
         assert_eq!(generate_series_row_count(5, 1, -1).unwrap(), 5);
         assert_eq!(generate_series_row_count(10, 0, -2).unwrap(), 6);
         // Single element (start == stop).
@@ -16547,7 +16543,10 @@ mod values_and_distinct_on_tests {
         let msg = enforce_generate_series_row_cap(11, 10)
             .expect_err("cap must be exceeded")
             .to_string();
-        assert!(msg.contains("cap"), "row-cap error must mention the cap: {msg}");
+        assert!(
+            msg.contains("cap"),
+            "row-cap error must mention the cap: {msg}"
+        );
         assert!(enforce_generate_series_row_cap(10, 10).is_ok());
     }
 
@@ -16714,7 +16713,10 @@ mod values_and_distinct_on_tests {
     #[test]
     fn distinct_on_with_group_by_rejected() {
         let msg = distinct_on_err("SELECT DISTINCT ON (a) a FROM t GROUP BY a");
-        assert!(msg.contains("GROUP BY"), "DISTINCT ON + GROUP BY rejected: {msg}");
+        assert!(
+            msg.contains("GROUP BY"),
+            "DISTINCT ON + GROUP BY rejected: {msg}"
+        );
     }
 
     #[test]

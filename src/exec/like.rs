@@ -278,10 +278,7 @@ fn classify(pattern: &str, escape: Option<char>) -> BoltResult<Shape> {
     if n_pct == 2 {
         // Look for the canonical `%foo%` shape: starts with `%`, ends with
         // `%`, no other `%` in between.
-        if let Some(mid) = pattern
-            .strip_prefix('%')
-            .and_then(|s| s.strip_suffix('%'))
-        {
+        if let Some(mid) = pattern.strip_prefix('%').and_then(|s| s.strip_suffix('%')) {
             // The middle slice contains no `%` (we already accounted for
             // exactly two in the original) and no `_` (we bailed out above
             // for that), so `Contains` is correct.
@@ -529,9 +526,7 @@ mod tests {
 
     /// Helper: compile + match in one call (no ESCAPE clause).
     fn m(pattern: &str, s: &str) -> bool {
-        PatternMatcher::compile(pattern, None)
-            .unwrap()
-            .matches(s)
+        PatternMatcher::compile(pattern, None).unwrap().matches(s)
     }
 
     /// Helper: compile + match with an explicit ESCAPE character.
@@ -934,7 +929,11 @@ mod tests {
     fn host_like_default_is_case_sensitive() {
         let arr = StringArray::from(vec![Some("FOO"), Some("foo")]);
         let out = host_like(&arr, "foo", None, false).expect("ok");
-        assert_eq!(out.value(0), false, "FOO must NOT match case-sensitive 'foo'");
+        assert_eq!(
+            out.value(0),
+            false,
+            "FOO must NOT match case-sensitive 'foo'"
+        );
         assert_eq!(out.value(1), true);
     }
 

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-1 per-block shared-memory **MIN / MAX** kernel.
 //!
@@ -50,10 +50,7 @@ pub fn kernel_entry(op: MinMaxOp, dtype: MinMaxDtype) -> String {
 ///
 /// Launch: `grid = ceil(n_rows / block) × stride`, `block = 256`,
 /// shared-mem static.
-pub fn compile_shmem_minmax_kernel(
-    op: MinMaxOp,
-    dtype: MinMaxDtype,
-) -> BoltResult<String> {
+pub fn compile_shmem_minmax_kernel(op: MinMaxOp, dtype: MinMaxDtype) -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = kernel_entry(op, dtype);
     let entry = entry.as_str();
@@ -146,12 +143,7 @@ pub fn compile_shmem_minmax_kernel(
     // Phase 1: zero block_set, init block_vals to identity.
     writeln!(ptx, "\tmov.u32 %r10, %r2;").map_err(write_err)?;
     writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r10, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r10, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
     let vbpw = val_bytes;
     writeln!(ptx, "\tmul.wide.u32 %rd10, %r10, {vbpw};").map_err(write_err)?;
@@ -189,28 +181,34 @@ pub fn compile_shmem_minmax_kernel(
     // val = vals[i]
     writeln!(ptx, "\tmul.wide.u32 %rd16, %r11, {vbpw};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd17, %rd3, %rd16;").map_err(write_err)?;
-    let val_reg = if dtype == MinMaxDtype::Int64 { "%rd20" } else { "%r20" };
+    let val_reg = if dtype == MinMaxDtype::Int64 {
+        "%rd20"
+    } else {
+        "%r20"
+    };
     writeln!(ptx, "\t{val_load} {val_reg}, [%rd17];").map_err(write_err)?;
 
     // Out-of-range key (key >= BLOCK_GROUPS): write directly to
     // global out_vals[key] using atom.global.<op>.<dtype>. Slot map
     // can't hold them.
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p2, %r13, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p2, %r13, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
     // In-range: shared-mem path.
     writeln!(ptx, "\tmul.wide.u32 %rd18, %r13, {vbpw};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd19, %rd0, %rd18;").map_err(write_err)?;
-    let scratch = if dtype == MinMaxDtype::Int64 { "%rd21" } else { "%r21" };
+    let scratch = if dtype == MinMaxDtype::Int64 {
+        "%rd21"
+    } else {
+        "%r21"
+    };
     writeln!(
         ptx,
         "\tatom.shared.{opn}.{at} {scratch}, [%rd19], {val_reg};",
-        opn = opn, at = atom_suffix, scratch = scratch, val_reg = val_reg
+        opn = opn,
+        at = atom_suffix,
+        scratch = scratch,
+        val_reg = val_reg
     )
     .map_err(write_err)?;
     // Mark slot as populated (idempotent; many threads can hit the
@@ -224,11 +222,18 @@ pub fn compile_shmem_minmax_kernel(
     writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd24, %r13, {vbpw};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd25, %rd4, %rd24;").map_err(write_err)?;
-    let scratch2 = if dtype == MinMaxDtype::Int64 { "%rd26" } else { "%r26" };
+    let scratch2 = if dtype == MinMaxDtype::Int64 {
+        "%rd26"
+    } else {
+        "%r26"
+    };
     writeln!(
         ptx,
         "\tatom.global.{opn}.{at} {scratch2}, [%rd25], {val_reg};",
-        opn = opn, at = atom_suffix, scratch2 = scratch2, val_reg = val_reg
+        opn = opn,
+        at = atom_suffix,
+        scratch2 = scratch2,
+        val_reg = val_reg
     )
     .map_err(write_err)?;
     // For overflow rows we also need to mark out_set[key] populated.
@@ -248,12 +253,7 @@ pub fn compile_shmem_minmax_kernel(
     // if the set flag is 1.
     writeln!(ptx, "\tmov.u32 %r14, %r2;").map_err(write_err)?;
     writeln!(ptx, "MERGE_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p3, %r14, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p3, %r14, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra MERGE_DONE;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd29, %r14, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd30, %rd1, %rd29;").map_err(write_err)?;
@@ -263,12 +263,12 @@ pub fn compile_shmem_minmax_kernel(
 
     // Slot populated. Load shared val, merge to global.
     writeln!(ptx, "\tmul.wide.u32 %rd31, %r14, {vbpw};").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.s64 %rd29, %rd0, %rd31;"
-    )
-    .map_err(write_err)?;
-    let slot_val_reg = if dtype == MinMaxDtype::Int64 { "%rd22" } else { "%r22" };
+    writeln!(ptx, "\tadd.s64 %rd29, %rd0, %rd31;").map_err(write_err)?;
+    let slot_val_reg = if dtype == MinMaxDtype::Int64 {
+        "%rd22"
+    } else {
+        "%r22"
+    };
     match dtype {
         MinMaxDtype::Int32 => {
             writeln!(ptx, "\tld.shared.s32 {slot_val_reg}, [%rd29];").map_err(write_err)?;
@@ -277,12 +277,12 @@ pub fn compile_shmem_minmax_kernel(
             writeln!(ptx, "\tld.shared.s64 {slot_val_reg}, [%rd29];").map_err(write_err)?;
         }
     }
-    writeln!(
-        ptx,
-        "\tadd.s64 %rd29, %rd4, %rd31;"
-    )
-    .map_err(write_err)?;
-    let scratch3 = if dtype == MinMaxDtype::Int64 { "%rd23" } else { "%r23" };
+    writeln!(ptx, "\tadd.s64 %rd29, %rd4, %rd31;").map_err(write_err)?;
+    let scratch3 = if dtype == MinMaxDtype::Int64 {
+        "%rd23"
+    } else {
+        "%r23"
+    };
     writeln!(
         ptx,
         "\tatom.global.{opn}.{at} {scratch3}, [%rd29], {slot_val_reg};",
@@ -348,22 +348,20 @@ mod tests {
             for dt in [MinMaxDtype::Int32, MinMaxDtype::Int64] {
                 let ptx = compile_shmem_minmax_kernel(op, dt).unwrap();
                 let opn = if op == MinMaxOp::Min { "min" } else { "max" };
-                let at = if dt == MinMaxDtype::Int32 { "s32" } else { "s64" };
+                let at = if dt == MinMaxDtype::Int32 {
+                    "s32"
+                } else {
+                    "s64"
+                };
                 let want = format!("atom.shared.{opn}.{at}");
-                assert!(
-                    ptx.contains(&want),
-                    "{:?}/{:?} missing {want}",
-                    op,
-                    dt
-                );
+                assert!(ptx.contains(&want), "{:?}/{:?} missing {want}", op, dt);
             }
         }
     }
 
     #[test]
     fn has_overflow_path() {
-        let ptx =
-            compile_shmem_minmax_kernel(MinMaxOp::Min, MinMaxDtype::Int32).unwrap();
+        let ptx = compile_shmem_minmax_kernel(MinMaxOp::Min, MinMaxDtype::Int32).unwrap();
         assert!(ptx.contains("OVERFLOW:"), "missing OVERFLOW label");
         assert!(
             ptx.contains("atom.global.min.s32"),

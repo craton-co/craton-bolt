@@ -77,7 +77,10 @@ struct Fixture {
 /// Deterministic from `seed` so the GPU result and the CPU oracle are built
 /// from identical inputs and reproduce across runs.
 fn fixture(n_rows: usize, n_id1: i32, n_id2: i32, n_id3: i32, seed: u64) -> Fixture {
-    assert!(n_id1 > 0 && n_id2 > 0 && n_id3 > 0, "cardinalities must be positive");
+    assert!(
+        n_id1 > 0 && n_id2 > 0 && n_id3 > 0,
+        "cardinalities must be positive"
+    );
     let mut rng = Xorshift64Star::new(seed);
 
     let mut id1 = Vec::with_capacity(n_rows);
@@ -95,11 +98,20 @@ fn fixture(n_rows: usize, n_id1: i32, n_id2: i32, n_id3: i32, seed: u64) -> Fixt
         // the i32 range) and a sign bit. This guarantees both signs occur and
         // that MIN lands clearly negative while MAX lands clearly positive.
         let mag = (rng.next_u64() & 0x1_FFFF_FFFF) as i64; // [0, 2^33)
-        let v = if rng.next_u64() & 1 == 0 { mag } else { -mag - 1 };
+        let v = if rng.next_u64() & 1 == 0 {
+            mag
+        } else {
+            -mag - 1
+        };
         ival.push(v);
     }
 
-    Fixture { id1, id2, id3, ival }
+    Fixture {
+        id1,
+        id2,
+        id3,
+        ival,
+    }
 }
 
 // ---- CPU naive references --------------------------------------------------
@@ -128,8 +140,7 @@ fn cpu_minmax_one_key(keys: &[i32], vals: &[i64]) -> Vec<(i32, i64, i64)> {
 fn cpu_minmax_two_key(k1: &[i32], k2: &[i32], vals: &[i64]) -> Vec<(i32, i32, i64, i64)> {
     assert_eq!(k1.len(), k2.len(), "k1/k2 length mismatch");
     assert_eq!(k1.len(), vals.len(), "keys/vals length mismatch");
-    let mut table: HashMap<(i32, i32), (i64, i64)> =
-        HashMap::with_capacity(k1.len().min(1 << 20));
+    let mut table: HashMap<(i32, i32), (i64, i64)> = HashMap::with_capacity(k1.len().min(1 << 20));
     for i in 0..k1.len() {
         let e = table.entry((k1[i], k2[i])).or_insert((vals[i], vals[i]));
         if vals[i] < e.0 {
@@ -207,7 +218,10 @@ fn tier2_single_key_minmax_i32_int_values() {
     let expected = cpu_minmax_one_key(&f.id3, &f.ival);
     // Sanity: high cardinality and a genuine signed spread, so the variant is
     // actually meaningful (not a degenerate all-positive / single-group case).
-    assert!(expected.len() > 1024, "fixture must exceed BLOCK_GROUPS distinct keys");
+    assert!(
+        expected.len() > 1024,
+        "fixture must exceed BLOCK_GROUPS distinct keys"
+    );
     assert!(
         expected.iter().any(|&(_, mn, _)| mn < 0),
         "expected at least one negative per-group MIN"
@@ -295,7 +309,10 @@ fn tier2_two_key_minmax_i64_int_values() {
     let f = fixture(n_rows, 100, 10_000, 1_000_000, 0x7C0D);
 
     let expected = cpu_minmax_two_key(&f.id1, &f.id2, &f.ival);
-    assert!(expected.len() > 1024, "fixture must produce many (id1,id2) groups");
+    assert!(
+        expected.len() > 1024,
+        "fixture must produce many (id1,id2) groups"
+    );
     assert!(
         expected.iter().any(|&(_, _, mn, _)| mn < 0),
         "expected at least one negative per-group MIN"
@@ -351,13 +368,21 @@ fn tier2_two_key_minmax_i64_int_values() {
         expected.len()
     );
     for (i, &(k1, k2, mn, mx)) in expected.iter().enumerate() {
-        assert_eq!((min_actual[i].0, min_actual[i].1), (k1, k2), "two-key MIN key mismatch at {i}");
+        assert_eq!(
+            (min_actual[i].0, min_actual[i].1),
+            (k1, k2),
+            "two-key MIN key mismatch at {i}"
+        );
         assert_eq!(
             min_actual[i].2, mn,
             "two-key MIN value mismatch for ({k1},{k2}): gpu={} cpu={}",
             min_actual[i].2, mn
         );
-        assert_eq!((max_actual[i].0, max_actual[i].1), (k1, k2), "two-key MAX key mismatch at {i}");
+        assert_eq!(
+            (max_actual[i].0, max_actual[i].1),
+            (k1, k2),
+            "two-key MAX key mismatch at {i}"
+        );
         assert_eq!(
             max_actual[i].2, mx,
             "two-key MAX value mismatch for ({k1},{k2}): gpu={} cpu={}",

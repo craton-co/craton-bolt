@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **AVG at Tier 2.1** — high-cardinality multi-AVG executor.
 //!
@@ -86,7 +86,9 @@ enum KernelSpec {
     /// `partition_reduce_kernel_multi::compile_partition_reduce_kernel_multi_with_spill(n_vals)`.
     /// `n_vals` is the per-row fan-out (1..=`MAX_VALS`). Batch-5 spill-aware
     /// variant — launches resolve `kernel_entry_with_spill(n_vals)`.
-    ReduceMulti { n_vals: u32 },
+    ReduceMulti {
+        n_vals: u32,
+    },
     /// `partition_reduce_kernel_count::compile_partition_reduce_kernel_count_with_spill()`.
     /// Batch-5 spill-aware variant — launches resolve `KERNEL_ENTRY_WITH_SPILL`.
     ReduceCount,
@@ -105,7 +107,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-            KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
+            KernelSpec::PartitionShmemStaging => {
+                partition_kernel::compile_partition_kernel_shmem_staging()?
+            }
             KernelSpec::ScatterWithDestIdx => {
                 scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel()?
             }
@@ -141,13 +145,9 @@ fn partition_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try to execute `plan` against `batch` via the Tier-2.1 AVG fast path.
 /// `None` on any miss — caller falls through to the next strategy.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -294,7 +294,8 @@ fn execute_inner(
         let claim_module = get_or_build_module(&KernelSpec::ScatterWithDestIdx)?;
         let func = claim_module.function(scatter_with_dest_idx_kernel::KERNEL_ENTRY)?;
 
-        let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+        let mut cursors: GpuVec<u32> =
+            GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
         let grid = n_rows.div_ceil(BLOCK_THREADS).max(1);
 
         let view_keys = keys_gpu.view();
@@ -384,8 +385,9 @@ fn execute_inner(
     let mut spill_count: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     // ---- Multi-SUM reduce -----------------------------------------------
-    let reduce_multi_module =
-        get_or_build_module(&KernelSpec::ReduceMulti { n_vals: n_vals as u32 })?;
+    let reduce_multi_module = get_or_build_module(&KernelSpec::ReduceMulti {
+        n_vals: n_vals as u32,
+    })?;
     {
         let entry = partition_reduce_kernel_multi::kernel_entry_with_spill(n_vals as u32);
         let func = reduce_multi_module.function(&entry)?;
@@ -424,8 +426,8 @@ fn execute_inner(
     // ---- COUNT reduce ----------------------------------------------------
     let reduce_count_module = get_or_build_module(&KernelSpec::ReduceCount)?;
     {
-        let func = reduce_count_module
-            .function(partition_reduce_kernel_count::KERNEL_ENTRY_WITH_SPILL)?;
+        let func =
+            reduce_count_module.function(partition_reduce_kernel_count::KERNEL_ENTRY_WITH_SPILL)?;
 
         let view_keys = scatter_keys.view();
         let view_offsets = offsets_kp1_gpu.view();
@@ -471,8 +473,7 @@ fn execute_inner(
     // Stage-4 (P1b): pinned D2H for every output buffer; sync once
     // after all are queued so the driver overlaps them.
     let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
-    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> =
-        Vec::with_capacity(n_vals);
+    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> = Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
         pinned_vals.push(ov.to_pinned_async(stream.raw())?);
     }
@@ -491,17 +492,13 @@ fn execute_inner(
         )));
     }
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
-    let host_out_vals: Vec<Vec<f64>> = pinned_vals
-        .iter()
-        .map(|p| p.as_slice().to_vec())
-        .collect();
+    let host_out_vals: Vec<Vec<f64>> = pinned_vals.iter().map(|p| p.as_slice().to_vec()).collect();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
     let host_out_counts: Vec<u64> = pinned_counts.as_slice().to_vec();
 
     // ---- Walk slots, divide host-side, build output ---------------------
     let mut out_keys_final: Vec<i32> = Vec::new();
-    let mut out_avgs_final: Vec<Vec<f64>> =
-        (0..n_vals).map(|_| Vec::new()).collect();
+    let mut out_avgs_final: Vec<Vec<f64>> = (0..n_vals).map(|_| Vec::new()).collect();
 
     for pid in 0..num_partitions as usize {
         let base = pid * block_groups;
@@ -568,9 +565,9 @@ fn execute_inner(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod cache_tests {
@@ -584,8 +581,7 @@ mod cache_tests {
             Err(_) => return, // no CUDA context — skip.
         };
         let after_first = LOAD_COUNT.load(Ordering::SeqCst);
-        let m2 = get_or_build_module(&KernelSpec::Partition)
-            .expect("second lookup must succeed");
+        let m2 = get_or_build_module(&KernelSpec::Partition).expect("second lookup must succeed");
         let after_second = LOAD_COUNT.load(Ordering::SeqCst);
         assert_eq!(
             after_second, after_first,
@@ -603,13 +599,11 @@ mod cache_tests {
             Ok(m) => m,
             Err(_) => return,
         };
-        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 2 })
-            .expect("n_vals=2 build");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 2 }).expect("n_vals=2 build");
         let baseline = LOAD_COUNT.load(Ordering::SeqCst);
-        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 1 })
-            .expect("n_vals=1 hit");
-        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 2 })
-            .expect("n_vals=2 hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 1 }).expect("n_vals=1 hit");
+        let _ = get_or_build_module(&KernelSpec::ReduceMulti { n_vals: 2 }).expect("n_vals=2 hit");
         assert_eq!(
             LOAD_COUNT.load(Ordering::SeqCst),
             baseline,
@@ -645,8 +639,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Avg(Expr::Column("v".into()))],
@@ -674,11 +674,21 @@ mod stage4_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let avs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let avs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i) as usize;
             let expected = sums[k] / counts[k] as f64;
-            assert!((avs.value(i) - expected).abs() < 1e-6, "key={} expected={} got={}", k, expected, avs.value(i));
+            assert!(
+                (avs.value(i) - expected).abs() < 1e-6,
+                "key={} expected={} got={}",
+                k,
+                expected,
+                avs.value(i)
+            );
         }
     }
 }

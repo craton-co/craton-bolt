@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side string dictionary paired with on-device i32 indices.
 //!
@@ -17,8 +17,8 @@
 //!   * Indices are `i32`. Allowing > `i32::MAX` distinct strings would break
 //!     downstream codegen; we surface that as a `BoltError::Other`.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use arrow_array::{Array, StringArray};
@@ -275,10 +275,7 @@ pub(crate) fn rank_for_index_in(dictionary: &[String], universe: &[String]) -> V
 /// Cost: `O((Na + Nb) log(Na + Nb))` to sort the union, then `O(Na log U +
 /// Nb log U)` for the two rank lookups. Intended for query-plan time, not a
 /// per-row hot path.
-pub(crate) fn unified_rank_maps_of(
-    dict_a: &[String],
-    dict_b: &[String],
-) -> (Vec<i64>, Vec<i64>) {
+pub(crate) fn unified_rank_maps_of(dict_a: &[String], dict_b: &[String]) -> (Vec<i64>, Vec<i64>) {
     // Sorted, de-duplicated union under byte collation.
     let mut universe: Vec<String> = Vec::with_capacity(dict_a.len() + dict_b.len());
     universe.extend(dict_a.iter().cloned());
@@ -453,7 +450,10 @@ impl DictionaryColumn {
     /// `insertion_rank(probe)` plus one when `probe` is present. See
     /// [`Self::indices_satisfying`].
     pub fn insertion_rank(&self, probe: &str) -> usize {
-        self.dictionary.iter().filter(|d| d.as_str() < probe).count()
+        self.dictionary
+            .iter()
+            .filter(|d| d.as_str() < probe)
+            .count()
     }
 
     /// GPU indices of every dictionary entry that satisfies `entry OP probe`
@@ -544,9 +544,7 @@ impl DictionaryColumn {
     /// row input without needing a CUDA toolkit. Production code must not use
     /// this — use [`Self::from_string_array`].
     #[cfg(test)]
-    pub(crate) fn dedupe_for_test<'a, I>(
-        rows: I,
-    ) -> BoltResult<(Vec<String>, Vec<i32>)>
+    pub(crate) fn dedupe_for_test<'a, I>(rows: I) -> BoltResult<(Vec<String>, Vec<i32>)>
     where
         I: IntoIterator<Item = Option<&'a str>>,
     {
@@ -815,10 +813,18 @@ mod tests {
     #[test]
     fn rank_for_index_against_universe() {
         // dict slots:        1        2        3
-        let dict = vec!["mango".to_string(), "apple".to_string(), "delta".to_string()];
+        let dict = vec![
+            "mango".to_string(),
+            "apple".to_string(),
+            "delta".to_string(),
+        ];
         let col = DictionaryColumn::new_host_only(dict, 0);
         // Universe (sorted, deduped) — here equal to the dict's own sorted set.
-        let universe = vec!["apple".to_string(), "delta".to_string(), "mango".to_string()];
+        let universe = vec![
+            "apple".to_string(),
+            "delta".to_string(),
+            "mango".to_string(),
+        ];
         let ranks = col.rank_for_index(&universe);
         // index0=NULL sentinel; idx1="mango"->2, idx2="apple"->0, idx3="delta"->1
         assert_eq!(ranks, vec![NULL_RANK_SENTINEL, 2, 0, 1]);
@@ -833,9 +839,9 @@ mod tests {
         use crate::plan::logical_plan::BinaryOp;
         // Two genuinely different dictionaries (different strings + order).
         let dict_a = vec![
-            "delta".to_string(),  // idx1
-            "apple".to_string(),  // idx2
-            "mango".to_string(),  // idx3
+            "delta".to_string(), // idx1
+            "apple".to_string(), // idx2
+            "mango".to_string(), // idx3
         ];
         let dict_b = vec![
             "cherry".to_string(), // idx1
@@ -887,7 +893,11 @@ mod tests {
     /// the column's own `collation_ranks` (offset by the NULL slot).
     #[test]
     fn unified_rank_maps_same_dictionary_collapses() {
-        let dict = vec!["delta".to_string(), "apple".to_string(), "Zebra".to_string()];
+        let dict = vec![
+            "delta".to_string(),
+            "apple".to_string(),
+            "Zebra".to_string(),
+        ];
         let (rank_a, rank_b) = unified_rank_maps_of(&dict, &dict);
         assert_eq!(rank_a, rank_b, "identical dicts → identical rank tables");
         // Drop the NULL sentinel and compare to collation_ranks (which is
@@ -952,15 +962,17 @@ mod tests {
         let pool: Vec<String> = (0..DISTINCT).map(|i| format!("val_{i}")).collect();
         let rows = (0..ROWS).map(|r| Some(pool[r % DISTINCT].as_str()));
 
-        let (dictionary, indices) =
-            DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
+        let (dictionary, indices) = DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
 
         // Distinct count must equal the input cardinality, now in byte-lex
         // order.
         assert_eq!(dictionary.len(), DISTINCT);
         let mut sorted_pool = pool.clone();
         sorted_pool.sort();
-        assert_eq!(dictionary, sorted_pool, "dictionary must be byte-lex sorted");
+        assert_eq!(
+            dictionary, sorted_pool,
+            "dictionary must be byte-lex sorted"
+        );
         // The dictionary is strictly increasing (sorted + distinct).
         for w in dictionary.windows(2) {
             assert!(w[0] < w[1], "dictionary must be strictly lex-increasing");
@@ -972,8 +984,7 @@ mod tests {
         let col = DictionaryColumn::new_host_only(dictionary, ROWS);
         for (r, &idx) in indices.iter().enumerate() {
             assert!(idx >= 1, "row {r} must have a non-NULL index, got {idx}");
-            let decoded =
-                DictionaryColumn::decode_index(&col.dictionary, idx).expect("decode");
+            let decoded = DictionaryColumn::decode_index(&col.dictionary, idx).expect("decode");
             assert_eq!(
                 decoded,
                 Some(pool[r % DISTINCT].as_str()),
@@ -993,17 +1004,8 @@ mod tests {
     fn dedupe_handles_interleaved_nulls() {
         // Nulls go to index 0 and do not enter the dictionary. Verifies the
         // digest-map dedupe doesn't accidentally treat None as a value.
-        let rows = vec![
-            Some("a"),
-            None,
-            Some("b"),
-            None,
-            Some("a"),
-            Some("c"),
-            None,
-        ];
-        let (dictionary, indices) =
-            DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
+        let rows = vec![Some("a"), None, Some("b"), None, Some("a"), Some("c"), None];
+        let (dictionary, indices) = DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
 
         assert_eq!(
             dictionary,
@@ -1022,14 +1024,25 @@ mod tests {
         // First-seen dictionary (slots 1,2,3) and a row index stream that uses
         // every code plus a NULL.
         //                          idx1     idx2     idx3
-        let mut dict = vec!["delta".to_string(), "apple".to_string(), "mango".to_string()];
+        let mut dict = vec![
+            "delta".to_string(),
+            "apple".to_string(),
+            "mango".to_string(),
+        ];
         //               delta apple NULL mango apple delta
         let mut indices: Vec<i32> = vec![1, 2, 0, 3, 2, 1];
 
         lex_sort_dictionary(&mut dict, &mut indices);
 
         // Sorted: apple(1) < delta(2) < mango(3).
-        assert_eq!(dict, vec!["apple".to_string(), "delta".to_string(), "mango".to_string()]);
+        assert_eq!(
+            dict,
+            vec![
+                "apple".to_string(),
+                "delta".to_string(),
+                "mango".to_string()
+            ]
+        );
         // Each non-NULL index now names its value's lex rank; NULL stays 0.
         // delta→2, apple→1, NULL→0, mango→3, apple→1, delta→2.
         assert_eq!(indices, vec![2, 1, 0, 3, 1, 2]);
@@ -1067,7 +1080,11 @@ mod tests {
         // Byte collation: 'A' (0x41) sorts before lowercase letters.
         assert_eq!(
             dictionary,
-            vec!["Apple".to_string(), "delta".to_string(), "mango".to_string()]
+            vec![
+                "Apple".to_string(),
+                "delta".to_string(),
+                "mango".to_string()
+            ]
         );
         let col = DictionaryColumn::new_host_only(dictionary, rows.len());
         assert_eq!(col.index_of("Apple"), Some(1));
@@ -1204,7 +1221,10 @@ mod tests {
         let input = StringArray::from(vec!["red", "green", "blue", "green"]);
         let col = DictionaryColumn::from_string_array(&input).expect("encode");
 
-        assert_eq!(col.dictionary, vec!["blue".to_string(), "green".to_string(), "red".to_string()]);
+        assert_eq!(
+            col.dictionary,
+            vec!["blue".to_string(), "green".to_string(), "red".to_string()]
+        );
         assert_eq!(col.index_of("blue"), Some(1));
         assert_eq!(col.index_of("green"), Some(2));
         assert_eq!(col.index_of("red"), Some(3));

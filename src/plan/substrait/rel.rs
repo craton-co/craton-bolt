@@ -33,9 +33,7 @@
 //! value* and narrowed allocation-free via `with_input_schema`.
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{
-    AggregateExpr, Expr, JoinType, LogicalPlan, SortExpr,
-};
+use crate::plan::logical_plan::{AggregateExpr, Expr, JoinType, LogicalPlan, SortExpr};
 
 use super::expr::convert_expr;
 use super::ConvertCtx;
@@ -566,8 +564,7 @@ fn convert_boxed_input(
     ctx: &ConvertCtx,
     parent: &str,
 ) -> BoltResult<LogicalPlan> {
-    let rel =
-        input.ok_or_else(|| BoltError::Plan(format!("Substrait {parent} has no input")))?;
+    let rel = input.ok_or_else(|| BoltError::Plan(format!("Substrait {parent} has no input")))?;
     convert_rel(rel, ctx)
 }
 
@@ -626,12 +623,12 @@ mod tests {
         Expression {
             rex_type: Some(RexType::Selection(Box::new(FieldReference {
                 reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
-                    reference_type: Some(reference_segment::ReferenceType::StructField(
-                        Box::new(reference_segment::StructField {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                        reference_segment::StructField {
                             field: idx,
                             child: None,
-                        }),
-                    )),
+                        },
+                    ))),
                 })),
                 root_type: Some(RootType::RootReference(RootReference {})),
             }))),
@@ -678,18 +675,14 @@ mod tests {
                     function_reference: 0, // resolves to "equal" in test ctx
                     arguments: vec![
                         substrait::proto::FunctionArgument {
-                            arg_type: Some(
-                                substrait::proto::function_argument::ArgType::Value(
-                                    field_ref(0),
-                                ),
-                            ),
+                            arg_type: Some(substrait::proto::function_argument::ArgType::Value(
+                                field_ref(0),
+                            )),
                         },
                         substrait::proto::FunctionArgument {
-                            arg_type: Some(
-                                substrait::proto::function_argument::ArgType::Value(
-                                    field_ref(1),
-                                ),
-                            ),
+                            arg_type: Some(substrait::proto::function_argument::ArgType::Value(
+                                field_ref(1),
+                            )),
                         },
                     ],
                     ..Default::default()

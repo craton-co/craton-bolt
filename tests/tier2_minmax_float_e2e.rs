@@ -93,11 +93,7 @@ fn cpu_minmax_single(keys: &[i32], vals: &[f64]) -> Vec<(i32, f64, f64)> {
 /// (`(a as u32 as u64) << 32 | (b as u32 as u64)`) so the sort order and key
 /// identity line up. Returns `(k1, k2, min, max)` sorted by packed-i64 key
 /// ASC (the order the two-key executor emits before unpacking).
-fn cpu_minmax_two(
-    k1: &[i32],
-    k2: &[i32],
-    vals: &[f64],
-) -> Vec<(i32, i32, f64, f64)> {
+fn cpu_minmax_two(k1: &[i32], k2: &[i32], vals: &[f64]) -> Vec<(i32, i32, f64, f64)> {
     assert_eq!(k1.len(), k2.len(), "k1/k2 length mismatch");
     assert_eq!(k1.len(), vals.len(), "key/vals length mismatch");
     let mut table: HashMap<i64, (f64, f64)> = HashMap::with_capacity(k1.len().min(1 << 21));
@@ -118,7 +114,12 @@ fn cpu_minmax_two(
     flat.into_iter()
         .map(|(packed, mn, mx)| {
             let u = packed as u64;
-            (((u >> 32) as u32) as i32, ((u & 0xFFFF_FFFF) as u32) as i32, mn, mx)
+            (
+                ((u >> 32) as u32) as i32,
+                ((u & 0xFFFF_FFFF) as u32) as i32,
+                mn,
+                mx,
+            )
         })
         .collect()
 }
@@ -170,12 +171,7 @@ fn fixture_single(n_rows: usize, n_distinct: i32, seed: u64) -> (Vec<i32>, Vec<f
 /// `n2 = 10_000` that is up to 1_000_000 pairs — high-card Tier-2 territory,
 /// well under the 100M dispatcher cap. Both keys non-negative; value is the
 /// same signed-f64 spread as the single-key fixture.
-fn fixture_two(
-    n_rows: usize,
-    n1: i32,
-    n2: i32,
-    seed: u64,
-) -> (Vec<i32>, Vec<i32>, Vec<f64>) {
+fn fixture_two(n_rows: usize, n1: i32, n2: i32, seed: u64) -> (Vec<i32>, Vec<i32>, Vec<f64>) {
     assert!(n1 > 0 && n2 > 0, "key moduli must be positive");
     let m1 = n1 as u64;
     let m2 = n2 as u64;
@@ -313,7 +309,11 @@ fn tier2_single_key_minmax_float_matches_cpu() {
     // EXACT multiset comparison: MIN/MAX select an actual input element, so
     // bit-exact equality is the contract (no tolerance).
     for (i, (got, exp)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert_eq!(got.0, exp.0, "key mismatch at row {i}: gpu={} cpu={}", got.0, exp.0);
+        assert_eq!(
+            got.0, exp.0,
+            "key mismatch at row {i}: gpu={} cpu={}",
+            got.0, exp.0
+        );
         assert!(
             f64_bits_eq(got.1, exp.1),
             "MIN mismatch for key {}: gpu={:?} cpu={:?}",
@@ -417,7 +417,14 @@ fn tier2_two_key_minmax_float_matches_cpu() {
 
     // Sort actual by the same packed-i64 key order the reference used.
     let mut actual: Vec<(i32, i32, f64, f64)> = (0..out.num_rows())
-        .map(|i| (k1_col.value(i), k2_col.value(i), min_col.value(i), max_col.value(i)))
+        .map(|i| {
+            (
+                k1_col.value(i),
+                k2_col.value(i),
+                min_col.value(i),
+                max_col.value(i),
+            )
+        })
         .collect();
     actual.sort_by_key(|&(a, b, _, _)| ((a as u32 as u64) << 32 | (b as u32 as u64)) as i64);
 

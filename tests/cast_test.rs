@@ -76,7 +76,11 @@ fn nth_project_cast_target(plan: &LogicalPlan, n: usize) -> DataType {
         match cur {
             LogicalPlan::Project { exprs, .. } => {
                 let e = exprs.get(n).unwrap_or_else(|| {
-                    panic!("expected at least {} projection exprs, got {}", n + 1, exprs.len())
+                    panic!(
+                        "expected at least {} projection exprs, got {}",
+                        n + 1,
+                        exprs.len()
+                    )
                 });
                 // Aliases are transparent — peel them off so `CAST(x AS Int64)`
                 // and `CAST(x AS Int64) AS y` both pin the same shape.
@@ -117,7 +121,8 @@ fn cast_same_type_parses_and_typechecks() {
         let plan = parse_sql(sql, &provider).unwrap_or_else(|e| panic!("parse `{sql}`: {e:?}"));
         assert_eq!(nth_project_cast_target(&plan, 0), want, "for SQL `{sql}`");
         // Type-check must succeed.
-        plan.schema().unwrap_or_else(|e| panic!("typecheck `{sql}`: {e:?}"));
+        plan.schema()
+            .unwrap_or_else(|e| panic!("typecheck `{sql}`: {e:?}"));
     }
 }
 
@@ -146,7 +151,8 @@ fn cast_int_to_float() {
     ] {
         let plan = parse_sql(sql, &provider).unwrap_or_else(|e| panic!("parse `{sql}`: {e:?}"));
         assert_eq!(nth_project_cast_target(&plan, 0), want, "for SQL `{sql}`");
-        plan.schema().unwrap_or_else(|e| panic!("typecheck `{sql}`: {e:?}"));
+        plan.schema()
+            .unwrap_or_else(|e| panic!("typecheck `{sql}`: {e:?}"));
     }
 }
 
@@ -175,7 +181,8 @@ fn cast_int_bool_both_directions() {
     ] {
         let plan = parse_sql(sql, &provider).unwrap_or_else(|e| panic!("parse `{sql}`: {e:?}"));
         assert_eq!(nth_project_cast_target(&plan, 0), want, "for SQL `{sql}`");
-        plan.schema().unwrap_or_else(|e| panic!("typecheck `{sql}`: {e:?}"));
+        plan.schema()
+            .unwrap_or_else(|e| panic!("typecheck `{sql}`: {e:?}"));
     }
 }
 
@@ -223,8 +230,7 @@ fn cast_utf8_to_int_rejected_at_typecheck() {
         "expected error to name both Utf8 and Int32, got: {msg}"
     );
     assert!(
-        msg.to_lowercase().contains("unsupported")
-            || msg.to_lowercase().contains("cast"),
+        msg.to_lowercase().contains("unsupported") || msg.to_lowercase().contains("cast"),
         "expected error to mention CAST/unsupported, got: {msg}"
     );
 }
@@ -298,7 +304,11 @@ fn try_cast_lowers_as_safe_cast() {
         assert!(
             matches!(
                 &exprs[0],
-                Expr::Cast { target: DataType::Int64, safe: true, .. }
+                Expr::Cast {
+                    target: DataType::Int64,
+                    safe: true,
+                    ..
+                }
             ),
             "TRY_CAST should lower to a safe Int64 cast, got: {:?}",
             exprs[0]
@@ -327,7 +337,6 @@ fn cast_int32_to_int64_lowers_cleanly() {
 #[test]
 fn cast_inside_filter_lowers_cleanly() {
     let provider = fixture();
-    let plan =
-        parse_sql("SELECT i32 FROM t WHERE CAST(i32 AS BIGINT) > 0", &provider).unwrap();
+    let plan = parse_sql("SELECT i32 FROM t WHERE CAST(i32 AS BIGINT) > 0", &provider).unwrap();
     lower_physical(&plan).expect("CAST in WHERE clause must lower cleanly");
 }

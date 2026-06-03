@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Craton Bolt — JIT-compiled GPU SQL engine.
 //!
@@ -23,14 +23,14 @@
 //! `*_with_validity` companions).
 
 pub mod cuda;
-pub mod plan;
-pub mod jit;
 pub mod exec;
-pub mod observability;
-pub mod metrics;
 /// Arrow Flight SQL server frontend (optional, `--features flight`).
 #[cfg(feature = "flight")]
 pub mod flight;
+pub mod jit;
+pub mod metrics;
+pub mod observability;
+pub mod plan;
 
 mod error;
 pub use error::{BoltError, BoltResult};
@@ -45,9 +45,9 @@ pub use error::{BoltError, BoltResult};
 pub use ::tracing;
 
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
-pub use plan::{DataFrame, LogicalPlan, PhysicalPlan, Expr};
-pub use exec::{Engine, EngineBuilder};
 pub use exec::streaming::{BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource};
+pub use exec::{Engine, EngineBuilder};
+pub use plan::{DataFrame, Expr, LogicalPlan, PhysicalPlan};
 
 /// Stage 4 (pool telemetry): public re-exports for downstream
 /// observability. [`pool_stats`] returns a [`PoolStats`] snapshot of
@@ -132,9 +132,7 @@ pub use metrics::snapshot as metrics_snapshot;
 /// that wouldn't reach the n=128 shmem case).
 #[doc(hidden)]
 pub mod __test_only_gpu_sort {
-    pub use crate::exec::gpu_sort::{
-        sort_indices_on_gpu_multi, GpuSortKey,
-    };
+    pub use crate::exec::gpu_sort::{sort_indices_on_gpu_multi, GpuSortKey};
     pub use crate::jit::sort_kernel::SortLayout;
 }
 

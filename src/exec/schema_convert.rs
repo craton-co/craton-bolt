@@ -88,10 +88,7 @@ pub(crate) fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
 /// slips through. `ctx` is interpolated into the error message so each call
 /// site reports the same wording it did before consolidation (e.g.
 /// `"this aggregate output path"`, `"join output path"`).
-pub(crate) fn plan_dtype_to_arrow_no_temporal(
-    d: DataType,
-    ctx: &str,
-) -> BoltResult<ArrowDataType> {
+pub(crate) fn plan_dtype_to_arrow_no_temporal(d: DataType, ctx: &str) -> BoltResult<ArrowDataType> {
     match d {
         DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "Date/Timestamp not yet supported in {}: {:?}",
@@ -111,9 +108,7 @@ pub(crate) fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        ArrowDataType::Decimal128(precision, scale) => {
-            Ok(DataType::Decimal128(*precision, *scale))
-        }
+        ArrowDataType::Decimal128(precision, scale) => Ok(DataType::Decimal128(*precision, *scale)),
         ArrowDataType::Date32 => Ok(DataType::Date32),
         ArrowDataType::Timestamp(unit, tz) => {
             let interned: Option<&'static str> = tz
@@ -121,12 +116,13 @@ pub(crate) fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
                 .map(crate::plan::logical_plan::intern_timezone);
             Ok(DataType::Timestamp(arrow_time_unit_to_plan(unit), interned))
         }
-        ArrowDataType::Dictionary(_key, value)
-            if matches!(value.as_ref(), ArrowDataType::Utf8) =>
-        {
+        ArrowDataType::Dictionary(_key, value) if matches!(value.as_ref(), ArrowDataType::Utf8) => {
             Ok(DataType::Utf8)
         }
-        other => Err(BoltError::Type(format!("unsupported Arrow dtype {:?}", other))),
+        other => Err(BoltError::Type(format!(
+            "unsupported Arrow dtype {:?}",
+            other
+        ))),
     }
 }
 
@@ -144,10 +140,7 @@ pub(crate) fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 /// temporal arms of paths that have not been wired) is what actually gates
 /// support — this converter must not reject a temporal input before that
 /// dispatch is reached, or MIN/MAX/COUNT over temporal columns can never run.
-pub(crate) fn arrow_dtype_to_plan_basic(
-    d: &ArrowDataType,
-    prefix: &str,
-) -> BoltResult<DataType> {
+pub(crate) fn arrow_dtype_to_plan_basic(d: &ArrowDataType, prefix: &str) -> BoltResult<DataType> {
     match d {
         ArrowDataType::Int32 => Ok(DataType::Int32),
         ArrowDataType::Int64 => Ok(DataType::Int64),
@@ -155,9 +148,7 @@ pub(crate) fn arrow_dtype_to_plan_basic(
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        ArrowDataType::Decimal128(precision, scale) => {
-            Ok(DataType::Decimal128(*precision, *scale))
-        }
+        ArrowDataType::Decimal128(precision, scale) => Ok(DataType::Decimal128(*precision, *scale)),
         // F7-finish: temporal inputs. `Date32` normalises to an i32 storage
         // dtype, `Timestamp(unit, tz)` to i64 — preserved verbatim so the
         // op dispatch can route MIN/MAX to the normalized reduction and
@@ -250,10 +241,7 @@ mod tests {
     /// back to Arrow.
     #[test]
     fn basic_accepts_timestamp_input_preserving_unit_and_tz() {
-        let arrow_in = ArrowDataType::Timestamp(
-            ArrowTimeUnit::Microsecond,
-            Some(Arc::from("UTC")),
-        );
+        let arrow_in = ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some(Arc::from("UTC")));
         let plan = arrow_dtype_to_plan_basic(&arrow_in, "").expect("timestamp ok");
         match plan {
             DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => assert_eq!(tz, "UTC"),
@@ -298,8 +286,7 @@ mod tests {
             true,
         )]);
         assert!(plan_schema_to_arrow_schema_no_temporal(&schema, "ctx").is_err());
-        let arrow =
-            plan_schema_to_arrow_schema_minmax_temporal(&schema).expect("timestamp schema");
+        let arrow = plan_schema_to_arrow_schema_minmax_temporal(&schema).expect("timestamp schema");
         assert_eq!(
             arrow.field(0).data_type(),
             &ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, Some(Arc::from("UTC"))),

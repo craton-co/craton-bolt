@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **cudarc-backed CUDA Driver API spike** (Stage 1).
 //!
@@ -45,8 +45,7 @@ use crate::error::{BoltError, BoltResult};
 /// latched here, but `ensure_device(n)` lets `CudaContext::new`
 /// initialise the cell with a non-default ordinal on a single-GPU
 /// system as a transitional step.
-static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> =
-    once_cell::sync::OnceCell::new();
+static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> = once_cell::sync::OnceCell::new();
 
 /// Initialise the cudarc primary context on `ordinal` if it isn't
 /// already. This is the canonical entry point for `CudaContext::new`
@@ -63,9 +62,8 @@ static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> =
 /// `docs/CUDARC_ADOPTION.md` Stage 2).
 pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
     let dev = GLOBAL_DEVICE.get_or_try_init(|| {
-        CudaDevice::new(ordinal as usize).map_err(|e| {
-            cudarc_err(&format!("cudarc CudaDevice::new({ordinal})"), e)
-        })
+        CudaDevice::new(ordinal as usize)
+            .map_err(|e| cudarc_err(&format!("cudarc CudaDevice::new({ordinal})"), e))
     })?;
     // Bind the primary context to THIS thread. See `device_ref()` for why a
     // per-call bind is mandatory: `CudaDevice::new` only makes the context
@@ -103,8 +101,7 @@ pub(crate) fn bind_current_thread() -> BoltResult<()> {
 /// is gone. No call site requires owned escape, so no clone remains.
 fn device_ref() -> BoltResult<&'static Arc<CudaDevice>> {
     let dev = GLOBAL_DEVICE.get_or_try_init(|| {
-        CudaDevice::new(0)
-            .map_err(|e| cudarc_err("cudarc CudaDevice::new", e))
+        CudaDevice::new(0).map_err(|e| cudarc_err("cudarc CudaDevice::new", e))
     })?;
     // CORRECTNESS (per-thread context currency): `get_or_try_init` runs the
     // init closure — and thus cudarc's `cuDevicePrimaryCtxRetain` +
@@ -221,11 +218,7 @@ pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
 /// # Safety
 /// `src` must be valid for `count * size_of::<T>()` bytes of reads;
 /// `dst` must point to a device allocation of at least that size.
-pub unsafe fn memcpy_h2d<T>(
-    dst: CUdeviceptr,
-    src: *const T,
-    count: usize,
-) -> BoltResult<()> {
+pub unsafe fn memcpy_h2d<T>(dst: CUdeviceptr, src: *const T, count: usize) -> BoltResult<()> {
     // Zero-length copies must short-circuit BEFORE synthesising a slice from
     // `src`: `std::slice::from_raw_parts` requires a non-null, aligned, and
     // dereferenceable pointer regardless of the requested length, so a caller
@@ -278,11 +271,7 @@ pub unsafe fn memcpy_h2d<T>(
 /// # Safety
 /// `dst` must be valid for `count * size_of::<T>()` bytes of writes;
 /// `src` must point to a live device allocation of at least that size.
-pub unsafe fn memcpy_d2h<T>(
-    dst: *mut T,
-    src: CUdeviceptr,
-    count: usize,
-) -> BoltResult<()> {
+pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> BoltResult<()> {
     // Zero-length copies must short-circuit BEFORE synthesising a slice from
     // `dst`: `std::slice::from_raw_parts_mut` requires a non-null, aligned,
     // dereferenceable pointer regardless of the requested length, so a caller

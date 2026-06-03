@@ -80,8 +80,7 @@ fn cuda_init_returns_typed_no_gpu_error() {
 /// `CUDA_ERROR_STUB`, so this must also be a clean typed error, not a panic.
 #[test]
 fn cuda_device_count_returns_typed_no_gpu_error() {
-    let err =
-        cuda_sys::device_count().expect_err("device_count() must fail under cuda-stub");
+    let err = cuda_sys::device_count().expect_err("device_count() must fail under cuda-stub");
     assert_is_stub_no_gpu_error(&err);
 }
 
@@ -104,7 +103,9 @@ fn cuda_context_new_returns_typed_no_gpu_error() {
 /// that we did not panic getting here.
 #[test]
 fn engine_new_returns_typed_no_gpu_error() {
-    let err = Engine::new().err().expect("Engine::new() must fail under cuda-stub");
+    let err = Engine::new()
+        .err()
+        .expect("Engine::new() must fail under cuda-stub");
     assert_is_stub_no_gpu_error(&err);
 }
 
@@ -117,10 +118,7 @@ fn stub_error_display_is_non_empty_and_mentions_no_gpu() {
     let err = cuda_sys::init().expect_err("cuda_sys::init() must fail under cuda-stub");
 
     let rendered = err.to_string();
-    assert!(
-        !rendered.is_empty(),
-        "stub error Display must be non-empty"
-    );
+    assert!(!rendered.is_empty(), "stub error Display must be non-empty");
 
     // Exact current wording. If the stub is reworded, update this single
     // assertion; the looser `assert_is_stub_no_gpu_error` substring check above

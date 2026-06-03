@@ -271,7 +271,7 @@ pub fn compile_distinct_flag_kernel(dtype: DataType, nullable: bool) -> BoltResu
         writeln!(p, "\tld.global.u8 %r10, [%rd11];").map_err(write_err)?;
         writeln!(p, "\tshr.u32 %r10, %r10, %r13;").map_err(write_err)?;
         writeln!(p, "\tand.b32 %r10, %r10, 1;").map_err(write_err)?; // %r10 = self_valid
-        // prev bit: byte = prev>>3, bit = prev&7.
+                                                                     // prev bit: byte = prev>>3, bit = prev&7.
         writeln!(p, "\tshr.u32 %r14, %r5, 3;").map_err(write_err)?;
         writeln!(p, "\tand.b32 %r15, %r5, 7;").map_err(write_err)?;
         writeln!(p, "\tmul.wide.u32 %rd12, %r14, 1;").map_err(write_err)?;
@@ -437,7 +437,10 @@ mod tests {
     #[test]
     fn bool_widens_to_b32_via_u8_load() {
         let ptx = compile_distinct_flag_kernel(DataType::Bool, false).unwrap();
-        assert!(ptx.contains(".visible .entry bolt_distinct_flag_b("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_distinct_flag_b("),
+            "{ptx}"
+        );
         // Bool loads a byte and compares as s32.
         assert!(ptx.contains("ld.global.u8 %rk0"), "{ptx}");
         assert!(ptx.contains("setp.eq.s32 %p4"), "{ptx}");

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY SUM orchestrator — **two-key (i64-packed)
 //! variant**.
@@ -72,7 +72,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
+            KernelSpec::PartitionI64ShmemStaging => {
+                partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?
+            }
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceSumI64 => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -96,7 +98,6 @@ fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
         KernelSpec::PartitionI64
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -149,7 +150,8 @@ pub fn execute_tier2_twokey_sum(
     // ----------------------------------------------------------------------
     // Step 1. Allocate partition-pass outputs.
     // ----------------------------------------------------------------------
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut counts: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
@@ -178,7 +180,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_counts);
         args.push_scalar_u32(n_rows);
 
-    launch_with_geometry(
+        launch_with_geometry(
             partition_fn,
             grid_blocks,
             BLOCK_THREADS,
@@ -198,10 +200,7 @@ pub fn execute_tier2_twokey_sum(
     // `compute_partition_offsets` + `upload_offsets` pair (2 syncs → 1).
     // ----------------------------------------------------------------------
     let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
-        partition_offsets::compute_and_upload_partition_offsets_async(
-            &counts,
-            stream.raw(),
-        )?;
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
     if offsets.len() != (num_partitions as usize) + 1 {
         return Err(BoltError::Other(format!(
             "tier2_twokey: prefix-sum returned {} offsets, expected {}",
@@ -220,7 +219,8 @@ pub fn execute_tier2_twokey_sum(
     // ----------------------------------------------------------------------
     let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
     let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
     // Step 5. JIT + launch the i64 scatter kernel.
@@ -247,7 +247,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_sv);
         args.push_scalar_u32(n_rows);
 
-    launch_with_geometry(
+        launch_with_geometry(
             scatter_fn,
             grid_blocks,
             BLOCK_THREADS,
@@ -294,8 +294,7 @@ pub fn execute_tier2_twokey_sum(
     let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
     let reduce_module = get_or_build_module(&KernelSpec::ReduceSumI64)?;
-    let reduce_fn =
-        reduce_module.function(partition_reduce_kernel_i64::KERNEL_ENTRY_WITH_SPILL)?;
+    let reduce_fn = reduce_module.function(partition_reduce_kernel_i64::KERNEL_ENTRY_WITH_SPILL)?;
 
     {
         let view_pk = scatter_keys.view();
@@ -315,7 +314,7 @@ pub fn execute_tier2_twokey_sum(
         args.push_output(&mut view_os);
         args.push_output(&mut view_sp);
 
-    launch_with_geometry(
+        launch_with_geometry(
             reduce_fn,
             num_partitions,
             partition_reduce_kernel_i64::BLOCK_THREADS,
@@ -356,8 +355,7 @@ pub fn execute_tier2_twokey_sum(
     }
 
     let block_groups = partition_reduce_kernel_i64::BLOCK_GROUPS as usize;
-    let mut per_partition: Vec<(Vec<i64>, Vec<f64>)> =
-        Vec::with_capacity(num_partitions as usize);
+    let mut per_partition: Vec<(Vec<i64>, Vec<f64>)> = Vec::with_capacity(num_partitions as usize);
 
     for pid in 0..num_partitions as usize {
         let base = pid * block_groups;
@@ -402,8 +400,7 @@ mod tests {
             Ok(v) => v,
             Err(_) => return,
         };
-        let result =
-            execute_tier2_twokey_sum(&keys, &vals, 0).expect("empty input must succeed");
+        let result = execute_tier2_twokey_sum(&keys, &vals, 0).expect("empty input must succeed");
         assert_eq!(
             result.per_partition.len(),
             partition_kernel_i64::NUM_PARTITIONS as usize,
@@ -467,9 +464,14 @@ mod tests {
         // 8-row fixture with duplicate (k1, k2) pairs so reduce kernel has
         // real per-partition work.
         let host_packed: Vec<i64> = vec![
-            pack(1, 10), pack(2, 20), pack(1, 10),
-            pack(3, 30), pack(2, 20), pack(1, 10),
-            pack(4, 40), pack(3, 31),
+            pack(1, 10),
+            pack(2, 20),
+            pack(1, 10),
+            pack(3, 30),
+            pack(2, 20),
+            pack(1, 10),
+            pack(4, 40),
+            pack(3, 31),
         ];
         let host_vals: Vec<f64> = vec![1.0, 2.0, 1.5, 3.0, 2.5, 1.25, 4.0, 3.1];
         let n_rows = host_packed.len() as u32;

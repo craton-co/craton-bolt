@@ -52,7 +52,12 @@ impl PlanRewrite for FilterIntoJoin {
 /// Recursively rewrite `plan`, folding eligible post-join filters into joins.
 fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => LogicalPlan::Window {
             input: Box::new(rewrite_plan(*input)),
             window_exprs,
             partition_by,
@@ -122,7 +127,12 @@ fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Union { inputs } => LogicalPlan::Union {
             inputs: inputs.into_iter().map(rewrite_plan).collect(),
         },
-        LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => LogicalPlan::SetOp {
             left: Box::new(rewrite_plan(*left)),
             right: Box::new(rewrite_plan(*right)),
             op,
@@ -190,7 +200,10 @@ mod tests {
         assert_eq!(before.fields.len(), after.fields.len());
         match out {
             LogicalPlan::Join { filter, .. } => {
-                assert!(filter.is_some(), "residual should carry the folded predicate");
+                assert!(
+                    filter.is_some(),
+                    "residual should carry the folded predicate"
+                );
             }
             other => panic!("expected Join (no Filter above), got {other:?}"),
         }
@@ -212,9 +225,17 @@ mod tests {
         };
         let out = FilterIntoJoin.rewrite(plan).expect("fold");
         match out {
-            LogicalPlan::Join { filter: Some(f), .. } => {
+            LogicalPlan::Join {
+                filter: Some(f), ..
+            } => {
                 // Two conjuncts AND-ed together.
-                assert!(matches!(f, Expr::Binary { op: BinaryOp::And, .. }));
+                assert!(matches!(
+                    f,
+                    Expr::Binary {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Join with merged residual, got {other:?}"),
         }
@@ -238,7 +259,9 @@ mod tests {
             },
         };
         let out = FilterIntoJoin.rewrite(plan).expect("noop");
-        assert!(matches!(out, LogicalPlan::Filter { .. }),
-            "outer-join post-filter must not be folded into the residual");
+        assert!(
+            matches!(out, LogicalPlan::Filter { .. }),
+            "outer-join post-filter must not be folded into the residual"
+        );
     }
 }

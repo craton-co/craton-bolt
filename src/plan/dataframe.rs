@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Lazy DataFrame builder over [`LogicalPlan`].
 //!
@@ -92,9 +92,7 @@ impl DataFrame {
     /// signature to `BoltResult<Self>` without breaking the public builder
     /// API — see the `first_error` field doc).
     pub fn from_plan(plan: LogicalPlan) -> Self {
-        let first_error = check_no_empty_union(&plan)
-            .err()
-            .map(|e| e.to_string());
+        let first_error = check_no_empty_union(&plan).err().map(|e| e.to_string());
         Self { plan, first_error }
     }
 
@@ -312,9 +310,7 @@ fn collect_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 collect_column_refs(a, out);
             }
         }
-        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
-            collect_column_refs(expr, out)
-        }
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => collect_column_refs(expr, out),
         Expr::Alias(inner, _) => collect_column_refs(inner, out),
         // A subquery references columns of its *own* schema, not the
         // enclosing query's, so do not collect them here. The `InSubquery`
@@ -355,8 +351,7 @@ fn check_no_empty_union(plan: &LogicalPlan) -> BoltResult<()> {
             }
             Ok(())
         }
-        LogicalPlan::Join { left, right, .. }
-        | LogicalPlan::SetOp { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
             check_no_empty_union(left)?;
             check_no_empty_union(right)
         }
@@ -366,11 +361,7 @@ fn check_no_empty_union(plan: &LogicalPlan) -> BoltResult<()> {
 /// Resolve `plan`'s output schema and verify every column referenced in
 /// `exprs` exists in it. Returns the first unresolved column as a
 /// [`BoltError::Plan`]; `op` is included in the message for context.
-fn validate_exprs_against_plan(
-    plan: &LogicalPlan,
-    exprs: &[Expr],
-    op: &str,
-) -> BoltResult<()> {
+fn validate_exprs_against_plan(plan: &LogicalPlan, exprs: &[Expr], op: &str) -> BoltResult<()> {
     // If the plan itself is already malformed enough that we can't compute a
     // schema, defer to the downstream type-checker rather than emitting a
     // misleading "column not found" — the real error is upstream.

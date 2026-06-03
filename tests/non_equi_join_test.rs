@@ -24,8 +24,7 @@ use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, LogicalPlan, MemTableProvider, PhysicalPlan,
-    Schema,
+    lower_physical, parse_sql, DataType, Field, LogicalPlan, MemTableProvider, PhysicalPlan, Schema,
 };
 
 // ---- Fixture ----------------------------------------------------------------
@@ -66,9 +65,7 @@ fn provider_and_batches() -> (MemTableProvider, RecordBatch, RecordBatch) {
     )]));
     let t1_batch = RecordBatch::try_new(
         t1_arrow,
-        vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-        ])) as ArrayRef],
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])) as ArrayRef],
     )
     .unwrap();
 
@@ -107,11 +104,8 @@ fn find_join_logical(p: &LogicalPlan) -> &LogicalPlan {
 #[test]
 fn lt_join_lowers_to_join_with_filter() {
     let (provider, _, _) = provider_and_batches();
-    let plan = parse_sql(
-        "SELECT * FROM t1 INNER JOIN t2 ON t1.a < t2.lo",
-        &provider,
-    )
-    .expect("parse");
+    let plan =
+        parse_sql("SELECT * FROM t1 INNER JOIN t2 ON t1.a < t2.lo", &provider).expect("parse");
     match find_join_logical(&plan) {
         LogicalPlan::Join { on, filter, .. } => {
             assert!(on.is_empty(), "pure non-equi ON yields no equi pairs");
@@ -146,18 +140,12 @@ fn lt_join_lowers_to_join_with_filter() {
 #[test]
 fn gt_join_lowers_to_join_with_filter() {
     let (provider, _, _) = provider_and_batches();
-    let plan = parse_sql(
-        "SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.lo",
-        &provider,
-    )
-    .expect("parse");
+    let plan =
+        parse_sql("SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.lo", &provider).expect("parse");
     match find_join_logical(&plan) {
         LogicalPlan::Join { on, filter, .. } => {
             assert!(on.is_empty(), "pure non-equi ON yields no equi pairs");
-            assert!(
-                filter.is_some(),
-                ">' predicate must populate filter slot"
-            );
+            assert!(filter.is_some(), ">' predicate must populate filter slot");
         }
         other => panic!("expected Join, got {other:?}"),
     }
@@ -192,11 +180,8 @@ fn outer_non_equi_join_lowers_then_executor_rejects() {
     // plan-time half — the executor rejection is exercised in the gated
     // online section below if a CUDA device is available.
     let (provider, _, _) = provider_and_batches();
-    let plan = parse_sql(
-        "SELECT * FROM t1 LEFT JOIN t2 ON t1.a < t2.lo",
-        &provider,
-    )
-    .expect("LEFT + non-equi must parse");
+    let plan = parse_sql("SELECT * FROM t1 LEFT JOIN t2 ON t1.a < t2.lo", &provider)
+        .expect("LEFT + non-equi must parse");
     match find_join_logical(&plan) {
         LogicalPlan::Join { filter, .. } => {
             assert!(filter.is_some(), "filter must carry non-equi predicate");

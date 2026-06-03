@@ -104,7 +104,7 @@ pub fn compile_scatter_with_dest_idx_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t.param .u64 {entry}_param_3,").map_err(write_err)?; // partition_cursors
     writeln!(ptx, "\t.param .u64 {entry}_param_4,").map_err(write_err)?; // out_keys
     writeln!(ptx, "\t.param .u64 {entry}_param_5,").map_err(write_err)?; // dest_idx
-    writeln!(ptx, "\t.param .u32 {entry}_param_6").map_err(write_err)?;  // n_rows
+    writeln!(ptx, "\t.param .u32 {entry}_param_6").map_err(write_err)?; // n_rows
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
 

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Dictionary-aware extended string operations: `CONCAT`, `SUBSTRING`,
 //! `CONCAT_WS`.
@@ -61,11 +61,7 @@ use crate::error::{BoltError, BoltResult};
 /// Insert `s` into (`dict`, `lookup`) if absent and return its 1-based index.
 /// Surfaces dictionary overflow as `BoltError::Other`, matching the
 /// existing `string_ops` / `from_string_array` conventions.
-fn intern(
-    dict: &mut Vec<String>,
-    lookup: &mut HashMap<String, i32>,
-    s: String,
-) -> BoltResult<i32> {
+fn intern(dict: &mut Vec<String>, lookup: &mut HashMap<String, i32>, s: String) -> BoltResult<i32> {
     if let Some(&idx) = lookup.get(&s) {
         return Ok(idx);
     }
@@ -599,10 +595,7 @@ fn concat_ws_pure(
 /// case; in practice many concatenations coincide and the dictionary stays
 /// small. The caller is responsible for not blowing up the dictionary on
 /// pathological cross-products.
-pub fn concat(
-    left: &DictionaryColumn,
-    right: &DictionaryColumn,
-) -> BoltResult<DictionaryColumn> {
+pub fn concat(left: &DictionaryColumn, right: &DictionaryColumn) -> BoltResult<DictionaryColumn> {
     if left.n_rows != right.n_rows {
         return Err(BoltError::Other(format!(
             "CONCAT: n_rows mismatch (left = {}, right = {})",
@@ -612,8 +605,7 @@ pub fn concat(
 
     let li: Vec<i32> = left.indices.to_vec()?;
     let ri: Vec<i32> = right.indices.to_vec()?;
-    let (new_dict, new_indices) =
-        concat_pure(&left.dictionary, &li, &right.dictionary, &ri)?;
+    let (new_dict, new_indices) = concat_pure(&left.dictionary, &li, &right.dictionary, &ri)?;
 
     let device_indices = GpuVec::<i32>::from_slice(&new_indices)?;
     Ok(DictionaryColumn {
@@ -675,10 +667,7 @@ pub fn substring(
 ///
 /// All input columns must share `n_rows`; the output preserves it. At least
 /// one input column is required.
-pub fn concat_ws(
-    separator: &str,
-    columns: &[&DictionaryColumn],
-) -> BoltResult<DictionaryColumn> {
+pub fn concat_ws(separator: &str, columns: &[&DictionaryColumn]) -> BoltResult<DictionaryColumn> {
     if columns.is_empty() {
         return Err(BoltError::Other(
             "CONCAT_WS: at least one input column is required".into(),
@@ -745,8 +734,7 @@ mod tests {
         let r_dict = owned(&["NY", "BERLIN"]);
         let r_idx = vec![1, 2, 2];
 
-        let (new_dict, new_idx) =
-            concat_pure(&l_dict, &l_idx, &r_dict, &r_idx).unwrap();
+        let (new_dict, new_idx) = concat_pure(&l_dict, &l_idx, &r_dict, &r_idx).unwrap();
         assert_eq!(new_dict, vec!["usNY", "euBERLIN", "usBERLIN"]);
         assert_eq!(new_idx, vec![1, 2, 3]);
     }
@@ -764,8 +752,7 @@ mod tests {
         let r_dict = owned(&["x", "y"]);
         let r_idx = vec![1, 0, 2, 0];
 
-        let (new_dict, new_idx) =
-            concat_pure(&l_dict, &l_idx, &r_dict, &r_idx).unwrap();
+        let (new_dict, new_idx) = concat_pure(&l_dict, &l_idx, &r_dict, &r_idx).unwrap();
         assert_eq!(new_dict, vec!["ay"]);
         assert_eq!(new_idx, vec![0, 0, 1, 0]);
     }
@@ -786,8 +773,7 @@ mod tests {
         // 0 rows: empty dictionary, empty indices.
         let l_dict = owned(&["a"]);
         let r_dict = owned(&["b"]);
-        let (new_dict, new_idx) =
-            concat_pure(&l_dict, &[], &r_dict, &[]).unwrap();
+        let (new_dict, new_idx) = concat_pure(&l_dict, &[], &r_dict, &[]).unwrap();
         assert!(new_dict.is_empty());
         assert!(new_idx.is_empty());
     }
@@ -797,8 +783,7 @@ mod tests {
         // Every row is NULL on the left -> dictionary stays empty.
         let l_dict = owned(&["a", "b"]);
         let r_dict = owned(&["x"]);
-        let (new_dict, new_idx) =
-            concat_pure(&l_dict, &[0, 0, 0], &r_dict, &[1, 1, 1]).unwrap();
+        let (new_dict, new_idx) = concat_pure(&l_dict, &[0, 0, 0], &r_dict, &[1, 1, 1]).unwrap();
         assert!(new_dict.is_empty());
         assert_eq!(new_idx, vec![0, 0, 0]);
     }
@@ -982,11 +967,7 @@ mod tests {
         // Row 1: a "foo", b "x" -> "foo-x".
         let a = owned(&["foo"]);
         let b = owned(&["x"]);
-        let (new_dict, new_idx) = concat_ws_pure(
-            "-",
-            &[(&a, &[0, 1]), (&b, &[1, 1])],
-        )
-        .unwrap();
+        let (new_dict, new_idx) = concat_ws_pure("-", &[(&a, &[0, 1]), (&b, &[1, 1])]).unwrap();
         assert_eq!(new_dict, vec!["x", "foo-x"]);
         assert_eq!(new_idx, vec![1, 2]);
     }
@@ -997,11 +978,7 @@ mod tests {
         // entry. This is the documented CONCAT_WS divergence from CONCAT.
         let a = owned(&["foo"]);
         let b = owned(&["bar"]);
-        let (new_dict, new_idx) = concat_ws_pure(
-            ",",
-            &[(&a, &[0, 1]), (&b, &[0, 1])],
-        )
-        .unwrap();
+        let (new_dict, new_idx) = concat_ws_pure(",", &[(&a, &[0, 1]), (&b, &[0, 1])]).unwrap();
         // Row 0: both NULL -> "" -> new idx 1.
         // Row 1: "foo,bar" -> new idx 2.
         assert_eq!(new_dict, vec!["", "foo,bar"]);
@@ -1013,11 +990,8 @@ mod tests {
         let a = owned(&["a"]);
         let b = owned(&["b"]);
         let c = owned(&["c"]);
-        let (new_dict, new_idx) = concat_ws_pure(
-            "/",
-            &[(&a, &[1, 1]), (&b, &[1, 0]), (&c, &[1, 1])],
-        )
-        .unwrap();
+        let (new_dict, new_idx) =
+            concat_ws_pure("/", &[(&a, &[1, 1]), (&b, &[1, 0]), (&c, &[1, 1])]).unwrap();
         // Row 0: "a/b/c"; Row 1: skip NULL b -> "a/c".
         assert_eq!(new_dict, vec!["a/b/c", "a/c"]);
         assert_eq!(new_idx, vec![1, 2]);
@@ -1027,8 +1001,7 @@ mod tests {
     fn concat_ws_empty_separator_acts_like_concat() {
         let a = owned(&["us"]);
         let b = owned(&["NY"]);
-        let (new_dict, new_idx) =
-            concat_ws_pure("", &[(&a, &[1]), (&b, &[1])]).unwrap();
+        let (new_dict, new_idx) = concat_ws_pure("", &[(&a, &[1]), (&b, &[1])]).unwrap();
         assert_eq!(new_dict, vec!["usNY"]);
         assert_eq!(new_idx, vec![1]);
     }
@@ -1037,8 +1010,7 @@ mod tests {
     fn concat_ws_zero_rows() {
         let a = owned(&["a"]);
         let b = owned(&["b"]);
-        let (new_dict, new_idx) =
-            concat_ws_pure("-", &[(&a, &[]), (&b, &[])]).unwrap();
+        let (new_dict, new_idx) = concat_ws_pure("-", &[(&a, &[]), (&b, &[])]).unwrap();
         assert!(new_dict.is_empty());
         assert!(new_idx.is_empty());
     }
@@ -1175,7 +1147,10 @@ mod tests {
         // TRIM('xy' FROM ...) strips any leading/trailing 'x' or 'y'.
         assert_eq!(trim_str("xyxabcyx", TrimSide::Both, Some("xy")), "abc");
         assert_eq!(trim_str("xyxabcyx", TrimSide::Leading, Some("xy")), "abcyx");
-        assert_eq!(trim_str("xyxabcyx", TrimSide::Trailing, Some("xy")), "xyxabc");
+        assert_eq!(
+            trim_str("xyxabcyx", TrimSide::Trailing, Some("xy")),
+            "xyxabc"
+        );
     }
 
     #[test]

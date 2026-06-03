@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-1 **MIN / MAX** GROUP BY executor (low-cardinality integer
 //! MIN/MAX over `n_groups <= BLOCK_GROUPS`).
@@ -19,18 +19,13 @@ use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::jit::partition_reduce_kernel_minmax::{MinMaxDtype, MinMaxOp};
-use crate::jit::shmem_minmax_kernel::{
-    compile_shmem_minmax_kernel, kernel_entry, BLOCK_GROUPS,
-};
+use crate::jit::shmem_minmax_kernel::{compile_shmem_minmax_kernel, kernel_entry, BLOCK_GROUPS};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const MIN_ROWS_FAST_PATH: usize = 64 * 1024;
 
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -99,7 +94,14 @@ pub fn try_execute(
         return None;
     }
 
-    Some(execute_inner(plan, key_arr, val_col, op, val_dtype, n_groups_est))
+    Some(execute_inner(
+        plan,
+        key_arr,
+        val_col,
+        op,
+        val_dtype,
+        n_groups_est,
+    ))
 }
 
 fn execute_inner(
@@ -132,11 +134,21 @@ fn execute_inner(
                 .to_vec();
             let vals_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(&vals_in, stream.raw())?;
             let init_out: Vec<i32> = vec![identity; n_groups_usz];
-            let mut out_vals_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(&init_out, stream.raw())?;
-            let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_groups_usz, stream.raw())?;
+            let mut out_vals_gpu: GpuVec<i32> =
+                GpuVec::<i32>::from_slice_async(&init_out, stream.raw())?;
+            let mut out_set_gpu: GpuVec<u8> =
+                GpuVec::<u8>::zeros_async(n_groups_usz, stream.raw())?;
 
             run_launch_i32(
-                op, val_dtype, &keys_gpu, &vals_gpu, &mut out_vals_gpu, &mut out_set_gpu, n_rows, n_groups, &stream,
+                op,
+                val_dtype,
+                &keys_gpu,
+                &vals_gpu,
+                &mut out_vals_gpu,
+                &mut out_set_gpu,
+                n_rows,
+                n_groups,
+                &stream,
             )?;
 
             // Stage-4 (P1b): pinned D2H; sync once.
@@ -168,9 +180,7 @@ fn execute_inner(
                 ],
             )
             .map_err(|e| {
-                BoltError::Other(format!(
-                    "groupby_shmem_minmax_exec(i32): build error: {e}"
-                ))
+                BoltError::Other(format!("groupby_shmem_minmax_exec(i32): build error: {e}"))
             })
         }
         MinMaxDtype::Int64 => {
@@ -186,11 +196,21 @@ fn execute_inner(
                 .to_vec();
             let vals_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice_async(&vals_in, stream.raw())?;
             let init_out: Vec<i64> = vec![identity; n_groups_usz];
-            let mut out_vals_gpu: GpuVec<i64> = GpuVec::<i64>::from_slice_async(&init_out, stream.raw())?;
-            let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_groups_usz, stream.raw())?;
+            let mut out_vals_gpu: GpuVec<i64> =
+                GpuVec::<i64>::from_slice_async(&init_out, stream.raw())?;
+            let mut out_set_gpu: GpuVec<u8> =
+                GpuVec::<u8>::zeros_async(n_groups_usz, stream.raw())?;
 
             run_launch_i64(
-                op, val_dtype, &keys_gpu, &vals_gpu, &mut out_vals_gpu, &mut out_set_gpu, n_rows, n_groups, &stream,
+                op,
+                val_dtype,
+                &keys_gpu,
+                &vals_gpu,
+                &mut out_vals_gpu,
+                &mut out_set_gpu,
+                n_rows,
+                n_groups,
+                &stream,
             )?;
 
             // Stage-4 (P1b): pinned D2H; sync once.
@@ -222,9 +242,7 @@ fn execute_inner(
                 ],
             )
             .map_err(|e| {
-                BoltError::Other(format!(
-                    "groupby_shmem_minmax_exec(i64): build error: {e}"
-                ))
+                BoltError::Other(format!("groupby_shmem_minmax_exec(i64): build error: {e}"))
             })
         }
     }
@@ -332,7 +350,10 @@ fn run_launch_i64(
     )
 }
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +363,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod stage4_tests {
@@ -368,8 +389,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Int32 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Int32,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Min(Expr::Column("v".into()))],

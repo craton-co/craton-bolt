@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end query tests for Craton Bolt.
 //!
@@ -55,7 +55,11 @@ fn sales_batch(n: usize) -> RecordBatch {
         ArrowField::new("price", ArrowDataType::Float64, false),
         ArrowField::new("tax", ArrowDataType::Float64, false),
     ]));
-    RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(price), Arc::new(tax)]).unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(region), Arc::new(price), Arc::new(tax)],
+    )
+    .unwrap()
 }
 
 // ---- Offline: parse -> plan -> PTX -----------------------------------------
@@ -83,8 +87,7 @@ fn parses_simple_select() {
 #[test]
 fn count_distinct_lowers_to_countrows() {
     let provider = sales_provider();
-    let plan =
-        parse_sql("SELECT COUNT(DISTINCT region_id) FROM sales", &provider).expect("parse");
+    let plan = parse_sql("SELECT COUNT(DISTINCT region_id) FROM sales", &provider).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
     // The top SELECT-order Project is identity over the single count column, so
     // the lowerer may collapse it; accept either a bare CountRows or a Project
@@ -140,8 +143,14 @@ fn parses_filtered_arithmetic_select() {
 
     // Ensure `price`, `tax`, and `region_id` (predicate) are all loaded.
     let input_names: Vec<&str> = kernel.inputs.iter().map(|c| c.name.as_str()).collect();
-    assert!(input_names.contains(&"price"), "inputs missing 'price': {input_names:?}");
-    assert!(input_names.contains(&"tax"), "inputs missing 'tax': {input_names:?}");
+    assert!(
+        input_names.contains(&"price"),
+        "inputs missing 'price': {input_names:?}"
+    );
+    assert!(
+        input_names.contains(&"tax"),
+        "inputs missing 'tax': {input_names:?}"
+    );
     assert!(
         input_names.contains(&"region_id"),
         "inputs missing 'region_id': {input_names:?}"
@@ -170,7 +179,10 @@ fn rejects_unknown_column() {
         Err(_) => {} // ok
         Ok(p) => {
             let lowered = lower_physical(&p);
-            assert!(lowered.is_err(), "expected unknown-column error from lowering");
+            assert!(
+                lowered.is_err(),
+                "expected unknown-column error from lowering"
+            );
         }
     }
 }
@@ -208,8 +220,14 @@ fn ptx_for_trivial_select_contains_required_directives() {
     };
     let ptx = compile_ptx(kernel, "bolt_kernel").expect("ptx");
 
-    assert!(ptx.contains(".version 7.5"), "missing .version directive\n{ptx}");
-    assert!(ptx.contains(".target sm_70"), "missing .target directive\n{ptx}");
+    assert!(
+        ptx.contains(".version 7.5"),
+        "missing .version directive\n{ptx}"
+    );
+    assert!(
+        ptx.contains(".target sm_70"),
+        "missing .target directive\n{ptx}"
+    );
     assert!(
         ptx.contains(".address_size 64"),
         "missing .address_size directive"
@@ -220,11 +238,20 @@ fn ptx_for_trivial_select_contains_required_directives() {
     );
     // Kernel-parameter load order is established by `ld.param.u64` (column ptrs) and
     // a trailing `ld.param.u32` (row count) — this is the order cuLaunchKernel sees.
-    assert!(ptx.contains("ld.param.u64"), "expected ld.param.u64 for column ptrs");
-    assert!(ptx.contains("ld.param.u32"), "expected ld.param.u32 for n_rows");
+    assert!(
+        ptx.contains("ld.param.u64"),
+        "expected ld.param.u64 for column ptrs"
+    );
+    assert!(
+        ptx.contains("ld.param.u32"),
+        "expected ld.param.u32 for n_rows"
+    );
     // f64 load + store, since `price` is Float64. Input loads route through
     // the read-only cache (`ld.global.nc`) — output stores remain plain.
-    assert!(ptx.contains("ld.global.nc.f64"), "missing f64 read-only-cache load");
+    assert!(
+        ptx.contains("ld.global.nc.f64"),
+        "missing f64 read-only-cache load"
+    );
     assert!(ptx.contains("st.global.f64"), "missing f64 store");
     assert!(ptx.contains("DONE:"), "missing DONE label");
     assert!(ptx.contains("ret;"), "missing ret;");
@@ -272,7 +299,10 @@ fn ptx_int32_dtype_load_store_suffixes() {
         panic!("expected Projection");
     };
     let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
-    assert!(ptx.contains("ld.global.nc.s32"), "expected s32 read-only-cache load");
+    assert!(
+        ptx.contains("ld.global.nc.s32"),
+        "expected s32 read-only-cache load"
+    );
     assert!(ptx.contains("st.global.s32"), "expected s32 store");
 }
 
@@ -290,7 +320,10 @@ fn ptx_int64_dtype_load_store_suffixes() {
         panic!("expected Projection");
     };
     let ptx = compile_ptx(kernel, "bolt_kernel").unwrap();
-    assert!(ptx.contains("ld.global.nc.s64"), "expected s64 read-only-cache load");
+    assert!(
+        ptx.contains("ld.global.nc.s64"),
+        "expected s64 read-only-cache load"
+    );
     assert!(ptx.contains("st.global.s64"), "expected s64 store");
 }
 
@@ -516,10 +549,7 @@ fn groupby_sum_int32_widens_to_i64() {
         "GROUP BY SUM(Int32) must widen to Int64 (wave 4)"
     );
     // Sanity check: aggregate is what we think it is.
-    assert!(matches!(
-        aggregate.aggregates[0],
-        AggregateExpr::Sum(_)
-    ));
+    assert!(matches!(aggregate.aggregates[0], AggregateExpr::Sum(_)));
 }
 
 // ---- Online (require CUDA device) ------------------------------------------
@@ -586,7 +616,9 @@ fn e2e_arithmetic_projection() {
     let batch = sales_batch(4096);
     engine.register_table("sales", batch.clone()).unwrap();
 
-    let h = engine.sql("SELECT price * tax FROM sales").expect("execute");
+    let h = engine
+        .sql("SELECT price * tax FROM sales")
+        .expect("execute");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 4096);
     let actual = out
@@ -607,7 +639,10 @@ fn e2e_arithmetic_projection() {
     for i in 0..4096 {
         let want = price.value(i) * tax.value(i);
         let got = actual.value(i);
-        assert!((got - want).abs() < REL_TOL, "row {i}: got {got}, want {want}");
+        assert!(
+            (got - want).abs() < REL_TOL,
+            "row {i}: got {got}, want {want}"
+        );
     }
 }
 
@@ -647,8 +682,16 @@ fn e2e_filtered_select() {
         .filter(|&i| region.value(i) == 1)
         .map(|i| price.value(i))
         .collect();
-    assert_eq!(out.num_rows(), expected.len(), "compacted row count = #matches");
-    assert_eq!(out.num_rows(), 512, "region_id = 1 matches 512 of 2048 rows");
+    assert_eq!(
+        out.num_rows(),
+        expected.len(),
+        "compacted row count = #matches"
+    );
+    assert_eq!(
+        out.num_rows(),
+        512,
+        "region_id = 1 matches 512 of 2048 rows"
+    );
     for (i, want) in expected.iter().enumerate() {
         assert_eq!(actual.value(i), *want, "compacted row {i}");
     }
@@ -673,11 +716,7 @@ fn e2e_large_i64_add() {
     let h = engine.sql("SELECT x + 1 FROM big").expect("execute");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), n);
-    let actual = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let actual = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     for i in 0..n {
         assert_eq!(actual.value(i), (i as i64) + 1, "row {i}");
     }
@@ -734,11 +773,7 @@ fn limit_with_offset_carries_both_values() {
     // `LIMIT n OFFSET k` collapses into a single Limit node carrying both
     // fields so executors don't need a separate Offset operator.
     let provider = sales_provider();
-    let plan = parse_sql(
-        "SELECT region_id FROM sales LIMIT 5 OFFSET 3",
-        &provider,
-    )
-    .expect("parse");
+    let plan = parse_sql("SELECT region_id FROM sales LIMIT 5 OFFSET 3", &provider).expect("parse");
     match &plan {
         LogicalPlan::Limit { limit, offset, .. } => {
             assert_eq!(*limit, 5);
@@ -776,11 +811,8 @@ fn order_by_desc_lowers_to_sort() {
 fn order_by_default_direction_is_ascending() {
     // No direction keyword -> ASC.
     let provider = sales_provider();
-    let plan = parse_sql(
-        "SELECT region_id FROM sales ORDER BY region_id",
-        &provider,
-    )
-    .expect("parse");
+    let plan =
+        parse_sql("SELECT region_id FROM sales ORDER BY region_id", &provider).expect("parse");
     match &plan {
         LogicalPlan::Sort { sort_exprs, .. } => {
             assert_eq!(sort_exprs.len(), 1);
@@ -798,8 +830,7 @@ fn having_desugars_to_filter_over_aggregate() {
     // HAVING wraps the (SELECT-ordered Project over Aggregate) in a Filter.
     // Walk down from the top to confirm the Aggregate is present below.
     let provider = agg_provider();
-    let sql =
-        "SELECT region_id, SUM(price) FROM sales GROUP BY region_id HAVING SUM(price) > 100";
+    let sql = "SELECT region_id, SUM(price) FROM sales GROUP BY region_id HAVING SUM(price) > 100";
     let plan = parse_sql(sql, &provider).expect("parse");
 
     // Top must be the HAVING Filter.
@@ -982,11 +1013,8 @@ fn join_schema_disambiguates_collisions() {
     // Left side keeps its bare names; right side gets `right.<col>` for any
     // collision (the convention chosen in `join_combined_schema`).
     let provider = join_provider();
-    let plan = parse_sql(
-        "SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id",
-        &provider,
-    )
-    .expect("parse");
+    let plan =
+        parse_sql("SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id", &provider).expect("parse");
     // Walk past any outer wrapper (Project from wildcard expansion) to find
     // the Join, then ask its own schema().
     fn find_join(p: &LogicalPlan) -> &LogicalPlan {
@@ -1012,12 +1040,18 @@ fn join_schema_disambiguates_collisions() {
         assert!(seen.insert(n), "duplicate field name '{n}' in {names:?}");
     }
     // Left side keeps bare names.
-    assert!(names.contains(&"id"), "left 'id' must survive bare in {names:?}");
+    assert!(
+        names.contains(&"id"),
+        "left 'id' must survive bare in {names:?}"
+    );
     assert!(
         names.contains(&"region_id"),
         "left 'region_id' must survive bare in {names:?}"
     );
-    assert!(names.contains(&"qty"), "left-only 'qty' must survive bare in {names:?}");
+    assert!(
+        names.contains(&"qty"),
+        "left-only 'qty' must survive bare in {names:?}"
+    );
     // Right side: colliding columns become `right.<col>`, non-colliders stay bare.
     assert!(
         names.contains(&"right.id"),
@@ -1039,11 +1073,8 @@ fn physical_join_output_schema_combines_sides() {
     // same combined+disambiguated schema as the logical layer — not the
     // pre-wave-8 "left only" approximation.
     let provider = join_provider();
-    let plan = parse_sql(
-        "SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id",
-        &provider,
-    )
-    .expect("parse");
+    let plan =
+        parse_sql("SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id", &provider).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
 
     // Find the PhysicalPlan::Join (the outer `SELECT *` lowers to a Project
@@ -1090,8 +1121,11 @@ fn physical_join_output_schema_combines_sides() {
     );
     assert_eq!(phys_schema.fields.len(), 6, "all six columns present");
     let phys_names: Vec<&str> = phys_schema.fields.iter().map(|f| f.name.as_str()).collect();
-    let logical_names: Vec<&str> =
-        logical_schema.fields.iter().map(|f| f.name.as_str()).collect();
+    let logical_names: Vec<&str> = logical_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
     assert_eq!(
         phys_names, logical_names,
         "physical and logical join schemas must agree on field names and order"
@@ -1122,7 +1156,11 @@ fn sales_batch_with_nulls(n: usize, n_null: usize) -> RecordBatch {
         ArrowField::new("price", ArrowDataType::Float64, true),
         ArrowField::new("tax", ArrowDataType::Float64, false),
     ]));
-    RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(price), Arc::new(tax)]).unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(region), Arc::new(price), Arc::new(tax)],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1213,12 +1251,10 @@ fn e2e_groupby_sum_with_nulls_in_value_column() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    let mut expected: std::collections::HashMap<i32, f64> =
-        std::collections::HashMap::new();
+    let mut expected: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
     for i in 0..n {
         if !price.is_null(i) {
-            *expected.entry(region.value(i)).or_insert(0.0) +=
-                price.value(i) * tax.value(i);
+            *expected.entry(region.value(i)).or_insert(0.0) += price.value(i) * tax.value(i);
         }
     }
 
@@ -1234,11 +1270,7 @@ fn e2e_groupby_sum_with_nulls_in_value_column() {
     let out = h.record_batch();
     assert_eq!(out.num_rows(), expected.len());
 
-    let out_region = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
+    let out_region = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
     let out_sum = out
         .column(1)
         .as_any()
@@ -1307,8 +1339,11 @@ fn provider_override_populates_input_has_validity() {
     let provider = NullableSales {
         inner: sales_provider(),
     };
-    let plan = parse_sql("SELECT region_id, price FROM sales WHERE region_id = 1", &provider)
-        .expect("parse ok");
+    let plan = parse_sql(
+        "SELECT region_id, price FROM sales WHERE region_id = 1",
+        &provider,
+    )
+    .expect("parse ok");
     let mut phys = lower_physical(&plan).expect("lower ok");
     craton_bolt::plan::physical_plan::populate_input_validity(&mut phys, &provider);
 
@@ -1385,12 +1420,10 @@ fn groupby_sum_with_nulls_uses_native_validity_path() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    let mut expected: std::collections::HashMap<i32, f64> =
-        std::collections::HashMap::new();
+    let mut expected: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
     for i in 0..n {
         if !price.is_null(i) {
-            *expected.entry(region.value(i)).or_insert(0.0) +=
-                price.value(i) * tax.value(i);
+            *expected.entry(region.value(i)).or_insert(0.0) += price.value(i) * tax.value(i);
         }
     }
 
@@ -1415,11 +1448,7 @@ fn groupby_sum_with_nulls_uses_native_validity_path() {
     let out = h.record_batch();
     assert_eq!(out.num_rows(), expected.len());
 
-    let out_region = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
+    let out_region = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
     let out_sum = out
         .column(1)
         .as_any()
@@ -1466,10 +1495,10 @@ fn groupby_sum_with_nulls_uses_native_validity_path() {
 #[test]
 #[ignore = "gpu:tier1"]
 fn pv_stage_f_groupby_no_pre_native_validity_round_trip() {
+    use arrow_array::ArrayRef;
     use craton_bolt::exec::groupby::NATIVE_VALIDITY_LAUNCHES;
     use craton_bolt::Engine;
     use std::sync::atomic::Ordering;
-    use arrow_array::ArrayRef;
 
     let baseline = NATIVE_VALIDITY_LAUNCHES.load(Ordering::Relaxed);
 
@@ -1483,14 +1512,7 @@ fn pv_stage_f_groupby_no_pre_native_validity_round_trip() {
         ArrowField::new("v", ArrowDataType::Int64, true),
     ]));
     let k = Int32Array::from(vec![1i32, 2, 1, 2, 1, 2]);
-    let v = Int64Array::from(vec![
-        Some(10i64),
-        Some(20),
-        None,
-        Some(40),
-        Some(50),
-        None,
-    ]);
+    let v = Int64Array::from(vec![Some(10i64), Some(20), None, Some(40), Some(50), None]);
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(k) as ArrayRef, Arc::new(v) as ArrayRef],
@@ -1516,8 +1538,7 @@ fn pv_stage_f_groupby_no_pre_native_validity_round_trip() {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("Int64");
-    let mut got: std::collections::HashMap<i32, i64> =
-        std::collections::HashMap::new();
+    let mut got: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
     for i in 0..out.num_rows() {
         got.insert(ks.value(i), ss.value(i));
     }
@@ -1581,14 +1602,24 @@ fn e2e_groupby_with_nulls() {
     let mut got: Vec<(Option<i32>, i64)> = (0..out.num_rows())
         .map(|i| {
             (
-                if keys.is_null(i) { None } else { Some(keys.value(i)) },
+                if keys.is_null(i) {
+                    None
+                } else {
+                    Some(keys.value(i))
+                },
                 sums.value(i),
             )
         })
         .collect();
     got.sort_by_key(|(k, _)| k.unwrap_or(i32::MAX)); // NULL group sorts last
-    assert!(got.contains(&(Some(1), 40)), "group k=1 -> SUM=40; got {got:?}");
-    assert!(got.contains(&(Some(2), 60)), "group k=2 -> SUM=60; got {got:?}");
+    assert!(
+        got.contains(&(Some(1), 40)),
+        "group k=1 -> SUM=40; got {got:?}"
+    );
+    assert!(
+        got.contains(&(Some(2), 60)),
+        "group k=2 -> SUM=60; got {got:?}"
+    );
     assert!(
         got.contains(&(None, 99)),
         "NULL group -> SUM=99 (the single null-keyed row); got {got:?}"
@@ -1692,8 +1723,7 @@ fn groupby_variance_parses_but_execution_is_gated() {
             },
         ]),
     );
-    let plan =
-        parse_sql("SELECT k, VAR_POP(v) FROM t GROUP BY k", &provider).expect("parse");
+    let plan = parse_sql("SELECT k, VAR_POP(v) FROM t GROUP BY k", &provider).expect("parse");
     let _phys = lower_physical(&plan).expect("lower");
 }
 
@@ -1774,7 +1804,10 @@ fn e2e_var_samp_single_row_is_null() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .expect("Float64");
-    assert!(!col_pop.is_null(0), "VAR_POP of a single row is defined (= 0)");
+    assert!(
+        !col_pop.is_null(0),
+        "VAR_POP of a single row is defined (= 0)"
+    );
     assert!(col_pop.value(0).abs() < 1e-12, "got {}", col_pop.value(0));
 }
 

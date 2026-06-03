@@ -31,9 +31,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-};
+use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::Engine;
@@ -347,37 +345,25 @@ fn sum_min_max_avg_f64_excludes_nulls() {
         "SELECT SUM(v) FROM t",
         f64_batch_with_nulls(),
     ));
-    assert!(
-        (sum - 60.0).abs() < 1e-12,
-        "SUM(Float64 nulls): got {sum}"
-    );
+    assert!((sum - 60.0).abs() < 1e-12, "SUM(Float64 nulls): got {sum}");
 
     let min = out_f64(&run_single_row_query(
         "SELECT MIN(v) FROM t",
         f64_batch_with_nulls(),
     ));
-    assert!(
-        (min - 10.0).abs() < 1e-12,
-        "MIN(Float64 nulls): got {min}"
-    );
+    assert!((min - 10.0).abs() < 1e-12, "MIN(Float64 nulls): got {min}");
 
     let max = out_f64(&run_single_row_query(
         "SELECT MAX(v) FROM t",
         f64_batch_with_nulls(),
     ));
-    assert!(
-        (max - 30.0).abs() < 1e-12,
-        "MAX(Float64 nulls): got {max}"
-    );
+    assert!((max - 30.0).abs() < 1e-12, "MAX(Float64 nulls): got {max}");
 
     let avg = out_f64(&run_single_row_query(
         "SELECT AVG(v) FROM t",
         f64_batch_with_nulls(),
     ));
-    assert!(
-        (avg - 20.0).abs() < 1e-12,
-        "AVG(Float64 nulls): got {avg}"
-    );
+    assert!((avg - 20.0).abs() < 1e-12, "AVG(Float64 nulls): got {avg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -484,17 +470,14 @@ fn primitive_aggregates_all_null_returns_sql_null() {
 #[test]
 #[ignore = "gpu:tier1"]
 fn nulls_at_boundary_positions() {
-    let arr = Int64Array::from(vec![
-        None,
-        Some(7_i64),
-        Some(11),
-        Some(13),
-        None,
-    ]);
+    let arr = Int64Array::from(vec![None, Some(7_i64), Some(11), Some(13), None]);
     let batch = one_col_batch(Arc::new(arr) as ArrayRef);
 
     // count = 3, sum = 31, min = 7, max = 13.
-    let count = out_i64(&run_single_row_query("SELECT COUNT(v) FROM t", batch.clone()));
+    let count = out_i64(&run_single_row_query(
+        "SELECT COUNT(v) FROM t",
+        batch.clone(),
+    ));
     assert_eq!(count, 3);
     let sum = out_i64(&run_single_row_query("SELECT SUM(v) FROM t", batch.clone()));
     assert_eq!(sum, 31);
@@ -558,7 +541,10 @@ fn sum_empty_table_returns_null() {
     let arr = Int64Array::from(Vec::<Option<i64>>::new());
     let batch = one_col_batch(Arc::new(arr) as ArrayRef);
 
-    let count = out_i64(&run_single_row_query("SELECT COUNT(v) FROM t", batch.clone()));
+    let count = out_i64(&run_single_row_query(
+        "SELECT COUNT(v) FROM t",
+        batch.clone(),
+    ));
     assert_eq!(count, 0);
 
     assert_out_null(&run_single_row_query("SELECT SUM(v) FROM t", batch));

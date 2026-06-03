@@ -397,7 +397,7 @@ fn optimize_greedy(model: &CardModel) -> Option<CostedPlan> {
             }
         }
         let (a, b, card, cost) = best?; // None => disconnected; bail
-        // Merge b into a (remove the higher index first to keep `a` valid).
+                                        // Merge b into a (remove the higher index first to keep `a` valid).
         let pb = parts.remove(b);
         let pa = parts.remove(a);
         let mut leaves = pa.leaves;
@@ -486,16 +486,16 @@ mod tests {
         // chosen by checking the deepest join covers {b,c} not {a,b}.
         if let JoinShape::Join { left, right } = &plan.shape {
             let pair = match (&**left, &**right) {
-                (JoinShape::Join { .. }, JoinShape::Leaf(i)) => {
-                    Some((left.leaves(), *i))
-                }
-                (JoinShape::Leaf(i), JoinShape::Join { .. }) => {
-                    Some((right.leaves(), *i))
-                }
+                (JoinShape::Join { .. }, JoinShape::Leaf(i)) => Some((left.leaves(), *i)),
+                (JoinShape::Leaf(i), JoinShape::Join { .. }) => Some((right.leaves(), *i)),
                 _ => None,
             };
             let (inner_leaves, outer) = pair.expect("one side is a 2-way join");
-            assert_eq!(inner_leaves, BTreeSet::from([1, 2]), "small relations join first");
+            assert_eq!(
+                inner_leaves,
+                BTreeSet::from([1, 2]),
+                "small relations join first"
+            );
             assert_eq!(outer, 0, "the large relation a joins last");
         } else {
             panic!("expected a join at the root");

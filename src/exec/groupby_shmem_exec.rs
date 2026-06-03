@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory pre-aggregation **executor** (Tier 1 fast path).
 //!
@@ -26,16 +26,14 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
 
-use arrow_schema::{Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
-use crate::exec::groupby_shmem_dispatch::{
-    dispatch, AggOp, DispatchInputs, GroupByStrategy,
-};
-use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::gpu_table::{GpuColumnData, GpuTable};
+use crate::exec::groupby_shmem_dispatch::{dispatch, AggOp, DispatchInputs, GroupByStrategy};
+use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
@@ -52,10 +50,7 @@ use crate::plan::physical_plan::PhysicalPlan;
 /// fast path. Returns `None` if any precondition fails — the caller MUST
 /// fall through to the safe path. Returns `Some(Err)` only for genuine GPU
 /// failures encountered after we committed to the fast path.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     // --- Plan-shape eligibility ------------------------------------------
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -199,12 +194,10 @@ fn run_shmem_sum_core(
     // Routed through the consolidated `exec::module_cache` so repeated
     // shmem-SUM launches skip PTX construction entirely. The kernel is
     // unparameterised — a fixed string is a sufficient spec id.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "shmem_sum".to_string(),
-        None,
-        || compile_shmem_sum_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module(module_path!(), "shmem_sum".to_string(), None, || {
+            compile_shmem_sum_kernel()
+        })?;
     let function = module.function(KERNEL_ENTRY)?;
 
     // --- Launch params (Agent 3's tuner) ---------------------------------
@@ -404,12 +397,7 @@ pub fn try_execute_resident(
         Err(_) => return None,
     };
     Some(run_shmem_sum_core(
-        plan,
-        keys_gpu,
-        vals_gpu,
-        &present,
-        n_groups,
-        &stream,
+        plan, keys_gpu, vals_gpu, &present, n_groups, &stream,
     ))
 }
 
@@ -556,9 +544,7 @@ fn reduce_i32_device(keys: &GpuVec<i32>, op: ReduceOp, stream: &CudaStream) -> B
             )))
         }
     };
-    folded.ok_or_else(|| {
-        BoltError::Other("reduce_i32_device: kernel produced no partials".into())
-    })
+    folded.ok_or_else(|| BoltError::Other("reduce_i32_device: kernel produced no partials".into()))
 }
 
 /// Build a 0-row output `RecordBatch` matching the plan's output schema.
@@ -589,7 +575,10 @@ const _BLOCK_THREADS_REF: u32 = BLOCK_THREADS;
 // in this crate carries its own copy; consolidating them is a separate
 // refactor.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -623,8 +612,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
@@ -652,7 +647,11 @@ mod stage4_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let vs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             assert_eq!(vs.value(i), expected[ks.value(i) as usize]);
         }

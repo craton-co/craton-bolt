@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **Two-key float MIN / MAX at Tier 2.1** — high-cardinality executor for
 //! `SELECT a, b, {MIN,MAX}(v) FROM x GROUP BY a, b` over `Float64` value
@@ -110,7 +110,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
+            KernelSpec::PartitionI64ShmemStaging => {
+                partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?
+            }
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceMinMaxFloatI64(rk) => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -133,12 +135,8 @@ fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try the two-key Tier-2.1 float MIN/MAX fast path. `None` on any miss.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -260,7 +258,8 @@ fn execute_inner(
     let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
     {
         let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
-        let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+        let mut cursors: GpuVec<u32> =
+            GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
         let view_keys = keys_gpu.view();
         let view_vals = vals_gpu.view();
@@ -318,7 +317,14 @@ fn execute_inner(
         args.push_output(&mut view_os);
         args.push_output(&mut view_sp);
 
-        launch_with_geometry(func, num_partitions, REDUCE_BLOCK_THREADS, 0, &stream, &mut args)?;
+        launch_with_geometry(
+            func,
+            num_partitions,
+            REDUCE_BLOCK_THREADS,
+            0,
+            &stream,
+            &mut args,
+        )?;
     }
 
     // Stage-4 (P1b): pinned D2H; sync once.
@@ -391,9 +397,9 @@ fn execute_inner(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {
@@ -651,9 +657,8 @@ mod cache_tests {
 
     #[test]
     fn op_dtype_combinations_are_distinct_cache_keys() {
-        let _ = match get_or_build_module(&KernelSpec::ReduceMinMaxFloatI64(
-            ReduceFloatKey::MinF64,
-        )) {
+        let _ = match get_or_build_module(&KernelSpec::ReduceMinMaxFloatI64(ReduceFloatKey::MinF64))
+        {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -689,9 +694,18 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k1".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "k2".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Min(Expr::Column("v".into()))],

@@ -112,7 +112,11 @@ fn i32_const_fold_add_overflow_does_not_wrap() {
     let expr = binary(BinaryOp::Add, i32_lit(i32::MAX), i32_lit(1));
     let folded = fold_predicate(expr);
     match folded {
-        Expr::Binary { op: BinaryOp::Add, left, right } => {
+        Expr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
             // Operands must survive intact — not collapsed to a literal.
             // `Expr` has no `PartialEq`, so match the inner literal value.
             assert!(
@@ -139,7 +143,13 @@ fn i32_const_fold_sub_underflow_does_not_wrap() {
     let expr = binary(BinaryOp::Sub, i32_lit(i32::MIN), i32_lit(1));
     let folded = fold_predicate(expr);
     assert!(
-        matches!(folded, Expr::Binary { op: BinaryOp::Sub, .. }),
+        matches!(
+            folded,
+            Expr::Binary {
+                op: BinaryOp::Sub,
+                ..
+            }
+        ),
         "i32::MIN - 1 must NOT be folded (would wrap to i32::MAX); got {folded:?}"
     );
 }
@@ -151,7 +161,13 @@ fn i32_const_fold_mul_overflow_does_not_wrap() {
     let expr = binary(BinaryOp::Mul, i32_lit(100_000), i32_lit(100_000));
     let folded = fold_predicate(expr);
     assert!(
-        matches!(folded, Expr::Binary { op: BinaryOp::Mul, .. }),
+        matches!(
+            folded,
+            Expr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ),
         "100000 * 100000 must NOT be folded (overflows i32); got {folded:?}"
     );
 }
@@ -180,16 +196,26 @@ fn i32_const_fold_overflow_survives_inside_comparison() {
     let expr = binary(BinaryOp::Eq, inner, i32_lit(0));
     let folded = fold_predicate(expr);
     match folded {
-        Expr::Binary { op: BinaryOp::Eq, left, .. } => {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            ..
+        } => {
             assert!(
-                matches!(*left, Expr::Binary { op: BinaryOp::Add, .. }),
+                matches!(
+                    *left,
+                    Expr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ),
                 "the overflowing add must remain an unfolded Binary under the comparison, \
                  got {left:?}"
             );
         }
-        other => panic!(
-            "comparison over an overflowing add must not fold to a constant; got {other:?}"
-        ),
+        other => {
+            panic!("comparison over an overflowing add must not fold to a constant; got {other:?}")
+        }
     }
 }
 
@@ -317,7 +343,10 @@ fn e2e_scalar_float_min_skips_nan() {
         .downcast_ref::<Float64Array>()
         .expect("Float64 min")
         .value(0);
-    assert_eq!(got, -1.0, "scalar MIN over [NaN,2,-1] must skip NaN -> -1.0");
+    assert_eq!(
+        got, -1.0,
+        "scalar MIN over [NaN,2,-1] must skip NaN -> -1.0"
+    );
 }
 
 // =============================================================================

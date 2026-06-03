@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! CPU reference model + regression hook for Tier-2 hash-partitioned GROUP BY
 //! with **N SUM aggregates** (1..=4).
@@ -40,7 +40,10 @@ fn cpu_tier2_multi_sum_model(
     vals: &[Vec<f64>], // shape: [n_vals][n_rows]
 ) -> Vec<(i32, Vec<f64>)> {
     let n_vals = vals.len();
-    assert!(n_vals >= 1 && n_vals <= 4, "n_vals must be 1..=4, got {n_vals}");
+    assert!(
+        n_vals >= 1 && n_vals <= 4,
+        "n_vals must be 1..=4, got {n_vals}"
+    );
     for (j, v) in vals.iter().enumerate() {
         assert_eq!(
             v.len(),
@@ -82,10 +85,7 @@ fn cpu_tier2_multi_sum_model(
 }
 
 /// Single-pass naive SUM-by-key over N value columns. Reference oracle.
-fn cpu_naive_multi_sum_groupby(
-    keys: &[i32],
-    vals: &[Vec<f64>],
-) -> Vec<(i32, Vec<f64>)> {
+fn cpu_naive_multi_sum_groupby(keys: &[i32], vals: &[Vec<f64>]) -> Vec<(i32, Vec<f64>)> {
     let n_vals = vals.len();
     let mut table: HashMap<i32, Vec<f64>> = HashMap::with_capacity(keys.len().min(1 << 20));
     for i in 0..keys.len() {
@@ -137,10 +137,7 @@ fn fixture(
 /// Max relative error across N value columns. Both inputs must be sorted by
 /// key and contain the same key set; we assert both. Absolute floor of 1.0
 /// in the denominator so near-zero sums don't blow up the ratio.
-fn max_relative_error_multi(
-    a: &[(i32, Vec<f64>)],
-    b: &[(i32, Vec<f64>)],
-) -> f64 {
+fn max_relative_error_multi(a: &[(i32, Vec<f64>)], b: &[(i32, Vec<f64>)]) -> f64 {
     assert_eq!(
         a.len(),
         b.len(),
@@ -526,19 +523,14 @@ fn tier2_multi_pipeline_matches_cpu_model() {
         ArrowField::new("v1", ArrowDataType::Float64, false),
         ArrowField::new("v2", ArrowDataType::Float64, false),
     ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(id2), Arc::new(v1), Arc::new(v2)],
-    )
-    .expect("build RecordBatch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(id2), Arc::new(v1), Arc::new(v2)])
+        .expect("build RecordBatch");
 
     // Stand up the engine on the default CUDA device. Mirrors the convention
     // in `tests/memory_tests.rs`: `.expect()` is fine because the test is
     // `#[ignore]`'d, so it only runs on a GPU host.
     let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
-    engine
-        .register_table("x", batch)
-        .expect("register table");
+    engine.register_table("x", batch).expect("register table");
 
     let h = engine
         .sql("SELECT id2, SUM(v1), SUM(v2) FROM x GROUP BY id2")
@@ -594,9 +586,9 @@ fn tier2_multi_pipeline_preserves_value_column_alignment() {
     let (keys, vals) = fixture_aligned_multiples(n_rows, n_distinct_keys, n_vals, 0xFEED);
     let expected = cpu_tier2_multi_sum_model(&keys, &vals);
 
-    use std::sync::Arc;
     use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
 
     // 1. RecordBatch: id2 (Int32) + v1/v2/v3 (Float64), where the fixture made
     //    v2 = 1000*key, v3 = 1_000_000*key per row, so per-group SUMs preserve

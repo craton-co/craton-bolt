@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for the sentinel-free GROUP BY `MIN(float)` / `MAX(float)`
 //! aggregate kernel.
@@ -148,10 +148,7 @@ pub const VALID_AGG_FLOAT_ENTRY: &str = "bolt_groupby_agg_valid";
 /// `(MIN | MAX, Float32 | Float64)` combinations are valid for this kernel;
 /// any other `(op, dtype)` returns [`BoltError::Other`] so the dispatch
 /// site fails loudly rather than silently emitting the wrong code.
-pub fn compile_agg_valid_float_kernel(
-    op: ReduceOp,
-    dtype: DataType,
-) -> BoltResult<String> {
+pub fn compile_agg_valid_float_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<String> {
     emit_agg_valid_float_kernel(op, dtype, /* with_validity = */ false)
 }
 
@@ -272,8 +269,7 @@ fn emit_agg_valid_float_kernel(
     // Bit-pattern register class for the CAS payload (`%vrN` for f32 / `%vrlN`
     // for f64). Distinct namespace from `%r` / `%rl` so the probe-loop and
     // CAS-loop registers don't collide.
-    writeln!(ptx, "\t.reg .{ty}   %{rc}<8>;", ty = bits_ty, rc = bits_reg)
-        .map_err(write_err)?;
+    writeln!(ptx, "\t.reg .{ty}   %{rc}<8>;", ty = bits_ty, rc = bits_reg).map_err(write_err)?;
     // Float-typed view of the same value for the comparison + select.
     writeln!(
         ptx,
@@ -307,8 +303,7 @@ fn emit_agg_valid_float_kernel(
     // Uses high-numbered registers (%r40..%r43, %p10) to stay out of the
     // way of the existing probe / CAS / SPILL register namespace.
     if with_validity {
-        writeln!(ptx, "\tld.param.u64 %rd40, [{entry}_param_11];")
-            .map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd40, [{entry}_param_11];").map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd40, %rd40;").map_err(write_err)?;
         // byte_idx = tid >> 3 ; bit_off = tid & 7
         writeln!(ptx, "\tshr.u32 %r40, %r3, 3;").map_err(write_err)?;
@@ -607,8 +602,7 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 /// Entry-point name of the kernel produced by
 /// [`compile_agg_valid_float_kernel_with_validity`]. Distinct from the
 /// no-validity entry so the host launcher can dispatch by symbol lookup.
-pub const VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY: &str =
-    "bolt_groupby_agg_valid_float_with_validity";
+pub const VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY: &str = "bolt_groupby_agg_valid_float_with_validity";
 
 /// Generate the validity-aware float MIN/MAX agg kernel.
 ///
@@ -655,11 +649,8 @@ mod with_validity_tests {
     /// name must be `bolt_groupby_agg_valid_float_with_validity`.
     #[test]
     fn min_f32_with_validity_emits_bfe_setp_branch_past_cas() {
-        let ptx = compile_agg_valid_float_kernel_with_validity(
-            ReduceOp::Min,
-            DataType::Float32,
-        )
-        .expect("kernel should compile");
+        let ptx = compile_agg_valid_float_kernel_with_validity(ReduceOp::Min, DataType::Float32)
+            .expect("kernel should compile");
 
         // Entry-point rename.
         assert!(
@@ -709,10 +700,7 @@ mod with_validity_tests {
         );
         // Highest-indexed param symbol.
         assert!(
-            ptx.contains(&format!(
-                "{}_param_11",
-                VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY
-            )),
+            ptx.contains(&format!("{}_param_11", VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY)),
             "expected param_11 (validity_ptr) in emitted PTX:\n{ptx}"
         );
     }
@@ -721,11 +709,8 @@ mod with_validity_tests {
     /// comparison, plus the same `bfe.u32`-based bit-test gate.
     #[test]
     fn max_f64_with_validity_emits_bit_test_and_b64_cas() {
-        let ptx = compile_agg_valid_float_kernel_with_validity(
-            ReduceOp::Max,
-            DataType::Float64,
-        )
-        .expect("kernel should compile");
+        let ptx = compile_agg_valid_float_kernel_with_validity(ReduceOp::Max, DataType::Float64)
+            .expect("kernel should compile");
         assert!(
             ptx.contains("atom.global.cas.b64"),
             "expected `atom.global.cas.b64` for Float64 CAS:\n{ptx}"
@@ -750,11 +735,8 @@ mod with_validity_tests {
     /// reason the no-validity variant does — wrong agg family.
     #[test]
     fn float_with_validity_rejects_sum() {
-        let err = compile_agg_valid_float_kernel_with_validity(
-            ReduceOp::Sum,
-            DataType::Float32,
-        )
-        .expect_err("Sum should be rejected by the MIN/MAX-only kernel");
+        let err = compile_agg_valid_float_kernel_with_validity(ReduceOp::Sum, DataType::Float32)
+            .expect_err("Sum should be rejected by the MIN/MAX-only kernel");
         let msg = err.to_string();
         assert!(
             msg.contains("MIN/MAX") || msg.contains("Sum"),
@@ -766,11 +748,8 @@ mod with_validity_tests {
     /// reason its no-validity sibling does.
     #[test]
     fn float_with_validity_rejects_int_dtype() {
-        let err = compile_agg_valid_float_kernel_with_validity(
-            ReduceOp::Min,
-            DataType::Int32,
-        )
-        .expect_err("Int32 should be rejected by the float-only kernel");
+        let err = compile_agg_valid_float_kernel_with_validity(ReduceOp::Min, DataType::Int32)
+            .expect_err("Int32 should be rejected by the float-only kernel");
         let msg = err.to_string();
         assert!(
             msg.contains("Int32") || msg.contains("floating-point"),
@@ -782,15 +761,9 @@ mod with_validity_tests {
     /// the PTX so the host-side launcher's symbol lookup succeeds.
     #[test]
     fn with_validity_entry_constant_matches_emitted_name() {
-        let ptx = compile_agg_valid_float_kernel_with_validity(
-            ReduceOp::Min,
-            DataType::Float32,
-        )
-        .unwrap();
-        let entry = format!(
-            ".visible .entry {}(",
-            VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY
-        );
+        let ptx =
+            compile_agg_valid_float_kernel_with_validity(ReduceOp::Min, DataType::Float32).unwrap();
+        let entry = format!(".visible .entry {}(", VALID_AGG_FLOAT_WITH_VALIDITY_ENTRY);
         assert!(
             ptx.contains(&entry),
             "PTX should declare entry as {entry:?}, got:\n{ptx}"

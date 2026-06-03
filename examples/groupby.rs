@@ -6,10 +6,10 @@
 //!
 //! (requires a CUDA-capable GPU.)
 
-use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use craton_bolt::Engine;
+use std::sync::Arc;
 
 const N_ROWS: usize = 100_000;
 const N_GROUPS: i32 = 64;

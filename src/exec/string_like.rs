@@ -300,8 +300,7 @@ mod tests {
     use crate::exec::like::PatternMatcher;
 
     fn dec(p: &str) -> Option<(LikeMode, String)> {
-        decompose_like_pattern(p, None)
-            .map(|(m, b)| (m, String::from_utf8(b).unwrap()))
+        decompose_like_pattern(p, None).map(|(m, b)| (m, String::from_utf8(b).unwrap()))
     }
 
     // ---- GPU device-path env gate ----------------------------------------
@@ -398,8 +397,17 @@ mod tests {
         // (decompose → like_match_row) must equal the host PatternMatcher.
         let patterns = ["foo", "foo%", "%foo", "%foo%", "", "%", "%%"];
         let inputs = [
-            "foo", "foobar", "barfoo", "abcfoodef", "bar", "", "f", "fo",
-            "FOO", "foofoo", "xfooy",
+            "foo",
+            "foobar",
+            "barfoo",
+            "abcfoodef",
+            "bar",
+            "",
+            "f",
+            "fo",
+            "FOO",
+            "foofoo",
+            "xfooy",
         ];
         for p in patterns {
             let (mode, lit) = decompose_like_pattern(p, None)
@@ -434,7 +442,12 @@ mod tests {
     #[test]
     fn mirror_contains_overlapping() {
         // Substring scan must find the needle at any start offset.
-        assert!(like_match_row(b"aXbcfoo", b"foo", LikeMode::Contains, false));
+        assert!(like_match_row(
+            b"aXbcfoo",
+            b"foo",
+            LikeMode::Contains,
+            false
+        ));
         assert!(like_match_row(b"fooooo", b"foo", LikeMode::Contains, false));
         assert!(!like_match_row(b"fo", b"foo", LikeMode::Contains, false));
     }

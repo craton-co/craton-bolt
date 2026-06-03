@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-1 **COUNT(*) GROUP BY** executor — shared-memory pre-aggregation
 //! for low-cardinality `SELECT key, COUNT(*) FROM x GROUP BY key`.
@@ -23,7 +23,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
@@ -31,18 +31,13 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
-use crate::jit::shmem_count_kernel::{
-    compile_shmem_count_kernel, BLOCK_GROUPS, KERNEL_ENTRY,
-};
+use crate::jit::shmem_count_kernel::{compile_shmem_count_kernel, BLOCK_GROUPS, KERNEL_ENTRY};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Schema};
 use crate::plan::physical_plan::PhysicalPlan;
 
 const MIN_ROWS_FAST_PATH: usize = 64 * 1024;
 
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -122,12 +117,10 @@ fn execute_inner(
     let keys_gpu: GpuVec<i32> = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
     let mut out_gpu: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
 
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "shmem_count".to_string(),
-        None,
-        || compile_shmem_count_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module(module_path!(), "shmem_count".to_string(), None, || {
+            compile_shmem_count_kernel()
+        })?;
     let function = module.function(KERNEL_ENTRY)?;
 
     let params = tune(TuneInputs {
@@ -198,7 +191,10 @@ fn execute_inner(
     })
 }
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // The cuda_sys/ptr/c_void imports are kept for consistency with the
@@ -238,7 +234,10 @@ mod stage4_tests {
             table: "t".into(),
             pre: None,
             aggregate: AggregateSpec {
-                inputs: vec![ColumnIO { name: "k".into(), dtype: DataType::Int32 }],
+                inputs: vec![ColumnIO {
+                    name: "k".into(),
+                    dtype: DataType::Int32,
+                }],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],
                 output_schema: Schema::new(vec![
@@ -248,9 +247,11 @@ mod stage4_tests {
                 input_has_validity: Vec::new(),
             },
         };
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("k", ArrowDataType::Int32, false),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Int32,
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef],

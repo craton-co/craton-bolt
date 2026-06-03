@@ -212,8 +212,14 @@ fn emit_is_ascii_ws(
     // ws_range = (b >= 0x09) && (b <= 0x0D)
     writeln!(ptx, "\tsetp.ge.u32 {pa}, {b}, 9;", pa = p_a, b = r_byte).map_err(write_err)?;
     writeln!(ptx, "\tsetp.le.u32 {pb}, {b}, 13;", pb = p_b, b = r_byte).map_err(write_err)?;
-    writeln!(ptx, "\tand.pred {po}, {pa}, {pb};", po = p_out, pa = p_a, pb = p_b)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tand.pred {po}, {pa}, {pb};",
+        po = p_out,
+        pa = p_a,
+        pb = p_b
+    )
+    .map_err(write_err)?;
     // is_space = (b == 0x20)
     writeln!(ptx, "\tsetp.eq.u32 {pa}, {b}, 32;", pa = p_a, b = r_byte).map_err(write_err)?;
     // p_out = ws_range || is_space
@@ -289,8 +295,13 @@ fn emit_trim_bounds(
     }
 
     // out_len = t_end - t_begin.
-    writeln!(ptx, "\tsub.s32 {ol}, %r31, {tb};", ol = r_outlen, tb = r_tbegin)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsub.s32 {ol}, %r31, {tb};",
+        ol = r_outlen,
+        tb = r_tbegin
+    )
+    .map_err(write_err)?;
     Ok(())
 }
 
@@ -371,16 +382,36 @@ pub fn compile_length_gather_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
     // n_rows guard.
-    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_3];", LENGTH_GATHER_ENTRY).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r4, [{}_param_3];",
+        LENGTH_GATHER_ENTRY
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // Globalize the three pointers.
-    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", LENGTH_GATHER_ENTRY).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd0, [{}_param_0];",
+        LENGTH_GATHER_ENTRY
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-    writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_1];", LENGTH_GATHER_ENTRY).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd1, [{}_param_1];",
+        LENGTH_GATHER_ENTRY
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
-    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_2];", LENGTH_GATHER_ENTRY).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd2, [{}_param_2];",
+        LENGTH_GATHER_ENTRY
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
 
     // idx = indices[tid] (read-only cache).
@@ -720,12 +751,23 @@ fn emit_load_src_slice(
     writeln!(ptx, "\tadd.s64 %rd22, %rd21, 4;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.nc.u32 {end}, [%rd22];", end = r_end).map_err(write_err)?;
     // len = end - begin
-    writeln!(ptx, "\tsub.s32 {len}, {end}, {begin};", len = r_len, end = r_end, begin = r_begin)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsub.s32 {len}, {end}, {begin};",
+        len = r_len,
+        end = r_end,
+        begin = r_begin
+    )
+    .map_err(write_err)?;
     // slice_ptr = src_bytes + begin
     writeln!(ptx, "\tmul.wide.u32 %rd23, {begin}, 1;", begin = r_begin).map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 {slice}, {bytes}, %rd23;", slice = rd_slice, bytes = rd_bytes)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tadd.s64 {slice}, {bytes}, %rd23;",
+        slice = rd_slice,
+        bytes = rd_bytes
+    )
+    .map_err(write_err)?;
     Ok(())
 }
 
@@ -825,8 +867,13 @@ fn emit_substring_char_window(
     writeln!(ptx, "\tbra {lbl}_TAKE;", lbl = label).map_err(write_err)?;
     writeln!(ptx, "{lbl}_TAKE_DONE:", lbl = label).map_err(write_err)?;
     // byte_copy = byte_end - byte_start
-    writeln!(ptx, "\tsub.s32 {bc}, %r26, {bs};", bc = r_bcopy, bs = r_bstart)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsub.s32 {bc}, %r26, {bs};",
+        bc = r_bcopy,
+        bs = r_bstart
+    )
+    .map_err(write_err)?;
     Ok(())
 }
 
@@ -1088,10 +1135,10 @@ pub fn compile_varwidth_write_pass(kind: ScalarFnKind) -> BoltResult<String> {
     } else if is_substring {
         writeln!(ptx, "\tld.param.u32 %r20, [{}_param_5];", entry).map_err(write_err)?; // start (1-based char)
         writeln!(ptx, "\tld.param.u32 %r21, [{}_param_6];", entry).map_err(write_err)?; // sub_len (char count)
-        // Character-indexed window: walk whole UTF-8 characters to find the
-        // byte start offset (%r22) and byte copy length (%r9). This MUST match
-        // the length pass byte-for-byte (same helper) so the bytes written
-        // exactly fill the region `out_offsets` reserved.
+                                                                                        // Character-indexed window: walk whole UTF-8 characters to find the
+                                                                                        // byte start offset (%r22) and byte copy length (%r9). This MUST match
+                                                                                        // the length pass byte-for-byte (same helper) so the bytes written
+                                                                                        // exactly fill the region `out_offsets` reserved.
         emit_substring_char_window(
             &mut ptx, "SUB", "%r7", "%rd10", "%r20", "%r21", "%r22", "%r9",
         )?;
@@ -1288,7 +1335,12 @@ pub fn compile_concat_len_pass(n: usize) -> BoltResult<String> {
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_{}];", entry, n_rows_param).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r4, [{}_param_{}];",
+        entry, n_rows_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
@@ -1302,10 +1354,15 @@ pub fn compile_concat_len_pass(n: usize) -> BoltResult<String> {
         // Globalize this input's offsets (%rd0) and bytes (%rd1). `emit_load_src_slice`
         // only reads offsets; %rd1 is unused in the length pass but globalized for
         // symmetry / cheap and to keep the helper's signature satisfied.
-        writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_{}];", entry, off_param).map_err(write_err)?;
-        writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-        writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_{}];", entry, bytes_param)
+        writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_{}];", entry, off_param)
             .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tld.param.u64 %rd1, [{}_param_{}];",
+            entry, bytes_param
+        )
+        .map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
         // %r5=begin, %r6=end, %r7=in_len_k, %rd10=slice_ptr (ptr unused here).
         emit_load_src_slice(&mut ptx, "%r5", "%r6", "%r7", "%rd10", "%rd0", "%rd1")?;
@@ -1314,8 +1371,12 @@ pub fn compile_concat_len_pass(n: usize) -> BoltResult<String> {
     }
 
     // row_lens[tid] = total. row_lens pointer is param_{2n}.
-    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_{}];", entry, row_lens_param)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd2, [{}_param_{}];",
+        entry, row_lens_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd11, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd12, %rd2, %rd11;").map_err(write_err)?;
@@ -1393,15 +1454,29 @@ pub fn compile_concat_write_pass(n: usize) -> BoltResult<String> {
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_{}];", entry, n_rows_param).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u32 %r4, [{}_param_{}];",
+        entry, n_rows_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // dst base = out_bytes + out_offsets[tid].
-    writeln!(ptx, "\tld.param.u64 %rd2, [{}_param_{}];", entry, out_off_param).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd2, [{}_param_{}];",
+        entry, out_off_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd2, %rd2;").map_err(write_err)?;
-    writeln!(ptx, "\tld.param.u64 %rd3, [{}_param_{}];", entry, out_bytes_param)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd3, [{}_param_{}];",
+        entry, out_bytes_param
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd13, %r3, 4;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd14, %rd2, %rd13;").map_err(write_err)?;
@@ -1418,10 +1493,15 @@ pub fn compile_concat_write_pass(n: usize) -> BoltResult<String> {
         let off_param = 2 * k;
         let bytes_param = 2 * k + 1;
         // Globalize input k's offsets (%rd0) and bytes (%rd1).
-        writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_{}];", entry, off_param).map_err(write_err)?;
-        writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
-        writeln!(ptx, "\tld.param.u64 %rd1, [{}_param_{}];", entry, bytes_param)
+        writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_{}];", entry, off_param)
             .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tld.param.u64 %rd1, [{}_param_{}];",
+            entry, bytes_param
+        )
+        .map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd1, %rd1;").map_err(write_err)?;
         // %r5=begin, %r6=end, %r9=in_len_k (copy_len), %rd10=src_ptr.
         // NOTE: %r9 holds the copy length — the IDENTICAL `end-begin` the length
@@ -1470,11 +1550,26 @@ mod tests {
         assert!(ptx.contains(".target sm_70"), "{ptx}");
         assert!(ptx.contains(".address_size 64"), "{ptx}");
         // 4-param ABI: indices, length_table, out, n_rows.
-        assert!(ptx.contains(".visible .entry bolt_str_length_gather("), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_length_gather_param_0,"), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_length_gather_param_1,"), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_length_gather_param_2,"), "{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_length_gather_param_3"), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_length_gather("),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_length_gather_param_0,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_length_gather_param_1,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_length_gather_param_2,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_length_gather_param_3"),
+            "{ptx}"
+        );
     }
 
     #[test]
@@ -1487,7 +1582,10 @@ mod tests {
             n_nc >= 2,
             "expected >=2 read-only-cache loads (indices + length_table), got {n_nc}\n{ptx}"
         );
-        assert!(ptx.contains("st.global.u32"), "missing the Int32 length store\n{ptx}");
+        assert!(
+            ptx.contains("st.global.u32"),
+            "missing the Int32 length store\n{ptx}"
+        );
         // n_rows guard before any work.
         let guard = ptx.find("bra DONE").expect("guard branch");
         let store = ptx.find("st.global.u32").expect("store");
@@ -1499,33 +1597,57 @@ mod tests {
     #[test]
     fn upper_len_pass_is_length_preserving() {
         let ptx = compile_varwidth_len_pass(ScalarFnKind::Upper).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_len_pass_upper("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_len_pass_upper("),
+            "{ptx}"
+        );
         // 4-param ABI for UPPER (no start/len).
-        assert!(ptx.contains(".param .u32 bolt_str_len_pass_upper_param_3"), "{ptx}");
+        assert!(
+            ptx.contains(".param .u32 bolt_str_len_pass_upper_param_3"),
+            "{ptx}"
+        );
         assert!(
             !ptx.contains("bolt_str_len_pass_upper_param_4"),
             "UPPER len pass must NOT have a 5th param\n{ptx}"
         );
         // out_len = in_len: the row_lens store happens; the slice end-begin
         // subtraction is the input length computation.
-        assert!(ptx.contains("sub.s32"), "missing in_len = end - begin\n{ptx}");
-        assert!(ptx.contains("st.global.u32"), "missing row_lens store\n{ptx}");
+        assert!(
+            ptx.contains("sub.s32"),
+            "missing in_len = end - begin\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.u32"),
+            "missing row_lens store\n{ptx}"
+        );
     }
 
     #[test]
     fn substring_len_pass_has_start_and_len_params_and_clamps() {
         let ptx = compile_varwidth_len_pass(ScalarFnKind::Substring).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_len_pass_substring("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_len_pass_substring("),
+            "{ptx}"
+        );
         // 6-param ABI: offsets, bytes, row_lens, n_rows, start, sub_len.
-        assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_4,"), "{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_len_pass_substring_param_5"), "{ptx}");
+        assert!(
+            ptx.contains(".param .u32 bolt_str_len_pass_substring_param_4,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_len_pass_substring_param_5"),
+            "{ptx}"
+        );
         // Character-indexed window: `max` clamps start0/want to >= 0, and the
         // start/take scan loops walk whole UTF-8 characters (a byte begins a
         // char iff `(b & 0xC0) != 0x80`, tested via `and.b32 ..., 192`).
         assert!(ptx.contains("max.s32"), "missing clamp max\n{ptx}");
         assert!(ptx.contains("LEN_SKIP:"), "missing char-skip scan\n{ptx}");
         assert!(ptx.contains("LEN_TAKE:"), "missing char-take scan\n{ptx}");
-        assert!(ptx.contains("and.b32 %r28, %r28, 192"), "missing UTF-8 boundary test\n{ptx}");
+        assert!(
+            ptx.contains("and.b32 %r28, %r28, 192"),
+            "missing UTF-8 boundary test\n{ptx}"
+        );
     }
 
     #[test]
@@ -1541,9 +1663,15 @@ mod tests {
     #[test]
     fn trim_both_len_pass_scans_both_ends() {
         let ptx = compile_varwidth_len_pass(ScalarFnKind::TrimBoth).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_len_pass_trim_both("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_len_pass_trim_both("),
+            "{ptx}"
+        );
         // 4-param ABI (no start/len): TRIM takes no extra params.
-        assert!(ptx.contains(".param .u32 bolt_str_len_pass_trim_both_param_3"), "{ptx}");
+        assert!(
+            ptx.contains(".param .u32 bolt_str_len_pass_trim_both_param_3"),
+            "{ptx}"
+        );
         assert!(
             !ptx.contains("bolt_str_len_pass_trim_both_param_4"),
             "TRIM len pass must NOT have a 5th param\n{ptx}"
@@ -1552,27 +1680,54 @@ mod tests {
         assert!(ptx.contains("TRIM_LEAD:"), "missing leading scan\n{ptx}");
         assert!(ptx.contains("TRIM_TRAIL:"), "missing trailing scan\n{ptx}");
         // ASCII-whitespace byte test: HT..CR range (9..=13) plus SPACE (32).
-        assert!(ptx.contains("setp.ge.u32 %p6, %r30, 9"), "missing ws low bound 9\n{ptx}");
-        assert!(ptx.contains("setp.le.u32 %p7, %r30, 13"), "missing ws high bound 13\n{ptx}");
-        assert!(ptx.contains("setp.eq.u32 %p6, %r30, 32"), "missing SPACE test 32\n{ptx}");
+        assert!(
+            ptx.contains("setp.ge.u32 %p6, %r30, 9"),
+            "missing ws low bound 9\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.le.u32 %p7, %r30, 13"),
+            "missing ws high bound 13\n{ptx}"
+        );
+        assert!(
+            ptx.contains("setp.eq.u32 %p6, %r30, 32"),
+            "missing SPACE test 32\n{ptx}"
+        );
         // out_len store still happens.
-        assert!(ptx.contains("st.global.u32"), "missing row_lens store\n{ptx}");
+        assert!(
+            ptx.contains("st.global.u32"),
+            "missing row_lens store\n{ptx}"
+        );
     }
 
     #[test]
     fn trim_leading_len_pass_scans_only_lead() {
         let ptx = compile_varwidth_len_pass(ScalarFnKind::TrimLeading).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_len_pass_trim_leading("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_len_pass_trim_leading("),
+            "{ptx}"
+        );
         assert!(ptx.contains("TRIM_LEAD:"), "leading must scan front\n{ptx}");
-        assert!(!ptx.contains("TRIM_TRAIL:"), "leading must NOT scan tail\n{ptx}");
+        assert!(
+            !ptx.contains("TRIM_TRAIL:"),
+            "leading must NOT scan tail\n{ptx}"
+        );
     }
 
     #[test]
     fn trim_trailing_len_pass_scans_only_trail() {
         let ptx = compile_varwidth_len_pass(ScalarFnKind::TrimTrailing).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_len_pass_trim_trailing("), "{ptx}");
-        assert!(ptx.contains("TRIM_TRAIL:"), "trailing must scan tail\n{ptx}");
-        assert!(!ptx.contains("TRIM_LEAD:"), "trailing must NOT scan front\n{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_len_pass_trim_trailing("),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains("TRIM_TRAIL:"),
+            "trailing must scan tail\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("TRIM_LEAD:"),
+            "trailing must NOT scan front\n{ptx}"
+        );
     }
 
     // ---- Variable-width write pass ---------------------------------------
@@ -1580,14 +1735,23 @@ mod tests {
     #[test]
     fn upper_write_pass_has_ascii_case_fold_and_loop() {
         let ptx = compile_varwidth_write_pass(ScalarFnKind::Upper).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_write_pass_upper("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_write_pass_upper("),
+            "{ptx}"
+        );
         // The per-byte copy loop structure is load-bearing.
         assert!(ptx.contains("WRITE_LOOP:"), "missing loop label\n{ptx}");
-        assert!(ptx.contains("WRITE_DONE:"), "missing loop exit label\n{ptx}");
+        assert!(
+            ptx.contains("WRITE_DONE:"),
+            "missing loop exit label\n{ptx}"
+        );
         // ASCII upper fold: compare against 'a'(97) and 'z'(122), subtract 32.
         assert!(ptx.contains("97"), "missing 'a' bound\n{ptx}");
         assert!(ptx.contains("122"), "missing 'z' bound\n{ptx}");
-        assert!(ptx.contains("sub.s32 %r12, %r11, 32"), "missing -32 case fold\n{ptx}");
+        assert!(
+            ptx.contains("sub.s32 %r12, %r11, 32"),
+            "missing -32 case fold\n{ptx}"
+        );
         // Per-byte store.
         assert!(ptx.contains("st.global.u8"), "missing byte store\n{ptx}");
     }
@@ -1595,23 +1759,44 @@ mod tests {
     #[test]
     fn lower_write_pass_adds_32_within_az() {
         let ptx = compile_varwidth_write_pass(ScalarFnKind::Lower).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_write_pass_lower("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_write_pass_lower("),
+            "{ptx}"
+        );
         // ASCII lower fold: 'A'(65)/'Z'(90), add 32.
         assert!(ptx.contains("65"), "missing 'A' bound\n{ptx}");
         assert!(ptx.contains("90"), "missing 'Z' bound\n{ptx}");
-        assert!(ptx.contains("add.s32 %r12, %r11, 32"), "missing +32 case fold\n{ptx}");
+        assert!(
+            ptx.contains("add.s32 %r12, %r11, 32"),
+            "missing +32 case fold\n{ptx}"
+        );
     }
 
     #[test]
     fn substring_write_pass_copies_and_takes_start_len() {
         let ptx = compile_varwidth_write_pass(ScalarFnKind::Substring).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_write_pass_substring("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_write_pass_substring("),
+            "{ptx}"
+        );
         // 7-param ABI.
-        assert!(ptx.contains(".param .u32 bolt_str_write_pass_substring_param_5,"), "{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_write_pass_substring_param_6"), "{ptx}");
+        assert!(
+            ptx.contains(".param .u32 bolt_str_write_pass_substring_param_5,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_write_pass_substring_param_6"),
+            "{ptx}"
+        );
         // No case fold for substring: it's a plain byte copy via mov.b32.
-        assert!(ptx.contains("mov.b32 %r13, %r11"), "substring must be a plain copy\n{ptx}");
-        assert!(!ptx.contains("sub.s32 %r12, %r11, 32"), "substring must not case-fold\n{ptx}");
+        assert!(
+            ptx.contains("mov.b32 %r13, %r11"),
+            "substring must be a plain copy\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("sub.s32 %r12, %r11, 32"),
+            "substring must not case-fold\n{ptx}"
+        );
         assert!(ptx.contains("WRITE_LOOP:"), "{ptx}");
     }
 
@@ -1628,9 +1813,15 @@ mod tests {
     #[test]
     fn trim_both_write_pass_copies_kept_window() {
         let ptx = compile_varwidth_write_pass(ScalarFnKind::TrimBoth).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_write_pass_trim_both("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_write_pass_trim_both("),
+            "{ptx}"
+        );
         // 5-param ABI, identical to UPPER/LOWER (no start/len params).
-        assert!(ptx.contains(".param .u32 bolt_str_write_pass_trim_both_param_4"), "{ptx}");
+        assert!(
+            ptx.contains(".param .u32 bolt_str_write_pass_trim_both_param_4"),
+            "{ptx}"
+        );
         assert!(
             !ptx.contains("bolt_str_write_pass_trim_both_param_5"),
             "TRIM write pass must NOT have a 6th param\n{ptx}"
@@ -1639,8 +1830,14 @@ mod tests {
         assert!(ptx.contains("TRIM_LEAD:"), "missing leading scan\n{ptx}");
         assert!(ptx.contains("TRIM_TRAIL:"), "missing trailing scan\n{ptx}");
         // Plain byte copy (no case fold).
-        assert!(ptx.contains("mov.b32 %r13, %r11"), "TRIM must be a plain copy\n{ptx}");
-        assert!(!ptx.contains("sub.s32 %r12, %r11, 32"), "TRIM must not case-fold\n{ptx}");
+        assert!(
+            ptx.contains("mov.b32 %r13, %r11"),
+            "TRIM must be a plain copy\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("sub.s32 %r12, %r11, 32"),
+            "TRIM must not case-fold\n{ptx}"
+        );
         // Shared per-byte copy loop.
         assert!(ptx.contains("WRITE_LOOP:"), "{ptx}");
         assert!(ptx.contains("WRITE_DONE:"), "{ptx}");
@@ -1654,23 +1851,39 @@ mod tests {
     #[test]
     fn trim_leading_write_pass_only_scans_front() {
         let ptx = compile_varwidth_write_pass(ScalarFnKind::TrimLeading).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_write_pass_trim_leading("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_write_pass_trim_leading("),
+            "{ptx}"
+        );
         assert!(ptx.contains("TRIM_LEAD:"), "{ptx}");
-        assert!(!ptx.contains("TRIM_TRAIL:"), "leading must not scan tail\n{ptx}");
+        assert!(
+            !ptx.contains("TRIM_TRAIL:"),
+            "leading must not scan tail\n{ptx}"
+        );
     }
 
     #[test]
     fn trim_trailing_write_pass_only_scans_tail() {
         let ptx = compile_varwidth_write_pass(ScalarFnKind::TrimTrailing).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_write_pass_trim_trailing("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_write_pass_trim_trailing("),
+            "{ptx}"
+        );
         assert!(ptx.contains("TRIM_TRAIL:"), "{ptx}");
-        assert!(!ptx.contains("TRIM_LEAD:"), "trailing must not scan front\n{ptx}");
+        assert!(
+            !ptx.contains("TRIM_LEAD:"),
+            "trailing must not scan front\n{ptx}"
+        );
     }
 
     #[test]
     fn trim_entry_name_helpers_match_emitted_entries() {
         for (kind, len_name, write_name) in [
-            (ScalarFnKind::TrimBoth, "bolt_str_len_pass_trim_both", "bolt_str_write_pass_trim_both"),
+            (
+                ScalarFnKind::TrimBoth,
+                "bolt_str_len_pass_trim_both",
+                "bolt_str_write_pass_trim_both",
+            ),
             (
                 ScalarFnKind::TrimLeading,
                 "bolt_str_len_pass_trim_leading",
@@ -1704,8 +1917,16 @@ mod tests {
         // The host launcher looks functions up by these names; they MUST equal
         // the `.visible .entry` the corresponding compiler emits.
         for (kind, len_name, write_name) in [
-            (ScalarFnKind::Upper, "bolt_str_len_pass_upper", "bolt_str_write_pass_upper"),
-            (ScalarFnKind::Lower, "bolt_str_len_pass_lower", "bolt_str_write_pass_lower"),
+            (
+                ScalarFnKind::Upper,
+                "bolt_str_len_pass_upper",
+                "bolt_str_write_pass_upper",
+            ),
+            (
+                ScalarFnKind::Lower,
+                "bolt_str_len_pass_lower",
+                "bolt_str_write_pass_lower",
+            ),
             (
                 ScalarFnKind::Substring,
                 "bolt_str_len_pass_substring",
@@ -1741,11 +1962,26 @@ mod tests {
         assert!(ptx.contains(".version 7.5"), "{ptx}");
         assert!(ptx.contains(".target sm_70"), "{ptx}");
         // 6-param ABI: offsets, bytes, lit, out_mask, n_rows, lit_len.
-        assert!(ptx.contains(".visible .entry bolt_str_like_match("), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_like_match_param_0,"), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_like_match_param_3,"), "{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_like_match_param_4,"), "{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_like_match_param_5"), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_like_match("),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_like_match_param_0,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_like_match_param_3,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_like_match_param_4,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_like_match_param_5"),
+            "{ptx}"
+        );
         // Output is a single u8 store per row.
         assert!(ptx.contains("st.global.u8"), "missing mask store\n{ptx}");
         // n_rows guard precedes the store.
@@ -1759,7 +1995,10 @@ mod tests {
         let ptx = compile_like_match_kernel(LikeMode::Exact, false).expect("compile");
         // Exact requires n == L: a `setp.ne.u32 %p3, %r8, %r5` (row_len vs L)
         // that branches away on inequality.
-        assert!(ptx.contains("setp.ne.u32 %p3, %r8, %r5"), "exact length-eq check\n{ptx}");
+        assert!(
+            ptx.contains("setp.ne.u32 %p3, %r8, %r5"),
+            "exact length-eq check\n{ptx}"
+        );
         // Byte compare loop present.
         assert!(ptx.contains("CMP_LOOP:"), "{ptx}");
         assert!(ptx.contains("CMP_OK:"), "{ptx}");
@@ -1771,18 +2010,27 @@ mod tests {
     fn like_prefix_emits_ge_length_check_and_no_scan() {
         let ptx = compile_like_match_kernel(LikeMode::Prefix, false).expect("compile");
         // Prefix requires n >= L: a `setp.lt.u32 %p3, %r8, %r5` (fail if n<L).
-        assert!(ptx.contains("setp.lt.u32 %p3, %r8, %r5"), "prefix length-ge check\n{ptx}");
+        assert!(
+            ptx.contains("setp.lt.u32 %p3, %r8, %r5"),
+            "prefix length-ge check\n{ptx}"
+        );
         assert!(ptx.contains("CMP_LOOP:"), "{ptx}");
         assert!(!ptx.contains("SCAN_LOOP:"), "prefix must not scan\n{ptx}");
         // Prefix compares from offset 0 — no suffix base subtraction of n-L.
-        assert!(!ptx.contains("sub.s32 %r14, %r8, %r5"), "prefix has no suffix base\n{ptx}");
+        assert!(
+            !ptx.contains("sub.s32 %r14, %r8, %r5"),
+            "prefix has no suffix base\n{ptx}"
+        );
     }
 
     #[test]
     fn like_suffix_emits_tail_base_offset() {
         let ptx = compile_like_match_kernel(LikeMode::Suffix, false).expect("compile");
         // Suffix computes base = n - L then compares the tail.
-        assert!(ptx.contains("sub.s32 %r14, %r8, %r5"), "suffix base = n - L\n{ptx}");
+        assert!(
+            ptx.contains("sub.s32 %r14, %r8, %r5"),
+            "suffix base = n - L\n{ptx}"
+        );
         assert!(ptx.contains("CMP_LOOP:"), "{ptx}");
         assert!(!ptx.contains("SCAN_LOOP:"), "suffix must not scan\n{ptx}");
     }
@@ -1796,15 +2044,24 @@ mod tests {
         assert!(ptx.contains("SCAN_NEXT:"), "contains advances start\n{ptx}");
         assert!(ptx.contains("CMP_LOOP:"), "contains inner compare\n{ptx}");
         // last_start = n - L.
-        assert!(ptx.contains("sub.s32 %r16, %r8, %r5"), "contains last_start = n - L\n{ptx}");
+        assert!(
+            ptx.contains("sub.s32 %r16, %r8, %r5"),
+            "contains last_start = n - L\n{ptx}"
+        );
     }
 
     #[test]
     fn like_negated_xors_the_result() {
         let plain = compile_like_match_kernel(LikeMode::Prefix, false).expect("compile");
         let negated = compile_like_match_kernel(LikeMode::Prefix, true).expect("compile");
-        assert!(!plain.contains("xor.b32 %r9, %r9, 1"), "non-negated must not XOR\n{plain}");
-        assert!(negated.contains("xor.b32 %r9, %r9, 1"), "NOT LIKE must XOR the 0/1\n{negated}");
+        assert!(
+            !plain.contains("xor.b32 %r9, %r9, 1"),
+            "non-negated must not XOR\n{plain}"
+        );
+        assert!(
+            negated.contains("xor.b32 %r9, %r9, 1"),
+            "NOT LIKE must XOR the 0/1\n{negated}"
+        );
     }
 
     // ---- N-input CONCAT two-pass producer ---------------------------------
@@ -1813,13 +2070,28 @@ mod tests {
     fn concat_len_pass_2_input_abi_and_sum() {
         let ptx = compile_concat_len_pass(2).expect("compile");
         assert!(ptx.contains(".version 7.5"), "{ptx}");
-        assert!(ptx.contains(".visible .entry bolt_str_concat_len_pass_2("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_concat_len_pass_2("),
+            "{ptx}"
+        );
         // 2 inputs -> 4 pointer params (off0,bytes0,off1,bytes1), then row_lens
         // at param_4 and n_rows at param_5.
-        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_0,"), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_3,"), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_4,"), "row_lens\n{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_concat_len_pass_2_param_5"), "n_rows\n{ptx}");
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_0,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_3,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_len_pass_2_param_4,"),
+            "row_lens\n{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_concat_len_pass_2_param_5"),
+            "n_rows\n{ptx}"
+        );
         assert!(
             !ptx.contains("bolt_str_concat_len_pass_2_param_6"),
             "2-input len pass must NOT have a 7th param\n{ptx}"
@@ -1832,7 +2104,10 @@ mod tests {
             "expected one length-accumulate per input\n{ptx}"
         );
         // A single u32 row_lens store at the end.
-        assert!(ptx.contains("st.global.u32 [%rd12], %r13"), "missing row_lens store\n{ptx}");
+        assert!(
+            ptx.contains("st.global.u32 [%rd12], %r13"),
+            "missing row_lens store\n{ptx}"
+        );
         // n_rows guard precedes the store.
         let guard = ptx.find("bra DONE").expect("guard");
         let store = ptx.find("st.global.u32 [%rd12]").expect("store");
@@ -1842,11 +2117,23 @@ mod tests {
     #[test]
     fn concat_len_pass_3_input_has_three_accumulates() {
         let ptx = compile_concat_len_pass(3).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_concat_len_pass_3("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_concat_len_pass_3("),
+            "{ptx}"
+        );
         // 3 inputs -> 6 pointer params; row_lens at param_6, n_rows at param_7.
-        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_3_param_5,"), "{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_concat_len_pass_3_param_6,"), "row_lens\n{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_concat_len_pass_3_param_7"), "n_rows\n{ptx}");
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_len_pass_3_param_5,"),
+            "{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_len_pass_3_param_6,"),
+            "row_lens\n{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_concat_len_pass_3_param_7"),
+            "n_rows\n{ptx}"
+        );
         assert_eq!(
             ptx.matches("add.s32 %r13, %r13, %r7").count(),
             3,
@@ -1857,16 +2144,34 @@ mod tests {
     #[test]
     fn concat_write_pass_2_input_abi_and_loops() {
         let ptx = compile_concat_write_pass(2).expect("compile");
-        assert!(ptx.contains(".visible .entry bolt_str_concat_write_pass_2("), "{ptx}");
+        assert!(
+            ptx.contains(".visible .entry bolt_str_concat_write_pass_2("),
+            "{ptx}"
+        );
         // 2 inputs -> 4 pointer params, then out_offsets (param_4), out_bytes
         // (param_5), n_rows (param_6).
-        assert!(ptx.contains(".param .u64 bolt_str_concat_write_pass_2_param_4,"), "out_offsets\n{ptx}");
-        assert!(ptx.contains(".param .u64 bolt_str_concat_write_pass_2_param_5,"), "out_bytes\n{ptx}");
-        assert!(ptx.contains(".param .u32 bolt_str_concat_write_pass_2_param_6"), "n_rows\n{ptx}");
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_write_pass_2_param_4,"),
+            "out_offsets\n{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u64 bolt_str_concat_write_pass_2_param_5,"),
+            "out_bytes\n{ptx}"
+        );
+        assert!(
+            ptx.contains(".param .u32 bolt_str_concat_write_pass_2_param_6"),
+            "n_rows\n{ptx}"
+        );
         // One copy loop per input, in order.
-        assert!(ptx.contains("CONCAT_WRITE_LOOP_0:"), "missing input-0 copy loop\n{ptx}");
+        assert!(
+            ptx.contains("CONCAT_WRITE_LOOP_0:"),
+            "missing input-0 copy loop\n{ptx}"
+        );
         assert!(ptx.contains("CONCAT_WRITE_DONE_0:"), "{ptx}");
-        assert!(ptx.contains("CONCAT_WRITE_LOOP_1:"), "missing input-1 copy loop\n{ptx}");
+        assert!(
+            ptx.contains("CONCAT_WRITE_LOOP_1:"),
+            "missing input-1 copy loop\n{ptx}"
+        );
         assert!(ptx.contains("CONCAT_WRITE_DONE_1:"), "{ptx}");
         assert!(
             !ptx.contains("CONCAT_WRITE_LOOP_2:"),
@@ -1876,7 +2181,10 @@ mod tests {
         assert!(ptx.contains("ld.global.nc.u8 %rs0"), "{ptx}");
         assert!(ptx.contains("st.global.u8 [%rd24], %rs0"), "{ptx}");
         // Running cursor advances by the same in_len (%r9) the length pass summed.
-        assert!(ptx.contains("add.s64 %rd30, %rd30, %rd25"), "cursor advance\n{ptx}");
+        assert!(
+            ptx.contains("add.s64 %rd30, %rd30, %rd25"),
+            "cursor advance\n{ptx}"
+        );
     }
 
     #[test]
@@ -1898,8 +2206,14 @@ mod tests {
         let len = compile_concat_len_pass(2).unwrap();
         let write = compile_concat_write_pass(2).unwrap();
         // Both passes emit `sub.s32 <len>, %r6, %r5` (end - begin) per input.
-        assert!(len.contains("sub.s32 %r7, %r6, %r5"), "len pass in_len calc\n{len}");
-        assert!(write.contains("sub.s32 %r9, %r6, %r5"), "write pass in_len calc\n{write}");
+        assert!(
+            len.contains("sub.s32 %r7, %r6, %r5"),
+            "len pass in_len calc\n{len}"
+        );
+        assert!(
+            write.contains("sub.s32 %r9, %r6, %r5"),
+            "write pass in_len calc\n{write}"
+        );
         // Same number of slice loads (one per input) in each pass.
         assert_eq!(len.matches("sub.s32 %r7, %r6, %r5").count(), 2, "{len}");
         assert_eq!(write.matches("sub.s32 %r9, %r6, %r5").count(), 2, "{write}");
@@ -1938,7 +2252,12 @@ mod tests {
     #[test]
     fn like_all_modes_handle_empty_literal() {
         // Every mode short-circuits L==0 before the per-byte loop (no OOB read).
-        for mode in [LikeMode::Exact, LikeMode::Prefix, LikeMode::Suffix, LikeMode::Contains] {
+        for mode in [
+            LikeMode::Exact,
+            LikeMode::Prefix,
+            LikeMode::Suffix,
+            LikeMode::Contains,
+        ] {
             let ptx = compile_like_match_kernel(mode, false).expect("compile");
             assert!(
                 ptx.contains("setp.ne.u32 %p1, %r5, 0"),

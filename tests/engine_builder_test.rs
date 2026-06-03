@@ -159,21 +159,14 @@ fn builder_constructed_engine_can_run_sql() {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "x",
-        DataType::Int32,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as _],
     )
     .expect("build record batch");
 
-    let mut engine = Engine::builder()
-        .device(0)
-        .build()
-        .expect("build engine");
+    let mut engine = Engine::builder().device(0).build().expect("build engine");
     engine.register_table("t", batch).expect("register table");
     let handle = engine
         .sql("SELECT x FROM t")

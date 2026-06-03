@@ -102,7 +102,9 @@ impl Xorshift64Star {
 pub fn shuffle_deterministic<T: Copy>(xs: &mut [T], seed: u64) {
     let mut s = seed;
     for i in (1..xs.len()).rev() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (s as usize) % (i + 1);
         xs.swap(i, j);
     }

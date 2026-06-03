@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY SUM orchestrator (head of the chain).
 //!
@@ -84,9 +84,9 @@ pub(crate) const PARTITION_REDUCE_SPILL_PREFIX: &str = "partition_reduce spill:"
 
 // The `stub_` aliases are historical names kept to minimise call-site churn;
 // they bind to the real GPU pipeline modules.
+use crate::exec::partition_offsets as stub_partition_offsets;
 use crate::jit::partition_kernel as stub_partition_kernel;
 use crate::jit::scatter_kernel as stub_scatter_kernel;
-use crate::exec::partition_offsets as stub_partition_offsets;
 // This file (Tier 2.1) owns:
 use crate::jit::partition_reduce_kernel;
 
@@ -125,7 +125,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => stub_partition_kernel::compile_partition_kernel()?,
-            KernelSpec::PartitionShmemStaging => stub_partition_kernel::compile_partition_kernel_shmem_staging()?,
+            KernelSpec::PartitionShmemStaging => {
+                stub_partition_kernel::compile_partition_kernel_shmem_staging()?
+            }
             KernelSpec::Scatter => stub_scatter_kernel::compile_scatter_kernel()?,
             // Batch 4: spill-counter-aware variant — MAX_PROBES overflow
             // surfaces as a structured error instead of silently dropping
@@ -149,7 +151,6 @@ fn partition_spec_for(n_rows: u32) -> KernelSpec {
         KernelSpec::Partition
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -234,7 +235,8 @@ pub fn execute_tier2_sum(
     // ----------------------------------------------------------------------
     // Step 1. Allocate the partition-pass outputs.
     // ----------------------------------------------------------------------
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut counts: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
@@ -290,10 +292,7 @@ pub fn execute_tier2_sum(
     // D2H of the counts and the H2D of the bases. Net: 2 syncs → 1.
     // ----------------------------------------------------------------------
     let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
-        stub_partition_offsets::compute_and_upload_partition_offsets_async(
-            &counts,
-            stream.raw(),
-        )?;
+        stub_partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
     if offsets.len() != (num_partitions as usize) + 1 {
         return Err(BoltError::Other(format!(
             "tier2: prefix-sum returned {} offsets, expected {}",
@@ -314,7 +313,8 @@ pub fn execute_tier2_sum(
     // ----------------------------------------------------------------------
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_rows as usize, stream.raw())?;
     let mut scatter_vals: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
     // Step 5. JIT + launch the scatter kernel.
@@ -383,8 +383,7 @@ pub fn execute_tier2_sum(
     if (offsets[num_partitions as usize] as usize) != n_rows_usize {
         return Err(BoltError::Other(format!(
             "tier2: offsets[K]={}, expected n_rows={}",
-            offsets[num_partitions as usize],
-            n_rows
+            offsets[num_partitions as usize], n_rows
         )));
     }
 
@@ -497,8 +496,7 @@ pub fn execute_tier2_sum(
     // empty `(vec![], vec![])` to preserve the length invariant on
     // `Tier2PartialResult.per_partition`.
     let block_groups = partition_reduce_kernel::BLOCK_GROUPS as usize;
-    let mut per_partition: Vec<(Vec<i32>, Vec<f64>)> =
-        Vec::with_capacity(num_partitions as usize);
+    let mut per_partition: Vec<(Vec<i32>, Vec<f64>)> = Vec::with_capacity(num_partitions as usize);
 
     for pid in 0..num_partitions as usize {
         let base = pid * block_groups;
@@ -572,7 +570,10 @@ mod tests {
             "Tier2PartialResult must always carry NUM_PARTITIONS slots"
         );
         for (k, v) in &result.per_partition {
-            assert!(k.is_empty() && v.is_empty(), "empty input yields empty partitions");
+            assert!(
+                k.is_empty() && v.is_empty(),
+                "empty input yields empty partitions"
+            );
         }
     }
 
@@ -635,7 +636,10 @@ mod tests {
             msg.contains("partition_reduce spill:"),
             "spill-error message must contain the stable prefix; got {msg}"
         );
-        assert!(msg.contains("42"), "spill count must appear in message; got {msg}");
+        assert!(
+            msg.contains("42"),
+            "spill count must appear in message; got {msg}"
+        );
     }
 
     /// GPU-gated: construct a workload where >BLOCK_GROUPS distinct keys
@@ -792,8 +796,7 @@ mod tests {
         // a buggy prefix-sum could produce. The reduce kernel would read it
         // as a slice `[10, 4)` which wraps to a huge range and walks OOB.
         let bad = [0u32, 5, 10, 4, 12, 20];
-        let err =
-            validate_offsets_monotonic(&bad, "tier2").expect_err("non-monotonic must fail");
+        let err = validate_offsets_monotonic(&bad, "tier2").expect_err("non-monotonic must fail");
         let msg = format!("{err}");
         assert!(
             msg.contains("not monotonic"),

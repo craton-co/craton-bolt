@@ -283,11 +283,7 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 /// `SPILL_BUMP` overflow handler and drops the collision-advance back-off; the
 /// i64 spill variant null-checks the counter pointer (the i32 spill variant,
 /// older, bumps unconditionally — preserved for byte-stable golden parity).
-pub(crate) fn emit_sum_kernel(
-    key_width: KeyWidth,
-    spill: bool,
-    entry: &str,
-) -> BoltResult<String> {
+pub(crate) fn emit_sum_kernel(key_width: KeyWidth, spill: bool, entry: &str) -> BoltResult<String> {
     let mut ptx = String::new();
     let block_groups = BLOCK_GROUPS;
     let mask = BLOCK_GROUPS - 1;
@@ -668,8 +664,12 @@ fn emit_export(
 
     writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
     writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 {loop_pred}, %r41, {bg};", bg = block_groups)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 {loop_pred}, %r41, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\t@{loop_pred} bra EXPORT_DONE;").map_err(write_err)?;
 
     // global_slot = %r40 + %r41
@@ -907,7 +907,10 @@ mod tests {
     fn output_is_deterministic() {
         let a = compile_partition_reduce_kernel().expect("compile a");
         let b = compile_partition_reduce_kernel().expect("compile b");
-        assert_eq!(a, b, "partition_reduce kernel emitter must be deterministic");
+        assert_eq!(
+            a, b,
+            "partition_reduce kernel emitter must be deterministic"
+        );
     }
 
     /// Linear-probe pattern detectable via labels: PROBE_TOP / CLAIM /
@@ -916,7 +919,10 @@ mod tests {
     #[test]
     fn has_linear_probe_structure() {
         let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
-        assert!(ptx.contains("PROBE_TOP:"), "PTX must label PROBE_TOP:\n{ptx}");
+        assert!(
+            ptx.contains("PROBE_TOP:"),
+            "PTX must label PROBE_TOP:\n{ptx}"
+        );
         assert!(ptx.contains("CLAIM:"), "PTX must label CLAIM:\n{ptx}");
         assert!(ptx.contains("MATCH:"), "PTX must label MATCH:\n{ptx}");
         // The collision-advance branches back to PROBE_TOP; the bounded
@@ -949,8 +955,8 @@ mod tests {
     #[ignore]
     fn ptx_loads_into_cuda_driver() {
         let ptx = compile_partition_reduce_kernel().expect("kernel compiles");
-        let module = crate::jit::CudaModule::from_ptx(&ptx)
-            .expect("PTX should load via cuModuleLoadDataEx");
+        let module =
+            crate::jit::CudaModule::from_ptx(&ptx).expect("PTX should load via cuModuleLoadDataEx");
         let _fn = module
             .function(KERNEL_ENTRY)
             .expect("kernel entry point should be reachable");

@@ -134,11 +134,7 @@ pub(crate) fn emit_spill_bump_with_null_check(
     writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
     writeln!(ptx, "\tsetp.eq.u64 %p5, %rd{rd_spill_idx}, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra LOOP_NEXT;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tatom.global.add.u32 %r36, [%rd{rd_spill_idx}], 1;"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd{rd_spill_idx}], 1;").map_err(write_err)?;
     Ok(())
 }
 
@@ -153,16 +149,9 @@ pub(crate) fn emit_spill_bump_with_null_check(
 /// SPILL_BUMP:
 /// \tatom.global.add.u32 %r36, [%rd9], 1;
 /// ```
-pub(crate) fn emit_spill_bump_unchecked(
-    ptx: &mut String,
-    rd_spill_idx: u32,
-) -> BoltResult<()> {
+pub(crate) fn emit_spill_bump_unchecked(ptx: &mut String, rd_spill_idx: u32) -> BoltResult<()> {
     writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tatom.global.add.u32 %r36, [%rd{rd_spill_idx}], 1;"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd{rd_spill_idx}], 1;").map_err(write_err)?;
     Ok(())
 }
 

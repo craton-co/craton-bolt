@@ -140,8 +140,7 @@ fn parse_group_by_string_column_supported() {
     // contract the frontend owns; the executor surface is covered by
     // `groupby_with_pre.rs`'s in-module test.
     let provider = s_provider();
-    parse_sql("SELECT s, COUNT(*) FROM t GROUP BY s", &provider)
-        .expect("GROUP BY Utf8 must parse");
+    parse_sql("SELECT s, COUNT(*) FROM t GROUP BY s", &provider).expect("GROUP BY Utf8 must parse");
 }
 
 #[test]
@@ -161,8 +160,7 @@ fn parse_upper_supported_by_frontend() {
     // scalar-function support landed. End-to-end execution is covered by the
     // gpu:string tests below.
     let provider = s_provider();
-    parse_sql("SELECT UPPER(s) FROM t", &provider)
-        .expect("UPPER(s) must parse and lower in v0.5");
+    parse_sql("SELECT UPPER(s) FROM t", &provider).expect("UPPER(s) must parse and lower in v0.5");
 }
 
 #[test]
@@ -170,8 +168,7 @@ fn parse_lower_supported_by_frontend() {
     // v0.5: LOWER is now accepted by the frontend, lowering to
     // `Expr::ScalarFn { kind: Lower, .. }`.
     let provider = s_provider();
-    parse_sql("SELECT LOWER(s) FROM t", &provider)
-        .expect("LOWER(s) must parse and lower in v0.5");
+    parse_sql("SELECT LOWER(s) FROM t", &provider).expect("LOWER(s) must parse and lower in v0.5");
 }
 
 #[test]
@@ -196,8 +193,7 @@ fn parse_substr_rejected_by_frontend() {
         .expect_err("SUBSTR is not yet supported by the frontend");
     let msg = format!("{err}");
     assert!(
-        msg.contains("SUBSTR")
-            || msg.contains("scalar function calls are not supported"),
+        msg.contains("SUBSTR") || msg.contains("scalar function calls are not supported"),
         "unexpected error for SUBSTR: {msg}"
     );
 }
@@ -242,8 +238,7 @@ fn parse_string_concat_type_mismatch_rejected() {
     let provider = sv_provider();
     let plan = parse_sql("SELECT s || v FROM t", &provider)
         .expect("s || v parses structurally; type-check happens at lowering");
-    let err = lower_physical(&plan)
-        .expect_err("s (Utf8) || v (Int64) must reject as a type error");
+    let err = lower_physical(&plan).expect_err("s (Utf8) || v (Int64) must reject as a type error");
     let msg = format!("{err}");
     assert!(
         msg.contains("Utf8") || msg.contains("requires Utf8"),
@@ -281,11 +276,8 @@ fn parse_like_constant_pattern_supported_v05() {
 
     // ESCAPE is now supported too: the frontend lowers `LIKE .. ESCAPE c`
     // to `Like { escape: Some(c), .. }`.
-    parse_sql(
-        r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",
-        &provider,
-    )
-    .expect("LIKE ... ESCAPE must parse in v0.5");
+    parse_sql(r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'", &provider)
+        .expect("LIKE ... ESCAPE must parse in v0.5");
 }
 
 #[test]
@@ -296,8 +288,8 @@ fn parse_trim_supported_by_frontend() {
     // StringProject (host-realized two-pass producer).
     use craton_bolt::plan::{lower_physical, PhysicalPlan};
     let provider = s_provider();
-    let plan = parse_sql("SELECT TRIM(s) FROM t", &provider)
-        .expect("TRIM(s) now parses at the frontend");
+    let plan =
+        parse_sql("SELECT TRIM(s) FROM t", &provider).expect("TRIM(s) now parses at the frontend");
     let phys = lower_physical(&plan).expect("TRIM(s) lowers");
     assert!(
         matches!(phys, PhysicalPlan::StringProject { .. }),
@@ -324,10 +316,7 @@ fn where_string_equality_returns_matching_rows() {
     use craton_bolt::Engine;
 
     let mut engine = Engine::new().expect("ctx");
-    let batch = sv_batch(
-        &["foo", "bar", "foo", "baz", "foo"],
-        &[1, 2, 3, 4, 5],
-    );
+    let batch = sv_batch(&["foo", "bar", "foo", "baz", "foo"], &[1, 2, 3, 4, 5]);
     engine.register_table("t", batch).expect("register");
 
     let h = engine
@@ -342,7 +331,10 @@ fn where_string_equality_returns_matching_rows() {
     // The engine compacts filter output, so `out` holds exactly the matching
     // rows' `v` values. The `!= 0` filter is a harmless safety net (none of the
     // fixture values are 0) that also tolerated the older non-compacting path.
-    let mut got: Vec<i64> = (0..v.len()).map(|i| v.value(i)).filter(|x| *x != 0).collect();
+    let mut got: Vec<i64> = (0..v.len())
+        .map(|i| v.value(i))
+        .filter(|x| *x != 0)
+        .collect();
     got.sort();
     assert_eq!(
         got,
@@ -359,10 +351,7 @@ fn where_string_inequality_returns_complement_rows() {
     use craton_bolt::Engine;
 
     let mut engine = Engine::new().expect("ctx");
-    let batch = sv_batch(
-        &["foo", "bar", "foo", "baz", "foo"],
-        &[1, 2, 3, 4, 5],
-    );
+    let batch = sv_batch(&["foo", "bar", "foo", "baz", "foo"], &[1, 2, 3, 4, 5]);
     engine.register_table("t", batch).expect("register");
 
     let h = engine
@@ -374,7 +363,10 @@ fn where_string_inequality_returns_complement_rows() {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("v is Int64");
-    let mut got: Vec<i64> = (0..v.len()).map(|i| v.value(i)).filter(|x| *x != 0).collect();
+    let mut got: Vec<i64> = (0..v.len())
+        .map(|i| v.value(i))
+        .filter(|x| *x != 0)
+        .collect();
     got.sort();
     assert_eq!(
         got,

@@ -175,7 +175,12 @@ impl JoinReorder {
 
     fn recurse_children(&self, plan: LogicalPlan) -> LogicalPlan {
         match plan {
-            LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+            LogicalPlan::Window {
+                input,
+                window_exprs,
+                partition_by,
+                order_by,
+            } => LogicalPlan::Window {
                 input: Box::new(self.rewrite_plan(*input)),
                 window_exprs,
                 partition_by,
@@ -218,7 +223,12 @@ impl JoinReorder {
             LogicalPlan::Union { inputs } => LogicalPlan::Union {
                 inputs: inputs.into_iter().map(|i| self.rewrite_plan(i)).collect(),
             },
-            LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => LogicalPlan::SetOp {
                 left: Box::new(self.rewrite_plan(*left)),
                 right: Box::new(self.rewrite_plan(*right)),
                 op,
@@ -465,8 +475,8 @@ fn column_names(plan: &LogicalPlan) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::logical_plan::{DataType, Field, Schema};
     use crate::plan::col;
+    use crate::plan::logical_plan::{DataType, Field, Schema};
 
     fn leaf(table: &str, col_name: &str) -> LogicalPlan {
         LogicalPlan::Scan {
@@ -520,7 +530,11 @@ mod tests {
         let plan = three_way();
         let before = format!("{:?}", plan);
         let out = JoinReorder::default().rewrite(plan).expect("noop");
-        assert_eq!(before, format!("{:?}", out), "NoStats must leave order stable");
+        assert_eq!(
+            before,
+            format!("{:?}", out),
+            "NoStats must leave order stable"
+        );
     }
 
     #[test]
@@ -544,7 +558,9 @@ mod tests {
         assert_eq!(bset, aset, "reorder must preserve the output column set");
         // It should still be a 2-level left-deep INNER join tree.
         match &out {
-            LogicalPlan::Join { left, join_type, .. } => {
+            LogicalPlan::Join {
+                left, join_type, ..
+            } => {
                 assert_eq!(*join_type, JoinType::Inner);
                 assert!(matches!(**left, LogicalPlan::Join { .. }));
             }
@@ -704,8 +720,18 @@ mod tests {
             }
         }
         fn go(plan: &LogicalPlan, out: &mut Vec<String>) {
-            if let LogicalPlan::Join { left, right, on, filter, .. } = plan {
-                assert!(filter.is_none(), "reorder must not introduce a residual filter");
+            if let LogicalPlan::Join {
+                left,
+                right,
+                on,
+                filter,
+                ..
+            } = plan
+            {
+                assert!(
+                    filter.is_none(),
+                    "reorder must not introduce a residual filter"
+                );
                 for (l, r) in on {
                     out.push(pair_key(l, r));
                 }
@@ -740,7 +766,11 @@ mod tests {
             "the set of equi-join predicates must be identical after reordering"
         );
         // And concretely: both original keys are still present.
-        assert_eq!(after_pairs.len(), 2, "exactly the two original ON pairs remain");
+        assert_eq!(
+            after_pairs.len(),
+            2,
+            "exactly the two original ON pairs remain"
+        );
     }
 
     /// Build a 4-leaf chain a-b-c-d connected as two cheap pairs (a-b, c-d)
@@ -820,7 +850,11 @@ mod tests {
         let out = pass.rewrite(plan).expect("reorder");
 
         // (a) all four leaves present.
-        assert_eq!(total_leaves(&out), 4, "all four input relations must survive");
+        assert_eq!(
+            total_leaves(&out),
+            4,
+            "all four input relations must survive"
+        );
         // (b) + (c) every predicate preserved, no residual filter.
         assert_eq!(
             before_pairs,

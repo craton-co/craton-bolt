@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for the predicate-only "scan" kernel used by filter compaction.
 //!
@@ -163,9 +163,10 @@ impl RegAlloc {
 
     /// Look up the physical register name previously assigned to `reg`.
     fn get(&self, reg: Reg) -> BoltResult<&str> {
-        self.mapping.get(&reg).map(|s| s.as_str()).ok_or_else(|| {
-            BoltError::Other(format!("scan_kernel: undefined register {:?}", reg))
-        })
+        self.mapping
+            .get(&reg)
+            .map(|s| s.as_str())
+            .ok_or_else(|| BoltError::Other(format!("scan_kernel: undefined register {:?}", reg)))
     }
 
     /// Map a logical dtype to a PTX register class string.
@@ -444,9 +445,11 @@ fn emit_op(
     tid: &str,
 ) -> BoltResult<()> {
     match op {
-        Op::LoadColumn { dst, col_idx, dtype } => {
-            emit_load(b, *dst, *col_idx, *dtype, input_ptrs, tid)
-        }
+        Op::LoadColumn {
+            dst,
+            col_idx,
+            dtype,
+        } => emit_load(b, *dst, *col_idx, *dtype, input_ptrs, tid),
         Op::Const { dst, lit } => emit_const(b, *dst, lit),
         Op::Cast { dst, src, from, to } => emit_cast(b, *dst, *src, *from, *to),
         Op::Binary {
@@ -635,7 +638,11 @@ fn emit_is_null_check(
 
     let dst_name = b.alloc.assign(dst, DataType::Bool)?;
     let pred = b.alloc.alloc("p");
-    let cmp = if want_null { "setp.eq.u32" } else { "setp.ne.u32" };
+    let cmp = if want_null {
+        "setp.eq.u32"
+    } else {
+        "setp.ne.u32"
+    };
     emit_fmt!(b, "{} {}, {}, 0;", cmp, pred, byte_reg)?;
     emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, pred)?;
     Ok(())
@@ -821,11 +828,7 @@ fn emit_cast(
                 Int64 => "s64",
                 Float32 => "f32",
                 Float64 => "f64",
-                Utf8 => {
-                    return Err(BoltError::Other(
-                        "scan_kernel: cannot cast Utf8".into(),
-                    ))
-                }
+                Utf8 => return Err(BoltError::Other("scan_kernel: cannot cast Utf8".into())),
                 Decimal128(_, _) => {
                     return Err(BoltError::Plan(
                         "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
@@ -1073,7 +1076,13 @@ fn emit_add_128(
     let b_lo_name = b.alloc.get(b_lo)?.to_string();
     let b_hi_name = b.alloc.get(b_hi)?.to_string();
     let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    emit_fmt!(b, "add.cc.u64 {}, {}, {};", dst_lo_name, a_lo_name, b_lo_name)?;
+    emit_fmt!(
+        b,
+        "add.cc.u64 {}, {}, {};",
+        dst_lo_name,
+        a_lo_name,
+        b_lo_name
+    )?;
     emit_fmt!(b, "addc.u64 {}, {}, {};", dst_hi_name, a_hi_name, b_hi_name)?;
     Ok(())
 }
@@ -1094,7 +1103,13 @@ fn emit_sub_128(
     let b_lo_name = b.alloc.get(b_lo)?.to_string();
     let b_hi_name = b.alloc.get(b_hi)?.to_string();
     let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    emit_fmt!(b, "sub.cc.u64 {}, {}, {};", dst_lo_name, a_lo_name, b_lo_name)?;
+    emit_fmt!(
+        b,
+        "sub.cc.u64 {}, {}, {};",
+        dst_lo_name,
+        a_lo_name,
+        b_lo_name
+    )?;
     emit_fmt!(b, "subc.u64 {}, {}, {};", dst_hi_name, a_hi_name, b_hi_name)?;
     Ok(())
 }
@@ -1118,7 +1133,13 @@ fn emit_mul_128(
     let cross1 = b.alloc.alloc("rl");
     let cross2 = b.alloc.alloc("rl");
     let (dst_lo_name, dst_hi_name) = b.alloc.assign_pair(dst_lo, dst_hi)?;
-    emit_fmt!(b, "mul.lo.u64 {}, {}, {};", dst_lo_name, a_lo_name, b_lo_name)?;
+    emit_fmt!(
+        b,
+        "mul.lo.u64 {}, {}, {};",
+        dst_lo_name,
+        a_lo_name,
+        b_lo_name
+    )?;
     emit_fmt!(b, "mul.hi.u64 {}, {}, {};", hi_acc, a_lo_name, b_lo_name)?;
     emit_fmt!(b, "mul.lo.u64 {}, {}, {};", cross1, a_lo_name, b_hi_name)?;
     emit_fmt!(b, "mul.lo.u64 {}, {}, {};", cross2, a_hi_name, b_lo_name)?;
@@ -1289,11 +1310,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         Int64 => "s64",
         Float32 => "f32",
         Float64 => "f64",
-        Utf8 => {
-            return Err(BoltError::Other(
-                "scan_kernel: cannot compare Utf8".into(),
-            ))
-        }
+        Utf8 => return Err(BoltError::Other("scan_kernel: cannot compare Utf8".into())),
         Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
@@ -1342,9 +1359,9 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
 
 /// Byte width of `dtype`, or an error for variable-width types.
 fn byte_width(dtype: DataType) -> BoltResult<usize> {
-    dtype.byte_width().ok_or_else(|| {
-        BoltError::Other(format!("scan_kernel: variable-width dtype {:?}", dtype))
-    })
+    dtype
+        .byte_width()
+        .ok_or_else(|| BoltError::Other(format!("scan_kernel: variable-width dtype {:?}", dtype)))
 }
 
 // V-12: the previous weaker local `validate_kernel_name` (only empty /
@@ -1514,8 +1531,8 @@ mod tests {
     fn rejects_utf8_input() {
         let mut spec = region_eq_1_spec();
         spec.inputs[0].dtype = DataType::Utf8;
-        let err = compile_predicate_kernel(&spec, "bolt_predicate")
-            .expect_err("must reject Utf8 inputs");
+        let err =
+            compile_predicate_kernel(&spec, "bolt_predicate").expect_err("must reject Utf8 inputs");
         assert!(format!("{}", err).contains("Utf8"));
     }
 
@@ -1554,9 +1571,6 @@ mod tests {
         // `_param_` substring would collide with synthesised parameter names.
         let err = compile_predicate_kernel(&spec, "bolt_param_evil")
             .expect_err("must reject kernel name containing `_param_`");
-        assert!(
-            format!("{}", err).contains("_param_"),
-            "got: {err}"
-        );
+        assert!(format!("{}", err).contains("_param_"), "got: {err}");
     }
 }

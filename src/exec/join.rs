@@ -60,14 +60,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::types::{Int32Type as ArrowInt32Type, Int64Type as ArrowInt64Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow_array::types::{Int32Type as ArrowInt32Type, Int64Type as ArrowInt64Type};
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::{Engine, QueryHandle};
@@ -201,7 +199,13 @@ fn execute_inner_join(
 
     let build_idx = lookup_columns(build_batch, build_keys)?;
     let probe_idx = lookup_columns(probe_batch, probe_keys)?;
-    check_key_dtypes(build_batch, &build_idx, probe_batch, &probe_idx, "INNER JOIN")?;
+    check_key_dtypes(
+        build_batch,
+        &build_idx,
+        probe_batch,
+        &probe_idx,
+        "INNER JOIN",
+    )?;
 
     // GPU fast path — single equi-key, Int32/Int64, both sides large enough,
     // no NULLs, unique build keys. On any gate miss this returns Ok(None)
@@ -363,7 +367,13 @@ fn execute_outer_join(
 
     let build_idx = lookup_columns(build_batch, build_keys)?;
     let probe_idx = lookup_columns(probe_batch, probe_keys)?;
-    check_key_dtypes(build_batch, &build_idx, probe_batch, &probe_idx, "OUTER JOIN")?;
+    check_key_dtypes(
+        build_batch,
+        &build_idx,
+        probe_batch,
+        &probe_idx,
+        "OUTER JOIN",
+    )?;
 
     // Stage-2 GPU OUTER fast path. Gate-misses return Ok(None); kernel
     // failures fall through to the host path with a debug log.
@@ -466,13 +476,11 @@ fn execute_cross_join(
     // Cartesian explosion cap. `arrow::compute::take` takes a
     // `UInt32Array`, so even on a 64-bit host the index space is bounded
     // by u32::MAX. Anything larger is rejected with a clear error.
-    let total = n_left
-        .checked_mul(n_right)
-        .ok_or_else(|| {
-            BoltError::Plan(format!(
-                "CROSS JOIN cartesian product overflows u64: {n_left} × {n_right}"
-            ))
-        })?;
+    let total = n_left.checked_mul(n_right).ok_or_else(|| {
+        BoltError::Plan(format!(
+            "CROSS JOIN cartesian product overflows u64: {n_left} × {n_right}"
+        ))
+    })?;
     if total > MAX_CROSS_ROWS {
         return Err(BoltError::Plan(format!(
             "CROSS JOIN cartesian product is too large: {n_left} × {n_right} = {total} rows \
@@ -487,16 +495,10 @@ fn execute_cross_join(
     if total >= crate::exec::gpu_join::CROSS_JOIN_GPU_MIN_CELLS
         && total < crate::exec::gpu_join::CROSS_JOIN_GPU_CELL_CAP
     {
-        match crate::exec::gpu_join::execute_cross_join_on_gpu(
-            &lhs,
-            &rhs,
-            arrow_schema.clone(),
-        ) {
+        match crate::exec::gpu_join::execute_cross_join_on_gpu(&lhs, &rhs, arrow_schema.clone()) {
             Ok(batch) => return Ok(QueryHandle::from_record_batch(batch)),
             Err(e) => {
-                log::debug!(
-                    "gpu_join: CROSS GPU path declined ({e}); falling back to host"
-                );
+                log::debug!("gpu_join: CROSS GPU path declined ({e}); falling back to host");
             }
         }
     }
@@ -677,7 +679,11 @@ fn execute_nested_loop_join_chunked(
     // `lhs` and `rhs` keep their (left, right) identity throughout so the
     // cross output column order never changes.
     let chunk_left = lhs.num_rows() >= rhs.num_rows();
-    let outer_rows = if chunk_left { lhs.num_rows() } else { rhs.num_rows() };
+    let outer_rows = if chunk_left {
+        lhs.num_rows()
+    } else {
+        rhs.num_rows()
+    };
 
     let mut matched: Vec<RecordBatch> = Vec::new();
     let mut start = 0usize;
@@ -700,8 +706,8 @@ fn execute_nested_loop_join_chunked(
         // `expr_agg::eval_expr` against the combined-schema columns, so the
         // predicate is evaluated row-by-row in SQL three-valued logic
         // (predicate result of NULL drops the row, matching WHERE semantics).
-        let filtered = crate::exec::filter::execute_filter(cross_handle, pred_ref)?
-            .into_record_batch();
+        let filtered =
+            crate::exec::filter::execute_filter(cross_handle, pred_ref)?.into_record_batch();
         if filtered.num_rows() > 0 {
             matched.push(filtered);
         }
@@ -716,8 +722,7 @@ fn execute_nested_loop_join_chunked(
     // Concatenate the matched blocks. Every block carries the identical
     // combined schema (`arrow_schema`), so `concat_batches` simply stacks
     // them; column order is preserved exactly.
-    let out = arrow::compute::concat_batches(&arrow_schema, matched.iter())
-        .map_err(arrow_err)?;
+    let out = arrow::compute::concat_batches(&arrow_schema, matched.iter()).map_err(arrow_err)?;
     Ok(QueryHandle::from_record_batch(out))
 }
 
@@ -840,8 +845,7 @@ fn build_hash_map(
     build_batch: &RecordBatch,
     build_idx: &[usize],
 ) -> BoltResult<HashMap<JoinKey, BuildSlot>> {
-    let mut map: HashMap<JoinKey, BuildSlot> =
-        HashMap::with_capacity(build_batch.num_rows());
+    let mut map: HashMap<JoinKey, BuildSlot> = HashMap::with_capacity(build_batch.num_rows());
     for row in 0..build_batch.num_rows() {
         if let Some(key) = extract_key(build_batch, build_idx, row)? {
             let row_u32 = row_to_u32(row)?;
@@ -855,11 +859,7 @@ fn build_hash_map(
 
 /// Re-orient (build, probe) pairs into (left, right). The Indices enum
 /// keeps the null-vs-dense distinction intact through the swap.
-fn orient_indices(
-    build_is_left: bool,
-    build: Indices,
-    probe: Indices,
-) -> (Indices, Indices) {
+fn orient_indices(build_is_left: bool, build: Indices, probe: Indices) -> (Indices, Indices) {
     if build_is_left {
         (build, probe)
     } else {
@@ -881,14 +881,10 @@ fn materialise(
 
     let mut output_cols: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
     for col in lhs.columns() {
-        output_cols.push(
-            arrow::compute::take(col.as_ref(), &left_arr, None).map_err(arrow_err)?,
-        );
+        output_cols.push(arrow::compute::take(col.as_ref(), &left_arr, None).map_err(arrow_err)?);
     }
     for col in rhs.columns() {
-        output_cols.push(
-            arrow::compute::take(col.as_ref(), &right_arr, None).map_err(arrow_err)?,
-        );
+        output_cols.push(arrow::compute::take(col.as_ref(), &right_arr, None).map_err(arrow_err)?);
     }
 
     let out = RecordBatch::try_new(arrow_schema, output_cols).map_err(arrow_err)?;
@@ -1048,11 +1044,7 @@ impl std::hash::Hash for JoinKey {
 /// Pull the (build_idx, ...) tuple of values for `row` out of `batch`.
 /// Returns `Ok(None)` if any key column is NULL at that row — the
 /// SQL "NULL keys never match" rule, applied uniformly to both sides.
-fn extract_key(
-    batch: &RecordBatch,
-    indices: &[usize],
-    row: usize,
-) -> BoltResult<Option<JoinKey>> {
+fn extract_key(batch: &RecordBatch, indices: &[usize], row: usize) -> BoltResult<Option<JoinKey>> {
     // Single-key fast path (the overwhelming common case): build `One`
     // directly with no heap allocation. NULL ⇒ no key (SQL "NULL never
     // matches"). Multi-column keys fall through to a `Vec`-backed `Many`,
@@ -1087,139 +1079,138 @@ fn extract_key_value(
         return Ok(None);
     }
     let v = match arr.data_type() {
-            ArrowDataType::Int32 => JoinKeyValue::I32(
-                arr.as_any().downcast_ref::<Int32Array>().unwrap().value(row),
-            ),
-            ArrowDataType::Int64 => JoinKeyValue::I64(
-                arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
-            ),
-            ArrowDataType::Float32 => JoinKeyValue::F32(
-                // Review C12: canonicalise -0.0 -> +0.0 so that signed-zero
-                // join keys match across sides (matches SQL/IEEE and
-                // DuckDB). NaN bit patterns are preserved as-is, so
-                // NaN-keyed rows never match (`NaN != NaN`).
-                canonicalise_f32(
-                    arr.as_any()
-                        .downcast_ref::<Float32Array>()
-                        .unwrap()
-                        .value(row),
-                )
-                .to_bits(),
-            ),
-            ArrowDataType::Float64 => JoinKeyValue::F64(
-                // Review C12: same signed-zero canonicalisation as Float32.
-                canonicalise_f64(
-                    arr.as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap()
-                        .value(row),
-                )
-                .to_bits(),
-            ),
-            ArrowDataType::Boolean => JoinKeyValue::Bool(
-                arr.as_any().downcast_ref::<BooleanArray>().unwrap().value(row),
-            ),
-            ArrowDataType::Utf8 => JoinKeyValue::Utf8(
-                // Raw Utf8 still allocates per row, but Box<str> skips
-                // String's capacity field + typical over-allocation.
-                // ~50% smaller than the previous `to_string()` path.
+        ArrowDataType::Int32 => JoinKeyValue::I32(
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        ArrowDataType::Int64 => JoinKeyValue::I64(
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        ArrowDataType::Float32 => JoinKeyValue::F32(
+            // Review C12: canonicalise -0.0 -> +0.0 so that signed-zero
+            // join keys match across sides (matches SQL/IEEE and
+            // DuckDB). NaN bit patterns are preserved as-is, so
+            // NaN-keyed rows never match (`NaN != NaN`).
+            canonicalise_f32(
                 arr.as_any()
-                    .downcast_ref::<StringArray>()
+                    .downcast_ref::<Float32Array>()
                     .unwrap()
-                    .value(row)
-                    .into(),
-            ),
-            // Correctness fix (review F-7 analogue): dict-encoded Utf8 keys
-            // must key on the DECODED STRING VALUE, not the raw dictionary
-            // index. The previous L6 optimisation keyed on the i32 index on
-            // the assumption that "one dict per batch/column ⇒ equal indices
-            // ⇔ equal strings". That assumption breaks the moment a join
-            // child yields a raw Arrow `DictionaryArray`: the build side and
-            // the probe side then carry INDEPENDENT dictionaries, so the
-            // SAME index can map to DIFFERENT strings (and the same string
-            // can sit at DIFFERENT indices). `check_key_dtypes` only checks
-            // the Arrow datatype — both sides are `Dictionary(Int32, Utf8)`
-            // — so it cannot catch this. Keying on the index produced silent
-            // WRONG join results.
-            //
-            // We therefore resolve each row's index through ITS OWN
-            // dictionary to the actual string and key on `Utf8(Box<str>)` —
-            // the exact same variant the raw-`StringArray` path produces. A
-            // dict-encoded side and a raw-string side (or two independently
-            // dict-encoded sides) now compare on string identity, which is
-            // correct regardless of how each side encoded its dictionary.
-            // This costs one string copy per row on the dict path (the raw
-            // Utf8 fast path below is untouched).
-            ArrowDataType::Dictionary(key_ty, value_ty)
-                if matches!(value_ty.as_ref(), ArrowDataType::Utf8) =>
-            {
-                // Resolve the dict index for `row` to a (values_array,
-                // position) pair, dispatching on the index width. NULL was
-                // already handled by the `arr.is_null(row)` guard at the top
-                // of this fn (Arrow dict NULL lives in the keys array's
-                // validity). We borrow the typed dictionary's `values()`
-                // (the dictionary value array) so we can decode the index to
-                // the actual string.
-                let (values_ref, value_pos): (&ArrayRef, usize) = match key_ty.as_ref()
-                {
-                    ArrowDataType::Int32 => {
-                        let da = arr
-                            .as_any()
-                            .downcast_ref::<DictionaryArray<ArrowInt32Type>>()
-                            .ok_or_else(|| {
-                                BoltError::Type(
-                                    "JOIN: dict<i32,utf8> downcast failed".into(),
-                                )
-                            })?;
-                        let pos = usize::try_from(da.keys().value(row)).map_err(|_| {
-                            BoltError::Type(
-                                "JOIN: dict<i32,utf8> negative key index".into(),
-                            )
+                    .value(row),
+            )
+            .to_bits(),
+        ),
+        ArrowDataType::Float64 => JoinKeyValue::F64(
+            // Review C12: same signed-zero canonicalisation as Float32.
+            canonicalise_f64(
+                arr.as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row),
+            )
+            .to_bits(),
+        ),
+        ArrowDataType::Boolean => JoinKeyValue::Bool(
+            arr.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row),
+        ),
+        ArrowDataType::Utf8 => JoinKeyValue::Utf8(
+            // Raw Utf8 still allocates per row, but Box<str> skips
+            // String's capacity field + typical over-allocation.
+            // ~50% smaller than the previous `to_string()` path.
+            arr.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .into(),
+        ),
+        // Correctness fix (review F-7 analogue): dict-encoded Utf8 keys
+        // must key on the DECODED STRING VALUE, not the raw dictionary
+        // index. The previous L6 optimisation keyed on the i32 index on
+        // the assumption that "one dict per batch/column ⇒ equal indices
+        // ⇔ equal strings". That assumption breaks the moment a join
+        // child yields a raw Arrow `DictionaryArray`: the build side and
+        // the probe side then carry INDEPENDENT dictionaries, so the
+        // SAME index can map to DIFFERENT strings (and the same string
+        // can sit at DIFFERENT indices). `check_key_dtypes` only checks
+        // the Arrow datatype — both sides are `Dictionary(Int32, Utf8)`
+        // — so it cannot catch this. Keying on the index produced silent
+        // WRONG join results.
+        //
+        // We therefore resolve each row's index through ITS OWN
+        // dictionary to the actual string and key on `Utf8(Box<str>)` —
+        // the exact same variant the raw-`StringArray` path produces. A
+        // dict-encoded side and a raw-string side (or two independently
+        // dict-encoded sides) now compare on string identity, which is
+        // correct regardless of how each side encoded its dictionary.
+        // This costs one string copy per row on the dict path (the raw
+        // Utf8 fast path below is untouched).
+        ArrowDataType::Dictionary(key_ty, value_ty)
+            if matches!(value_ty.as_ref(), ArrowDataType::Utf8) =>
+        {
+            // Resolve the dict index for `row` to a (values_array,
+            // position) pair, dispatching on the index width. NULL was
+            // already handled by the `arr.is_null(row)` guard at the top
+            // of this fn (Arrow dict NULL lives in the keys array's
+            // validity). We borrow the typed dictionary's `values()`
+            // (the dictionary value array) so we can decode the index to
+            // the actual string.
+            let (values_ref, value_pos): (&ArrayRef, usize) = match key_ty.as_ref() {
+                ArrowDataType::Int32 => {
+                    let da = arr
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<ArrowInt32Type>>()
+                        .ok_or_else(|| {
+                            BoltError::Type("JOIN: dict<i32,utf8> downcast failed".into())
                         })?;
-                        (da.values(), pos)
-                    }
-                    ArrowDataType::Int64 => {
-                        let da = arr
-                            .as_any()
-                            .downcast_ref::<DictionaryArray<ArrowInt64Type>>()
-                            .ok_or_else(|| {
-                                BoltError::Type(
-                                    "JOIN: dict<i64,utf8> downcast failed".into(),
-                                )
-                            })?;
-                        let pos = usize::try_from(da.keys().value(row)).map_err(|_| {
-                            BoltError::Type(
-                                "JOIN: dict<i64,utf8> negative key index".into(),
-                            )
-                        })?;
-                        (da.values(), pos)
-                    }
-                    other => {
-                        return Err(BoltError::Type(format!(
-                            "JOIN: unsupported dict key dtype {other:?} (expected Int32/Int64)"
-                        )));
-                    }
-                };
-                // Decode the index to the string via the dictionary's value
-                // array. Downcast to StringArray — guaranteed Utf8 by the
-                // `value_ty` guard above.
-                let str_values = values_ref
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        BoltError::Type(
-                            "JOIN: dict values not a StringArray despite Utf8 value type"
-                                .into(),
-                        )
+                    let pos = usize::try_from(da.keys().value(row)).map_err(|_| {
+                        BoltError::Type("JOIN: dict<i32,utf8> negative key index".into())
                     })?;
-                JoinKeyValue::Utf8(str_values.value(value_pos).into())
-            }
-            other => {
-                return Err(BoltError::Type(format!(
-                    "JOIN: unsupported key dtype {other:?}"
-                )));
-            }
-        };
+                    (da.values(), pos)
+                }
+                ArrowDataType::Int64 => {
+                    let da = arr
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<ArrowInt64Type>>()
+                        .ok_or_else(|| {
+                            BoltError::Type("JOIN: dict<i64,utf8> downcast failed".into())
+                        })?;
+                    let pos = usize::try_from(da.keys().value(row)).map_err(|_| {
+                        BoltError::Type("JOIN: dict<i64,utf8> negative key index".into())
+                    })?;
+                    (da.values(), pos)
+                }
+                other => {
+                    return Err(BoltError::Type(format!(
+                        "JOIN: unsupported dict key dtype {other:?} (expected Int32/Int64)"
+                    )));
+                }
+            };
+            // Decode the index to the string via the dictionary's value
+            // array. Downcast to StringArray — guaranteed Utf8 by the
+            // `value_ty` guard above.
+            let str_values = values_ref
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    BoltError::Type(
+                        "JOIN: dict values not a StringArray despite Utf8 value type".into(),
+                    )
+                })?;
+            JoinKeyValue::Utf8(str_values.value(value_pos).into())
+        }
+        other => {
+            return Err(BoltError::Type(format!(
+                "JOIN: unsupported key dtype {other:?}"
+            )));
+        }
+    };
     Ok(Some(v))
 }
 
@@ -1232,13 +1223,21 @@ fn extract_key_value(
 /// (review C12).
 #[inline]
 fn canonicalise_f64(x: f64) -> f64 {
-    if x == 0.0 { 0.0 } else { x }
+    if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
 }
 
 /// `f32` analogue of [`canonicalise_f64`].
 #[inline]
 fn canonicalise_f32(x: f32) -> f32 {
-    if x == 0.0 { 0.0 } else { x }
+    if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
 }
 
 /// Look up every name in `names` in the batch's schema, returning the
@@ -1246,9 +1245,10 @@ fn canonicalise_f32(x: f32) -> f32 {
 fn lookup_columns(batch: &RecordBatch, names: &[String]) -> BoltResult<Vec<usize>> {
     let mut out: Vec<usize> = Vec::with_capacity(names.len());
     for n in names {
-        let idx = batch.schema().index_of(n).map_err(|e| {
-            BoltError::Plan(format!("JOIN: key column '{n}' not in batch: {e}"))
-        })?;
+        let idx = batch
+            .schema()
+            .index_of(n)
+            .map_err(|e| BoltError::Plan(format!("JOIN: key column '{n}' not in batch: {e}")))?;
         out.push(idx);
     }
     Ok(out)
@@ -1274,15 +1274,9 @@ fn empty_array_for_dtype(dt: &ArrowDataType) -> BoltResult<ArrayRef> {
     Ok(match dt {
         ArrowDataType::Int32 => Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
         ArrowDataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-        ArrowDataType::Float32 => {
-            Arc::new(Float32Array::from(Vec::<f32>::new())) as ArrayRef
-        }
-        ArrowDataType::Float64 => {
-            Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef
-        }
-        ArrowDataType::Boolean => {
-            Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef
-        }
+        ArrowDataType::Float32 => Arc::new(Float32Array::from(Vec::<f32>::new())) as ArrayRef,
+        ArrowDataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+        ArrowDataType::Boolean => Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef,
         ArrowDataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
         other => {
             return Err(BoltError::Type(format!(
@@ -1750,11 +1744,7 @@ mod tests {
 
     /// Build a single-column DictionaryArray<Int32, Utf8> RecordBatch from
     /// `(keys, values)` pairs.
-    fn dict_utf8_batch(
-        name: &str,
-        keys: Vec<Option<i32>>,
-        values: Vec<&str>,
-    ) -> RecordBatch {
+    fn dict_utf8_batch(name: &str, keys: Vec<Option<i32>>, values: Vec<&str>) -> RecordBatch {
         let key_arr = Int32Array::from(keys);
         let value_arr = StringArray::from(values);
         let dict =
@@ -1839,7 +1829,7 @@ mod tests {
         let b_alpha = extract_key(&build, &[0], 0).unwrap().unwrap(); // idx 0 -> "alpha"
         let p_idx0 = extract_key(&probe, &[0], 0).unwrap().unwrap(); // idx 0 -> "zeta"
         let p_alpha = extract_key(&probe, &[0], 1).unwrap().unwrap(); // idx 1 -> "alpha"
-        // Same index, different string => must NOT be equal.
+                                                                      // Same index, different string => must NOT be equal.
         assert_ne!(b_alpha, p_idx0);
         // Different index, same string => MUST be equal.
         assert_eq!(b_alpha, p_alpha);
@@ -1849,11 +1839,7 @@ mod tests {
     fn extract_key_dict_utf8_null_row_is_none() {
         // NULL dict-key rows should surface as `Ok(None)` from extract_key,
         // matching the SQL "NULL never matches" rule.
-        let batch = dict_utf8_batch(
-            "s",
-            vec![Some(0), None, Some(1)],
-            vec!["alpha", "beta"],
-        );
+        let batch = dict_utf8_batch("s", vec![Some(0), None, Some(1)], vec!["alpha", "beta"]);
         assert!(extract_key(&batch, &[0], 0).unwrap().is_some());
         assert!(extract_key(&batch, &[0], 1).unwrap().is_none());
         assert!(extract_key(&batch, &[0], 2).unwrap().is_some());

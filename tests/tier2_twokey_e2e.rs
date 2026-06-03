@@ -62,19 +62,12 @@ fn unpack(packed: i64) -> (i32, i32) {
 /// Naive reference: HashMap keyed by `(i32, i32)` directly. Returns
 /// `(key1, key2, sum)` triples sorted ascending by `(key1, key2)` — the
 /// same canonical order the merger emits.
-fn reference_naive(
-    col0: &[i32],
-    col1: &[i32],
-    vals: &[f64],
-) -> Vec<(i32, i32, f64)> {
+fn reference_naive(col0: &[i32], col1: &[i32], vals: &[f64]) -> Vec<(i32, i32, f64)> {
     let mut acc: HashMap<(i32, i32), f64> = HashMap::with_capacity(col0.len());
     for i in 0..col0.len() {
         *acc.entry((col0[i], col1[i])).or_insert(0.0) += vals[i];
     }
-    let mut out: Vec<(i32, i32, f64)> = acc
-        .into_iter()
-        .map(|((k1, k2), v)| (k1, k2, v))
-        .collect();
+    let mut out: Vec<(i32, i32, f64)> = acc.into_iter().map(|((k1, k2), v)| (k1, k2, v)).collect();
     out.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     out
 }
@@ -82,11 +75,7 @@ fn reference_naive(
 /// Pack-then-reduce model: pack into i64, reduce on the packed key, then
 /// unpack on read. This mirrors what the GPU pipeline produces (modulo
 /// per-partition ordering, which the merger normalises).
-fn reference_packed(
-    col0: &[i32],
-    col1: &[i32],
-    vals: &[f64],
-) -> Vec<(i32, i32, f64)> {
+fn reference_packed(col0: &[i32], col1: &[i32], vals: &[f64]) -> Vec<(i32, i32, f64)> {
     let packed = pack(col0, col1);
     let mut acc: HashMap<i64, f64> = HashMap::with_capacity(col0.len());
     for i in 0..col0.len() {

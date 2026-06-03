@@ -267,12 +267,7 @@ pub fn compile_partition_kernel_i64_global_atomics() -> BoltResult<String> {
     writeln!(ptx, "\tmul.lo.u64 %rd21, %rd20, %rd9;").map_err(write_err)?;
 
     // pid_u64 = hash >> 52    (top log2(K)=12 bits of the multiplied product)
-    writeln!(
-        ptx,
-        "\tshr.u64 %rd22, %rd21, {shift};",
-        shift = shift
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rd22, %rd21, {shift};", shift = shift).map_err(write_err)?;
     // Narrow to u32 for the atomic + the per-row store.
     writeln!(ptx, "\tcvt.u32.u64 %r10, %rd22;").map_err(write_err)?;
 
@@ -440,12 +435,7 @@ pub fn compile_partition_kernel_i64_shmem_staging() -> BoltResult<String> {
     for k in 0..slots_per_thread {
         // slot_index = tid + k * block_threads
         let offset = k * block_threads;
-        writeln!(
-            ptx,
-            "\tadd.u32 %r14, %r2, {off};",
-            off = offset
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.u32 %r14, %r2, {off};", off = offset).map_err(write_err)?;
         writeln!(ptx, "\tmul.wide.u32 %rd20, %r14, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd21, %rd3, %rd20;").map_err(write_err)?;
         writeln!(ptx, "\tst.shared.u32 [%rd21], %r13;").map_err(write_err)?;
@@ -479,12 +469,7 @@ pub fn compile_partition_kernel_i64_shmem_staging() -> BoltResult<String> {
     writeln!(ptx, "\tmul.lo.u64 %rd24, %rd23, %rd9;").map_err(write_err)?;
 
     // pid_u64 = hash >> 52    (top log2(K)=12 bits of the multiplied product)
-    writeln!(
-        ptx,
-        "\tshr.u64 %rd25, %rd24, {shift};",
-        shift = shift
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tshr.u64 %rd25, %rd24, {shift};", shift = shift).map_err(write_err)?;
     // Narrow to u32 for the atomic + the per-row store.
     writeln!(ptx, "\tcvt.u32.u64 %r10, %rd25;").map_err(write_err)?;
 
@@ -529,12 +514,7 @@ pub fn compile_partition_kernel_i64_shmem_staging() -> BoltResult<String> {
     for k in 0..slots_per_thread {
         let offset = k * block_threads;
         // slot_index = tid + k * block_threads
-        writeln!(
-            ptx,
-            "\tadd.u32 %r20, %r2, {off};",
-            off = offset
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tadd.u32 %r20, %r2, {off};", off = offset).map_err(write_err)?;
         // shared_addr = &block_counts[slot_index]
         writeln!(ptx, "\tmul.wide.u32 %rd30, %r20, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd31, %rd3, %rd30;").map_err(write_err)?;

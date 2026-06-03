@@ -215,12 +215,7 @@ impl Engine {
         let deduped = crate::exec::distinct::distinct_on_first_per_key(&base, dp.n_keys)?;
 
         // --- 3. Drop the leading key columns to restore the user projection. ---
-        let user_cols: Vec<ArrayRef> = deduped
-            .columns()
-            .iter()
-            .skip(dp.n_keys)
-            .cloned()
-            .collect();
+        let user_cols: Vec<ArrayRef> = deduped.columns().iter().skip(dp.n_keys).cloned().collect();
         let out_schema = plan_schema_to_arrow_schema(&dp.output_schema)?;
         let projected = RecordBatch::try_new_with_options(
             out_schema,

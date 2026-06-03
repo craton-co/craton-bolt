@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **Two-key multi-aggregate Tier-2.1** executor.
 //!
@@ -64,7 +64,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
+            KernelSpec::PartitionI64ShmemStaging => {
+                partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?
+            }
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceMultiI64 { n_vals } => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -88,11 +90,7 @@ fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -195,7 +193,8 @@ fn execute_inner(
     let num_partitions = partition_kernel_i64::NUM_PARTITIONS;
 
     // -------- Partition pass (i64) --------
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut counts: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
     let partition_module = get_or_build_module(&partition_i64_spec_for(n_rows))?;
     {
@@ -235,7 +234,8 @@ fn execute_inner(
         for j in 0..n_vals {
             // Fresh per-iteration cursor — must be re-zeroed so each
             // scatter call writes into slots [0..m_k) of each partition.
-            let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+            let mut cursors: GpuVec<u32> =
+                GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
             // Split-borrow on `scatter_vals` to hold scatter_keys mutably
             // alongside scatter_vals[j] mutably.
@@ -281,8 +281,7 @@ fn execute_inner(
         n_vals: n_vals as u32,
     })?;
     {
-        let entry =
-            partition_reduce_kernel_multi_i64::kernel_entry_with_spill(n_vals as u32);
+        let entry = partition_reduce_kernel_multi_i64::kernel_entry_with_spill(n_vals as u32);
         let func = reduce_module.function(&entry)?;
 
         // Kernel param order:
@@ -295,8 +294,7 @@ fn execute_inner(
         let views_sv: Vec<_> = scatter_vals.iter().map(|g| g.view()).collect();
         let view_po = offsets_kp1_gpu.view();
         let mut view_ok = out_keys_gpu.view_mut();
-        let mut views_ov: Vec<_> =
-            out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
+        let mut views_ov: Vec<_> = out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
         let mut view_os = out_set_gpu.view_mut();
         let mut view_sp = spill.view_mut();
 
@@ -325,8 +323,7 @@ fn execute_inner(
 
     // -------- Stage-4 (P1b): pinned D2H; sync once --------
     let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
-    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> =
-        Vec::with_capacity(n_vals);
+    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> = Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
         pinned_vals.push(ov.to_pinned_async(stream.raw())?);
     }
@@ -340,10 +337,7 @@ fn execute_inner(
         )));
     }
     let host_out_keys: Vec<i64> = pinned_keys.as_slice().to_vec();
-    let host_out_vals: Vec<Vec<f64>> = pinned_vals
-        .iter()
-        .map(|p| p.as_slice().to_vec())
-        .collect();
+    let host_out_vals: Vec<Vec<f64>> = pinned_vals.iter().map(|p| p.as_slice().to_vec()).collect();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
 
     // (key_i64, [sum_0, sum_1, ..., sum_{N-1}])
@@ -405,9 +399,9 @@ fn execute_inner(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {
@@ -582,13 +576,13 @@ mod cache_tests {
             Ok(m) => m,
             Err(_) => return,
         };
-        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 3 })
-            .expect("n_vals=3 build");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 3 }).expect("n_vals=3 build");
         let baseline = LOAD_COUNT.load(Ordering::SeqCst);
-        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 })
-            .expect("n_vals=2 hit");
-        let _ = get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 3 })
-            .expect("n_vals=3 hit");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 2 }).expect("n_vals=2 hit");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMultiI64 { n_vals: 3 }).expect("n_vals=3 hit");
         assert_eq!(LOAD_COUNT.load(Ordering::SeqCst), baseline);
     }
 }
@@ -615,10 +609,22 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v1".into(), dtype: DataType::Float64 },
-                    ColumnIO { name: "v2".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k1".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "k2".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v1".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v2".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0, 1],
                 aggregates: vec![

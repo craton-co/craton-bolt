@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **Two-key MIN / MAX at Tier 2.1** вЂ” high-cardinality executor for
 //! `SELECT a, b, {MIN,MAX}(v) FROM x GROUP BY a, b` over **integer** value
@@ -116,11 +116,11 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
-            KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
-            KernelSpec::ScatterI64ToI64 => {
-                scatter_kernel_i64::compile_scatter_kernel_i64_to_i64()?
+            KernelSpec::PartitionI64ShmemStaging => {
+                partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?
             }
+            KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
+            KernelSpec::ScatterI64ToI64 => scatter_kernel_i64::compile_scatter_kernel_i64_to_i64()?,
             KernelSpec::ReduceMinMaxI64(rk) => {
                 // Batch 5: spill-counter-aware variant. The launch sites
                 // resolve `kernel_entry_with_spill(op, dt)` and push a u32
@@ -142,13 +142,9 @@ fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try the two-key Tier-2.1 integer MIN/MAX fast path. `None` on any
 /// precondition miss so the caller falls through to the next strategy.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -279,7 +275,15 @@ fn execute_inner(
             )?;
             let v: Vec<i32> = scattered_f64.iter().map(|&x| x as i32).collect();
             let vals_typed_gpu = GpuVec::<i32>::from_slice_async(&v, stream.raw())?;
-            run_reduce_phase_i32(plan, op, vals_typed_gpu, scatter_keys, offsets, num_partitions, &stream)
+            run_reduce_phase_i32(
+                plan,
+                op,
+                vals_typed_gpu,
+                scatter_keys,
+                offsets,
+                num_partitions,
+                &stream,
+            )
         }
         MinMaxDtype::Int64 => {
             let arr = val_col
@@ -298,7 +302,15 @@ fn execute_inner(
                 num_partitions,
                 &stream,
             )?;
-            run_reduce_phase_i64(plan, op, scatter_vals_i64, scatter_keys, offsets, num_partitions, &stream)
+            run_reduce_phase_i64(
+                plan,
+                op,
+                scatter_vals_i64,
+                scatter_keys,
+                offsets,
+                num_partitions,
+                &stream,
+            )
         }
     }
 }
@@ -317,11 +329,13 @@ fn run_scatter_f64(
     stream: &CudaStream,
 ) -> BoltResult<(GpuVec<i64>, Vec<f64>)> {
     let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut scatter_vals_f64: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut scatter_vals_f64: GpuVec<f64> =
+        GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
 
     let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
     let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
-    let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     let view_keys = keys_gpu.view();
     let view_vals = vals_in_gpu.view();
@@ -364,11 +378,13 @@ fn run_scatter_i64_to_i64(
     stream: &CudaStream,
 ) -> BoltResult<(GpuVec<i64>, GpuVec<i64>)> {
     let mut scatter_keys: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut scatter_vals_i64: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut scatter_vals_i64: GpuVec<i64> =
+        GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
 
     let scatter_module = get_or_build_module(&KernelSpec::ScatterI64ToI64)?;
     let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY_I64_TO_I64)?;
-    let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     let view_keys = keys_gpu.view();
     let view_vals = vals_in_gpu.view();
@@ -413,9 +429,10 @@ fn run_reduce_phase_i32(
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
     let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
-    let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxI64(
-        ReduceKey::from_pair(op, MinMaxDtype::Int32),
-    ))?;
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxI64(ReduceKey::from_pair(
+        op,
+        MinMaxDtype::Int32,
+    )))?;
     {
         let entry = minmax_i64_entry(op, MinMaxDtype::Int32);
         let func = reduce_module.function(&entry)?;
@@ -437,7 +454,14 @@ fn run_reduce_phase_i32(
         args.push_output(&mut view_os);
         args.push_output(&mut view_sp);
 
-        launch_with_geometry(func, num_partitions, REDUCE_BLOCK_THREADS, 0, stream, &mut args)?;
+        launch_with_geometry(
+            func,
+            num_partitions,
+            REDUCE_BLOCK_THREADS,
+            0,
+            stream,
+            &mut args,
+        )?;
     }
 
     // Stage-4 (P1b): pinned D2H; sync once.
@@ -518,9 +542,10 @@ fn run_reduce_phase_i64(
     let mut out_set_gpu: GpuVec<u8> = GpuVec::<u8>::zeros_async(n_out_slots, stream.raw())?;
     let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
-    let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxI64(
-        ReduceKey::from_pair(op, MinMaxDtype::Int64),
-    ))?;
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMaxI64(ReduceKey::from_pair(
+        op,
+        MinMaxDtype::Int64,
+    )))?;
     {
         let entry = minmax_i64_entry(op, MinMaxDtype::Int64);
         let func = reduce_module.function(&entry)?;
@@ -542,7 +567,14 @@ fn run_reduce_phase_i64(
         args.push_output(&mut view_os);
         args.push_output(&mut view_sp);
 
-        launch_with_geometry(func, num_partitions, REDUCE_BLOCK_THREADS, 0, stream, &mut args)?;
+        launch_with_geometry(
+            func,
+            num_partitions,
+            REDUCE_BLOCK_THREADS,
+            0,
+            stream,
+            &mut args,
+        )?;
     }
 
     // Stage-4 (P1b): pinned D2H; sync once.
@@ -617,9 +649,9 @@ fn run_reduce_phase_i64(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {
@@ -629,8 +661,8 @@ mod tests {
     /// scatter вЂ” the kernel PTX must contain no `.f64` references.
     #[test]
     fn int64_twokey_scatter_kernel_has_no_f64() {
-        let ptx = scatter_kernel_i64::compile_scatter_kernel_i64_to_i64()
-            .expect("typed kernel compiles");
+        let ptx =
+            scatter_kernel_i64::compile_scatter_kernel_i64_to_i64().expect("typed kernel compiles");
         assert!(
             !ptx.contains(".f64") && !ptx.contains("%fd"),
             "Int64 two-key fast path must avoid f64:\n{ptx}"
@@ -651,8 +683,7 @@ mod tests {
     /// is bit-exact for i32.
     #[test]
     fn int32_twokey_scatter_kernel_remains_f64() {
-        let ptx =
-            scatter_kernel_i64::compile_scatter_kernel_i64().expect("kernel compiles");
+        let ptx = scatter_kernel_i64::compile_scatter_kernel_i64().expect("kernel compiles");
         assert!(
             ptx.contains("st.global.f64"),
             "Int32 two-key path still uses the f64-val scatter:\n{ptx}"
@@ -767,7 +798,9 @@ mod eligibility_tests {
     fn rejects_two_aggregates() {
         let mut plan = build_twokey_minmax_plan(true, DataType::Int32);
         if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
-            aggregate.aggregates.push(AggregateExpr::Max(Expr::Column("v".into())));
+            aggregate
+                .aggregates
+                .push(AggregateExpr::Max(Expr::Column("v".into())));
         }
         let batch = twokey_minmax_batch_i32(300_000);
         assert!(try_execute(&plan, &batch).is_none());
@@ -917,9 +950,18 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Int32 },
+                    ColumnIO {
+                        name: "k1".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "k2".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Int32,
+                    },
                 ],
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Min(Expr::Column("v".into()))],

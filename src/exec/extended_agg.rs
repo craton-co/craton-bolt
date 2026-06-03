@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side aggregate execution for the dtypes the GPU reduction kernels
 //! don't cover: `Bool` (any aggregate) and `Utf8` (COUNT/MIN/MAX only).
@@ -126,9 +126,9 @@ pub fn execute_extended_scalar(
             let strs = downcast_str(array, "MAX")?;
             Ok(Arc::new(utf8_max_array(strs, 0..strs.len())) as ArrayRef)
         }
-        (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => Err(
-            BoltError::Type("SUM/AVG over Utf8 is not defined".into()),
-        ),
+        (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => {
+            Err(BoltError::Type("SUM/AVG over Utf8 is not defined".into()))
+        }
         (_, dt) => Err(BoltError::Other(format!(
             "extended_agg: unhandled (aggregate, input dtype) combination for {:?}",
             dt
@@ -217,9 +217,9 @@ pub fn execute_extended_grouped(
             }
             Ok(Arc::new(StringArray::from(out)) as ArrayRef)
         }
-        (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => Err(
-            BoltError::Type("SUM/AVG over Utf8 is not defined".into()),
-        ),
+        (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => {
+            Err(BoltError::Type("SUM/AVG over Utf8 is not defined".into()))
+        }
         (_, dt) => Err(BoltError::Other(format!(
             "extended_agg: unhandled (aggregate, input dtype) combination for {:?}",
             dt
@@ -272,15 +272,12 @@ fn resolve_input_array<'a>(
     table_batch: &'a RecordBatch,
 ) -> BoltResult<(DataType, &'a dyn Array)> {
     let col_name = bare_column_name(aggregate_inner(expr))?;
-    let idx = table_batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|e| {
-            BoltError::Plan(format!(
-                "extended_agg input column '{}' not present in batch: {}",
-                col_name, e
-            ))
-        })?;
+    let idx = table_batch.schema().index_of(col_name).map_err(|e| {
+        BoltError::Plan(format!(
+            "extended_agg input column '{}' not present in batch: {}",
+            col_name, e
+        ))
+    })?;
     let array = table_batch.column(idx).as_ref();
     let dtype = match array.data_type() {
         arrow_schema::DataType::Boolean => DataType::Bool,
@@ -311,9 +308,7 @@ fn validate_output_dtype(
         (AggregateExpr::Max(_), DataType::Utf8) => DataType::Utf8,
         (AggregateExpr::Count(_), DataType::Utf8) => DataType::Int64,
         (AggregateExpr::Sum(_) | AggregateExpr::Avg(_), DataType::Utf8) => {
-            return Err(BoltError::Type(
-                "SUM/AVG over Utf8 is not defined".into(),
-            ))
+            return Err(BoltError::Type("SUM/AVG over Utf8 is not defined".into()))
         }
         // VAR_POP / VAR_SAMP never reach this module: `handles` returns
         // false for them, so the caller's numeric dispatch takes over. If
@@ -348,13 +343,16 @@ fn validate_output_dtype(
 }
 
 fn downcast_bool<'a>(array: &'a dyn Array, op_name: &str) -> BoltResult<&'a BooleanArray> {
-    array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-        BoltError::Type(format!(
-            "extended_agg: {} expected BooleanArray, got {:?}",
-            op_name,
-            array.data_type()
-        ))
-    })
+    array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            BoltError::Type(format!(
+                "extended_agg: {} expected BooleanArray, got {:?}",
+                op_name,
+                array.data_type()
+            ))
+        })
 }
 
 fn downcast_str<'a>(array: &'a dyn Array, op_name: &str) -> BoltResult<&'a StringArray> {

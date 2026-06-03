@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for the single-pass open-addressing GPU hash-grouping kernels.
 //!
@@ -298,12 +298,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r4, [{}_param_2];",
-        KEYS_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_2];", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
@@ -334,12 +329,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     }
 
     // Load k and compute k-1 (mask).
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r5, [{}_param_3];",
-        KEYS_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r5, [{}_param_3];", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
 
     // max_probes = k * MAX_PROBE_FACTOR. Computed once at kernel entry so
@@ -356,12 +346,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     // Load this thread's key value from group_col. The group-by column is a
     // read-only input (the host allocates it as a distinct GpuVec from the
     // keys_table the kernel CASes into), so route through the read-only cache.
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd0, [{}_param_0];",
-        KEYS_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
@@ -375,12 +360,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
     // Load keys_table base ptr.
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd3, [{}_param_1];",
-        KEYS_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd3, [{}_param_1];", KEYS_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
 
     // %rl4 = EMPTY_KEY ; %rl0 still holds the key.
@@ -403,11 +383,7 @@ fn compile_groupby_keys_kernel_inner(with_key_validity: bool) -> BoltResult<Stri
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
     // atom.cas: try EMPTY -> key. Returns previous value.
-    writeln!(
-        ptx,
-        "\tatom.global.cas.b64 %rl5, [%rd5], %rl4, %rl0;"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.cas.b64 %rl5, [%rd5], %rl4, %rl0;").map_err(write_err)?;
     // If old == EMPTY, we inserted.
     writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra DONE;").map_err(write_err)?;
@@ -618,11 +594,7 @@ pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
 
     // Try CAS: EMPTY -> cur_key. Returns previous value into %rl5.
-    writeln!(
-        ptx,
-        "\tatom.global.cas.b64 %rl5, [%rd5], %rl4, %rl0;"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.cas.b64 %rl5, [%rd5], %rl4, %rl0;").map_err(write_err)?;
 
     // If old == EMPTY, we placed cur_key successfully; done.
     writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
@@ -683,11 +655,7 @@ pub fn compile_groupby_keys_kernel_robin_hood() -> BoltResult<String> {
     // ------------------------------------------------------------------
     writeln!(ptx, "RH_SWAP:").map_err(write_err)?;
     // atom.cas(slot, expected=%rl5 occupant, new=%rl0 cur_key) → %rl8 actual
-    writeln!(
-        ptx,
-        "\tatom.global.cas.b64 %rl8, [%rd5], %rl5, %rl0;"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.cas.b64 %rl8, [%rd5], %rl5, %rl0;").map_err(write_err)?;
     // If %rl8 != %rl5 (CAS failed), slot changed under us → RH_RETRY.
     writeln!(ptx, "\tsetp.eq.s64 %p5, %rl8, %rl5;").map_err(write_err)?;
     writeln!(ptx, "\t@!%p5 bra RH_RETRY;").map_err(write_err)?;
@@ -793,10 +761,7 @@ pub fn compile_groupby_keys_kernel_dispatched() -> BoltResult<(String, &'static 
 /// multiprocessor. Silent-drop matches the keys kernel's behaviour: the
 /// kernel ABI is unchanged and the host's load-factor invariant ensures the
 /// bound never triggers on a correctly-sequenced launch.
-pub fn compile_groupby_agg_kernel(
-    op: ReduceOp,
-    input_dtype: DataType,
-) -> BoltResult<String> {
+pub fn compile_groupby_agg_kernel(op: ReduceOp, input_dtype: DataType) -> BoltResult<String> {
     compile_groupby_agg_kernel_inner(op, input_dtype, false)
 }
 
@@ -885,12 +850,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r4, [{}_param_4];",
-        AGG_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_4];", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
@@ -902,12 +862,8 @@ fn compile_groupby_agg_kernel_inner(
         writeln!(ptx, "\tshr.u32 %r14, %r3, 5;").map_err(write_err)?;
         writeln!(ptx, "\tand.b32 %r15, %r3, 31;").map_err(write_err)?;
         // base = value_validity_ptr (param_6)
-        writeln!(
-            ptx,
-            "\tld.param.u64 %rd16, [{}_param_6];",
-            AGG_KERNEL_ENTRY
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd16, [{}_param_6];", AGG_KERNEL_ENTRY)
+            .map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd16, %rd16;").map_err(write_err)?;
         writeln!(ptx, "\tmul.wide.u32 %rd17, %r14, 4;").map_err(write_err)?;
         writeln!(ptx, "\tadd.s64 %rd18, %rd16, %rd17;").map_err(write_err)?;
@@ -919,12 +875,7 @@ fn compile_groupby_agg_kernel_inner(
     }
 
     // k and mask = k - 1.
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r5, [{}_param_5];",
-        AGG_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r5, [{}_param_5];", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
 
     // max_probes = k * MAX_PROBE_FACTOR. Computed once at kernel entry so the
@@ -941,12 +892,7 @@ fn compile_groupby_agg_kernel_inner(
     .map_err(write_err)?;
 
     // Load the key for this row. Key column is a read-only input.
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd0, [{}_param_0];",
-        AGG_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
@@ -960,12 +906,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "\tand.b32 %r8, %r7, %r6;").map_err(write_err)?;
 
     // Keys table base.
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd3, [{}_param_1];",
-        AGG_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd3, [{}_param_1];", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
 
     // Bounded-probe counter. %r21 increments once per slot examined; on
@@ -1002,12 +943,7 @@ fn compile_groupby_agg_kernel_inner(
     writeln!(ptx, "FOUND:").map_err(write_err)?;
 
     // Load the input column value for this row (read-only input column).
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd6, [{}_param_2];",
-        AGG_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd6, [{}_param_2];", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd6, %rd6;").map_err(write_err)?;
     writeln!(
         ptx,
@@ -1025,12 +961,7 @@ fn compile_groupby_agg_kernel_inner(
     .map_err(write_err)?;
 
     // Compute the accumulator slot address (acc_table + slot * elem_bytes).
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd9, [{}_param_3];",
-        AGG_KERNEL_ENTRY
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd9, [{}_param_3];", AGG_KERNEL_ENTRY).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd9, %rd9;").map_err(write_err)?;
     writeln!(
         ptx,
@@ -1222,8 +1153,7 @@ fn compile_groupby_agg_kernel_multi_inner(
 ) -> BoltResult<String> {
     if specs.is_empty() {
         return Err(BoltError::Other(
-            "compile_groupby_agg_kernel_multi: specs must be non-empty"
-                .into(),
+            "compile_groupby_agg_kernel_multi: specs must be non-empty".into(),
         ));
     }
     let n = specs.len();
@@ -1320,8 +1250,7 @@ fn compile_groupby_agg_kernel_multi_inner(
         } else {
             "u64"
         };
-        writeln!(ptx, "\t.param .{kind} {entry}_param_{p}{trailing}")
-            .map_err(write_err)?;
+        writeln!(ptx, "\t.param .{kind} {entry}_param_{p}{trailing}").map_err(write_err)?;
     }
     writeln!(ptx, ")").map_err(write_err)?;
     writeln!(ptx, "{{").map_err(write_err)?;
@@ -1362,20 +1291,12 @@ fn compile_groupby_agg_kernel_multi_inner(
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r4, [{entry}_param_{n_rows_param}];"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{entry}_param_{n_rows_param}];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     // k and mask = k - 1.
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r5, [{entry}_param_{k_param}];"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r5, [{entry}_param_{k_param}];").map_err(write_err)?;
     writeln!(ptx, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;
 
     // max_probes = k * MAX_PROBE_FACTOR.
@@ -1440,10 +1361,7 @@ fn compile_groupby_agg_kernel_multi_inner(
     // per-class counter so the names never collide across specs sharing a
     // class.
     let mut class_slot_counter: Vec<(&str, usize)> = Vec::new();
-    fn take_two_slots<'a>(
-        counter: &mut Vec<(&'a str, usize)>,
-        rc: &'a str,
-    ) -> (usize, usize) {
+    fn take_two_slots<'a>(counter: &mut Vec<(&'a str, usize)>, rc: &'a str) -> (usize, usize) {
         if let Some(entry) = counter.iter_mut().find(|(c, _)| *c == rc) {
             let base = entry.1;
             entry.1 = base + 2;
@@ -1474,11 +1392,7 @@ fn compile_groupby_agg_kernel_multi_inner(
             writeln!(ptx, "\tshr.u32 %r24, %r3, 5;").map_err(write_err)?;
             writeln!(ptx, "\tand.b32 %r25, %r3, 31;").map_err(write_err)?;
             // base = validity_ptr_j (read-only input → .nc).
-            writeln!(
-                ptx,
-                "\tld.param.u64 %rd16, [{entry}_param_{vparam}];"
-            )
-            .map_err(write_err)?;
+            writeln!(ptx, "\tld.param.u64 %rd16, [{entry}_param_{vparam}];").map_err(write_err)?;
             writeln!(ptx, "\tcvta.to.global.u64 %rd16, %rd16;").map_err(write_err)?;
             writeln!(ptx, "\tmul.wide.u32 %rd17, %r24, 4;").map_err(write_err)?;
             writeln!(ptx, "\tadd.s64 %rd18, %rd16, %rd17;").map_err(write_err)?;
@@ -1492,11 +1406,7 @@ fn compile_groupby_agg_kernel_multi_inner(
         // Scratch %rd index pool: reuse %rd10..%rd13 per j — each spec owns
         // them only between its load and its atom; nothing carries across.
         // Load input_j[tid].
-        writeln!(
-            ptx,
-            "\tld.param.u64 %rd10, [{entry}_param_{input_param}];"
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd10, [{entry}_param_{input_param}];").map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd10, %rd10;").map_err(write_err)?;
         writeln!(
             ptx,
@@ -1518,11 +1428,7 @@ fn compile_groupby_agg_kernel_multi_inner(
         .map_err(write_err)?;
 
         // Accumulator slot address: acc_j + slot * elem_bytes_j.
-        writeln!(
-            ptx,
-            "\tld.param.u64 %rd13, [{entry}_param_{acc_param}];"
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd13, [{entry}_param_{acc_param}];").map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd13, %rd13;").map_err(write_err)?;
         writeln!(
             ptx,
@@ -1902,9 +1808,9 @@ pub fn compile_groupby_decimal_kernel(
             writeln!(ptx, "\txor.b64 %rd25, %rd21, %rd23;").map_err(write_err)?; // acc_hi ^ sum_hi
             writeln!(ptx, "\tsetp.lt.s64 %p6, %rd25, 0;").map_err(write_err)?; // res_diff
             writeln!(ptx, "\tand.pred %p7, %p5, %p6;").map_err(write_err)?; // overflow
-            // On overflow: set the shared flag and do NOT store the wrapped
-            // result (leave the slot unchanged) — the host turns the flag into
-            // the same error the scalar/host SUM path raises.
+                                                                            // On overflow: set the shared flag and do NOT store the wrapped
+                                                                            // result (leave the slot unchanged) — the host turns the flag into
+                                                                            // the same error the scalar/host SUM path raises.
             writeln!(ptx, "\t@!%p7 bra DEC_STORE;").map_err(write_err)?;
             writeln!(ptx, "\tld.param.u64 %rd30, [{entry}_param_7];").map_err(write_err)?;
             writeln!(ptx, "\tcvta.to.global.u64 %rd30, %rd30;").map_err(write_err)?;
@@ -1959,7 +1865,11 @@ pub fn compile_groupby_decimal_kernel(
     // returning a wrong aggregate. Mirrors the OVERFLOW path in the integer
     // keys/agg kernels.
     writeln!(ptx, "DEC_OVERFLOW:").map_err(write_err)?;
-    writeln!(ptx, "\tld.param.u64 %rd44, [{entry}_param_{overflow_param}];").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd44, [{entry}_param_{overflow_param}];"
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd44, %rd44;").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.add.u32 %r30, [%rd44], 1;").map_err(write_err)?;
 
@@ -2117,8 +2027,14 @@ mod ptx_shape_tests {
         assert!(!ptx.contains("bolt_groupby_keys_param_5"));
         assert!(!ptx.contains("bfe.u32"));
         // The probe-bound bailout must surface to the host, not silently drop.
-        assert!(ptx.contains("OVERFLOW:"), "keys kernel must emit OVERFLOW label:\n{ptx}");
-        assert!(ptx.contains("@%p3 bra OVERFLOW;"), "probe bound must branch to OVERFLOW:\n{ptx}");
+        assert!(
+            ptx.contains("OVERFLOW:"),
+            "keys kernel must emit OVERFLOW label:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p3 bra OVERFLOW;"),
+            "probe bound must branch to OVERFLOW:\n{ptx}"
+        );
         assert!(
             ptx.contains("ld.param.u64 %rd22, [bolt_groupby_keys_param_4];")
                 && ptx.contains("atom.global.add.u32 %r22, [%rd22], 1;"),
@@ -2130,8 +2046,7 @@ mod ptx_shape_tests {
     /// the overflow counter to param_5, and emits the packed-bit extract.
     #[test]
     fn keys_kernel_with_validity_adds_param_and_bfe() {
-        let ptx = compile_groupby_keys_kernel_with_validity()
-            .expect("validity keys ptx");
+        let ptx = compile_groupby_keys_kernel_with_validity().expect("validity keys ptx");
         // 6 params: 0..=5; param_4 = validity, param_5 = overflow counter.
         assert!(ptx.contains("bolt_groupby_keys_param_5"));
         // word_idx = tid >> 5
@@ -2151,13 +2066,19 @@ mod ptx_shape_tests {
     /// the always-present trailing overflow counter at param_6.
     #[test]
     fn agg_kernel_classic_has_overflow_counter_and_no_bfe() {
-        let ptx = compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Int64)
-            .expect("classic agg ptx");
+        let ptx =
+            compile_groupby_agg_kernel(ReduceOp::Sum, DataType::Int64).expect("classic agg ptx");
         assert!(ptx.contains("bolt_groupby_agg_param_6"));
         assert!(!ptx.contains("bolt_groupby_agg_param_7"));
         assert!(!ptx.contains("bfe.u32"));
-        assert!(ptx.contains("OVERFLOW:"), "agg kernel must emit OVERFLOW label:\n{ptx}");
-        assert!(ptx.contains("@%p3 bra OVERFLOW;"), "probe bound must branch to OVERFLOW:\n{ptx}");
+        assert!(
+            ptx.contains("OVERFLOW:"),
+            "agg kernel must emit OVERFLOW label:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p3 bra OVERFLOW;"),
+            "probe bound must branch to OVERFLOW:\n{ptx}"
+        );
         assert!(
             ptx.contains("ld.param.u64 %rd22, [bolt_groupby_agg_param_6];")
                 && ptx.contains("atom.global.add.u32 %r22, [%rd22], 1;"),
@@ -2169,11 +2090,8 @@ mod ptx_shape_tests {
     /// pushes the overflow counter to param_7.
     #[test]
     fn agg_kernel_with_validity_adds_param_and_bfe() {
-        let ptx = compile_groupby_agg_kernel_with_validity(
-            ReduceOp::Sum,
-            DataType::Int64,
-        )
-        .expect("validity agg ptx");
+        let ptx = compile_groupby_agg_kernel_with_validity(ReduceOp::Sum, DataType::Int64)
+            .expect("validity agg ptx");
         assert!(ptx.contains("bolt_groupby_agg_param_7"));
         assert!(ptx.contains("shr.u32 %r14, %r3, 5;"));
         assert!(ptx.contains("and.b32 %r15, %r3, 31;"));
@@ -2197,12 +2115,20 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_kernel_emits_n_atomics_and_one_hash() {
         let specs = [
-            AggSpec { op: ReduceOp::Sum,   input_dtype: DataType::Int64 },
-            AggSpec { op: ReduceOp::Count, input_dtype: DataType::Int64 },
-            AggSpec { op: ReduceOp::Sum,   input_dtype: DataType::Int32 },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            },
+            AggSpec {
+                op: ReduceOp::Count,
+                input_dtype: DataType::Int64,
+            },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int32,
+            },
         ];
-        let ptx = compile_groupby_agg_kernel_multi(&specs)
-            .expect("fused multi-agg ptx");
+        let ptx = compile_groupby_agg_kernel_multi(&specs).expect("fused multi-agg ptx");
 
         // Three atomic updates, one per spec. Each Sum/Count over Int*
         // lowers to `atom.global.add.<u64|s32>` (see `atomic_for`).
@@ -2248,12 +2174,24 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_classic_has_no_validity_machinery() {
         let specs = [
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int32 },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int32,
+            },
         ];
         let ptx = compile_groupby_agg_kernel_multi(&specs).expect("classic multi");
-        assert!(!ptx.contains("bfe.u32"), "classic multi must not extract validity bits");
-        assert!(!ptx.contains("SPEC_SKIP_"), "classic multi must not emit skip labels");
+        assert!(
+            !ptx.contains("bfe.u32"),
+            "classic multi must not extract validity bits"
+        );
+        assert!(
+            !ptx.contains("SPEC_SKIP_"),
+            "classic multi must not emit skip labels"
+        );
         // 2 + 2*n = 6 .u64 params, no validity pointers appended.
         assert_eq!(ptx.matches(".param .u64 ").count(), 6);
         assert_eq!(ptx.matches(".param .u32 ").count(), 2);
@@ -2265,22 +2203,31 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_all_false_mask_matches_classic() {
         let specs = [
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
-            AggSpec { op: ReduceOp::Count, input_dtype: DataType::Int64 },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            },
+            AggSpec {
+                op: ReduceOp::Count,
+                input_dtype: DataType::Int64,
+            },
         ];
         let classic = compile_groupby_agg_kernel_multi(&specs).unwrap();
-        let masked = compile_groupby_agg_kernel_multi_with_validity(
-            &specs,
-            &[false, false],
-        )
-        .unwrap();
-        assert_eq!(classic, masked, "all-false validity mask must match classic PTX");
+        let masked =
+            compile_groupby_agg_kernel_multi_with_validity(&specs, &[false, false]).unwrap();
+        assert_eq!(
+            classic, masked,
+            "all-false validity mask must match classic PTX"
+        );
     }
 
     /// `spec_has_validity` length must equal `specs` length.
     #[test]
     fn agg_multi_validity_rejects_length_mismatch() {
-        let specs = [AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 }];
+        let specs = [AggSpec {
+            op: ReduceOp::Sum,
+            input_dtype: DataType::Int64,
+        }];
         assert!(
             compile_groupby_agg_kernel_multi_with_validity(&specs, &[]).is_err(),
             "mismatched mask length must error"
@@ -2298,15 +2245,21 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_with_validity_emits_per_spec_guard() {
         let specs = [
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int32 },
-            AggSpec { op: ReduceOp::Count, input_dtype: DataType::Int64 },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int32,
+            },
+            AggSpec {
+                op: ReduceOp::Count,
+                input_dtype: DataType::Int64,
+            },
         ];
-        let ptx = compile_groupby_agg_kernel_multi_with_validity(
-            &specs,
-            &[true, true, true],
-        )
-        .expect("validity multi");
+        let ptx = compile_groupby_agg_kernel_multi_with_validity(&specs, &[true, true, true])
+            .expect("validity multi");
 
         // Core 2 + 2*3 = 8 .u64 params + 3 validity pointers = 11 .u64 params.
         assert_eq!(
@@ -2351,15 +2304,21 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_with_validity_mixed_mask_guards_only_flagged() {
         let specs = [
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 }, // nullable
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int32 }, // not null
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 }, // nullable
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            }, // nullable
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int32,
+            }, // not null
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            }, // nullable
         ];
-        let ptx = compile_groupby_agg_kernel_multi_with_validity(
-            &specs,
-            &[true, false, true],
-        )
-        .expect("mixed validity multi");
+        let ptx = compile_groupby_agg_kernel_multi_with_validity(&specs, &[true, false, true])
+            .expect("mixed validity multi");
 
         // 8 core + 2 validity pointers (specs 0 and 2 only).
         assert_eq!(ptx.matches(".param .u64 ").count(), 8 + 2);
@@ -2368,7 +2327,10 @@ mod ptx_shape_tests {
         assert_eq!(ptx.matches("bfe.u32 %r27, %r26, %r25, 1;").count(), 2);
         // Landing pads for the flagged specs only.
         assert!(ptx.contains("SPEC_SKIP_0:"));
-        assert!(!ptx.contains("SPEC_SKIP_1:"), "spec 1 is not nullable — no guard");
+        assert!(
+            !ptx.contains("SPEC_SKIP_1:"),
+            "spec 1 is not nullable — no guard"
+        );
         assert!(ptx.contains("SPEC_SKIP_2:"));
 
         // All three atomics still present.
@@ -2382,14 +2344,16 @@ mod ptx_shape_tests {
     #[test]
     fn agg_multi_validity_pointers_follow_scalars() {
         let specs = [
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
-            AggSpec { op: ReduceOp::Sum, input_dtype: DataType::Int64 },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            },
+            AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: DataType::Int64,
+            },
         ];
-        let ptx = compile_groupby_agg_kernel_multi_with_validity(
-            &specs,
-            &[true, true],
-        )
-        .unwrap();
+        let ptx = compile_groupby_agg_kernel_multi_with_validity(&specs, &[true, true]).unwrap();
         // n_rows = param_6, k = param_7 stay .u32; validity = param_8, param_9.
         assert!(ptx.contains(".u32 bolt_groupby_agg_multi_param_6"));
         assert!(ptx.contains(".u32 bolt_groupby_agg_multi_param_7"));
@@ -2456,7 +2420,10 @@ mod ptx_shape_tests {
         let i32_ref = compile_groupby_agg_kernel(ReduceOp::Min, DataType::Int32)
             .expect("MIN(Int32) reference");
         assert_eq!(date, i32_ref);
-        assert!(date.contains("atom.global.min.s32"), "expected s32 min atomic:\n{date}");
+        assert!(
+            date.contains("atom.global.min.s32"),
+            "expected s32 min atomic:\n{date}"
+        );
     }
 
     /// MAX(Timestamp) GROUP BY must collapse to the Int64 atomic kernel.
@@ -2467,7 +2434,10 @@ mod ptx_shape_tests {
         let i64_ref = compile_groupby_agg_kernel(ReduceOp::Max, DataType::Int64)
             .expect("MAX(Int64) reference");
         assert_eq!(ts, i64_ref);
-        assert!(ts.contains("atom.global.max.s64"), "expected s64 max atomic:\n{ts}");
+        assert!(
+            ts.contains("atom.global.max.s64"),
+            "expected s64 max atomic:\n{ts}"
+        );
     }
 
     /// COUNT over temporal value columns routes through the integer add atomic.
@@ -2495,7 +2465,10 @@ mod ptx_shape_tests {
                 "unexpected SUM(temporal) error for {dt:?}: {err}"
             );
             // Fused multi-agg path rejects it too.
-            let specs = [AggSpec { op: ReduceOp::Sum, input_dtype: dt }];
+            let specs = [AggSpec {
+                op: ReduceOp::Sum,
+                input_dtype: dt,
+            }];
             assert!(compile_groupby_agg_kernel_multi(&specs).is_err());
         }
     }
@@ -2639,7 +2612,10 @@ mod ptx_shape_tests {
     #[test]
     fn rh_kernel_emits_swap_branch_and_bound() {
         let ptx = compile_groupby_keys_kernel_robin_hood().expect("rh ptx");
-        assert!(ptx.contains("RH_PROBE_LOOP:"), "missing RH_PROBE_LOOP label");
+        assert!(
+            ptx.contains("RH_PROBE_LOOP:"),
+            "missing RH_PROBE_LOOP label"
+        );
         assert!(ptx.contains("RH_SWAP:"), "missing RH_SWAP label");
         // The bounded-probe cap mov should reference MAX_RH_PROBE * 2
         // (doubled because RH_RETRY can legitimately re-probe the same
@@ -2687,8 +2663,7 @@ mod ptx_shape_tests {
         // Save + clear the env so the dispatcher takes the default branch.
         let prev = std::env::var("BOLT_HASH_ALGO").ok();
         std::env::remove_var("BOLT_HASH_ALGO");
-        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
-            .expect("dispatcher default");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched().expect("dispatcher default");
         assert_eq!(entry, KEYS_KERNEL_ENTRY);
         // Restore.
         if let Some(v) = prev {
@@ -2705,19 +2680,16 @@ mod ptx_shape_tests {
         let prev = std::env::var("BOLT_HASH_ALGO").ok();
 
         std::env::set_var("BOLT_HASH_ALGO", "robin_hood");
-        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
-            .expect("rh long form");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched().expect("rh long form");
         assert_eq!(entry, KEYS_KERNEL_RH_ENTRY);
 
         std::env::set_var("BOLT_HASH_ALGO", "RH");
-        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
-            .expect("rh short upper");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched().expect("rh short upper");
         assert_eq!(entry, KEYS_KERNEL_RH_ENTRY);
 
         // Unknown values fall back to linear.
         std::env::set_var("BOLT_HASH_ALGO", "wibble");
-        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched()
-            .expect("unknown fallback");
+        let (_ptx, entry) = compile_groupby_keys_kernel_dispatched().expect("unknown fallback");
         assert_eq!(entry, KEYS_KERNEL_ENTRY);
 
         // Restore.
@@ -2758,23 +2730,44 @@ mod ptx_shape_tests {
     /// must not appear.
     #[test]
     fn grouped_decimal_entry_and_classic_abi() {
-        for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
+        for op in [
+            GroupedDecimalOp::Sum,
+            GroupedDecimalOp::Min,
+            GroupedDecimalOp::Max,
+        ] {
             let ptx = compile_groupby_decimal_kernel(op, false).expect("decimal ptx");
             assert!(
                 ptx.contains(&format!(".visible .entry {}(", AGG_DECIMAL_KERNEL_ENTRY)),
                 "missing entry for {op:?}:\n{ptx}"
             );
             // 9 params: 0..=8, where param_8 is the overflow counter. No param_9.
-            assert!(ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
-            assert!(!ptx.contains(&format!("{}_param_9", AGG_DECIMAL_KERNEL_ENTRY)), "{op:?}");
-            // Classic path emits no validity bit-extract.
-            assert!(!ptx.contains("bfe.u32"), "classic decimal must not extract validity:\n{ptx}");
-            // Probe-bound + lock-bound bailouts surface via the counter.
-            assert!(ptx.contains("DEC_OVERFLOW:"), "{op:?} missing DEC_OVERFLOW label:\n{ptx}");
-            assert!(ptx.contains("@%p2 bra DEC_OVERFLOW;"), "{op:?} probe bound must reach DEC_OVERFLOW:\n{ptx}");
             assert!(
-                ptx.contains(&format!("ld.param.u64 %rd44, [{}_param_8];", AGG_DECIMAL_KERNEL_ENTRY))
-                    && ptx.contains("atom.global.add.u32 %r30, [%rd44], 1;"),
+                ptx.contains(&format!("{}_param_8", AGG_DECIMAL_KERNEL_ENTRY)),
+                "{op:?}"
+            );
+            assert!(
+                !ptx.contains(&format!("{}_param_9", AGG_DECIMAL_KERNEL_ENTRY)),
+                "{op:?}"
+            );
+            // Classic path emits no validity bit-extract.
+            assert!(
+                !ptx.contains("bfe.u32"),
+                "classic decimal must not extract validity:\n{ptx}"
+            );
+            // Probe-bound + lock-bound bailouts surface via the counter.
+            assert!(
+                ptx.contains("DEC_OVERFLOW:"),
+                "{op:?} missing DEC_OVERFLOW label:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("@%p2 bra DEC_OVERFLOW;"),
+                "{op:?} probe bound must reach DEC_OVERFLOW:\n{ptx}"
+            );
+            assert!(
+                ptx.contains(&format!(
+                    "ld.param.u64 %rd44, [{}_param_8];",
+                    AGG_DECIMAL_KERNEL_ENTRY
+                )) && ptx.contains("atom.global.add.u32 %r30, [%rd44], 1;"),
                 "{op:?} DEC_OVERFLOW must bump the counter at param_8:\n{ptx}"
             );
         }
@@ -2787,9 +2780,15 @@ mod ptx_shape_tests {
         let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, true)
             .expect("decimal validity ptx");
         assert!(ptx.contains(&format!("{}_param_9", AGG_DECIMAL_KERNEL_ENTRY)));
-        assert!(ptx.contains("bfe.u32"), "validity variant must extract the row's bit:\n{ptx}");
+        assert!(
+            ptx.contains("bfe.u32"),
+            "validity variant must extract the row's bit:\n{ptx}"
+        );
         // Overflow counter now lives at param_9.
-        assert!(ptx.contains(&format!("ld.param.u64 %rd44, [{}_param_9];", AGG_DECIMAL_KERNEL_ENTRY)));
+        assert!(ptx.contains(&format!(
+            "ld.param.u64 %rd44, [{}_param_9];",
+            AGG_DECIMAL_KERNEL_ENTRY
+        )));
     }
 
     /// The per-slot spin lock must be BOUNDED: a runaway acquire loop is a
@@ -2797,10 +2796,17 @@ mod ptx_shape_tests {
     /// must bail into DEC_OVERFLOW rather than spinning forever.
     #[test]
     fn grouped_decimal_lock_loop_is_bounded() {
-        for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
+        for op in [
+            GroupedDecimalOp::Sum,
+            GroupedDecimalOp::Min,
+            GroupedDecimalOp::Max,
+        ] {
             let ptx = compile_groupby_decimal_kernel(op, false).unwrap();
             assert!(
-                ptx.contains(&format!("setp.gt.u32 %p10, %r29, {};", DECIMAL_MAX_LOCK_ATTEMPTS)),
+                ptx.contains(&format!(
+                    "setp.gt.u32 %p10, %r29, {};",
+                    DECIMAL_MAX_LOCK_ATTEMPTS
+                )),
                 "{op:?} lock loop must compare its attempt counter against the bound:\n{ptx}"
             );
             assert!(
@@ -2817,7 +2823,11 @@ mod ptx_shape_tests {
     /// two-word CAS) would tear the inter-word carry / the all-or-nothing pick.
     #[test]
     fn grouped_decimal_uses_per_slot_spinlock() {
-        for op in [GroupedDecimalOp::Sum, GroupedDecimalOp::Min, GroupedDecimalOp::Max] {
+        for op in [
+            GroupedDecimalOp::Sum,
+            GroupedDecimalOp::Min,
+            GroupedDecimalOp::Max,
+        ] {
             let ptx = compile_groupby_decimal_kernel(op, false).unwrap();
             assert!(
                 ptx.contains("atom.global.cas.b32 %r22, [%rd16], 0, 1;"),
@@ -2842,18 +2852,27 @@ mod ptx_shape_tests {
     #[test]
     fn grouped_decimal_sum_is_carry_add_with_overflow() {
         let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, false).unwrap();
-        assert!(ptx.contains("add.cc.u64"), "SUM needs carry-out add:\n{ptx}");
+        assert!(
+            ptx.contains("add.cc.u64"),
+            "SUM needs carry-out add:\n{ptx}"
+        );
         assert!(ptx.contains("addc.u64"), "SUM needs carry-in add:\n{ptx}");
         // Overflow flag is set via exch on param_7 (the overflow pointer).
         assert!(
-            ptx.contains(&format!("ld.param.u64 %rd30, [{}_param_7];", AGG_DECIMAL_KERNEL_ENTRY)),
+            ptx.contains(&format!(
+                "ld.param.u64 %rd30, [{}_param_7];",
+                AGG_DECIMAL_KERNEL_ENTRY
+            )),
             "SUM must read the overflow-flag pointer:\n{ptx}"
         );
         assert!(
             ptx.contains("atom.global.exch.b32 %r23, [%rd30], 1;"),
             "SUM must raise the overflow flag on detected overflow:\n{ptx}"
         );
-        assert!(!ptx.contains("selp.b64"), "SUM must not compare-select:\n{ptx}");
+        assert!(
+            !ptx.contains("selp.b64"),
+            "SUM must not compare-select:\n{ptx}"
+        );
     }
 
     /// MIN/MAX emit the 128-bit signed-hi / unsigned-lo compare-and-select and
@@ -2865,15 +2884,19 @@ mod ptx_shape_tests {
         assert!(min.contains("setp.lt.s64"), "MIN hi signed-lt:\n{min}");
         assert!(min.contains("setp.lt.u64"), "MIN lo unsigned-lt:\n{min}");
         assert!(min.contains("selp.b64"), "MIN selects via selp.b64:\n{min}");
-        assert!(!min.contains("add.cc.u64") && !min.contains("addc.u64"),
-            "MIN must NOT carry-add:\n{min}");
+        assert!(
+            !min.contains("add.cc.u64") && !min.contains("addc.u64"),
+            "MIN must NOT carry-add:\n{min}"
+        );
 
         let max = compile_groupby_decimal_kernel(GroupedDecimalOp::Max, false).unwrap();
         assert!(max.contains("setp.gt.s64"), "MAX hi signed-gt:\n{max}");
         assert!(max.contains("setp.gt.u64"), "MAX lo unsigned-gt:\n{max}");
         assert!(max.contains("selp.b64"), "MAX selects via selp.b64:\n{max}");
-        assert!(!max.contains("add.cc.u64") && !max.contains("addc.u64"),
-            "MAX must NOT carry-add:\n{max}");
+        assert!(
+            !max.contains("add.cc.u64") && !max.contains("addc.u64"),
+            "MAX must NOT carry-add:\n{max}"
+        );
     }
 
     /// The slot is loaded + stored as two 8-byte halves (hi at `+8`) with PLAIN
@@ -2882,9 +2905,21 @@ mod ptx_shape_tests {
     #[test]
     fn grouped_decimal_slot_is_plain_two_half_rmw() {
         let ptx = compile_groupby_decimal_kernel(GroupedDecimalOp::Sum, false).unwrap();
-        assert!(ptx.contains("ld.global.u64 %rd20, [%rd13];"), "lo load:\n{ptx}");
-        assert!(ptx.contains("ld.global.u64 %rd21, [%rd13+8];"), "hi load:\n{ptx}");
-        assert!(ptx.contains("st.global.u64 [%rd13], %rd22;"), "lo store:\n{ptx}");
-        assert!(ptx.contains("st.global.u64 [%rd13+8], %rd23;"), "hi store:\n{ptx}");
+        assert!(
+            ptx.contains("ld.global.u64 %rd20, [%rd13];"),
+            "lo load:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("ld.global.u64 %rd21, [%rd13+8];"),
+            "hi load:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.u64 [%rd13], %rd22;"),
+            "lo store:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.u64 [%rd13+8], %rd23;"),
+            "hi store:\n{ptx}"
+        );
     }
 }

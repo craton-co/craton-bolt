@@ -65,7 +65,11 @@ fn fold_agg(agg: AggregateExpr) -> AggregateExpr {
 /// Bottom-up fold of a single expression tree.
 pub fn fold_expr(expr: Expr) -> Expr {
     match expr {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::CastFormat { .. } => expr,
+        Expr::Extract { .. }
+        | Expr::DateTrunc { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::CastFormat { .. } => expr,
         // Leaves are already folded.
         Expr::Column(_) | Expr::Literal(_) => expr,
         Expr::Binary { op, left, right } => {
@@ -514,7 +518,13 @@ mod tests {
     fn collapses_double_negation() {
         let e = col("a").eq(lit(1_i64)).not().not();
         // NOT NOT (a = 1) => (a = 1)
-        assert!(matches!(fold_expr(e), Expr::Binary { op: BinaryOp::Eq, .. }));
+        assert!(matches!(
+            fold_expr(e),
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -532,7 +542,11 @@ mod tests {
             // (1 + 1 = 2) AND (a > 0)  =>  true AND (a > 0)  =>  (a > 0)
             predicate: b(
                 BinaryOp::And,
-                b(BinaryOp::Eq, b(BinaryOp::Add, lit(1_i64), lit(1_i64)), lit(2_i64)),
+                b(
+                    BinaryOp::Eq,
+                    b(BinaryOp::Add, lit(1_i64), lit(1_i64)),
+                    lit(2_i64),
+                ),
                 col("a").gt(lit(0_i64)),
             ),
         };
@@ -543,7 +557,13 @@ mod tests {
         match out {
             LogicalPlan::Filter { predicate, .. } => {
                 // Collapsed to just `a > 0`.
-                assert!(matches!(predicate, Expr::Binary { op: BinaryOp::Gt, .. }));
+                assert!(matches!(
+                    predicate,
+                    Expr::Binary {
+                        op: BinaryOp::Gt,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Filter, got {other:?}"),
         }

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY orchestrator for **multiple SUM** aggregates.
 //!
@@ -123,7 +123,8 @@ pub fn execute_tier2_multi_sum(
     // ----------------------------------------------------------------------
     // Step 1. Allocate the partition-pass outputs.
     // ----------------------------------------------------------------------
-    let mut counts: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut counts: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
     let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
@@ -135,12 +136,12 @@ pub fn execute_tier2_multi_sum(
     // `partition_kernel::SHMEM_STAGING_MIN_ROWS` comparison as before; only
     // the resulting cache-key string differs from the enum-returning
     // executors, so that mapping stays local here).
-    let partition_spec_id = if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows)
-    {
-        "partition_shmem_staging"
-    } else {
-        "partition_global_atomics"
-    };
+    let partition_spec_id =
+        if crate::exec::groupby_tier2_common::use_shmem_staging_partition(n_rows) {
+            "partition_shmem_staging"
+        } else {
+            "partition_global_atomics"
+        };
     let partition_module = module_cache::get_or_build_module(
         module_path!(),
         partition_spec_id.to_string(),
@@ -184,10 +185,7 @@ pub fn execute_tier2_multi_sum(
     // kernel consumes.
     // ----------------------------------------------------------------------
     let (offsets, offsets_gpu): (Vec<u32>, GpuVec<u32>) =
-        partition_offsets::compute_and_upload_partition_offsets_async(
-            &counts,
-            stream.raw(),
-        )?;
+        partition_offsets::compute_and_upload_partition_offsets_async(&counts, stream.raw())?;
     if offsets.len() != (num_partitions as usize) + 1 {
         return Err(BoltError::Other(format!(
             "tier2_multi: prefix-sum returned {} offsets, expected {}",
@@ -218,7 +216,8 @@ pub fn execute_tier2_multi_sum(
         scatter_vals.push(GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?);
     }
     let mut dest_idx: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut partition_cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut partition_cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     // ----------------------------------------------------------------------
     // Step 5. Atomic-claim pass — runs ONCE.
@@ -255,14 +254,7 @@ pub fn execute_tier2_multi_sum(
         args.push_output(&mut view_di);
         args.push_scalar_u32(n_rows);
 
-        launch_with_geometry(
-            claim_fn,
-            grid_blocks,
-            BLOCK_THREADS,
-            0,
-            &stream,
-            &mut args,
-        )?;
+        launch_with_geometry(claim_fn, grid_blocks, BLOCK_THREADS, 0, &stream, &mut args)?;
     }
 
     // ----------------------------------------------------------------------
@@ -329,8 +321,7 @@ pub fn execute_tier2_multi_sum(
     if (offsets[num_partitions as usize] as usize) != n_rows_usize {
         return Err(BoltError::Other(format!(
             "tier2_multi: offsets[K]={}, expected n_rows={}",
-            offsets[num_partitions as usize],
-            n_rows
+            offsets[num_partitions as usize], n_rows
         )));
     }
 
@@ -386,8 +377,7 @@ pub fn execute_tier2_multi_sum(
         let views_sv: Vec<_> = scatter_vals.iter().map(|g| g.view()).collect();
         let view_po = offsets_kp1_gpu.view();
         let mut view_ok = out_keys_gpu.view_mut();
-        let mut views_ov: Vec<_> =
-            out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
+        let mut views_ov: Vec<_> = out_vals_gpu.iter_mut().map(|g| g.view_mut()).collect();
         let mut view_os = out_set_gpu.view_mut();
         let mut view_sp = spill.view_mut();
 
@@ -417,8 +407,7 @@ pub fn execute_tier2_multi_sum(
     // Stage-4 (P1b): pinned D2H for the fixed-size outputs; sync once
     // after all transfers are queued.
     let pinned_keys = out_keys_gpu.to_pinned_async(stream.raw())?;
-    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> =
-        Vec::with_capacity(n_vals);
+    let mut pinned_vals: Vec<crate::cuda::PinnedHostBuffer<f64>> = Vec::with_capacity(n_vals);
     for ov in &out_vals_gpu {
         pinned_vals.push(ov.to_pinned_async(stream.raw())?);
     }
@@ -432,10 +421,7 @@ pub fn execute_tier2_multi_sum(
         )));
     }
     let host_out_keys: Vec<i32> = pinned_keys.as_slice().to_vec();
-    let host_out_vals: Vec<Vec<f64>> = pinned_vals
-        .iter()
-        .map(|p| p.as_slice().to_vec())
-        .collect();
+    let host_out_vals: Vec<Vec<f64>> = pinned_vals.iter().map(|p| p.as_slice().to_vec()).collect();
     let host_out_set: Vec<u8> = pinned_set.as_slice().to_vec();
 
     // Walk per-partition slot maps. For each populated slot push

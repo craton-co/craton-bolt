@@ -45,9 +45,7 @@
 
 use std::collections::HashSet;
 
-use arrow_array::{
-    Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-};
+use arrow_array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
@@ -120,7 +118,11 @@ pub(crate) fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
     match dtype {
         DataType::Int32 | DataType::Float32 => Ok(32),
         DataType::Int64 | DataType::Float64 => Ok(64),
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "GROUP BY key dtype {:?} not supported in v1",
             dtype
         ))),
@@ -265,7 +267,11 @@ pub(crate) fn load_key_column_bits(
                 .map(|&v| canonicalise_f64(v).to_bits())
                 .collect()
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => {
             return Err(BoltError::Type(format!(
                 "GROUP BY key dtype {:?} not supported in v1",
                 key_io.dtype
@@ -343,10 +349,7 @@ pub(crate) fn canonicalise_f32(x: f32) -> f32 {
 /// future regression where `shift == 64` produces a deterministic `0` instead
 /// of triggering UB / a debug panic on a bare `<<` overshift. This is the
 /// single source of truth that previously had to be fixed twice.
-pub(crate) fn pack_keys(
-    aggregate: &AggregateSpec,
-    batch: &RecordBatch,
-) -> BoltResult<PackedKeys> {
+pub(crate) fn pack_keys(aggregate: &AggregateSpec, batch: &RecordBatch) -> BoltResult<PackedKeys> {
     if aggregate.group_by.is_empty() {
         return Err(BoltError::Other(
             "pack_keys: aggregate has no GROUP BY columns".into(),
@@ -392,10 +395,8 @@ pub(crate) fn pack_keys(
     //   - For two columns: the FIRST group-by column occupies the HIGH 32
     //     bits (bit_offset = 32), the second occupies the LOW 32 bits
     //     (bit_offset = 0).
-    let mut components: Vec<KeyComponent> =
-        Vec::with_capacity(aggregate.group_by.len());
-    let mut bit_streams: Vec<Vec<u64>> =
-        Vec::with_capacity(aggregate.group_by.len());
+    let mut components: Vec<KeyComponent> = Vec::with_capacity(aggregate.group_by.len());
+    let mut bit_streams: Vec<Vec<u64>> = Vec::with_capacity(aggregate.group_by.len());
 
     // Accumulate per-key-column null masks into a single combined `key_valid`
     // vector. If every key column has zero nulls we keep `combined_mask` as
@@ -524,7 +525,11 @@ pub(crate) fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyVal
                 // bit_offset is always 0.
                 u
             }
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 // pack_keys would have already rejected these dtypes — we
                 // can't reach this branch from the executors, but keep the
                 // match exhaustive and return a 0 placeholder.
@@ -536,7 +541,11 @@ pub(crate) fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyVal
             DataType::Int64 => KeyValue::I64(raw as i64),
             DataType::Float32 => KeyValue::F32(f32::from_bits(raw as u32)),
             DataType::Float64 => KeyValue::F64(f64::from_bits(raw)),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => KeyValue::I64(0),
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => KeyValue::I64(0),
         };
         out.push(val);
     }
@@ -591,9 +600,7 @@ fn downcast_err(name: &str, expected: &str) -> BoltError {
 /// dedup (groupby_common): used by [`load_key_column_bits`]; delegates to the
 /// shared `schema_convert` helper exactly as the executors' local
 /// `arrow_dtype_to_plan` aliases did.
-fn arrow_dtype_to_plan(
-    d: &arrow_schema::DataType,
-) -> BoltResult<DataType> {
+fn arrow_dtype_to_plan(d: &arrow_schema::DataType) -> BoltResult<DataType> {
     crate::exec::schema_convert::arrow_dtype_to_plan_basic(d, "")
 }
 
@@ -613,9 +620,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, RecordBatch};
-    use arrow_schema::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-    };
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
     use crate::plan::logical_plan::Schema;
     use crate::plan::physical_plan::AggregateSpec;
@@ -644,18 +649,11 @@ mod tests {
     /// bitmaps.
     fn one_col_batch(name: &str, arr: ArrayRef) -> RecordBatch {
         let dt = arr.data_type().clone();
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            name, dt, true,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(name, dt, true)]));
         RecordBatch::try_new(schema, vec![arr]).expect("one-col batch")
     }
 
-    fn two_col_batch(
-        n1: &str,
-        a1: ArrayRef,
-        n2: &str,
-        a2: ArrayRef,
-    ) -> RecordBatch {
+    fn two_col_batch(n1: &str, a1: ArrayRef, n2: &str, a2: ArrayRef) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(n1, a1.data_type().clone(), true),
             ArrowField::new(n2, a2.data_type().clone(), true),
@@ -669,8 +667,7 @@ mod tests {
         let agg = spec(vec![("k", DataType::Int32)], vec![0]);
         let batch = one_col_batch(
             "k",
-            Arc::new(Int32Array::from(vec![7i32, -3, 0, i32::MIN, i32::MAX]))
-                as ArrayRef,
+            Arc::new(Int32Array::from(vec![7i32, -3, 0, i32::MIN, i32::MAX])) as ArrayRef,
         );
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         assert_eq!(packed.components.len(), 1);
@@ -744,10 +741,7 @@ mod tests {
     fn pack_keys_float32() {
         let agg = spec(vec![("f", DataType::Float32)], vec![0]);
         let vals = vec![1.5f32, -2.25, 0.0, -0.0, f32::INFINITY];
-        let batch = one_col_batch(
-            "f",
-            Arc::new(Float32Array::from(vals.clone())) as ArrayRef,
-        );
+        let batch = one_col_batch("f", Arc::new(Float32Array::from(vals.clone())) as ArrayRef);
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         assert_eq!(packed.components.len(), 1);
         assert_eq!(packed.components[0].original_dtype, DataType::Float32);
@@ -788,10 +782,7 @@ mod tests {
         let plain_nan = f32::NAN;
         let finite = 1.5f32;
         let vals = vec![payload_nan, signalling_nan, neg_nan, plain_nan, finite];
-        let batch = one_col_batch(
-            "f",
-            Arc::new(Float32Array::from(vals)) as ArrayRef,
-        );
+        let batch = one_col_batch("f", Arc::new(Float32Array::from(vals)) as ArrayRef);
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         // All four NaN rows pack to one key.
         let nan_key = packed.keys_i64[0];
@@ -801,7 +792,10 @@ mod tests {
         // The canonical key is exactly `f32::NAN.to_bits()`.
         assert_eq!(nan_key, (f32::NAN.to_bits() as u64) as i64);
         // A finite value is a distinct group.
-        assert_ne!(packed.keys_i64[4], nan_key, "finite value must NOT join NaN group");
+        assert_ne!(
+            packed.keys_i64[4], nan_key,
+            "finite value must NOT join NaN group"
+        );
     }
 
     /// F3 (f64 lane): same NaN-collapse contract as `pack_keys_nan_collapse_f32`.
@@ -814,17 +808,17 @@ mod tests {
         let plain_nan = f64::NAN;
         let finite = -2.25f64;
         let vals = vec![payload_nan, signalling_nan, neg_nan, plain_nan, finite];
-        let batch = one_col_batch(
-            "f",
-            Arc::new(Float64Array::from(vals)) as ArrayRef,
-        );
+        let batch = one_col_batch("f", Arc::new(Float64Array::from(vals)) as ArrayRef);
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         let nan_key = packed.keys_i64[0];
         assert_eq!(packed.keys_i64[1], nan_key, "signalling NaN must collapse");
         assert_eq!(packed.keys_i64[2], nan_key, "negative NaN must collapse");
         assert_eq!(packed.keys_i64[3], nan_key, "plain NaN must collapse");
         assert_eq!(nan_key, f64::NAN.to_bits() as i64);
-        assert_ne!(packed.keys_i64[4], nan_key, "finite value must NOT join NaN group");
+        assert_ne!(
+            packed.keys_i64[4], nan_key,
+            "finite value must NOT join NaN group"
+        );
     }
 
     /// 4. Three columns exceeds the v1 lossless packing budget.
@@ -931,10 +925,8 @@ mod tests {
             vec![("a", DataType::Int32), ("b", DataType::Int32)],
             vec![0, 1],
         );
-        let a: ArrayRef =
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)]));
-        let b: ArrayRef =
-            Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)]));
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)]));
+        let b: ArrayRef = Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)]));
         let batch = two_col_batch("a", a, "b", b);
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         let mask = packed.key_valid.expect("expected mask");
@@ -971,8 +963,7 @@ mod tests {
     #[test]
     fn pack_keys_single_i64_round_trips() {
         let agg = spec(vec![("k", DataType::Int64)], vec![0]);
-        let arr: ArrayRef =
-            Arc::new(Int64Array::from(vec![0i64, -1, i64::MAX, i64::MIN]));
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![0i64, -1, i64::MAX, i64::MIN]));
         let batch = one_col_batch("k", arr);
         let packed = pack_keys(&agg, &batch).expect("pack ok");
         for (row, &v) in [0i64, -1, i64::MAX, i64::MIN].iter().enumerate() {
@@ -994,10 +985,7 @@ mod tests {
             Some(vec![false, true])
         );
         assert_eq!(
-            and_masks(
-                Some(vec![true, true, false]),
-                Some(vec![true, false, true])
-            ),
+            and_masks(Some(vec![true, true, false]), Some(vec![true, false, true])),
             Some(vec![true, false, false])
         );
     }

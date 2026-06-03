@@ -101,7 +101,8 @@ fn assert_err_contains(result: Result<(), String>, needle: &str) {
     match result {
         Ok(()) => panic!("expected error containing {needle:?}, got Ok"),
         Err(msg) => assert!(
-            msg.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()),
+            msg.to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()),
             "expected error to contain {needle:?}, got: {msg}"
         ),
     }
@@ -120,11 +121,11 @@ fn single_table_with_table_prefix() {
 #[test]
 fn single_table_with_table_prefix_in_where() {
     let provider = two_tables();
-    let res = try_plan(
-        "SELECT id FROM orders WHERE orders.total > 100",
-        &provider,
+    let res = try_plan("SELECT id FROM orders WHERE orders.total > 100", &provider);
+    assert!(
+        res.is_ok(),
+        "qualified WHERE column should resolve: {res:?}"
     );
-    assert!(res.is_ok(), "qualified WHERE column should resolve: {res:?}");
 }
 
 // ---- Single-table: alias ----------------------------------------------------
@@ -175,7 +176,10 @@ fn join_with_table_prefixes() {
                FROM orders INNER JOIN customers \
                ON orders.customer_id = customers.id";
     let res = try_plan(sql, &provider);
-    assert!(res.is_ok(), "JOIN with qualified columns should plan: {res:?}");
+    assert!(
+        res.is_ok(),
+        "JOIN with qualified columns should plan: {res:?}"
+    );
 }
 
 #[test]
@@ -188,7 +192,10 @@ fn join_with_aliases_on_both_sides() {
                FROM orders AS o INNER JOIN customers AS c \
                ON o.customer_id = c.id";
     let res = try_plan(sql, &provider);
-    assert!(res.is_ok(), "JOIN with both-side aliases should plan: {res:?}");
+    assert!(
+        res.is_ok(),
+        "JOIN with both-side aliases should plan: {res:?}"
+    );
 }
 
 #[test]
@@ -211,7 +218,10 @@ fn join_with_qualified_where_predicate() {
                ON orders.customer_id = customers.id \
                WHERE orders.total > 100";
     let res = try_plan(sql, &provider);
-    assert!(res.is_ok(), "qualified WHERE after JOIN should plan: {res:?}");
+    assert!(
+        res.is_ok(),
+        "qualified WHERE after JOIN should plan: {res:?}"
+    );
 }
 
 // ---- Error paths ------------------------------------------------------------
@@ -300,8 +310,7 @@ fn three_part_column_ref_respects_alias_precedence() {
         try_plan("SELECT any_schema.t.x FROM mytable AS t", &provider).is_ok(),
         "schema-qualified ref via alias should resolve"
     );
-    let shadowed =
-        try_plan("SELECT any_schema.mytable.x FROM mytable AS t", &provider);
+    let shadowed = try_plan("SELECT any_schema.mytable.x FROM mytable AS t", &provider);
     assert_err_contains(shadowed, "unknown table qualifier");
 }
 
@@ -309,10 +318,7 @@ fn three_part_column_ref_respects_alias_precedence() {
 fn four_part_identifier_rejected_as_deeply_qualified() {
     // Beyond 3 parts the message falls back to "deeply qualified".
     let provider = two_tables();
-    let res = try_plan(
-        "SELECT db.public.orders.id FROM orders",
-        &provider,
-    );
+    let res = try_plan("SELECT db.public.orders.id FROM orders", &provider);
     assert_err_contains(res, "deeply qualified");
 }
 

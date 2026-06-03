@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Arrow-compatible columnar GPU storage primitives.
 //!
@@ -319,15 +319,13 @@ impl<T: Pod> GpuBuffer<T> {
         // 2. Host-to-device copy of the tail directly into the offset
         //    `prefix_len * size_of::<T>()` bytes.
         if !tail.is_empty() {
-            let byte_offset = prefix_len
-                .checked_mul(size_of::<T>())
-                .ok_or_else(|| {
-                    BoltError::Memory(format!(
-                        "GpuBuffer::from_prefix_and_tail: offset overflow: {} * {}",
-                        prefix_len,
-                        size_of::<T>()
-                    ))
-                })?;
+            let byte_offset = prefix_len.checked_mul(size_of::<T>()).ok_or_else(|| {
+                BoltError::Memory(format!(
+                    "GpuBuffer::from_prefix_and_tail: offset overflow: {} * {}",
+                    prefix_len,
+                    size_of::<T>()
+                ))
+            })?;
             // M1: checked device-pointer add (mirrors the `checked_mul`
             // discipline used for `byte_offset` just above). A wrapping add
             // here would silently fold an overflowing offset back to a low
@@ -763,7 +761,6 @@ impl<T: Pod> GpuBuffer<T> {
         }
         Ok(())
     }
-
 }
 
 impl GpuBuffer<u8> {
@@ -1272,9 +1269,7 @@ unsafe impl<T: Pod> Send for GpuBuffer<T> {}
 // stream rather than racing through shared references.
 
 /// Upload an Arrow primitive array's value buffer to the GPU as a typed buffer.
-pub fn primitive_to_gpu<P>(
-    arr: &arrow_array::PrimitiveArray<P>,
-) -> BoltResult<GpuBuffer<P::Native>>
+pub fn primitive_to_gpu<P>(arr: &arrow_array::PrimitiveArray<P>) -> BoltResult<GpuBuffer<P::Native>>
 where
     P: arrow_array::types::ArrowPrimitiveType,
     P::Native: Pod,
@@ -1668,8 +1663,7 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
             // fast path and keeps parity with `GpuBuffer::Drop`.)
             // SAFETY: see the `cuMemFreeHost` SAFETY note below; here there is
             // additionally no outstanding async work to fence against.
-            let rc =
-                unsafe { cuda_sys::mem_free_host(self.ptr as *mut std::ffi::c_void) };
+            let rc = unsafe { cuda_sys::mem_free_host(self.ptr as *mut std::ffi::c_void) };
             if let Err(e) = rc {
                 log::warn!(
                     "craton-bolt: cuMemFreeHost failed ({:?}); pinned host buffer leaked",
@@ -1687,8 +1681,7 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
             // `CUDA_ERROR_INVALID_HANDLE` WITHOUT waiting for that stream's
             // still-draining DMA. We record that and escalate to a
             // device-wide sync below before freeing the pages.
-            let sync_rc =
-                unsafe { cuda_sys::check(cuda_sys::cuStreamSynchronize(stream)) };
+            let sync_rc = unsafe { cuda_sys::check(cuda_sys::cuStreamSynchronize(stream)) };
             if let Err(e) = sync_rc {
                 any_failed = true;
                 log::warn!(
@@ -1726,8 +1719,7 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         // Cast via `*mut std::ffi::c_void` so we don't pull `libc` into the
         // module's `use` list just for this one type — `std::ffi::c_void`
         // and `libc::c_void` are the same alias.
-        let rc =
-            unsafe { cuda_sys::mem_free_host(self.ptr as *mut std::ffi::c_void) };
+        let rc = unsafe { cuda_sys::mem_free_host(self.ptr as *mut std::ffi::c_void) };
         if let Err(e) = rc {
             log::warn!(
                 "craton-bolt: cuMemFreeHost failed ({:?}); pinned host buffer leaked",
@@ -1790,7 +1782,10 @@ mod tests {
         // Exact multiples must be left alone (no spurious second-bump).
         assert_eq!(round_up_to_alignment(64, ARROW_ALIGNMENT), Some(64));
         assert_eq!(round_up_to_alignment(128, ARROW_ALIGNMENT), Some(128));
-        assert_eq!(round_up_to_alignment(64 * 1024, ARROW_ALIGNMENT), Some(64 * 1024));
+        assert_eq!(
+            round_up_to_alignment(64 * 1024, ARROW_ALIGNMENT),
+            Some(64 * 1024)
+        );
     }
 
     #[test]
@@ -1823,7 +1818,10 @@ mod tests {
         // which rounds to a value with the alignment bits cleared.
         let max_fitting = usize::MAX - (ARROW_ALIGNMENT - 1);
         let expected = usize::MAX & !(ARROW_ALIGNMENT - 1);
-        assert_eq!(round_up_to_alignment(max_fitting, ARROW_ALIGNMENT), Some(expected));
+        assert_eq!(
+            round_up_to_alignment(max_fitting, ARROW_ALIGNMENT),
+            Some(expected)
+        );
 
         // One byte past that limit overflows.
         assert_eq!(
@@ -1959,8 +1957,8 @@ mod pinned_safety_tests {
         // hardening contract calls out. A `from_raw_parts(null, 0)` here
         // would be UB even though the slice is empty — the production path
         // must short-circuit before reaching that call.
-        let buf: PinnedHostBuffer<u8> = PinnedHostBuffer::new(0)
-            .expect("zero-length pinned alloc must not error");
+        let buf: PinnedHostBuffer<u8> =
+            PinnedHostBuffer::new(0).expect("zero-length pinned alloc must not error");
         let s = buf.as_slice();
         assert_eq!(s.len(), 0);
         // `as_ptr()` is allowed to be null for an empty buffer, but the
@@ -1980,8 +1978,7 @@ mod pinned_safety_tests {
         // if that short-circuit failed and we hit the FFI, the cuda-stub
         // build would panic with `CUDA_ERROR_STUB`.
         for _ in 0..8 {
-            let _b: PinnedHostBuffer<i64> =
-                PinnedHostBuffer::new(0).expect("zero-len alloc");
+            let _b: PinnedHostBuffer<i64> = PinnedHostBuffer::new(0).expect("zero-len alloc");
         }
     }
 
@@ -1995,8 +1992,7 @@ mod pinned_safety_tests {
         // This buffer is empty, so its `Drop` will skip the FFI free and
         // also skip the stream sync (the ptr-null short-circuit runs
         // first). That keeps the test driver-free on hosts without CUDA.
-        let buf: PinnedHostBuffer<u32> =
-            PinnedHostBuffer::new(0).expect("zero-len alloc");
+        let buf: PinnedHostBuffer<u32> = PinnedHostBuffer::new(0).expect("zero-len alloc");
         let fake_stream: CUstream = 0xDEAD_BEEF_usize as CUstream;
         assert_eq!(buf.recorded_stream_count(), 0);
         buf.mark_stream_use(fake_stream);

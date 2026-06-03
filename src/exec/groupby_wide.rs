@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! GROUP BY execution for "wide" composite keys — those whose total bit
 //! width exceeds 64 (e.g. `GROUP BY (a, b)` where both are `Int64`, or any
@@ -55,9 +55,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
@@ -169,9 +167,7 @@ pub fn execute_groupby_wide(
         // Look up (or insert) the per-group accumulator vector. `entry`
         // gives us one borrow of `groups` for the whole branch, avoiding
         // the double-borrow you'd hit with a manual `get_mut` + `insert`.
-        let accs = groups
-            .entry(tuple)
-            .or_insert_with(|| fresh_accs.clone());
+        let accs = groups.entry(tuple).or_insert_with(|| fresh_accs.clone());
 
         // Feed each aggregate its row value, skipping per-aggregate inputs
         // that are NULL at this row. Mirrors the call-site filter in
@@ -197,8 +193,7 @@ pub fn execute_groupby_wide(
 
     // 6. Build the output RecordBatch.
     let m_keys = key_cols.len();
-    let mut arrays: Vec<ArrayRef> =
-        Vec::with_capacity(m_keys + aggregate.aggregates.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(m_keys + aggregate.aggregates.len());
 
     // 6a. Key columns: one per group-by column, in group_by order.
     let key_arrays = build_key_arrays(&sorted, &key_cols)?;
@@ -209,22 +204,23 @@ pub fn execute_groupby_wide(
     // 6b. Aggregate columns: each accumulator finalised into the
     //     plan-declared output dtype.
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
-        let out_field = aggregate.output_schema.fields.get(m_keys + i).ok_or_else(|| {
-            BoltError::Other(format!(
-                "execute_groupby_wide: output_schema missing field for aggregate index {}",
-                i
-            ))
-        })?;
+        let out_field = aggregate
+            .output_schema
+            .fields
+            .get(m_keys + i)
+            .ok_or_else(|| {
+                BoltError::Other(format!(
+                    "execute_groupby_wide: output_schema missing field for aggregate index {}",
+                    i
+                ))
+            })?;
         let arr = finalize_agg_column(agg, out_field, i, &sorted)?;
         arrays.push(arr);
     }
 
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
-    RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        BoltError::Other(format!(
-            "failed to build wide GROUP BY RecordBatch: {e}"
-        ))
-    })
+    RecordBatch::try_new(arrow_schema, arrays)
+        .map_err(|e| BoltError::Other(format!("failed to build wide GROUP BY RecordBatch: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +365,11 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
             // Review C12: same signed-zero canonicalisation as Float32.
             Ok(KeyValue::F64Bits(canonicalise_f64(pa.value(row)).to_bits()))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
@@ -531,7 +531,11 @@ fn resolve_aggregates<'a>(
         // Reject Bool/Utf8 inputs.
         match io.dtype {
             DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: Bool/Utf8 aggregate inputs not supported (column '{}')",
                     io.name
@@ -597,7 +601,11 @@ fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> BoltResult<AggInputValue
                 .ok_or_else(|| downcast_err(&plan.name, "Float64"))?;
             Ok(AggInputValue::F64(pa.value(row)))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "wide GROUP BY: aggregate input dtype {:?} not supported (column '{}')",
             plan.dtype, plan.name
         ))),
@@ -675,7 +683,9 @@ enum Accumulator {
     /// `(count, mean, M2)` state. The output finaliser
     /// (`finalize_agg_column`) picks the right `var_*` / `stddev_*`
     /// accessor on the state.
-    Welford { state: crate::exec::welford::WelfordState },
+    Welford {
+        state: crate::exec::welford::WelfordState,
+    },
 }
 
 impl Accumulator {
@@ -897,7 +907,11 @@ fn build_key_arrays(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: key dtype {:?} not supported on output",
                     kc.dtype
@@ -1083,7 +1097,11 @@ fn collect_sum_min_max(
                 DataType::Int64 => TypedColumn::I64(Vec::new()),
                 DataType::Float32 => TypedColumn::F32(Vec::new()),
                 DataType::Float64 => TypedColumn::F64(Vec::new()),
-                DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+                DataType::Bool
+                | DataType::Utf8
+                | DataType::Decimal128(_, _)
+                | DataType::Date32
+                | DataType::Timestamp(_, _) => {
                     return Err(BoltError::Type(format!(
                         "wide GROUP BY: cannot emit empty {:?} aggregate column",
                         out_dtype
@@ -1097,87 +1115,86 @@ fn collect_sum_min_max(
         .first()
         .and_then(|(_, accs)| accs.get(i))
         .ok_or_else(|| {
-            BoltError::Other(
-                "wide GROUP BY: internal — no groups when finalising aggregate".into(),
-            )
+            BoltError::Other("wide GROUP BY: internal — no groups when finalising aggregate".into())
         })?;
 
-    let collected: TypedColumn = match first {
-        Accumulator::SumI64 { .. } => {
-            let mut out: Vec<i64> = Vec::with_capacity(sorted.len());
-            for (_, accs) in sorted {
-                match accs.get(i) {
-                    Some(Accumulator::SumI64 { total }) => out.push(*total),
-                    _ => return Err(variant_mismatch_err("SumI64")),
+    let collected: TypedColumn =
+        match first {
+            Accumulator::SumI64 { .. } => {
+                let mut out: Vec<i64> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::SumI64 { total }) => out.push(*total),
+                        _ => return Err(variant_mismatch_err("SumI64")),
+                    }
                 }
+                TypedColumn::I64(out)
             }
-            TypedColumn::I64(out)
-        }
-        Accumulator::SumF64 { .. } => {
-            let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
-            for (_, accs) in sorted {
-                match accs.get(i) {
-                    Some(Accumulator::SumF64 { total }) => out.push(*total),
-                    _ => return Err(variant_mismatch_err("SumF64")),
+            Accumulator::SumF64 { .. } => {
+                let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::SumF64 { total }) => out.push(*total),
+                        _ => return Err(variant_mismatch_err("SumF64")),
+                    }
                 }
+                TypedColumn::F64(out)
             }
-            TypedColumn::F64(out)
-        }
-        Accumulator::MinI32 { .. } | Accumulator::MaxI32 { .. } => {
-            let mut out: Vec<i32> = Vec::with_capacity(sorted.len());
-            for (_, accs) in sorted {
-                match accs.get(i) {
-                    Some(Accumulator::MinI32 { v, .. })
-                    | Some(Accumulator::MaxI32 { v, .. }) => out.push(*v),
-                    _ => return Err(variant_mismatch_err("MinI32/MaxI32")),
+            Accumulator::MinI32 { .. } | Accumulator::MaxI32 { .. } => {
+                let mut out: Vec<i32> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::MinI32 { v, .. })
+                        | Some(Accumulator::MaxI32 { v, .. }) => out.push(*v),
+                        _ => return Err(variant_mismatch_err("MinI32/MaxI32")),
+                    }
                 }
+                TypedColumn::I32(out)
             }
-            TypedColumn::I32(out)
-        }
-        Accumulator::MinI64 { .. } | Accumulator::MaxI64 { .. } => {
-            let mut out: Vec<i64> = Vec::with_capacity(sorted.len());
-            for (_, accs) in sorted {
-                match accs.get(i) {
-                    Some(Accumulator::MinI64 { v, .. })
-                    | Some(Accumulator::MaxI64 { v, .. }) => out.push(*v),
-                    _ => return Err(variant_mismatch_err("MinI64/MaxI64")),
+            Accumulator::MinI64 { .. } | Accumulator::MaxI64 { .. } => {
+                let mut out: Vec<i64> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::MinI64 { v, .. })
+                        | Some(Accumulator::MaxI64 { v, .. }) => out.push(*v),
+                        _ => return Err(variant_mismatch_err("MinI64/MaxI64")),
+                    }
                 }
+                TypedColumn::I64(out)
             }
-            TypedColumn::I64(out)
-        }
-        Accumulator::MinF32 { .. } | Accumulator::MaxF32 { .. } => {
-            let mut out: Vec<f32> = Vec::with_capacity(sorted.len());
-            for (_, accs) in sorted {
-                match accs.get(i) {
-                    Some(Accumulator::MinF32 { v, .. })
-                    | Some(Accumulator::MaxF32 { v, .. }) => out.push(*v),
-                    _ => return Err(variant_mismatch_err("MinF32/MaxF32")),
+            Accumulator::MinF32 { .. } | Accumulator::MaxF32 { .. } => {
+                let mut out: Vec<f32> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::MinF32 { v, .. })
+                        | Some(Accumulator::MaxF32 { v, .. }) => out.push(*v),
+                        _ => return Err(variant_mismatch_err("MinF32/MaxF32")),
+                    }
                 }
+                TypedColumn::F32(out)
             }
-            TypedColumn::F32(out)
-        }
-        Accumulator::MinF64 { .. } | Accumulator::MaxF64 { .. } => {
-            let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
-            for (_, accs) in sorted {
-                match accs.get(i) {
-                    Some(Accumulator::MinF64 { v, .. })
-                    | Some(Accumulator::MaxF64 { v, .. }) => out.push(*v),
-                    _ => return Err(variant_mismatch_err("MinF64/MaxF64")),
+            Accumulator::MinF64 { .. } | Accumulator::MaxF64 { .. } => {
+                let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::MinF64 { v, .. })
+                        | Some(Accumulator::MaxF64 { v, .. }) => out.push(*v),
+                        _ => return Err(variant_mismatch_err("MinF64/MaxF64")),
+                    }
                 }
+                TypedColumn::F64(out)
             }
-            TypedColumn::F64(out)
-        }
-        Accumulator::Count { .. } | Accumulator::Avg { .. } => {
-            return Err(BoltError::Other(
-                "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
-            ))
-        }
-        Accumulator::Welford { .. } => {
-            return Err(BoltError::Other(
-                "wide GROUP BY: internal — Welford variant in SUM/MIN/MAX path".into(),
-            ))
-        }
-    };
+            Accumulator::Count { .. } | Accumulator::Avg { .. } => {
+                return Err(BoltError::Other(
+                    "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
+                ))
+            }
+            Accumulator::Welford { .. } => {
+                return Err(BoltError::Other(
+                    "wide GROUP BY: internal — Welford variant in SUM/MIN/MAX path".into(),
+                ))
+            }
+        };
     pack_typed_array(out_dtype, collected)
 }
 
@@ -1199,18 +1216,10 @@ enum TypedColumn {
 fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRef> {
     match (col, out_dtype) {
         // Exact-match paths.
-        (TypedColumn::I32(v), DataType::Int32) => {
-            Ok(Arc::new(Int32Array::from(v)) as ArrayRef)
-        }
-        (TypedColumn::I64(v), DataType::Int64) => {
-            Ok(Arc::new(Int64Array::from(v)) as ArrayRef)
-        }
-        (TypedColumn::F32(v), DataType::Float32) => {
-            Ok(Arc::new(Float32Array::from(v)) as ArrayRef)
-        }
-        (TypedColumn::F64(v), DataType::Float64) => {
-            Ok(Arc::new(Float64Array::from(v)) as ArrayRef)
-        }
+        (TypedColumn::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
+        (TypedColumn::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
+        (TypedColumn::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
+        (TypedColumn::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
 
         // Widening (matches groupby.rs::pack_array).
         (TypedColumn::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
@@ -1279,7 +1288,10 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,7 +1301,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod tests {
@@ -1491,18 +1503,22 @@ mod tests {
         // Two distinct (a, b) tuples:
         //   (1, 10): vs = [1, 2, 3]  -> n=3, var_pop = 2/3, var_samp = 1.0
         //   (1, 20): vs = [42]       -> n=1, var_pop = 0,   var_samp = NULL
-        let rows: Vec<(i64, i64, i64)> = vec![
-            (1, 10, 1),
-            (1, 10, 2),
-            (1, 10, 3),
-            (1, 20, 42),
-        ];
+        let rows: Vec<(i64, i64, i64)> = vec![(1, 10, 1), (1, 10, 2), (1, 10, 3), (1, 20, 42)];
         let batch = build_two_key_batch(&rows);
 
         let inputs = vec![
-            ColumnIO { name: "a".into(), dtype: DataType::Int64 },
-            ColumnIO { name: "b".into(), dtype: DataType::Int64 },
-            ColumnIO { name: "v".into(), dtype: DataType::Int64 },
+            ColumnIO {
+                name: "a".into(),
+                dtype: DataType::Int64,
+            },
+            ColumnIO {
+                name: "b".into(),
+                dtype: DataType::Int64,
+            },
+            ColumnIO {
+                name: "v".into(),
+                dtype: DataType::Int64,
+            },
         ];
         let output_schema = Schema::new(vec![
             Field::new("a", DataType::Int64, false),

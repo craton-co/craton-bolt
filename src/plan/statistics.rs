@@ -45,9 +45,7 @@
 
 use std::collections::HashMap;
 
-use crate::plan::logical_plan::{
-    BinaryOp, Expr, LogicalPlan, UnaryOp,
-};
+use crate::plan::logical_plan::{BinaryOp, Expr, LogicalPlan, UnaryOp};
 
 /// Default selectivity applied to a single equality conjunct (`col = const`)
 /// when no NDV statistic is available to refine it. Mirrors the canonical
@@ -205,7 +203,11 @@ fn estimate_rows_f64(plan: &LogicalPlan, stats: &dyn StatsProvider) -> Option<f6
             // no per-key NDV is available.
             Some(distinct_rows_heuristic(rows))
         }
-        LogicalPlan::Limit { input, limit, offset } => {
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
             let rows = estimate_rows_f64(input, stats)?;
             // OFFSET first discards `offset` rows, then LIMIT caps the rest.
             let after_offset = (rows - *offset as f64).max(0.0);
@@ -220,7 +222,12 @@ fn estimate_rows_f64(plan: &LogicalPlan, stats: &dyn StatsProvider) -> Option<f6
             }
             Some(total)
         }
-        LogicalPlan::SetOp { left, right, op, all } => {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
             use crate::plan::logical_plan::SetOpKind;
             let l = estimate_rows_f64(left, stats)?;
             let r = estimate_rows_f64(right, stats)?;
@@ -376,12 +383,7 @@ pub fn estimate_equijoin_rows(
 /// Standard rule: divide by `max(ndv_l, ndv_r)`. When only one side has an
 /// NDV, use it. When neither does, assume the join key ranges over the larger
 /// input (`max(|L|, |R|)`), the most conservative non-explosive default.
-fn join_key_cardinality(
-    ndv_l: Option<usize>,
-    ndv_r: Option<usize>,
-    l: f64,
-    r: f64,
-) -> f64 {
+fn join_key_cardinality(ndv_l: Option<usize>, ndv_r: Option<usize>, l: f64, r: f64) -> f64 {
     match (ndv_l, ndv_r) {
         (Some(a), Some(b)) => a.max(b) as f64,
         (Some(a), None) => a as f64,
@@ -531,9 +533,10 @@ fn scan_ndv_for_column(
         LogicalPlan::Union { inputs } => inputs
             .iter()
             .find_map(|b| scan_ndv_for_column(b, column, stats)),
-        LogicalPlan::Join { left, right, .. }
-        | LogicalPlan::SetOp { left, right, .. } => scan_ndv_for_column(left, column, stats)
-            .or_else(|| scan_ndv_for_column(right, column, stats)),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            scan_ndv_for_column(left, column, stats)
+                .or_else(|| scan_ndv_for_column(right, column, stats))
+        }
     }
 }
 
@@ -639,11 +642,7 @@ mod tests {
         }
     }
 
-    fn scan_two(
-        table: &str,
-        c0: &str,
-        c1: &str,
-    ) -> LogicalPlan {
+    fn scan_two(table: &str, c0: &str, c1: &str) -> LogicalPlan {
         LogicalPlan::Scan {
             table: table.to_string(),
             projection: None,

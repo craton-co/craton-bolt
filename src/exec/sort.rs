@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! ORDER BY executor — host-side sort of a RecordBatch.
 //!
@@ -283,8 +283,12 @@ fn try_gpu_sort_radix(
 
     // Resolve every key into (column index, dtype, direction, nulls_first).
     // Any miss on bare-column / known-dtype / index lookup falls through.
-    let mut resolved: Vec<(usize, crate::plan::logical_plan::DataType, SortDirection, bool)> =
-        Vec::with_capacity(sort_exprs.len());
+    let mut resolved: Vec<(
+        usize,
+        crate::plan::logical_plan::DataType,
+        SortDirection,
+        bool,
+    )> = Vec::with_capacity(sort_exprs.len());
     for se in sort_exprs {
         // Gate 3: bare column reference.
         let col_name = match expr_to_column_name(&se.expr) {
@@ -364,10 +368,7 @@ fn try_gpu_sort_radix(
 ///
 /// On any miss we return `Ok(None)`; the host path handles the input
 /// correctly.
-fn try_gpu_sort(
-    batch: &RecordBatch,
-    sort_exprs: &[SortExpr],
-) -> BoltResult<Option<RecordBatch>> {
+fn try_gpu_sort(batch: &RecordBatch, sort_exprs: &[SortExpr]) -> BoltResult<Option<RecordBatch>> {
     // `SortDirection` is imported at module scope; only `MAX_SORT_KEYS` is
     // needed locally here.
     use crate::jit::sort_kernel::MAX_SORT_KEYS;
@@ -388,8 +389,12 @@ fn try_gpu_sort(
     }
 
     // Resolve every key: bare column ref + supported dtype.
-    let mut resolved: Vec<(usize, crate::plan::logical_plan::DataType, SortDirection, bool)> =
-        Vec::with_capacity(sort_exprs.len());
+    let mut resolved: Vec<(
+        usize,
+        crate::plan::logical_plan::DataType,
+        SortDirection,
+        bool,
+    )> = Vec::with_capacity(sort_exprs.len());
     for se in sort_exprs {
         let col_name = match expr_to_column_name(&se.expr) {
             Ok(n) => n,
@@ -450,8 +455,7 @@ fn resolve_key_shape(
     for se in sort_exprs {
         let col_name = expr_to_column_name(&se.expr).ok()?;
         let idx = batch.schema().index_of(&col_name).ok()?;
-        let dtype =
-            crate::exec::gpu_sort::arrow_dtype_to_internal(batch.column(idx).data_type())?;
+        let dtype = crate::exec::gpu_sort::arrow_dtype_to_internal(batch.column(idx).data_type())?;
         dtypes.push(dtype);
         dirs.push(if se.descending {
             SortDirection::Desc
@@ -517,7 +521,13 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -528,7 +538,13 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -642,7 +658,11 @@ mod tests {
         std::env::remove_var(BOLT_GPU_SORT_ENV);
         assert!(should_use_gpu_sort(
             1_000_000,
-            &[PlanDataType::Int32, PlanDataType::Int64, PlanDataType::Int32],
+            &[
+                PlanDataType::Int32,
+                PlanDataType::Int64,
+                PlanDataType::Int32
+            ],
             &dirs(3)
         ));
     }
@@ -761,7 +781,10 @@ mod tests {
         // sort key — but since Expr variants beyond Column/Alias are project-specific,
         // we use Alias-of-Column which should succeed, then assert success.
         let aliased = SortExpr {
-            expr: Expr::Alias(Box::new(Expr::Column("a".to_string())), "a_alias".to_string()),
+            expr: Expr::Alias(
+                Box::new(Expr::Column("a".to_string())),
+                "a_alias".to_string(),
+            ),
             descending: false,
             nulls_first: false,
         };
@@ -841,11 +864,7 @@ mod tests {
     }
 
     /// Build a 2-column batch (Int32 + Int32) with `n` rows.
-    fn padded_two_int_batch(
-        n: usize,
-        col_a_name: &str,
-        col_b_name: &str,
-    ) -> RecordBatch {
+    fn padded_two_int_batch(n: usize, col_a_name: &str, col_b_name: &str) -> RecordBatch {
         let n = n.max(GPU_SORT_MIN_ROWS);
         let a: Vec<i32> = (0..n as i32).collect();
         let b: Vec<i32> = (0..n as i32).map(|i| i * 2).collect();
@@ -855,10 +874,7 @@ mod tests {
         ]));
         RecordBatch::try_new(
             schema,
-            vec![
-                Arc::new(Int32Array::from(a)),
-                Arc::new(Int32Array::from(b)),
-            ],
+            vec![Arc::new(Int32Array::from(a)), Arc::new(Int32Array::from(b))],
         )
         .unwrap()
     }
@@ -1067,10 +1083,7 @@ mod tests {
         assert!(matches!(res, Ok(None)));
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
-        assert_eq!(
-            before, after,
-            "counter must not bump when env gate is off"
-        );
+        assert_eq!(before, after, "counter must not bump when env gate is off");
     }
 
     /// The dispatch also rejects when row count is below the threshold,
@@ -1089,7 +1102,6 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert_eq!(before, after, "small-input gate must short-circuit");
-
     }
 
     /// #19: single-key DESC engages the radix path (the v0.7 gate would
@@ -1112,7 +1124,6 @@ mod tests {
             before,
             after,
         );
-
     }
 
     /// #19: multi-key ASC ASC engages the radix path.
@@ -1124,10 +1135,7 @@ mod tests {
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
         let batch = padded_two_int_batch(GPU_SORT_MIN_ROWS, "a", "b");
-        let _ = try_gpu_sort_radix(
-            &batch,
-            &[col("a", false, false), col("b", false, false)],
-        );
+        let _ = try_gpu_sort_radix(&batch, &[col("a", false, false), col("b", false, false)]);
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
@@ -1136,7 +1144,6 @@ mod tests {
             before,
             after,
         );
-
     }
 
     /// #19: mixed ASC DESC across keys is handled — the per-key direction
@@ -1150,10 +1157,7 @@ mod tests {
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
         let batch = padded_two_int_batch(GPU_SORT_MIN_ROWS, "a", "b");
-        let _ = try_gpu_sort_radix(
-            &batch,
-            &[col("a", false, false), col("b", true, false)],
-        );
+        let _ = try_gpu_sort_radix(&batch, &[col("a", false, false), col("b", true, false)]);
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
@@ -1162,7 +1166,6 @@ mod tests {
             before,
             after,
         );
-
     }
 
     /// A mixed (Int32, Bool) multi-key sort falls through to the bitonic /
@@ -1197,10 +1200,7 @@ mod tests {
         )
         .unwrap();
 
-        let res = try_gpu_sort_radix(
-            &batch,
-            &[col("a", false, false), col("b", false, false)],
-        );
+        let res = try_gpu_sort_radix(&batch, &[col("a", false, false), col("b", false, false)]);
         assert!(matches!(res, Ok(None)), "mixed int+bool must fall through");
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
@@ -1222,13 +1222,8 @@ mod tests {
 
         let n = GPU_SORT_MIN_ROWS;
         let b: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "b",
-            DataType::Float64,
-            false,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(b))]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(b))]).unwrap();
 
         let _ = try_gpu_sort_radix(&batch, &[col("b", false, false)]);
 

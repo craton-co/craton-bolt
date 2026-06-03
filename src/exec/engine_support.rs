@@ -9,8 +9,8 @@
 //! internals, so they live cleanly outside the giant `impl Engine` block.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arrow_array::{
@@ -75,17 +75,17 @@ pub(crate) fn try_extend_column(
         host_revision: _,
     } = prev;
     let new_data: GpuColumnData = match data {
-        GpuColumnData::I32 { values: old, validity } => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "incremental extend: column '{name}' was I32 on device but \
+        GpuColumnData::I32 {
+            values: old,
+            validity,
+        } => {
+            let pa = arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                BoltError::Type(format!(
+                    "incremental extend: column '{name}' was I32 on device but \
                          host array is {:?}",
-                        arr.data_type()
-                    ))
-                })?;
+                    arr.data_type()
+                ))
+            })?;
             // Nullable primitives carry an unpacked per-row validity buffer
             // that the prefix-extend path doesn't update. If the device
             // column already has validity, or the appended batch introduces
@@ -94,81 +94,73 @@ pub(crate) fn try_extend_column(
             if validity.is_some() || pa.null_count() != 0 {
                 return Ok(None);
             }
-            let tail: Vec<i32> = (prev_rows..n_rows_total)
-                .map(|i| pa.value(i))
-                .collect();
+            let tail: Vec<i32> = (prev_rows..n_rows_total).map(|i| pa.value(i)).collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
             GpuColumnData::I32 {
                 values: extended,
                 validity: None,
             }
         }
-        GpuColumnData::I64 { values: old, validity } => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "incremental extend: column '{name}' was I64 on device but \
+        GpuColumnData::I64 {
+            values: old,
+            validity,
+        } => {
+            let pa = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                BoltError::Type(format!(
+                    "incremental extend: column '{name}' was I64 on device but \
                          host array is {:?}",
-                        arr.data_type()
-                    ))
-                })?;
+                    arr.data_type()
+                ))
+            })?;
             use arrow::array::Array as _;
             if validity.is_some() || pa.null_count() != 0 {
                 return Ok(None);
             }
-            let tail: Vec<i64> = (prev_rows..n_rows_total)
-                .map(|i| pa.value(i))
-                .collect();
+            let tail: Vec<i64> = (prev_rows..n_rows_total).map(|i| pa.value(i)).collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
             GpuColumnData::I64 {
                 values: extended,
                 validity: None,
             }
         }
-        GpuColumnData::F32 { values: old, validity } => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "incremental extend: column '{name}' was F32 on device but \
+        GpuColumnData::F32 {
+            values: old,
+            validity,
+        } => {
+            let pa = arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                BoltError::Type(format!(
+                    "incremental extend: column '{name}' was F32 on device but \
                          host array is {:?}",
-                        arr.data_type()
-                    ))
-                })?;
+                    arr.data_type()
+                ))
+            })?;
             use arrow::array::Array as _;
             if validity.is_some() || pa.null_count() != 0 {
                 return Ok(None);
             }
-            let tail: Vec<f32> = (prev_rows..n_rows_total)
-                .map(|i| pa.value(i))
-                .collect();
+            let tail: Vec<f32> = (prev_rows..n_rows_total).map(|i| pa.value(i)).collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
             GpuColumnData::F32 {
                 values: extended,
                 validity: None,
             }
         }
-        GpuColumnData::F64 { values: old, validity } => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "incremental extend: column '{name}' was F64 on device but \
+        GpuColumnData::F64 {
+            values: old,
+            validity,
+        } => {
+            let pa = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                BoltError::Type(format!(
+                    "incremental extend: column '{name}' was F64 on device but \
                          host array is {:?}",
-                        arr.data_type()
-                    ))
-                })?;
+                    arr.data_type()
+                ))
+            })?;
             use arrow::array::Array as _;
             if validity.is_some() || pa.null_count() != 0 {
                 return Ok(None);
             }
-            let tail: Vec<f64> = (prev_rows..n_rows_total)
-                .map(|i| pa.value(i))
-                .collect();
+            let tail: Vec<f64> = (prev_rows..n_rows_total).map(|i| pa.value(i)).collect();
             let extended = old.extended_with_prefix(n_rows_total, prev_rows, &tail)?;
             GpuColumnData::F64 {
                 values: extended,
@@ -176,16 +168,13 @@ pub(crate) fn try_extend_column(
             }
         }
         GpuColumnData::Bool(old) => {
-            let ba = arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "incremental extend: column '{name}' was Bool on device but \
+            let ba = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                BoltError::Type(format!(
+                    "incremental extend: column '{name}' was Bool on device but \
                          host array is {:?}",
-                        arr.data_type()
-                    ))
-                })?;
+                    arr.data_type()
+                ))
+            })?;
             // Only safe for null-free Bool — the variant we have is
             // `Bool` (non-nullable). If the appended batch added nulls,
             // the GpuColumnData variant would need to become
@@ -204,16 +193,13 @@ pub(crate) fn try_extend_column(
             GpuColumnData::Bool(extended)
         }
         GpuColumnData::BoolNullable { values, validity } => {
-            let ba = arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    BoltError::Type(format!(
-                        "incremental extend: column '{name}' was BoolNullable on \
+            let ba = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                BoltError::Type(format!(
+                    "incremental extend: column '{name}' was BoolNullable on \
                          device but host array is {:?}",
-                        arr.data_type()
-                    ))
-                })?;
+                    arr.data_type()
+                ))
+            })?;
             let tail_rows = n_rows_total - prev_rows;
             let mut tail_v: Vec<u8> = Vec::with_capacity(tail_rows);
             let mut tail_m: Vec<u8> = Vec::with_capacity(tail_rows);
@@ -228,8 +214,7 @@ pub(crate) fn try_extend_column(
                 }
             }
             let new_values = values.extended_with_prefix(n_rows_total, prev_rows, &tail_v)?;
-            let new_validity =
-                validity.extended_with_prefix(n_rows_total, prev_rows, &tail_m)?;
+            let new_validity = validity.extended_with_prefix(n_rows_total, prev_rows, &tail_m)?;
             GpuColumnData::BoolNullable {
                 values: new_values,
                 validity: new_validity,
@@ -339,8 +324,8 @@ pub(crate) fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 )]
 #[allow(dead_code)]
 pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<RecordBatch> {
-    use arrow_array::{Array, DictionaryArray, StringArray};
     use arrow_array::types::{Int32Type, Int64Type};
+    use arrow_array::{Array, DictionaryArray, StringArray};
 
     let schema = batch.schema();
     let mut changed = false;
@@ -356,15 +341,14 @@ pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<
                 // Supports Int32 and Int64 key types (matches `arrow_dtype_to_plan`).
                 let n = col.len();
                 let mut out: Vec<Option<String>> = Vec::with_capacity(n);
-                let decode_into = |out: &mut Vec<Option<String>>,
-                                   value_idx: usize,
-                                   sa: &StringArray| {
-                    if sa.is_null(value_idx) {
-                        out.push(None);
-                    } else {
-                        out.push(Some(sa.value(value_idx).to_string()));
-                    }
-                };
+                let decode_into =
+                    |out: &mut Vec<Option<String>>, value_idx: usize, sa: &StringArray| {
+                        if sa.is_null(value_idx) {
+                            out.push(None);
+                        } else {
+                            out.push(Some(sa.value(value_idx).to_string()));
+                        }
+                    };
                 match key_ty.as_ref() {
                     ArrowDataType::Int32 => {
                         let da = col
@@ -499,8 +483,11 @@ pub(crate) fn flatten_dictionary_utf8_columns(batch: RecordBatch) -> BoltResult<
         return Ok(batch);
     }
     let new_schema = Arc::new(ArrowSchema::new(new_fields));
-    RecordBatch::try_new(new_schema, new_cols)
-        .map_err(|e| BoltError::Type(format!("register_table: rebuild after dict flatten failed: {e}")))
+    RecordBatch::try_new(new_schema, new_cols).map_err(|e| {
+        BoltError::Type(format!(
+            "register_table: rebuild after dict flatten failed: {e}"
+        ))
+    })
 }
 
 /// Parse the `BOLT_POOL_STATS_INTERVAL_SECS` environment variable into
@@ -693,9 +680,7 @@ pub(crate) fn propagate_column_nullability(
     for (idx, field) in schema.fields().iter().enumerate() {
         let arr = batch.column(idx);
         let has_nulls = match field.data_type() {
-            ArrowDataType::Dictionary(key_t, _)
-                if key_t.as_ref() == &ArrowDataType::Int32 =>
-            {
+            ArrowDataType::Dictionary(key_t, _) if key_t.as_ref() == &ArrowDataType::Int32 => {
                 // Dict keys carry the per-row validity. Downcast and ask the
                 // keys array directly; fall back to the array's own
                 // `null_count()` if the downcast fails (shouldn't happen for
@@ -737,7 +722,10 @@ pub(crate) fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSch
 ///
 /// Factored out of the `execute` arm so the host-side row-count step is unit
 /// testable without a GPU / engine.
-pub(crate) fn build_count_rows_batch(n_rows: usize, output_schema: &Schema) -> BoltResult<RecordBatch> {
+pub(crate) fn build_count_rows_batch(
+    n_rows: usize,
+    output_schema: &Schema,
+) -> BoltResult<RecordBatch> {
     if output_schema.fields.len() != 1 {
         return Err(BoltError::Plan(format!(
             "CountRows output schema must have exactly one column, got {}",
@@ -746,9 +734,8 @@ pub(crate) fn build_count_rows_batch(n_rows: usize, output_schema: &Schema) -> B
     }
     let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
     let arr: ArrayRef = Arc::new(Int64Array::from(vec![n_rows as i64]));
-    RecordBatch::try_new(arrow_schema, vec![arr]).map_err(|e| {
-        BoltError::Other(format!("failed to build CountRows RecordBatch: {e}"))
-    })
+    RecordBatch::try_new(arrow_schema, vec![arr])
+        .map_err(|e| BoltError::Other(format!("failed to build CountRows RecordBatch: {e}")))
 }
 
 /// Convert a host-side computed `HostColumn` into an `ArrayRef`.
@@ -758,7 +745,9 @@ pub(crate) fn build_count_rows_batch(n_rows: usize, output_schema: &Schema) -> B
 /// materialised column back into the output `RecordBatch`. Mirrors the
 /// `arrow_array_to_host_column` shape in `filter.rs` (the inverse
 /// direction).
-pub(crate) fn host_column_to_arrow_array(col: crate::exec::expr_agg::HostColumn) -> BoltResult<ArrayRef> {
+pub(crate) fn host_column_to_arrow_array(
+    col: crate::exec::expr_agg::HostColumn,
+) -> BoltResult<ArrayRef> {
     use crate::exec::expr_agg::HostColumn;
     Ok(match col {
         HostColumn::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
@@ -790,9 +779,9 @@ mod tests {
     //! engine's device-backed integration tests.
 
     use super::*;
-    use arrow_array::Array;
     use crate::cuda::GpuVec;
     use crate::exec::gpu_table::{GpuColumn, GpuColumnData};
+    use arrow_array::Array;
 
     /// A zero-row `GpuColumnData` of the requested shape, built from
     /// `GpuVec::empty()` (no device allocation). Used only to drive the
@@ -949,7 +938,7 @@ mod tests {
             Some("x".to_string()),
             Some("y".to_string()),
         ]))
-                .unwrap();
+        .unwrap();
         let utf8_arr = utf8_arr
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()

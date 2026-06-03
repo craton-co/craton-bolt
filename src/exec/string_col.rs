@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Device columns for non-primitive dtypes: `Bool` and `Utf8`.
 //!
@@ -198,9 +198,7 @@ impl ExtendedDeviceCol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{
-        types::Int32Type, DictionaryArray, LargeStringArray, StringArray,
-    };
+    use arrow_array::{types::Int32Type, DictionaryArray, LargeStringArray, StringArray};
 
     // -------- Pure host-side fixtures: lock in the Arrow input contract ----
 
@@ -288,11 +286,7 @@ mod tests {
         // Arrow's StringArray is byte-addressed UTF-8, so `value(i)` must
         // round-trip the exact bytes (no normalisation).
         let nul_and_max = "\u{0}\u{FFFF}".to_string();
-        let arr = StringArray::from(vec![
-            "日本語",
-            "naïve",
-            nul_and_max.as_str(),
-        ]);
+        let arr = StringArray::from(vec!["日本語", "naïve", nul_and_max.as_str()]);
         assert_eq!(arr.len(), 3);
         assert_eq!(arr.value(0), "日本語");
         assert_eq!(arr.value(1), "naïve");
@@ -309,8 +303,7 @@ mod tests {
         // hold a `DictionaryArray<Int32, Utf8>` must `cast` to Utf8 first;
         // verify the path that produces the StringArray we'd hand to
         // `upload_utf8` round-trips the values correctly.
-        let dict: DictionaryArray<Int32Type> =
-            vec!["a", "b", "a", "c", "b"].into_iter().collect();
+        let dict: DictionaryArray<Int32Type> = vec!["a", "b", "a", "c", "b"].into_iter().collect();
         // arrow_cast is not in scope; use the array's downcast + values API
         // to materialise the equivalent StringArray.
         let keys = dict.keys();
@@ -344,8 +337,7 @@ mod tests {
         // by showing the two types are *not* interchangeable at the Arrow
         // level, while their value semantics line up — callers wishing to
         // upload LargeUtf8 must downcast offsets first.
-        let large: LargeStringArray =
-            LargeStringArray::from(vec![Some("a"), None, Some("bb")]);
+        let large: LargeStringArray = LargeStringArray::from(vec![Some("a"), None, Some("bb")]);
         assert_eq!(large.len(), 3);
         assert_eq!(large.null_count(), 1);
         assert_eq!(large.value(0), "a");
@@ -426,8 +418,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:string_col"]
     fn gpu_upload_bool_with_nulls_preserves_validity() {
-        let arr =
-            BooleanArray::from(vec![Some(true), None, Some(false), None, Some(true)]);
+        let arr = BooleanArray::from(vec![Some(true), None, Some(false), None, Some(true)]);
         let dev = ExtendedDeviceCol::upload_bool(&arr).expect("upload");
         assert!(matches!(dev, ExtendedDeviceCol::BoolNullable { .. }));
         assert!(dev.validity_device_ptr().is_some());

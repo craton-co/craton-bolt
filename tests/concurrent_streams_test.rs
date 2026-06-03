@@ -127,8 +127,11 @@ fn dim_batch() -> RecordBatch {
     ]));
     let keys: Int32Array = (0..ID1_CARD).collect();
     let vals: Int32Array = (0..ID1_CARD).map(|k| 1000 + k).collect();
-    RecordBatch::try_new(s, vec![Arc::new(keys) as ArrayRef, Arc::new(vals) as ArrayRef])
-        .unwrap()
+    RecordBatch::try_new(
+        s,
+        vec![Arc::new(keys) as ArrayRef, Arc::new(vals) as ArrayRef],
+    )
+    .unwrap()
 }
 
 // ---- Result extraction ------------------------------------------------------
@@ -140,7 +143,9 @@ fn dim_batch() -> RecordBatch {
 /// Run a single-key `SELECT k, SUM(v) GROUP BY k` style query and collect a
 /// sorted `(key, agg)` vector. Column 0 must be Int32, column 1 Float64.
 fn collect_key_agg(engine: &Engine, sql: &str) -> Vec<(i32, f64)> {
-    let h = engine.sql(sql).unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+    let h = engine
+        .sql(sql)
+        .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
     let b = h.record_batch();
     let keys = b
         .column(0)
@@ -195,14 +200,20 @@ const Q_T2_HIGHCARD: &str = "SELECT id3, SUM(v1) FROM fact GROUP BY id3";
 
 /// Run a scalar `SELECT SUM(v2) FROM fact` and return the single f64 cell.
 fn collect_scalar(engine: &Engine) -> f64 {
-    let h = engine.sql(Q_AGG).unwrap_or_else(|e| panic!("q_agg failed: {e}"));
+    let h = engine
+        .sql(Q_AGG)
+        .unwrap_or_else(|e| panic!("q_agg failed: {e}"));
     let b = h.record_batch();
     let c = b
         .column(0)
         .as_any()
         .downcast_ref::<Float64Array>()
         .expect("scalar SUM must be Float64");
-    assert_eq!(b.num_rows(), 1, "scalar aggregate must return exactly one row");
+    assert_eq!(
+        b.num_rows(),
+        1,
+        "scalar aggregate must return exactly one row"
+    );
     c.value(0)
 }
 
@@ -219,8 +230,12 @@ fn run_all(engine: &Engine) -> QuerySet {
 /// thread stand up identical state.
 fn build_engine(n: usize) -> Engine {
     let mut engine = Engine::new().expect("CUDA engine");
-    engine.register_table("fact", fact_batch(n)).expect("register fact");
-    engine.register_table("dim", dim_batch()).expect("register dim");
+    engine
+        .register_table("fact", fact_batch(n))
+        .expect("register fact");
+    engine
+        .register_table("dim", dim_batch())
+        .expect("register dim");
     engine
 }
 
@@ -241,7 +256,9 @@ fn assert_key_agg_eq(label: &str, got: &[(i32, f64)], want: &[(i32, f64)]) {
         assert!(
             rel < REL_TOL,
             "{label}: key {} value diverged across re-invocation: got {} want {} (rel {rel:e})",
-            g.0, g.1, w.1
+            g.0,
+            g.1,
+            w.1
         );
     }
 }
@@ -253,7 +270,8 @@ fn assert_queryset_eq(label: &str, got: &QuerySet, want: &QuerySet) {
     assert!(
         rel < REL_TOL,
         "{label}/q_agg: scalar SUM diverged across re-invocation: got {} want {} (rel {rel:e})",
-        got.agg, want.agg
+        got.agg,
+        want.agg
     );
 }
 

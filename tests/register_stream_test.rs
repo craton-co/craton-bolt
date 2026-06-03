@@ -115,15 +115,12 @@ fn e2e_register_table_stream_producer_error_aborts() {
 
     // Table must NOT be registered after the failed install — the
     // next call with the same name should succeed.
-    let good: Vec<BoltResult<RecordBatch>> =
-        vec![Ok(make_batch(vec![7, 8], vec![70, 80]))];
+    let good: Vec<BoltResult<RecordBatch>> = vec![Ok(make_batch(vec![7, 8], vec![70, 80]))];
     engine
         .register_table_stream("t_err", declared_schema(), good)
         .expect("post-rollback re-register");
 
-    let h = engine
-        .sql("SELECT SUM(v) FROM t_err")
-        .expect("execute");
+    let h = engine.sql("SELECT SUM(v) FROM t_err").expect("execute");
     let sum = h
         .record_batch()
         .column(0)

@@ -23,9 +23,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
-};
+use craton_bolt::plan::{lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema};
 use proptest::prelude::*;
 
 mod common;
@@ -46,9 +44,7 @@ mod semantic_diff {
         Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
         StringArray,
     };
-    use arrow_schema::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-    };
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
     use super::common::REL_TOL;
 
@@ -205,8 +201,7 @@ mod semantic_diff {
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        let mut rows: Vec<Vec<Cell>> =
-            (0..n_rows).map(|_| Vec::with_capacity(n_cols)).collect();
+        let mut rows: Vec<Vec<Cell>> = (0..n_rows).map(|_| Vec::with_capacity(n_cols)).collect();
         for c in 0..n_cols {
             let col = batch.column(c);
             for (r, row) in rows.iter_mut().enumerate().take(n_rows) {
@@ -310,11 +305,11 @@ mod semantic_diff {
         use duckdb::types::ToSql;
         let mut app = conn.appender(name).expect("duckdb appender");
         let n = batch.num_rows();
-        let cols: Vec<arrow_array::ArrayRef> =
-            (0..batch.num_columns()).map(|c| batch.column(c).clone()).collect();
+        let cols: Vec<arrow_array::ArrayRef> = (0..batch.num_columns())
+            .map(|c| batch.column(c).clone())
+            .collect();
         for i in 0..n {
-            let cells: Vec<Cell> =
-                cols.iter().map(|c| arrow_cell(c.as_ref(), i)).collect();
+            let cells: Vec<Cell> = cols.iter().map(|c| arrow_cell(c.as_ref(), i)).collect();
             let boxed: Vec<Box<dyn ToSql>> = cells
                 .into_iter()
                 .map(|c| -> Box<dyn ToSql> {
@@ -398,14 +393,38 @@ mod semantic_diff {
 /// Bolt) in the semantic property.
 fn fixture() -> MemTableProvider {
     let t = Schema::new(vec![
-        Field { name: "k".into(), dtype: DataType::Int32,   nullable: false },
-        Field { name: "v".into(), dtype: DataType::Float64, nullable: false },
-        Field { name: "s".into(), dtype: DataType::Utf8,    nullable: false },
-        Field { name: "b".into(), dtype: DataType::Bool,    nullable: false },
+        Field {
+            name: "k".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "v".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
+        Field {
+            name: "s".into(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        },
+        Field {
+            name: "b".into(),
+            dtype: DataType::Bool,
+            nullable: false,
+        },
     ]);
     let u = Schema::new(vec![
-        Field { name: "uk".into(), dtype: DataType::Int32,   nullable: false },
-        Field { name: "uw".into(), dtype: DataType::Float64, nullable: false },
+        Field {
+            name: "uk".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "uw".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
     ]);
     MemTableProvider::new()
         .with_table("t", t)
@@ -465,20 +484,39 @@ fn fixture() -> MemTableProvider {
 // does not blow up the row count.
 
 #[derive(Clone, Debug)]
-enum Col { K, V, S, B }
+enum Col {
+    K,
+    V,
+    S,
+    B,
+}
 impl Col {
     fn as_str(&self) -> &'static str {
-        match self { Col::K => "k", Col::V => "v", Col::S => "s", Col::B => "b" }
+        match self {
+            Col::K => "k",
+            Col::V => "v",
+            Col::S => "s",
+            Col::B => "b",
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-enum Agg { Sum, Count, Min, Max, Avg }
+enum Agg {
+    Sum,
+    Count,
+    Min,
+    Max,
+    Avg,
+}
 impl Agg {
     fn as_str(&self) -> &'static str {
         match self {
-            Agg::Sum => "SUM", Agg::Count => "COUNT", Agg::Min => "MIN",
-            Agg::Max => "MAX", Agg::Avg => "AVG",
+            Agg::Sum => "SUM",
+            Agg::Count => "COUNT",
+            Agg::Min => "MIN",
+            Agg::Max => "MAX",
+            Agg::Avg => "AVG",
         }
     }
 }
@@ -503,12 +541,23 @@ impl Lit {
 }
 
 #[derive(Clone, Debug)]
-enum CmpOp { Eq, Neq, Lt, Le, Gt, Ge }
+enum CmpOp {
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 impl CmpOp {
     fn as_str(&self) -> &'static str {
         match self {
-            CmpOp::Eq => "=", CmpOp::Neq => "!=", CmpOp::Lt => "<",
-            CmpOp::Le => "<=", CmpOp::Gt => ">", CmpOp::Ge => ">=",
+            CmpOp::Eq => "=",
+            CmpOp::Neq => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
         }
     }
 }
@@ -517,10 +566,14 @@ impl CmpOp {
 /// Restricted to integer columns so the subquery's projected column type
 /// matches the probe type on both engines.
 #[derive(Clone, Debug)]
-enum IntCol { K }
+enum IntCol {
+    K,
+}
 impl IntCol {
     fn as_str(&self) -> &'static str {
-        match self { IntCol::K => "k" }
+        match self {
+            IntCol::K => "k",
+        }
     }
 }
 
@@ -528,7 +581,7 @@ impl IntCol {
 enum BoolExpr {
     Cmp(Col, CmpOp, Lit),
     And(Box<BoolExpr>, Box<BoolExpr>),
-    Or (Box<BoolExpr>, Box<BoolExpr>),
+    Or(Box<BoolExpr>, Box<BoolExpr>),
     /// `<int_col> IN (SELECT uk FROM u [WHERE uk <cmp> <int>])` — a correlated-
     /// free scalar/IN subquery against the join-partner table. The subquery's
     /// projected column (`uk`, Int32) matches the probe column's type so both
@@ -538,12 +591,9 @@ enum BoolExpr {
 impl BoolExpr {
     fn render(&self) -> String {
         match self {
-            BoolExpr::Cmp(c, op, l) =>
-                format!("{} {} {}", c.as_str(), op.as_str(), l.render()),
-            BoolExpr::And(a, b) =>
-                format!("({} AND {})", a.render(), b.render()),
-            BoolExpr::Or(a, b) =>
-                format!("({} OR {})", a.render(), b.render()),
+            BoolExpr::Cmp(c, op, l) => format!("{} {} {}", c.as_str(), op.as_str(), l.render()),
+            BoolExpr::And(a, b) => format!("({} AND {})", a.render(), b.render()),
+            BoolExpr::Or(a, b) => format!("({} OR {})", a.render(), b.render()),
             BoolExpr::InSubquery(c, filter) => {
                 let mut sub = String::from("SELECT uk FROM u");
                 if let Some((op, n)) = filter {
@@ -570,11 +620,10 @@ enum StrFn {
 impl StrFn {
     fn render(&self) -> String {
         match self {
-            StrFn::Upper  => "UPPER(s)".to_string(),
-            StrFn::Lower  => "LOWER(s)".to_string(),
+            StrFn::Upper => "UPPER(s)".to_string(),
+            StrFn::Lower => "LOWER(s)".to_string(),
             StrFn::Length => "LENGTH(s)".to_string(),
-            StrFn::Substring(start, len) =>
-                format!("SUBSTRING(s FROM {} FOR {})", start, len),
+            StrFn::Substring(start, len) => format!("SUBSTRING(s FROM {} FOR {})", start, len),
         }
     }
 }
@@ -594,12 +643,16 @@ enum ProjItem {
 impl ProjItem {
     fn render(&self) -> String {
         match self {
-            ProjItem::Col(c)        => c.as_str().to_string(),
-            ProjItem::Agg(a, c)     => format!("{}({})", a.as_str(), c.as_str()),
-            ProjItem::CountStar     => "COUNT(*)".to_string(),
-            ProjItem::StrFn(f)      => f.render(),
-            ProjItem::Case(w, t, e) =>
-                format!("CASE WHEN {} THEN {} ELSE {} END", w.render(), t.render(), e.render()),
+            ProjItem::Col(c) => c.as_str().to_string(),
+            ProjItem::Agg(a, c) => format!("{}({})", a.as_str(), c.as_str()),
+            ProjItem::CountStar => "COUNT(*)".to_string(),
+            ProjItem::StrFn(f) => f.render(),
+            ProjItem::Case(w, t, e) => format!(
+                "CASE WHEN {} THEN {} ELSE {} END",
+                w.render(),
+                t.render(),
+                e.render()
+            ),
         }
     }
 }
@@ -678,7 +731,11 @@ enum Stmt {
 }
 
 #[derive(Clone, Debug)]
-enum SetOpKind { Union, Except, Intersect }
+enum SetOpKind {
+    Union,
+    Except,
+    Intersect,
+}
 impl SetOpKind {
     fn as_str(&self) -> &'static str {
         match self {
@@ -693,7 +750,13 @@ impl Stmt {
     fn render(&self) -> String {
         match self {
             Stmt::Plain(q) => q.render(),
-            Stmt::SetOp { kind, all, col, left_where, right_where } => {
+            Stmt::SetOp {
+                kind,
+                all,
+                col,
+                left_where,
+                right_where,
+            } => {
                 let branch = |w: &Option<BoolExpr>| {
                     let mut s = format!("SELECT {} FROM t", col.as_str());
                     if let Some(w) = w {
@@ -710,7 +773,13 @@ impl Stmt {
                 } else {
                     ""
                 };
-                format!("{} {}{} {}", branch(left_where), kind.as_str(), all_kw, branch(right_where))
+                format!(
+                    "{} {}{} {}",
+                    branch(left_where),
+                    kind.as_str(),
+                    all_kw,
+                    branch(right_where)
+                )
             }
         }
     }
@@ -721,12 +790,7 @@ impl Stmt {
 // ---------------------------------------------------------------------------
 
 fn col_strategy() -> impl Strategy<Value = Col> {
-    prop_oneof![
-        Just(Col::K),
-        Just(Col::V),
-        Just(Col::S),
-        Just(Col::B),
-    ]
+    prop_oneof![Just(Col::K), Just(Col::V), Just(Col::S), Just(Col::B),]
 }
 
 fn agg_strategy() -> impl Strategy<Value = Agg> {
@@ -793,7 +857,7 @@ fn bool_expr_strategy() -> impl Strategy<Value = BoolExpr> {
             (inner.clone(), inner.clone())
                 .prop_map(|(a, b)| BoolExpr::And(Box::new(a), Box::new(b))),
             (inner.clone(), inner.clone())
-                .prop_map(|(a, b)| BoolExpr::Or (Box::new(a), Box::new(b))),
+                .prop_map(|(a, b)| BoolExpr::Or(Box::new(a), Box::new(b))),
         ]
     })
 }
@@ -826,9 +890,18 @@ fn query_strategy() -> impl Strategy<Value = Query> {
         prop::option::of(bool_expr_strategy()),
         prop::option::of(col_strategy()),
         prop::option::of(0u32..1000),
-    ).prop_map(|(projection, join, where_clause, group_by, having, order_by, limit)| {
-        Query { projection, join, where_clause, group_by, having, order_by, limit }
-    })
+    )
+        .prop_map(
+            |(projection, join, where_clause, group_by, having, order_by, limit)| Query {
+                projection,
+                join,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+            },
+        )
 }
 
 fn set_op_kind_strategy() -> impl Strategy<Value = SetOpKind> {

@@ -233,8 +233,7 @@ mod tests {
     /// An all-NULL column packs to all-zeros: every row is masked out.
     #[test]
     fn packed_validity_all_nulls_all_zeros() {
-        let arr: Arc<Int32Array> =
-            Arc::new(Int32Array::from(vec![Option::<i32>::None; 8]));
+        let arr: Arc<Int32Array> = Arc::new(Int32Array::from(vec![Option::<i32>::None; 8]));
         let packed = packed_validity_for(arr.as_ref());
         assert_eq!(packed, vec![0x00u8]);
     }
@@ -259,8 +258,9 @@ mod tests {
         let want = packed_validity_for(&arr); // = [0x55]
 
         // The unpacked on-device form: one u8 per row (1 = present, 0 = NULL).
-        let unpacked: Vec<u8> =
-            (0..arr.len()).map(|i| if arr.is_null(i) { 0 } else { 1 }).collect();
+        let unpacked: Vec<u8> = (0..arr.len())
+            .map(|i| if arr.is_null(i) { 0 } else { 1 })
+            .collect();
         let got = normalize_device_validity_to_packed(
             &unpacked,
             DeviceValidityFormat::Unpacked,
@@ -274,20 +274,12 @@ mod tests {
     #[test]
     fn normalize_packed_is_identity() {
         let packed = vec![0x55u8];
-        let got = normalize_device_validity_to_packed(
-            &packed,
-            DeviceValidityFormat::Packed,
-            8,
-        );
+        let got = normalize_device_validity_to_packed(&packed, DeviceValidityFormat::Packed, 8);
         assert_eq!(got, vec![0x55u8]);
 
         // A packed buffer covering 17 rows is 3 bytes; a short input
         // zero-extends, a long input truncates.
-        let got = normalize_device_validity_to_packed(
-            &[0xFFu8],
-            DeviceValidityFormat::Packed,
-            17,
-        );
+        let got = normalize_device_validity_to_packed(&[0xFFu8], DeviceValidityFormat::Packed, 17);
         assert_eq!(got, vec![0xFF, 0x00, 0x00]);
     }
 

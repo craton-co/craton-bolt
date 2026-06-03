@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory **float MIN / MAX** kernel — Tier 2.1
 //! variant for `Float32` and `Float64` value dtypes.
@@ -573,11 +573,20 @@ fn emit_export_phase(
     block_threads: u32,
     spill: bool,
 ) -> BoltResult<()> {
-    let (p_guard, p_set) = if spill { ("%p6", "%p7") } else { ("%p5", "%p6") };
+    let (p_guard, p_set) = if spill {
+        ("%p6", "%p7")
+    } else {
+        ("%p5", "%p6")
+    };
     writeln!(ptx, "\tmul.lo.u32 %r40, %r0, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
     writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 {p_guard}, %r41, {bg};", bg = block_groups).map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 {p_guard}, %r41, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\t@{p_guard} bra EXPORT_DONE;").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
 
@@ -693,12 +702,7 @@ fn emit_cas_loop(
         FloatDtype::Float64 => ("%rd40", "%rd41", "%rd42", "%fd4"),
     };
 
-    writeln!(
-        ptx,
-        "{lp}_LOAD:",
-        lp = label_prefix
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "{lp}_LOAD:", lp = label_prefix).map_err(write_err)?;
     // Read the current bits.
     match dtype {
         FloatDtype::Float32 => {
@@ -752,12 +756,7 @@ fn emit_cas_loop(
             .map_err(write_err)?;
         }
     }
-    writeln!(
-        ptx,
-        "\t@{eq_pred} bra {lp}_DONE;",
-        lp = label_prefix
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@{eq_pred} bra {lp}_DONE;", lp = label_prefix).map_err(write_err)?;
     // CAS. If we win (swapped == old) the slot now holds newv. If we
     // lose, someone else updated; re-read and try again.
     let swap_reg = match dtype {
@@ -772,18 +771,12 @@ fn emit_cas_loop(
     let won_pred = "%p9";
     match dtype {
         FloatDtype::Float32 => {
-            writeln!(
-                ptx,
-                "\tsetp.eq.b32 {won_pred}, {swap_reg}, {old_bit_reg};"
-            )
-            .map_err(write_err)?;
+            writeln!(ptx, "\tsetp.eq.b32 {won_pred}, {swap_reg}, {old_bit_reg};")
+                .map_err(write_err)?;
         }
         FloatDtype::Float64 => {
-            writeln!(
-                ptx,
-                "\tsetp.eq.b64 {won_pred}, {swap_reg}, {old_bit_reg};"
-            )
-            .map_err(write_err)?;
+            writeln!(ptx, "\tsetp.eq.b64 {won_pred}, {swap_reg}, {old_bit_reg};")
+                .map_err(write_err)?;
         }
     }
     // Occupancy-friendly back-off on the CAS-loss retry path. When CAS
@@ -796,17 +789,8 @@ fn emit_cas_loop(
         ns = SPIN_BACKOFF_NS
     )
     .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\t@!{won_pred} nanosleep.u32 %nstime;"
-    )
-    .map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\t@!{won_pred} bra {lp}_LOAD;",
-        lp = label_prefix
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@!{won_pred} nanosleep.u32 %nstime;").map_err(write_err)?;
+    writeln!(ptx, "\t@!{won_pred} bra {lp}_LOAD;", lp = label_prefix).map_err(write_err)?;
     writeln!(ptx, "{lp}_DONE:", lp = label_prefix).map_err(write_err)?;
     Ok(())
 }
@@ -851,12 +835,7 @@ mod tests {
             for dt in [FloatDtype::Float32, FloatDtype::Float64] {
                 let ptx = compile_partition_reduce_kernel_minmax_float(op, dt).unwrap();
                 let want = format!("atom.shared.cas.{}", dt.ptx_cas_suffix());
-                assert!(
-                    ptx.contains(&want),
-                    "{:?}/{:?}: missing {want}",
-                    op,
-                    dt
-                );
+                assert!(ptx.contains(&want), "{:?}/{:?}: missing {want}", op, dt);
             }
         }
     }

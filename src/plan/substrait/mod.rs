@@ -38,9 +38,9 @@ mod rel;
 use std::collections::HashMap;
 
 use crate::error::{BoltError, BoltResult};
+use crate::plan::logical_plan::LogicalPlan;
 use crate::plan::logical_plan::{DataType, Literal, Schema, TimeUnit};
 use crate::plan::sql_frontend::{MemTableProvider, TableProvider};
-use crate::plan::logical_plan::LogicalPlan;
 
 // Re-export the sibling converter entry points so callers (and tests) can
 // reach the lower-level conversions without going through the full plan
@@ -180,10 +180,7 @@ pub(crate) struct ConvertCtx<'a> {
 impl<'a> ConvertCtx<'a> {
     /// Root context with no input schema yet (used at the plan entry point;
     /// `rel.rs` narrows it via [`Self::with_input_schema`] as it descends).
-    pub(crate) fn new(
-        provider: &'a MemTableProvider,
-        functions: &'a HashMap<u32, String>,
-    ) -> Self {
+    pub(crate) fn new(provider: &'a MemTableProvider, functions: &'a HashMap<u32, String>) -> Self {
         Self {
             provider,
             functions,
@@ -220,9 +217,7 @@ impl<'a> ConvertCtx<'a> {
     pub(crate) fn resolve_table(&self, names: &[String]) -> BoltResult<(String, Schema)> {
         let table = names
             .last()
-            .ok_or_else(|| {
-                BoltError::Plan("substrait: NamedTable has no name parts".into())
-            })?
+            .ok_or_else(|| BoltError::Plan("substrait: NamedTable has no name parts".into()))?
             .clone();
         let schema = self.provider.schema(&table)?;
         Ok((table, schema))
@@ -243,9 +238,7 @@ impl<'a> ConvertCtx<'a> {
     /// scope or the index is out of range.
     pub(crate) fn field_name(&self, idx: usize) -> BoltResult<String> {
         let schema = self.input_schema.ok_or_else(|| {
-            BoltError::Plan(
-                "substrait: field reference with no input schema in scope".into(),
-            )
+            BoltError::Plan("substrait: field reference with no input schema in scope".into())
         })?;
         schema
             .fields
@@ -274,10 +267,7 @@ impl<'a> expr::SubstraitCtx for ConvertCtx<'a> {
         ConvertCtx::function_name(self, anchor)
     }
 
-    fn literal_to_literal(
-        &self,
-        lit: &proto::expression::Literal,
-    ) -> BoltResult<Literal> {
+    fn literal_to_literal(&self, lit: &proto::expression::Literal) -> BoltResult<Literal> {
         substrait_literal_to_literal(lit)
     }
 }
@@ -336,9 +326,10 @@ pub(crate) fn substrait_type_to_dtype(t: &proto::Type) -> BoltResult<DataType> {
         // Substrait `timestamp` is microsecond ticks, naive (no zone).
         Kind::Timestamp(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
         // `timestamp_tz` is the same i64-micros but anchored to UTC.
-        Kind::TimestampTz(_) => {
-            DataType::Timestamp(TimeUnit::Microsecond, Some(crate::plan::logical_plan::intern_timezone("UTC")))
-        }
+        Kind::TimestampTz(_) => DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(crate::plan::logical_plan::intern_timezone("UTC")),
+        ),
         other => {
             return Err(BoltError::Plan(format!(
                 "substrait: type {} not yet supported",
@@ -363,9 +354,7 @@ pub(crate) fn substrait_type_to_dtype(t: &proto::Type) -> BoltResult<DataType> {
 ///
 /// Anything else is rejected with
 /// `BoltError::Plan("substrait: literal <X> not yet supported")`.
-pub(crate) fn substrait_literal_to_literal(
-    l: &proto::expression::Literal,
-) -> BoltResult<Literal> {
+pub(crate) fn substrait_literal_to_literal(l: &proto::expression::Literal) -> BoltResult<Literal> {
     use proto::expression::literal::LiteralType;
 
     // A literal whose `null` type field is set is a typed SQL NULL.
@@ -409,15 +398,11 @@ pub(crate) fn substrait_literal_to_literal(
         // the engine's `Date32` storage.
         LiteralType::Date(days) => Literal::Date32(*days),
         // `timestamp` is i64 microseconds since the epoch, naive.
-        LiteralType::Timestamp(micros) => {
-            Literal::Timestamp(*micros, TimeUnit::Microsecond, None)
-        }
+        LiteralType::Timestamp(micros) => Literal::Timestamp(*micros, TimeUnit::Microsecond, None),
         // `timestamp_tz` is i64 microseconds since the epoch, UTC-anchored.
-        LiteralType::TimestampTz(micros) => Literal::timestamp_with_tz(
-            *micros,
-            TimeUnit::Microsecond,
-            Some("UTC".to_string()),
-        ),
+        LiteralType::TimestampTz(micros) => {
+            Literal::timestamp_with_tz(*micros, TimeUnit::Microsecond, Some("UTC".to_string()))
+        }
         other => {
             return Err(BoltError::Plan(format!(
                 "substrait: literal {} not yet supported",
@@ -630,8 +615,8 @@ mod type_mapping_tests {
 #[cfg(test)]
 mod literal_mapping_tests {
     use super::*;
-    use substrait::proto;
     use proto::expression::literal::LiteralType;
+    use substrait::proto;
 
     /// Wrap a `LiteralType` into a `Literal` message.
     fn lit(lt: LiteralType) -> proto::expression::Literal {

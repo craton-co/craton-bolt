@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Sentinel-free open-addressing GROUP BY kernels.
 //!
@@ -278,12 +278,7 @@ pub fn compile_keys_valid_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tmov.u32 %r22, 0;").map_err(write_err)?;
     writeln!(ptx, "SPIN:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r22, %r22, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.gt.u32 %p5, %r22, {limit};",
-        limit = SPIN_LIMIT
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p5, %r22, {limit};", limit = SPIN_LIMIT).map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
     // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
     // read-of-published-value contract explicit (sm_70+). Replaces the
@@ -298,12 +293,7 @@ pub fn compile_keys_valid_kernel() -> BoltResult<String> {
     // letting the warp scheduler run other warps — notably the warp
     // holding this slot's writer. The nanosleep is emitted only on
     // the failed-read path; the committed path falls through.
-    writeln!(
-        ptx,
-        "\t@%p2 mov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 mov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     // Now safe to read the committed key.
@@ -379,10 +369,7 @@ pub fn compile_keys_valid_kernel() -> BoltResult<String> {
 /// increments `spill_counter_ptr` and (if `< max_spill`) writes its
 /// `(key, candidate_value)` pair into the parallel spill buffers. The
 /// host folds these into the per-group accumulator after kernel sync.
-pub fn compile_agg_valid_kernel(
-    op: ReduceOp,
-    input_dtype: DataType,
-) -> BoltResult<String> {
+pub fn compile_agg_valid_kernel(op: ReduceOp, input_dtype: DataType) -> BoltResult<String> {
     // Reject unsupported (op, dtype) combinations up front with explicit errors.
     let atomic = atomic_for(op, input_dtype)?;
 
@@ -520,12 +507,7 @@ pub fn compile_agg_valid_kernel(
     writeln!(ptx, "\tmov.u32 %r22, 0;").map_err(write_err)?;
     writeln!(ptx, "SPIN:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r22, %r22, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.gt.u32 %p5, %r22, {limit};",
-        limit = SPIN_LIMIT
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p5, %r22, {limit};", limit = SPIN_LIMIT).map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
     // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
     // read-of-published-value contract explicit (sm_70+). Replaces the
@@ -545,12 +527,7 @@ pub fn compile_agg_valid_kernel(
     // Occupancy-friendly back-off: yield SM cycles when slot is still
     // un-published. See the keys kernel for the full rationale; the
     // nanosleep is emitted only on the spin-back path.
-    writeln!(
-        ptx,
-        "\t@%p2 mov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 mov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     // valid==2 here: key is committed. Compare.
@@ -654,8 +631,7 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> BoltResult<&'static str> {
 
         (Min, Float32) | (Min, Float64) | (Max, Float32) | (Max, Float64) => {
             return Err(BoltError::Other(
-                "MIN/MAX over float not yet supported in GROUP BY (valid-flag variant)"
-                    .into(),
+                "MIN/MAX over float not yet supported in GROUP BY (valid-flag variant)".into(),
             ))
         }
 
@@ -770,13 +746,11 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 
 /// Entry-point name of the keys kernel produced by
 /// [`compile_keys_valid_kernel_with_validity`].
-pub const VALID_KEYS_KERNEL_WITH_VALIDITY_ENTRY: &str =
-    "bolt_groupby_keys_valid_with_validity";
+pub const VALID_KEYS_KERNEL_WITH_VALIDITY_ENTRY: &str = "bolt_groupby_keys_valid_with_validity";
 
 /// Entry-point name of the aggregate-update kernel produced by
 /// [`compile_agg_valid_kernel_with_validity`].
-pub const VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY: &str =
-    "bolt_groupby_agg_valid_with_validity";
+pub const VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY: &str = "bolt_groupby_agg_valid_with_validity";
 
 /// Pack a per-row boolean validity vector into the Arrow-compatible
 /// little-endian packed-bit layout the `_with_validity` kernels expect.
@@ -985,12 +959,7 @@ pub fn compile_keys_valid_kernel_with_validity() -> BoltResult<String> {
     writeln!(ptx, "\tmov.u32 %r22, 0;").map_err(write_err)?;
     writeln!(ptx, "SPIN:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r22, %r22, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.gt.u32 %p5, %r22, {limit};",
-        limit = SPIN_LIMIT
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p5, %r22, {limit};", limit = SPIN_LIMIT).map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
     // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
     // read-of-published-value contract explicit (sm_70+). Replaces the
@@ -1000,12 +969,7 @@ pub fn compile_keys_valid_kernel_with_validity() -> BoltResult<String> {
     writeln!(ptx, "\tld.acquire.gpu.u32 %r10, [%rd8];").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r10, 2;").map_err(write_err)?;
     // Occupancy-friendly back-off — see no-validity keys kernel.
-    writeln!(
-        ptx,
-        "\t@%p2 mov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 mov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
@@ -1202,12 +1166,7 @@ pub fn compile_agg_valid_kernel_with_validity(
     writeln!(ptx, "\tmov.u32 %r22, 0;").map_err(write_err)?;
     writeln!(ptx, "SPIN:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r22, %r22, 1;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.gt.u32 %p5, %r22, {limit};",
-        limit = SPIN_LIMIT
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.gt.u32 %p5, %r22, {limit};", limit = SPIN_LIMIT).map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra SPILL;").map_err(write_err)?;
     // ACQUIRE-LOAD: pairs with the publisher's atomic store; makes the
     // read-of-published-value contract explicit (sm_70+). Replaces the
@@ -1219,12 +1178,7 @@ pub fn compile_agg_valid_kernel_with_validity(
     writeln!(ptx, "\t@%p1 bra ADVANCE;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ne.s32 %p2, %r9, 2;").map_err(write_err)?;
     // Occupancy-friendly back-off — see no-validity keys kernel.
-    writeln!(
-        ptx,
-        "\t@%p2 mov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 mov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 nanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra SPIN;").map_err(write_err)?;
     writeln!(ptx, "\tld.global.s64 %rl5, [%rd6];").map_err(write_err)?;
@@ -1450,8 +1404,8 @@ mod tests {
     /// ordering rather than relying on SASS-level implicit acquire.
     #[test]
     fn agg_valid_kernel_reads_valid_flag() {
-        let ptx = compile_agg_valid_kernel(ReduceOp::Sum, DataType::Int64)
-            .expect("agg kernel compiles");
+        let ptx =
+            compile_agg_valid_kernel(ReduceOp::Sum, DataType::Int64).expect("agg kernel compiles");
         assert!(
             ptx.contains("ld.acquire.gpu.u32"),
             "agg kernel must issue ld.acquire.gpu.u32 to inspect slot_valid \
@@ -1534,8 +1488,7 @@ mod tests {
     /// write of the candidate value to the spill_values buffer.
     #[test]
     fn agg_kernel_contains_probe_limit_and_spill() {
-        let ptx = compile_agg_valid_kernel(ReduceOp::Sum, DataType::Int64)
-            .expect("compile");
+        let ptx = compile_agg_valid_kernel(ReduceOp::Sum, DataType::Int64).expect("compile");
         assert!(
             ptx.contains("mov.u32 %r21, 0;"),
             "agg kernel must initialise the bounded-probe counter:\n{ptx}"

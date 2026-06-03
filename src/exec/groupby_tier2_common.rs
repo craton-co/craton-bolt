@@ -147,8 +147,7 @@ pub(crate) fn run_partition_launch(
 
     let mut counts: GpuVec<u32> =
         GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
-    let mut partition_ids: GpuVec<u32> =
-        GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     {
         let func = partition_module.function(partition_kernel::KERNEL_ENTRY)?;
@@ -241,8 +240,7 @@ pub(crate) fn run_partition_launch_i64(
 
     let mut counts: GpuVec<u32> =
         GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
-    let mut partition_ids: GpuVec<u32> =
-        GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut partition_ids: GpuVec<u32> = GpuVec::<u32>::zeros_async(n_rows as usize, stream.raw())?;
 
     {
         let func = partition_module.function(partition_kernel_i64::KERNEL_ENTRY)?;
@@ -478,12 +476,11 @@ pub(crate) fn collect_populated_slots_sorted<T: Copy + Send + Sync>(
     let host_keys = &host_keys[..n_slots];
     let host_vals = &host_vals[..n_slots];
 
-    let mut pairs: Vec<(i32, T)> =
-        if n_slots > PARALLEL_SLOT_SCAN_THRESHOLD {
-            collect_pairs_parallel(host_keys, host_vals, host_set, n_slots)
-        } else {
-            collect_pairs_serial(host_keys, host_vals, host_set, n_slots)
-        };
+    let mut pairs: Vec<(i32, T)> = if n_slots > PARALLEL_SLOT_SCAN_THRESHOLD {
+        collect_pairs_parallel(host_keys, host_vals, host_set, n_slots)
+    } else {
+        collect_pairs_serial(host_keys, host_vals, host_set, n_slots)
+    };
 
     pairs.sort_by_key(|(k, _)| *k);
     pairs
@@ -797,10 +794,8 @@ mod tests {
             host_vals.push(i as f64);
             host_set.push((i % 3 != 0) as u8);
         }
-        let serial =
-            collect_pairs_serial::<f64>(&host_keys, &host_vals, &host_set, n_slots);
-        let parallel =
-            collect_pairs_parallel::<f64>(&host_keys, &host_vals, &host_set, n_slots);
+        let serial = collect_pairs_serial::<f64>(&host_keys, &host_vals, &host_set, n_slots);
+        let parallel = collect_pairs_parallel::<f64>(&host_keys, &host_vals, &host_set, n_slots);
         // Pre-sort sequences must be identical (same selection, same order).
         assert_eq!(serial, parallel);
     }

@@ -160,9 +160,7 @@ pub fn run_to_fixpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::logical_plan::{
-        BinaryOp, DataType, Field, JoinType, LogicalPlan, Schema,
-    };
+    use crate::plan::logical_plan::{BinaryOp, DataType, Field, JoinType, LogicalPlan, Schema};
     use crate::plan::{col, lit};
 
     /// Run the full default pipeline over `plan`, driven to a bounded
@@ -173,7 +171,10 @@ mod tests {
 
     #[test]
     fn pipeline_has_all_five_passes_in_order() {
-        let names: Vec<String> = default_passes().iter().map(|p| p.name().to_string()).collect();
+        let names: Vec<String> = default_passes()
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -395,7 +396,13 @@ mod tests {
             LogicalPlan::Filter { input, predicate } => {
                 // The `1 = 1` conjunct folded away; only `b > 0` remains.
                 assert!(
-                    matches!(predicate, crate::plan::Expr::Binary { op: BinaryOp::Gt, .. }),
+                    matches!(
+                        predicate,
+                        crate::plan::Expr::Binary {
+                            op: BinaryOp::Gt,
+                            ..
+                        }
+                    ),
                     "expected the surviving predicate to be `b > 0`"
                 );
                 *input
@@ -440,8 +447,10 @@ mod tests {
         match out {
             LogicalPlan::Join { left, filter, .. } => {
                 assert!(filter.is_some(), "a > b should fold into the residual");
-                assert!(matches!(*left, LogicalPlan::Filter { .. }),
-                    "a > 0 should land on the left input");
+                assert!(
+                    matches!(*left, LogicalPlan::Filter { .. }),
+                    "a > 0 should land on the left input"
+                );
             }
             other => panic!("expected Join at the root, got {other:?}"),
         }
@@ -546,7 +555,13 @@ mod tests {
             LogicalPlan::Filter { predicate, .. } => {
                 // Only `b > 0` survives; the cast/equality conjunct folded out.
                 assert!(
-                    matches!(predicate, crate::plan::Expr::Binary { op: BinaryOp::Gt, .. }),
+                    matches!(
+                        predicate,
+                        crate::plan::Expr::Binary {
+                            op: BinaryOp::Gt,
+                            ..
+                        }
+                    ),
                     "expected the folded predicate to be just `b > 0`, got {predicate:?}"
                 );
             }

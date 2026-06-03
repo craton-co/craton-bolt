@@ -123,9 +123,7 @@ fn bench_utf8_threshold(c: &mut Criterion) {
             engine.register_table("t", batch).expect("register");
 
             b.iter(|| {
-                let h = engine
-                    .sql("SELECT col FROM t ORDER BY col")
-                    .expect("sql");
+                let h = engine.sql("SELECT col FROM t ORDER BY col").expect("sql");
                 black_box(h);
             });
         });

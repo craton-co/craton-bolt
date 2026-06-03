@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Craton Bolt micro-benchmarks. Measures plan + codegen latency on CPU; gated
 //! end-to-end GPU execution behind `BOLT_BENCH_GPU=1`.
@@ -43,9 +43,21 @@ const MEASUREMENT_SECS: u64 = 20;
 
 fn schema() -> Schema {
     Schema::new(vec![
-        Field { name: "region_id".into(), dtype: DataType::Int32, nullable: false },
-        Field { name: "price".into(), dtype: DataType::Float64, nullable: false },
-        Field { name: "tax".into(), dtype: DataType::Float64, nullable: false },
+        Field {
+            name: "region_id".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "price".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
+        Field {
+            name: "tax".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
     ])
 }
 
@@ -80,8 +92,7 @@ const Q_PROJ_HEAVY: &str = "SELECT price FROM sales";
 /// Heavy arithmetic: 20 binary ops per row (10 multiplies + 10 adds/subs),
 /// all folded into one expression. Chosen so the per-row FLOPs dominate
 /// per-row launch overhead and PCIe-D2H of a single output column.
-const Q_ARITH_HEAVY: &str =
-    "SELECT \
+const Q_ARITH_HEAVY: &str = "SELECT \
         price * tax \
         + price * 0.01 \
         + tax * 0.02 \
@@ -98,8 +109,7 @@ const Q_ARITH_HEAVY: &str =
 /// Heavy filter: select ~25 % of rows AND apply a multi-op arithmetic
 /// expression on the surviving column so the post-compaction kernel and the
 /// arithmetic kernel both do real work.
-const Q_FILTERED_HEAVY: &str =
-    "SELECT \
+const Q_FILTERED_HEAVY: &str = "SELECT \
         price * tax \
         + price * 1.01 \
         - tax * 0.5 \
@@ -168,7 +178,9 @@ fn bench_ptx_gen(c: &mut Criterion) {
     ] {
         let plan = parse_sql(sql, &p).unwrap();
         let phys = lower_physical(&plan).unwrap();
-        let PhysicalPlan::Projection { kernel, .. } = phys else { panic!() };
+        let PhysicalPlan::Projection { kernel, .. } = phys else {
+            panic!()
+        };
         g.bench_function(name, |b| {
             b.iter(|| {
                 let ptx = compile_ptx(black_box(&kernel), "bolt_kernel").unwrap();
@@ -208,13 +220,7 @@ fn bench_cpu_reference(c: &mut Criterion) {
             for i in 0..BENCH_ROWS {
                 let p = prices[i];
                 let t = taxes[i];
-                let v = p * t
-                    + p * 0.01
-                    + t * 0.02
-                    + p * 1.001
-                    - t * 0.999
-                    + p * 1.05
-                    - t * 0.05
+                let v = p * t + p * 0.01 + t * 0.02 + p * 1.001 - t * 0.999 + p * 1.05 - t * 0.05
                     + p * 0.5
                     + t * 0.7
                     + p * t * 1.1
@@ -282,9 +288,7 @@ fn bench_polars(c: &mut Criterion) {
         b.iter(|| {
             let p = col("price");
             let t = col("tax");
-            let expr = p.clone() * t.clone()
-                + p.clone() * lit(1.01)
-                - t.clone() * lit(0.5)
+            let expr = p.clone() * t.clone() + p.clone() * lit(1.01) - t.clone() * lit(0.5)
                 + p.clone() * lit(0.7);
             let out = df
                 .clone()

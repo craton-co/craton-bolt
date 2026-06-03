@@ -103,7 +103,15 @@ fn is_null_lowers_to_fused_projection_with_op_is_null_check() {
     let n_is_null_checks = kernel
         .ops
         .iter()
-        .filter(|op| matches!(op, Op::IsNullCheck { want_null: true, .. }))
+        .filter(|op| {
+            matches!(
+                op,
+                Op::IsNullCheck {
+                    want_null: true,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(
         n_is_null_checks, 1,
@@ -159,7 +167,15 @@ fn is_not_null_lowers_to_fused_projection_with_op_is_null_check() {
     let n_is_not_null_checks = kernel
         .ops
         .iter()
-        .filter(|op| matches!(op, Op::IsNullCheck { want_null: false, .. }))
+        .filter(|op| {
+            matches!(
+                op,
+                Op::IsNullCheck {
+                    want_null: false,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(
         n_is_not_null_checks, 1,
@@ -184,10 +200,13 @@ fn is_null_anded_with_other_lowers_to_fused_projection() {
     // One IsNullCheck for `x IS NULL`, one Binary{Gt} for `id > 1`,
     // one Binary{And} fusing them.
     assert!(
-        kernel
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::IsNullCheck { want_null: true, .. })),
+        kernel.ops.iter().any(|op| matches!(
+            op,
+            Op::IsNullCheck {
+                want_null: true,
+                ..
+            }
+        )),
         "expected Op::IsNullCheck in fused predicate, got {:?}",
         kernel.ops
     );
@@ -389,8 +408,7 @@ fn scan_kernel_ptx_is_null_shape() {
         kernel.ops
     );
 
-    let ptx = compile_predicate_kernel(kernel, "bolt_predicate")
-        .expect("scan_kernel PTX codegen");
+    let ptx = compile_predicate_kernel(kernel, "bolt_predicate").expect("scan_kernel PTX codegen");
 
     assert!(
         ptx.contains("ld.global.nc.u8"),
@@ -505,8 +523,7 @@ fn scan_kernel_ptx_not_shape() {
         kernel.ops
     );
 
-    let ptx = compile_predicate_kernel(kernel, "bolt_predicate")
-        .expect("scan_kernel PTX codegen");
+    let ptx = compile_predicate_kernel(kernel, "bolt_predicate").expect("scan_kernel PTX codegen");
     assert!(
         ptx.contains("setp.gt.s64"),
         "expected inner comparison `setp.gt.s64` in scan-kernel PTX, got:\n{ptx}"
@@ -653,11 +670,7 @@ fn e2e_is_null_filters_through_gpu_projection() {
     // routing ever regresses (e.g. someone re-introduces the host
     // detour for bare-column unary), this assert fires before the GPU
     // launch and makes the failure easy to diagnose.
-    let plan = parse_sql(
-        "SELECT id, x FROM t WHERE x IS NULL",
-        &t_provider(),
-    )
-    .expect("parse");
+    let plan = parse_sql("SELECT id, x FROM t WHERE x IS NULL", &t_provider()).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
     let (kernel, _) = unwrap_projection(&phys);
     assert!(

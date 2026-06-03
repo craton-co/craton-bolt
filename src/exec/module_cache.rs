@@ -1950,8 +1950,16 @@ mod kernelspec_cache_tests {
             },
         )
         .expect("stub loader must succeed");
-        assert_eq!(compile_calls.load(AOrdering::SeqCst), 1, "cold miss must compile");
-        assert_eq!(loader_calls.load(AOrdering::SeqCst), 1, "cold miss must load");
+        assert_eq!(
+            compile_calls.load(AOrdering::SeqCst),
+            1,
+            "cold miss must compile"
+        );
+        assert_eq!(
+            loader_calls.load(AOrdering::SeqCst),
+            1,
+            "cold miss must load"
+        );
 
         // Second call with the same spec: warm hit. Neither the compile
         // closure nor the loader should run.
@@ -2238,7 +2246,12 @@ mod scalar_agg_cache_tests {
         // after the salt so a hand inspection of the cache dir still
         // distinguishes scalar-agg entries from projection-path entries.
         let salt = crate::jit::disk_cache::codegen_salt();
-        let composed = compose_disk_key(SCALAR_AGG_DISK_PREFIX, "bolt_reduce", 0xdead_beef, 0xcafe_babe);
+        let composed = compose_disk_key(
+            SCALAR_AGG_DISK_PREFIX,
+            "bolt_reduce",
+            0xdead_beef,
+            0xcafe_babe,
+        );
         assert!(
             composed.starts_with(&format!("{salt}-scalar_agg__")),
             "composed disk key must carry the salt then the scalar_agg prefix: {composed}"
@@ -2263,17 +2276,33 @@ mod scalar_agg_cache_tests {
         let k = compose_disk_key("scalar_agg__", "bolt_reduce", 0xABCD, 0x1234);
 
         // (1) salt is the leading component.
-        assert!(k.starts_with(&format!("{salt}-")), "missing salt prefix: {k}");
+        assert!(
+            k.starts_with(&format!("{salt}-")),
+            "missing salt prefix: {k}"
+        );
         // (2) the historical tail is preserved byte-for-byte after the salt
         //     (V-3: `__` separator in place of the old `::`).
         let tail = format!("scalar_agg__bolt_reduce-{}", hash_to_key(0xABCD, 0x1234));
-        assert_eq!(k, format!("{salt}-{tail}"), "tail must be salt + historical shape");
+        assert_eq!(
+            k,
+            format!("{salt}-{tail}"),
+            "tail must be salt + historical shape"
+        );
         // (3) a different spec hash yields a different key.
-        assert_ne!(k, compose_disk_key("scalar_agg__", "bolt_reduce", 0xABCD, 0x9999));
+        assert_ne!(
+            k,
+            compose_disk_key("scalar_agg__", "bolt_reduce", 0xABCD, 0x9999)
+        );
         // (4) a different family prefix yields a different key (no aliasing).
-        assert_ne!(k, compose_disk_key("hash_join__", "bolt_reduce", 0xABCD, 0x1234));
+        assert_ne!(
+            k,
+            compose_disk_key("hash_join__", "bolt_reduce", 0xABCD, 0x1234)
+        );
         // ...and a different entry symbol too.
-        assert_ne!(k, compose_disk_key("scalar_agg__", "bolt_other", 0xABCD, 0x1234));
+        assert_ne!(
+            k,
+            compose_disk_key("scalar_agg__", "bolt_other", 0xABCD, 0x1234)
+        );
     }
 
     /// The key fingerprint is stable across `Clone` of the same spec —
@@ -2521,7 +2550,12 @@ mod hash_join_cache_tests {
         assert_eq!(HASH_JOIN_DISK_PREFIX, "hash_join__");
         // Shape: `"{codegen_salt}-{PREFIX}{entry}-{hex}"` (JIT-M1 salt prepended).
         let salt = crate::jit::disk_cache::codegen_salt();
-        let composed = compose_disk_key(HASH_JOIN_DISK_PREFIX, "bolt_build", 0xdead_beef, 0xcafe_babe);
+        let composed = compose_disk_key(
+            HASH_JOIN_DISK_PREFIX,
+            "bolt_build",
+            0xdead_beef,
+            0xcafe_babe,
+        );
         assert!(
             composed.starts_with(&format!("{salt}-hash_join__")),
             "composed disk key must carry the salt then the hash_join prefix: {composed}"
@@ -2680,8 +2714,7 @@ mod radix_sort_cache_tests {
         // both live under the Scatter→ScatterWithIndices branch but use
         // different `entry` strings — the entry tag participates in the
         // key, so the call must miss and compile again.
-        let scatter_with_indices_i32 =
-            mk_spec(RadixSortPass::ScatterWithIndices, DataType::Int32);
+        let scatter_with_indices_i32 = mk_spec(RadixSortPass::ScatterWithIndices, DataType::Int32);
         let m4 = cache.get_or_build(
             &scatter_with_indices_i32,
             "bolt_radix_scatter_i32_with_indices",
@@ -2724,15 +2757,16 @@ mod radix_sort_cache_tests {
         let k_hist_i32 = RadixSortKey::new(&hist_i32, "bolt_radix_histogram_i32");
         let k_hist_i64 = RadixSortKey::new(&hist_i64, "bolt_radix_histogram_i64");
         let k_scatter_i32 = RadixSortKey::new(&scatter_i32, "bolt_radix_scatter_i32");
-        let k_scatter_wi_i32 = RadixSortKey::new(
-            &scatter_wi_i32,
-            "bolt_radix_scatter_i32_with_indices",
-        );
+        let k_scatter_wi_i32 =
+            RadixSortKey::new(&scatter_wi_i32, "bolt_radix_scatter_i32_with_indices");
         let k_msb_flip_i32 = RadixSortKey::new(&msb_flip_i32, "bolt_radix_msb_flip_i32");
         let k_hist_i32_alt = RadixSortKey::new(&hist_i32, "bolt_radix_histogram_alt");
 
         assert_ne!(k_hist_i32, k_hist_i64, "dtype must participate in the key");
-        assert_ne!(k_hist_i32, k_scatter_i32, "pass must participate in the key");
+        assert_ne!(
+            k_hist_i32, k_scatter_i32,
+            "pass must participate in the key"
+        );
         assert_ne!(
             k_scatter_i32, k_scatter_wi_i32,
             "Scatter and ScatterWithIndices must hash distinctly"
@@ -2759,8 +2793,12 @@ mod radix_sort_cache_tests {
         assert_eq!(RADIX_SORT_DISK_PREFIX, "radix_sort__");
         // Shape: `"{codegen_salt}-{PREFIX}{entry}-{hex}"` (JIT-M1 salt prepended).
         let salt = crate::jit::disk_cache::codegen_salt();
-        let composed =
-            compose_disk_key(RADIX_SORT_DISK_PREFIX, "bolt_radix_histogram_i32", 0xdead_beef, 0xcafe_babe);
+        let composed = compose_disk_key(
+            RADIX_SORT_DISK_PREFIX,
+            "bolt_radix_histogram_i32",
+            0xdead_beef,
+            0xcafe_babe,
+        );
         assert!(
             composed.starts_with(&format!("{salt}-radix_sort__")),
             "composed disk key must carry the salt then the radix_sort prefix: {composed}"

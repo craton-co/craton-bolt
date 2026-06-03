@@ -52,16 +52,12 @@
 use std::sync::Arc;
 
 use arrow::compute::{lexsort_to_indices, SortColumn, SortOptions};
-use arrow_array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt32Array,
-};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
-use crate::plan::logical_plan::{
-    DataType, Expr, Schema, SortExpr, WindowExpr, WindowFunc,
-};
+use crate::plan::logical_plan::{DataType, Expr, Schema, SortExpr, WindowExpr, WindowFunc};
 
 /// Execute a window node host-side, appending one column per `window_exprs`
 /// entry to the input batch.
@@ -82,13 +78,7 @@ pub fn execute_window(
     // device, or `--features cuda-stub` — in which case we fall through to the
     // host executor below. Any *successful* GPU result must match the host
     // path bit-for-bit (same NULL grouping, same RANGE-frame peer semantics).
-    match gpu::try_execute_window_gpu(
-        &input,
-        window_exprs,
-        partition_by,
-        order_by,
-        output_schema,
-    ) {
+    match gpu::try_execute_window_gpu(&input, window_exprs, partition_by, order_by, output_schema) {
         Ok(Some(handle)) => return Ok(handle),
         Ok(None) => { /* decline -> host fallback */ }
         Err(e) => return Err(e),
@@ -149,9 +139,8 @@ pub fn execute_window(
     // 2. Compute each window column (in original row order).
     let mut appended: Vec<ArrayRef> = Vec::with_capacity(window_exprs.len());
     for (we, of) in window_exprs.iter().zip(appended_fields) {
-        let arr = compute_window_column(
-            &batch, &perm, &part_keys, &order_keys, &we.func, of.dtype,
-        )?;
+        let arr =
+            compute_window_column(&batch, &perm, &part_keys, &order_keys, &we.func, of.dtype)?;
         appended.push(arr);
     }
 
@@ -243,8 +232,7 @@ fn compute_window_column(
     while i < perm.len() {
         // Find the extent of this partition: [i, part_end).
         let mut part_end = i + 1;
-        while part_end < perm.len()
-            && part_keys.iter().all(|k| k.eq_rows(perm[i], perm[part_end]))
+        while part_end < perm.len() && part_keys.iter().all(|k| k.eq_rows(perm[i], perm[part_end]))
         {
             part_end += 1;
         }
@@ -476,8 +464,7 @@ impl Accumulator {
                     AggKind::Sum => {
                         self.int_sum = self.int_sum.checked_add(x).ok_or_else(|| {
                             BoltError::Type(
-                                "SUM(integer) overflow: accumulator exceeds i64 range"
-                                    .to_string(),
+                                "SUM(integer) overflow: accumulator exceeds i64 range".to_string(),
                             )
                         })?;
                     }
@@ -508,16 +495,12 @@ impl Accumulator {
                         // longer sticks for MIN (it's the maximum, so any
                         // real value beats it), and MAX returns NaN if present.
                         AggKind::Min => {
-                            if float_total_cmp(x, self.extreme)
-                                == std::cmp::Ordering::Less
-                            {
+                            if float_total_cmp(x, self.extreme) == std::cmp::Ordering::Less {
                                 self.extreme = x;
                             }
                         }
                         AggKind::Max => {
-                            if float_total_cmp(x, self.extreme)
-                                == std::cmp::Ordering::Greater
-                            {
+                            if float_total_cmp(x, self.extreme) == std::cmp::Ordering::Greater {
                                 self.extreme = x;
                             }
                         }
@@ -655,23 +638,41 @@ impl ResultBuilder {
             Repr::Int { values, valid } => {
                 let cells = values.into_iter().zip(valid);
                 match self.out_dtype {
-                    DataType::Int32 => Ok(Arc::new(Int32Array::from_iter(
-                        cells.map(|(v, ok)| if ok { Some(v as i32) } else { None }),
-                    ))),
-                    _ => Ok(Arc::new(Int64Array::from_iter(
-                        cells.map(|(v, ok)| if ok { Some(v) } else { None }),
-                    ))),
+                    DataType::Int32 => Ok(Arc::new(Int32Array::from_iter(cells.map(|(v, ok)| {
+                        if ok {
+                            Some(v as i32)
+                        } else {
+                            None
+                        }
+                    })))),
+                    _ => Ok(Arc::new(Int64Array::from_iter(cells.map(|(v, ok)| {
+                        if ok {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })))),
                 }
             }
             Repr::Float { values, valid } => {
                 let cells = values.into_iter().zip(valid);
                 match self.out_dtype {
-                    DataType::Float32 => Ok(Arc::new(Float32Array::from_iter(
-                        cells.map(|(v, ok)| if ok { Some(v as f32) } else { None }),
-                    ))),
-                    _ => Ok(Arc::new(Float64Array::from_iter(
-                        cells.map(|(v, ok)| if ok { Some(v) } else { None }),
-                    ))),
+                    DataType::Float32 => {
+                        Ok(Arc::new(Float32Array::from_iter(cells.map(|(v, ok)| {
+                            if ok {
+                                Some(v as f32)
+                            } else {
+                                None
+                            }
+                        }))))
+                    }
+                    _ => Ok(Arc::new(Float64Array::from_iter(cells.map(|(v, ok)| {
+                        if ok {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })))),
                 }
             }
         }
@@ -685,7 +686,7 @@ impl ResultBuilder {
 /// An owned, comparable per-row view of a key column (partition or order).
 /// Used only for *equality* checks between two row indices (peer-group and
 /// partition-boundary detection). Ordering is delegated to Arrow's lexsort.
-enum KeyColumn {
+pub(crate) enum KeyColumn {
     Int64(Vec<Option<i64>>),
     Float64(Vec<Option<f64>>),
     Bool(Vec<Option<bool>>),
@@ -708,7 +709,13 @@ impl KeyColumn {
                 let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
                 KeyColumn::Int64(
                     (0..n)
-                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) })
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i) as i64)
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -724,7 +731,13 @@ impl KeyColumn {
                 let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
                 KeyColumn::Int64(
                     (0..n)
-                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) })
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i) as i64)
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -743,7 +756,13 @@ impl KeyColumn {
                 let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
                 KeyColumn::Float64(
                     (0..n)
-                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i) as f64)
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -816,7 +835,7 @@ impl KeyColumn {
 /// cannot represent exactly) survive intact. Float inputs keep an `f64` lane.
 /// The two lanes are surfaced as [`Cell`]s so the [`Accumulator`] can stay on
 /// the native type per column.
-enum NumericColumn {
+pub(crate) enum NumericColumn {
     Int(Vec<Option<i64>>),
     Float(Vec<Option<f64>>),
 }
@@ -830,9 +849,9 @@ enum Cell {
 
 impl NumericColumn {
     fn extract(batch: &RecordBatch, e: &Expr) -> BoltResult<Self> {
+        use crate::plan::logical_plan::Literal;
         use arrow_array::{Float32Array, Float64Array, Int32Array, Int64Array};
         use arrow_schema::DataType as A;
-        use crate::plan::logical_plan::Literal;
 
         // Aggregate-input literals (e.g. the `COUNT(*)` sentinel `1`) are
         // broadcast to every row. A NULL literal broadcasts to all-NULL.
@@ -862,7 +881,13 @@ impl NumericColumn {
                 let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
                 NumericColumn::Int(
                     (0..n)
-                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) })
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i) as i64)
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -878,7 +903,13 @@ impl NumericColumn {
                 let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
                 NumericColumn::Float(
                     (0..n)
-                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i) as f64)
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -1118,19 +1149,15 @@ pub(crate) mod gpu {
                 WindowFunc::RowNumber => GpuWindowKind::RowNumber,
                 WindowFunc::Rank => GpuWindowKind::Rank,
                 WindowFunc::DenseRank => GpuWindowKind::DenseRank,
-                WindowFunc::Count(_) => {
-                    match agg {
-                        Some(dt) if agg_input_is_int(dt) => GpuWindowKind::Count,
-                        Some(dt) => {
-                            return Decision::Decline(format!(
-                                "COUNT input dtype {dt:?} not GPU-eligible"
-                            ))
-                        }
-                        None => {
-                            return Decision::Decline("COUNT missing input dtype".into())
-                        }
+                WindowFunc::Count(_) => match agg {
+                    Some(dt) if agg_input_is_int(dt) => GpuWindowKind::Count,
+                    Some(dt) => {
+                        return Decision::Decline(format!(
+                            "COUNT input dtype {dt:?} not GPU-eligible"
+                        ))
                     }
-                }
+                    None => return Decision::Decline("COUNT missing input dtype".into()),
+                },
                 WindowFunc::Sum(_) => match agg {
                     Some(dt) if agg_input_is_int(dt) => GpuWindowKind::Sum,
                     Some(dt) => {
@@ -1238,11 +1265,7 @@ pub(crate) mod gpu {
     /// Running SUM(col) (RANGE frame) in permuted order: partition-local
     /// inclusive scan of the i64 input (NULL contributes 0), then lift each
     /// peer to the peer-group-end sum.
-    pub(crate) fn derive_sum(
-        part_head: &[bool],
-        peer_head: &[bool],
-        values: &[i64],
-    ) -> Vec<i64> {
+    pub(crate) fn derive_sum(part_head: &[bool], peer_head: &[bool], values: &[i64]) -> Vec<i64> {
         let incl = segmented_inclusive_sum(values, part_head);
         lift_to_peer_end(&incl, peer_head)
     }
@@ -1534,9 +1557,8 @@ pub(crate) mod gpu {
 
         // (3) Device launch: upload key lanes, run the boundary kernel.
         let stream = CudaStream::null_or_default();
-        let n_u32 = u32::try_from(n_rows).map_err(|_| {
-            BoltError::GpuCapacity(format!("window: n_rows {n_rows} exceeds u32"))
-        })?;
+        let n_u32 = u32::try_from(n_rows)
+            .map_err(|_| BoltError::GpuCapacity(format!("window: n_rows {n_rows} exceeds u32")))?;
 
         let part_key_gpu = GpuVec::<i64>::from_slice(&part_lane)?;
         let order_key_gpu = GpuVec::<i64>::from_slice(&order_lane)?;
@@ -1649,13 +1671,8 @@ pub(crate) mod gpu {
             // every `part_head`. ABI (see compile_segmented_scan_kernel):
             //   param_0 values (i64*), param_1 seg_head (u8*),
             //   param_2 out (i64*), param_3 n_rows (u32).
-            let scan_out = launch_segmented_scan(
-                scan_fn.raw(),
-                &values,
-                &part_head_u8,
-                n_u32,
-                &stream,
-            )?;
+            let scan_out =
+                launch_segmented_scan(scan_fn.raw(), &values, &part_head_u8, n_u32, &stream)?;
 
             // Host derivation: turn (flags, inclusive scan) into per-row values
             // in PERMUTED order, exactly as the host-side reference math.
@@ -1685,7 +1702,11 @@ pub(crate) mod gpu {
             .map(|f| f.as_ref().clone())
             .collect();
         for (arr, of) in appended.iter().zip(appended_fields) {
-            fields.push(ArrowField::new(of.name.clone(), arr.data_type().clone(), true));
+            fields.push(ArrowField::new(
+                of.name.clone(),
+                arr.data_type().clone(),
+                true,
+            ));
         }
         cols.extend(appended);
         let schema = Arc::new(ArrowSchema::new(fields));
@@ -1751,19 +1772,16 @@ pub(crate) mod gpu {
     fn pack_i64_output(values: &[i64], dtype: DataType) -> ArrayRef {
         use arrow_array::Int32Array;
         match dtype {
-            DataType::Int32 => {
-                Arc::new(Int32Array::from_iter(values.iter().map(|&v| Some(v as i32))))
-            }
+            DataType::Int32 => Arc::new(Int32Array::from_iter(
+                values.iter().map(|&v| Some(v as i32)),
+            )),
             _ => Arc::new(Int64Array::from_iter(values.iter().map(|&v| Some(v)))),
         }
     }
 
     /// Resolve a bare-column (optionally aliased) expression to its Arrow
     /// dtype in `batch`, or `None` for computed expressions / missing columns.
-    fn resolve_column_dtype(
-        batch: &RecordBatch,
-        e: &Expr,
-    ) -> Option<arrow_schema::DataType> {
+    fn resolve_column_dtype(batch: &RecordBatch, e: &Expr) -> Option<arrow_schema::DataType> {
         let name = match bare_column_name(e) {
             Ok(n) => n,
             Err(_) => return None,
@@ -1776,9 +1794,9 @@ pub(crate) mod gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::logical_plan::{Field as PField, Schema as PSchema};
     use arrow_array::{Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as AwSchema};
-    use crate::plan::logical_plan::{Field as PField, Schema as PSchema};
 
     /// Build a handle from columns: (name, Int32 values).
     fn int_col(name: &str, values: Vec<i32>) -> (ArrowField, ArrayRef) {
@@ -1833,7 +1851,13 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -1845,7 +1869,13 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -1886,7 +1916,11 @@ mod tests {
         let ks = as_str(&out, "k");
         let vs: Vec<Option<i64>> = {
             let idx = out.schema().index_of("v").unwrap();
-            let a = out.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            let a = out
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
             (0..a.len()).map(|i| Some(a.value(i) as i64)).collect()
         };
         let rn = as_i64(&out, "rn");
@@ -1900,7 +1934,13 @@ mod tests {
                 ("b", 20) => 2,
                 _ => unreachable!(),
             };
-            assert_eq!(rn[i], Some(expected), "row {i} (k={}, v={:?})", ks[i], vs[i]);
+            assert_eq!(
+                rn[i],
+                Some(expected),
+                "row {i} (k={}, v={:?})",
+                ks[i],
+                vs[i]
+            );
         }
     }
 
@@ -1930,7 +1970,11 @@ mod tests {
             .into_record_batch();
 
         let idx = out.schema().index_of("v").unwrap();
-        let va = out.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+        let va = out
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         let vs: Vec<i32> = (0..va.len()).map(|i| va.value(i)).collect();
         let rk = as_i64(&out, "rk");
         let dr = as_i64(&out, "dr");
@@ -1993,16 +2037,17 @@ mod tests {
             func: WindowFunc::Sum(col("v")),
             output_name: "rs".into(),
         }];
-        let os = out_schema(
-            &[("v", DataType::Int32)],
-            &[("rs", DataType::Int64)],
-        );
+        let os = out_schema(&[("v", DataType::Int32)], &[("rs", DataType::Int64)]);
         let out = execute_window(h, &wexprs, &[], &[order("v")], &os)
             .unwrap()
             .into_record_batch();
 
         let idx = out.schema().index_of("v").unwrap();
-        let va = out.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+        let va = out
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         let vs: Vec<i32> = (0..va.len()).map(|i| va.value(i)).collect();
         let rs = as_i64(&out, "rs");
         for i in 0..vs.len() {
@@ -2054,9 +2099,8 @@ mod tests {
         ]));
         let kcol = Arc::new(StringArray::from(vec!["a", "a", "a"])) as ArrayRef;
         let vcol = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef;
-        let h = QueryHandle::from_record_batch(
-            RecordBatch::try_new(schema, vec![kcol, vcol]).unwrap(),
-        );
+        let h =
+            QueryHandle::from_record_batch(RecordBatch::try_new(schema, vec![kcol, vcol]).unwrap());
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Count(col("v")),
             output_name: "cnt".into(),
@@ -2264,10 +2308,7 @@ mod tests {
             // Two segments: [1,2,3] then [10,20].
             let vals = [1, 2, 3, 10, 20];
             let head = [true, false, false, true, false];
-            assert_eq!(
-                segmented_inclusive_sum(&vals, &head),
-                vec![1, 3, 6, 10, 30]
-            );
+            assert_eq!(segmented_inclusive_sum(&vals, &head), vec![1, 3, 6, 10, 30]);
         }
 
         #[test]
@@ -2337,7 +2378,10 @@ mod tests {
             let part_head = [true, false, false];
             let peer_head = [true, false, true];
             let values = [10, 10, 20];
-            assert_eq!(derive_sum(&part_head, &peer_head, &values), vec![20, 20, 40]);
+            assert_eq!(
+                derive_sum(&part_head, &peer_head, &values),
+                vec![20, 20, 40]
+            );
         }
 
         #[test]
@@ -2346,7 +2390,10 @@ mod tests {
             let part_head = [true, false, false];
             let peer_head = [true, false, false];
             let values = [10, 0, 20];
-            assert_eq!(derive_sum(&part_head, &peer_head, &values), vec![30, 30, 30]);
+            assert_eq!(
+                derive_sum(&part_head, &peer_head, &values),
+                vec![30, 30, 30]
+            );
         }
 
         #[test]
@@ -2424,8 +2471,7 @@ mod tests {
                 Decision::Decline(_)
             ));
             // > one block -> decline (multi-block scan deferred).
-            let too_big =
-                (crate::jit::window_kernel::WINDOW_BLOCK_SIZE as usize) + 1;
+            let too_big = (crate::jit::window_kernel::WINDOW_BLOCK_SIZE as usize) + 1;
             assert!(matches!(
                 dispatch_decision(&frefs, too_big, &[A::Int64], &[None]),
                 Decision::Decline(_)
@@ -2471,16 +2517,10 @@ mod tests {
             // Int64 key with a NULL in the middle; identity permutation.
             let key = KeyColumn::Int64(vec![Some(7), None, Some(-3)]);
             let perm = [0usize, 1, 2];
-            assert_eq!(
-                encode_key_lane(&key, &perm),
-                vec![7, NULL_KEY_SENTINEL, -3]
-            );
+            assert_eq!(encode_key_lane(&key, &perm), vec![7, NULL_KEY_SENTINEL, -3]);
             // Bool encodes false=0/true=1, NULL=sentinel.
             let bkey = KeyColumn::Bool(vec![Some(false), Some(true), None]);
-            assert_eq!(
-                encode_key_lane(&bkey, &perm),
-                vec![0, 1, NULL_KEY_SENTINEL]
-            );
+            assert_eq!(encode_key_lane(&bkey, &perm), vec![0, 1, NULL_KEY_SENTINEL]);
         }
 
         #[test]
@@ -2581,8 +2621,14 @@ mod tests {
                 int_col("v", vec![10, 30, 10, 20]),
             ]);
             let wexprs = vec![
-                WindowExpr { func: WindowFunc::Rank, output_name: "rk".into() },
-                WindowExpr { func: WindowFunc::DenseRank, output_name: "dr".into() },
+                WindowExpr {
+                    func: WindowFunc::Rank,
+                    output_name: "rk".into(),
+                },
+                WindowExpr {
+                    func: WindowFunc::DenseRank,
+                    output_name: "dr".into(),
+                },
             ];
             let os = out_schema(
                 &[("k", DataType::Int32), ("v", DataType::Int32)],
@@ -2592,7 +2638,11 @@ mod tests {
                 .unwrap()
                 .into_record_batch();
             let idx = out.schema().index_of("v").unwrap();
-            let va = out.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            let va = out
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
             let vs: Vec<i32> = (0..va.len()).map(|i| va.value(i)).collect();
             let rk = as_i64(&out, "rk");
             let dr = as_i64(&out, "dr");
@@ -2632,7 +2682,11 @@ mod tests {
                 .unwrap()
                 .into_record_batch();
             let idx = out.schema().index_of("v").unwrap();
-            let va = out.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            let va = out
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
             let vs: Vec<i32> = (0..va.len()).map(|i| va.value(i)).collect();
             let rs = as_i64(&out, "rs");
             for i in 0..vs.len() {

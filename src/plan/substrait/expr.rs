@@ -49,9 +49,9 @@ use crate::plan::logical_plan::{BinaryOp, DataType, Expr, Literal};
 
 use substrait::proto::expression::{
     field_reference::ReferenceType as FieldReferenceType,
-    reference_segment::ReferenceType as SegmentReferenceType,
-    Cast as SubstraitCast, FieldReference, IfThen, Literal as SubstraitLiteral,
-    ReferenceSegment, ScalarFunction, SwitchExpression,
+    reference_segment::ReferenceType as SegmentReferenceType, Cast as SubstraitCast,
+    FieldReference, IfThen, Literal as SubstraitLiteral, ReferenceSegment, ScalarFunction,
+    SwitchExpression,
 };
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::r#type::Kind as TypeKind;
@@ -104,10 +104,7 @@ pub(crate) trait SubstraitCtx {
 /// Entry point for the expression half of Substrait ingestion. See the
 /// module docs for the supported-node envelope; unsupported nodes surface a
 /// [`BoltError::Plan`].
-pub(crate) fn convert_expr<C: SubstraitCtx + ?Sized>(
-    e: &Expression,
-    ctx: &C,
-) -> BoltResult<Expr> {
+pub(crate) fn convert_expr<C: SubstraitCtx + ?Sized>(e: &Expression, ctx: &C) -> BoltResult<Expr> {
     convert_expr_depth(e, ctx, 0)
 }
 
@@ -179,9 +176,10 @@ fn convert_field_reference<C: SubstraitCtx + ?Sized>(
     field_ref: &FieldReference,
     ctx: &C,
 ) -> BoltResult<Expr> {
-    let rt = field_ref.reference_type.as_ref().ok_or_else(|| {
-        BoltError::Plan("substrait: FieldReference has no reference_type".into())
-    })?;
+    let rt = field_ref
+        .reference_type
+        .as_ref()
+        .ok_or_else(|| BoltError::Plan("substrait: FieldReference has no reference_type".into()))?;
     let seg = match rt {
         FieldReferenceType::DirectReference(seg) => seg,
         FieldReferenceType::MaskedReference(_) => {
@@ -513,8 +511,7 @@ fn convert_cast<C: SubstraitCtx + ?Sized>(
 /// everything else (struct, list, map, user-defined, etc.) is rejected.
 fn substrait_type_to_datatype(ty: &substrait::proto::Type) -> BoltResult<DataType> {
     use substrait::proto::r#type::{
-        Decimal as DecimalType, PrecisionTimestamp, PrecisionTimestampTz, Timestamp,
-        TimestampTz,
+        Decimal as DecimalType, PrecisionTimestamp, PrecisionTimestampTz, Timestamp, TimestampTz,
     };
     let kind = ty
         .kind
@@ -548,10 +545,12 @@ fn substrait_type_to_datatype(ty: &substrait::proto::Type) -> BoltResult<DataTyp
         TypeKind::PrecisionTimestamp(PrecisionTimestamp { precision, .. }) => {
             DataType::Timestamp(precision_to_timeunit(*precision)?, None)
         }
-        TypeKind::PrecisionTimestampTz(PrecisionTimestampTz { precision, .. }) => DataType::Timestamp(
-            precision_to_timeunit(*precision)?,
-            Some(crate::plan::logical_plan::intern_timezone("UTC")),
-        ),
+        TypeKind::PrecisionTimestampTz(PrecisionTimestampTz { precision, .. }) => {
+            DataType::Timestamp(
+                precision_to_timeunit(*precision)?,
+                Some(crate::plan::logical_plan::intern_timezone("UTC")),
+            )
+        }
         other => {
             return Err(BoltError::Plan(format!(
                 "substrait: unsupported cast target type {}",
@@ -578,9 +577,7 @@ fn decimal_datatype(precision: i32, scale: i32) -> BoltResult<DataType> {
 
 /// Map a Substrait timestamp `precision` (decimal digits of sub-second
 /// resolution) to the engine [`TimeUnit`](crate::plan::logical_plan::TimeUnit).
-fn precision_to_timeunit(
-    precision: i32,
-) -> BoltResult<crate::plan::logical_plan::TimeUnit> {
+fn precision_to_timeunit(precision: i32) -> BoltResult<crate::plan::logical_plan::TimeUnit> {
     use crate::plan::logical_plan::TimeUnit;
     Ok(match precision {
         0 => TimeUnit::Second,
@@ -641,9 +638,7 @@ fn convert_if_then<C: SubstraitCtx + ?Sized>(
     depth: usize,
 ) -> BoltResult<Expr> {
     if if_then.ifs.is_empty() {
-        return Err(BoltError::Plan(
-            "substrait: IfThen has no clauses".into(),
-        ));
+        return Err(BoltError::Plan("substrait: IfThen has no clauses".into()));
     }
     let mut branches: Vec<(Expr, Expr)> = Vec::with_capacity(if_then.ifs.len());
     for clause in &if_then.ifs {
@@ -651,10 +646,9 @@ fn convert_if_then<C: SubstraitCtx + ?Sized>(
             .r#if
             .as_ref()
             .ok_or_else(|| BoltError::Plan("substrait: IfThen clause has no condition".into()))?;
-        let then_e = clause
-            .then
-            .as_ref()
-            .ok_or_else(|| BoltError::Plan("substrait: IfThen clause has no `then` value".into()))?;
+        let then_e = clause.then.as_ref().ok_or_else(|| {
+            BoltError::Plan("substrait: IfThen clause has no `then` value".into())
+        })?;
         let cond = convert_expr_depth(cond_e, ctx, depth + 1)?;
         let then = convert_expr_depth(then_e, ctx, depth + 1)?;
         branches.push((cond, then));
@@ -680,10 +674,9 @@ fn convert_switch<C: SubstraitCtx + ?Sized>(
     ctx: &C,
     depth: usize,
 ) -> BoltResult<Expr> {
-    let match_e = switch
-        .r#match
-        .as_ref()
-        .ok_or_else(|| BoltError::Plan("substrait: SwitchExpression has no `match` value".into()))?;
+    let match_e = switch.r#match.as_ref().ok_or_else(|| {
+        BoltError::Plan("substrait: SwitchExpression has no `match` value".into())
+    })?;
     let match_expr = convert_expr_depth(match_e, ctx, depth + 1)?;
     if switch.ifs.is_empty() {
         return Err(BoltError::Plan(
@@ -696,10 +689,9 @@ fn convert_switch<C: SubstraitCtx + ?Sized>(
             .r#if
             .as_ref()
             .ok_or_else(|| BoltError::Plan("substrait: switch clause has no key literal".into()))?;
-        let then_e = clause
-            .then
-            .as_ref()
-            .ok_or_else(|| BoltError::Plan("substrait: switch clause has no `then` value".into()))?;
+        let then_e = clause.then.as_ref().ok_or_else(|| {
+            BoltError::Plan("substrait: switch clause has no `then` value".into())
+        })?;
         let key = ctx.literal_to_literal(key_lit)?;
         let cond = Expr::Binary {
             op: BinaryOp::Eq,

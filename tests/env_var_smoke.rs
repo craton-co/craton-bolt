@@ -98,12 +98,20 @@ fn bolt_gpu_join_table_cap_mb_parses_valid_integer() {
     // Below the 64 MiB floor → clamped up.
     std::env::set_var(CAP_ENV_VAR, "1");
     let cap = parse_env_cap().expect("1 MiB parses");
-    assert_eq!(cap, 64 * 1024 * 1024, "sub-floor input must clamp to 64 MiB");
+    assert_eq!(
+        cap,
+        64 * 1024 * 1024,
+        "sub-floor input must clamp to 64 MiB"
+    );
 
     // Above the 4 GiB ceiling → clamped down.
     std::env::set_var(CAP_ENV_VAR, "99999");
     let cap = parse_env_cap().expect("99999 MiB parses");
-    assert_eq!(cap, 4096 * 1024 * 1024, "super-ceiling input must clamp to 4 GiB");
+    assert_eq!(
+        cap,
+        4096 * 1024 * 1024,
+        "super-ceiling input must clamp to 4 GiB"
+    );
 
     restore(CAP_ENV_VAR, prev);
 }
@@ -178,7 +186,10 @@ fn bolt_gpu_join_streaming_intern_flips_on_truthy() {
     assert!(streaming_intern_enabled(), "'true' env: streaming ON");
 
     std::env::set_var(STREAMING_INTERN_ENV_VAR, "yes");
-    assert!(streaming_intern_enabled(), "'yes' env: streaming ON (non-falsy)");
+    assert!(
+        streaming_intern_enabled(),
+        "'yes' env: streaming ON (non-falsy)"
+    );
 
     restore(STREAMING_INTERN_ENV_VAR, prev);
 }

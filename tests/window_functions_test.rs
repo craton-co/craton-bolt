@@ -37,9 +37,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{parse_sql, DataType, Field, MemTableProvider, Schema};
@@ -145,8 +143,7 @@ fn engine_v(name: &str, v: Vec<Option<i32>>) -> Engine {
         ArrowDataType::Int32,
         true,
     )]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(v))]).expect("batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(v))]).expect("batch");
     engine.register_table(name, batch).expect("register");
     engine
 }

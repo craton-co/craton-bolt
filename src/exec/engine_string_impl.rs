@@ -143,8 +143,7 @@ impl Engine {
                 // validity-carrying `None`), distinct from `LENGTH('') = 0` —
                 // matching the now-NULL-correct `exec::string_ops::length`
                 // (agent-C F-3). Valid rows map to `table[key+1]`.
-                let table_lengths =
-                    build_length_table(dict, KeyLayout::OneBasedNullSlot0)?;
+                let table_lengths = build_length_table(dict, KeyLayout::OneBasedNullSlot0)?;
                 let keys_host = keys_vec.to_vec()?;
                 // DictUtf8 keys are 0-based; remap to the 1-based table by
                 // adding 1 only when the column is the DictUtf8 layout.
@@ -152,10 +151,7 @@ impl Engine {
                     crate::exec::gpu_table::GpuColumnData::DictUtf8 { valid_mask, .. } => {
                         // Consult validity: NULL rows → SQL NULL, valid rows →
                         // table[key+1].
-                        let mask = valid_mask
-                            .as_ref()
-                            .map(|m| m.to_vec())
-                            .transpose()?;
+                        let mask = valid_mask.as_ref().map(|m| m.to_vec()).transpose()?;
                         let mut out: Vec<Option<i64>> = Vec::with_capacity(keys_host.len());
                         for (row, &k) in keys_host.iter().enumerate() {
                             let is_valid = match &mask {
@@ -174,13 +170,9 @@ impl Engine {
                                 )));
                             } else {
                                 // table index = key + 1 (slot 0 is NULL).
-                                let len = *table_lengths
-                                    .get(k as usize + 1)
-                                    .ok_or_else(|| {
-                                        BoltError::Other(format!(
-                                            "LENGTH: key {k} out of range"
-                                        ))
-                                    })?;
+                                let len = *table_lengths.get(k as usize + 1).ok_or_else(|| {
+                                    BoltError::Other(format!("LENGTH: key {k} out of range"))
+                                })?;
                                 out.push(Some(len as i64));
                             }
                         }
@@ -207,8 +199,7 @@ impl Engine {
 
         let module =
             CudaModule::from_ptx(&crate::jit::string_kernel::compile_length_gather_kernel()?)?;
-        let function =
-            module.function(crate::jit::string_kernel::LENGTH_GATHER_ENTRY)?;
+        let function = module.function(crate::jit::string_kernel::LENGTH_GATHER_ENTRY)?;
 
         // ABI: (indices, length_table, out, n_rows). Assemble raw kernel
         // params directly (heterogeneous list; same pattern as
@@ -327,15 +318,12 @@ impl Engine {
                     // Decode it to a plain Utf8 array so the built batch matches
                     // the schema; non-dictionary columns pass through unchanged.
                     if matches!(src_col.data_type(), ArrowDataType::Dictionary(_, _)) {
-                        let decoded = arrow::compute::cast(
-                            src_col.as_ref(),
-                            &ArrowDataType::Utf8,
-                        )
-                        .map_err(|e| {
-                            BoltError::Other(format!(
+                        let decoded = arrow::compute::cast(src_col.as_ref(), &ArrowDataType::Utf8)
+                            .map_err(|e| {
+                                BoltError::Other(format!(
                                 "StringProject: decode dictionary '{source}' to Utf8 failed: {e}"
                             ))
-                        })?;
+                            })?;
                         arrays.push(decoded);
                     } else {
                         arrays.push(src_col.clone());
@@ -359,21 +347,19 @@ impl Engine {
                         let mut v = Vec::with_capacity(src_batch.num_columns());
                         for (i, field) in src_schema.fields().iter().enumerate() {
                             let arr = src_batch.column(i);
-                            let decoded: ArrayRef = if matches!(
-                                arr.data_type(),
-                                ArrowDataType::Dictionary(_, _)
-                            ) {
-                                arrow::compute::cast(arr.as_ref(), &ArrowDataType::Utf8)
-                                    .map_err(|e| {
-                                        BoltError::Other(format!(
-                                            "StringProject(CaseUtf8): decode dictionary \
+                            let decoded: ArrayRef =
+                                if matches!(arr.data_type(), ArrowDataType::Dictionary(_, _)) {
+                                    arrow::compute::cast(arr.as_ref(), &ArrowDataType::Utf8)
+                                        .map_err(|e| {
+                                            BoltError::Other(format!(
+                                                "StringProject(CaseUtf8): decode dictionary \
                                              '{}' to Utf8 failed: {e}",
-                                            field.name()
-                                        ))
-                                    })?
-                            } else {
-                                arr.clone()
-                            };
+                                                field.name()
+                                            ))
+                                        })?
+                                } else {
+                                    arr.clone()
+                                };
                             let hc = crate::exec::filter::arrow_array_to_host_column(
                                 decoded.as_ref(),
                                 n_rows,
@@ -494,16 +480,14 @@ impl Engine {
         // correctness-guaranteed host path here. Results are identical either
         // way; wiring the device launch is a follow-up.
         if transform.is_host_realized() {
-            let arr =
-                host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
+            let arr = host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
             return Ok(Arc::new(arr) as ArrayRef);
         }
 
         // Host fallback for non-ASCII dictionaries: the byte-wise GPU fold is
         // only correct for ASCII (Unicode case mapping can change byte length).
         if !dict_is_ascii(dict) {
-            let arr =
-                host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
+            let arr = host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
             return Ok(Arc::new(arr) as ArrayRef);
         }
 
@@ -512,8 +496,7 @@ impl Engine {
         // byte-identical for ASCII dictionaries. The device launch below is
         // only reached when `BOLT_GPU_STRING` is truthy.
         if !crate::exec::string_project::gpu_string_enabled() {
-            let arr =
-                host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
+            let arr = host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
             return Ok(Arc::new(arr) as ArrayRef);
         }
 
@@ -548,9 +531,8 @@ impl Engine {
         // ---- Pass 1: length pass → row_lens. ABI (UPPER/LOWER, 4 params):
         //      (src_offsets, src_bytes, row_lens, n_rows).
         {
-            let module = CudaModule::from_ptx(
-                &crate::jit::string_kernel::compile_varwidth_len_pass(kind)?,
-            )?;
+            let module =
+                CudaModule::from_ptx(&crate::jit::string_kernel::compile_varwidth_len_pass(kind)?)?;
             let entry = crate::jit::string_kernel::len_pass_entry(kind)?;
             let function = module.function(&entry)?;
 
@@ -774,30 +756,28 @@ impl Engine {
         // through un-rewritten) is cast to Utf8 so the path stays host-fallback-
         // safe (no panic, no hard error) for unexpected run-time layouts.
         let owned_cast: ArrayRef;
-        let str_arr: &arrow_array::StringArray = match col_arr
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-        {
-            Some(a) => a,
-            None => {
-                owned_cast = arrow::compute::cast(col_arr.as_ref(), &ArrowDataType::Utf8)
-                    .map_err(|e| {
-                        BoltError::Plan(format!(
-                            "StringLikeFilter: column '{column}' is not Utf8 and could \
+        let str_arr: &arrow_array::StringArray =
+            match col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+                Some(a) => a,
+                None => {
+                    owned_cast = arrow::compute::cast(col_arr.as_ref(), &ArrowDataType::Utf8)
+                        .map_err(|e| {
+                            BoltError::Plan(format!(
+                                "StringLikeFilter: column '{column}' is not Utf8 and could \
                              not be cast (got {:?}): {e}",
-                            col_arr.data_type()
-                        ))
-                    })?;
-                owned_cast
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                    .ok_or_else(|| {
-                        BoltError::Plan(format!(
-                            "StringLikeFilter: cast of column '{column}' did not yield Utf8"
-                        ))
-                    })?
-            }
-        };
+                                col_arr.data_type()
+                            ))
+                        })?;
+                    owned_cast
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .ok_or_else(|| {
+                            BoltError::Plan(format!(
+                                "StringLikeFilter: cast of column '{column}' did not yield Utf8"
+                            ))
+                        })?
+                }
+            };
 
         // Build the boolean mask: GPU device path, with a host fallback that
         // produces the identical mask if the launch is not viable.
@@ -810,20 +790,18 @@ impl Engine {
             crate::exec::string_like::host_mask_via_mirror(str_arr, literal, mode, negated)
         } else {
             match self.string_like_mask_gpu(str_arr, literal, mode, negated) {
-            Ok(m) => m,
-            Err(e) => {
-                // Host fallback: evaluate the SAME predicate via the validated
-                // host mirror (equivalent to exec::like::host_like for these
-                // shapes). Correctness is unaffected; only the GPU speedup is
-                // lost. Logged so a hardware bring-up notices.
-                log::warn!(
-                    "StringLikeFilter: GPU matcher unavailable ({e}); \
+                Ok(m) => m,
+                Err(e) => {
+                    // Host fallback: evaluate the SAME predicate via the validated
+                    // host mirror (equivalent to exec::like::host_like for these
+                    // shapes). Correctness is unaffected; only the GPU speedup is
+                    // lost. Logged so a hardware bring-up notices.
+                    log::warn!(
+                        "StringLikeFilter: GPU matcher unavailable ({e}); \
                      falling back to host LIKE for column '{column}'"
-                );
-                crate::exec::string_like::host_mask_via_mirror(
-                    str_arr, literal, mode, negated,
-                )
-            }
+                    );
+                    crate::exec::string_like::host_mask_via_mirror(str_arr, literal, mode, negated)
+                }
             }
         };
 
@@ -833,9 +811,7 @@ impl Engine {
             .iter()
             .map(|c| {
                 arrow::compute::filter(c.as_ref(), &mask).map_err(|e| {
-                    BoltError::Other(format!(
-                        "StringLikeFilter: arrow filter failed: {e}"
-                    ))
+                    BoltError::Other(format!("StringLikeFilter: arrow filter failed: {e}"))
                 })
             })
             .collect::<BoltResult<Vec<_>>>()?;
@@ -860,8 +836,8 @@ impl Engine {
         mode: crate::jit::string_kernel::LikeMode,
         negated: bool,
     ) -> BoltResult<arrow_array::BooleanArray> {
-        use arrow_array::Array;
         use crate::exec::string_like::{build_row_aligned_from_strings, mask_to_boolean_array};
+        use arrow_array::Array;
 
         let n_rows = col.len();
         let (offsets, bytes, validity) = build_row_aligned_from_strings(col)?;
@@ -882,9 +858,8 @@ impl Engine {
         };
         // Literal: bake as a small device buffer. Pad empty to 1 byte so the
         // device pointer is valid (lit_len==0 short-circuits before any read).
-        let lit_len = u32::try_from(literal.len()).map_err(|_| {
-            BoltError::Other("StringLikeFilter: literal length exceeds u32".into())
-        })?;
+        let lit_len = u32::try_from(literal.len())
+            .map_err(|_| BoltError::Other("StringLikeFilter: literal length exceeds u32".into()))?;
         let lit_gpu = if literal.is_empty() {
             GpuVec::<u8>::zeros(1)?
         } else {
@@ -896,9 +871,9 @@ impl Engine {
         let stream = CudaStream::null_or_default();
         let grid_x = grid_x_for(n_rows_u32, BLOCK_SIZE);
 
-        let module = CudaModule::from_ptx(
-            &crate::jit::string_kernel::compile_like_match_kernel(mode, negated)?,
-        )?;
+        let module = CudaModule::from_ptx(&crate::jit::string_kernel::compile_like_match_kernel(
+            mode, negated,
+        )?)?;
         let function = module.function(crate::jit::string_kernel::LIKE_MATCH_ENTRY)?;
 
         let mut p_off = offsets_gpu.device_ptr();

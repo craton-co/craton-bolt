@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY **two-key result merger**.
 //!
@@ -42,7 +42,7 @@ use arrow_array::{Float64Array, Int32Array, RecordBatch};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_tier2_twokey_orchestrator::Tier2TwokeyPartial;
-use crate::plan::logical_plan::{Schema};
+use crate::plan::logical_plan::Schema;
 
 /// Unpack a single packed i64 key into its two Int32 halves.
 ///
@@ -146,9 +146,9 @@ pub fn build_tier2_twokey_result(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType};
-#[cfg(test)]
 use crate::plan::logical_plan::DataType;
+#[cfg(test)]
+use arrow_schema::DataType as ArrowDataType;
 
 #[cfg(test)]
 mod tests {
@@ -203,21 +203,27 @@ mod tests {
         let cases: &[(i32, i32)] = &[
             (0, 0),
             (1, 2),
-            (-1, -1),       // both halves all-ones
+            (-1, -1), // both halves all-ones
             (i32::MIN, 0),
             (0, i32::MIN),
             (i32::MAX, i32::MIN),
         ];
         for &(a, b) in cases {
             let packed = pack(a, b);
-            assert_eq!(unpack_i64(packed), (a, b), "round-trip failed for ({a}, {b})");
+            assert_eq!(
+                unpack_i64(packed),
+                (a, b),
+                "round-trip failed for ({a}, {b})"
+            );
         }
     }
 
     #[test]
     fn empty_input_yields_empty_batch() {
         let schema = out_schema();
-        let partial = Tier2TwokeyPartial { per_partition: vec![] };
+        let partial = Tier2TwokeyPartial {
+            per_partition: vec![],
+        };
         let batch = build_tier2_twokey_result(partial, &schema).expect("build ok");
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 3);
@@ -247,7 +253,10 @@ mod tests {
             per_partition: vec![
                 (vec![pack(7, 1), pack(4, 9)], vec![70.0, 49.0]),
                 (vec![pack(1, 5), pack(9, 2)], vec![15.0, 92.0]),
-                (vec![pack(5, 5), pack(2, 0), pack(6, 6)], vec![55.0, 20.0, 66.0]),
+                (
+                    vec![pack(5, 5), pack(2, 0), pack(6, 6)],
+                    vec![55.0, 20.0, 66.0],
+                ),
             ],
         };
         let batch = build_tier2_twokey_result(partial, &schema).expect("build ok");
@@ -316,15 +325,20 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA toolkit + JIT (executes Tier-2 twokey pipeline + merge)"]
     fn stage6_orchestrator_plus_merge_twokey_smoke() {
-        use std::collections::HashMap;
         use crate::cuda::GpuVec;
         use crate::exec::groupby_tier2_twokey_orchestrator::execute_tier2_twokey_sum;
+        use std::collections::HashMap;
 
         // 8-row fixture with duplicate (k1, k2) pairs.
         let host_packed: Vec<i64> = vec![
-            pack(1, 10), pack(2, 20), pack(1, 10),
-            pack(3, 30), pack(2, 20), pack(1, 10),
-            pack(4, 40), pack(3, 31),
+            pack(1, 10),
+            pack(2, 20),
+            pack(1, 10),
+            pack(3, 30),
+            pack(2, 20),
+            pack(1, 10),
+            pack(4, 40),
+            pack(3, 31),
         ];
         let host_vals: Vec<f64> = vec![1.0, 2.0, 1.5, 3.0, 2.5, 1.25, 4.0, 3.1];
         let n_rows = host_packed.len() as u32;

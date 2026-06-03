@@ -21,7 +21,7 @@ use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
+    lower_physical, parse_sql, DataType, Field, MemTableProvider, Schema,
 };
 
 mod common;
@@ -147,8 +147,9 @@ fn stddev_over_non_numeric_column_is_rejected() {
     // rather than deferring to `lower_physical`. Either layer rejecting is
     // acceptable; accept whichever surfaces it first.
     let err = match parse_sql("SELECT STDDEV_POP(name) FROM t", &provider) {
-        Ok(plan) => lower_physical(&plan)
-            .expect_err("STDDEV over Utf8 must error at parse or lowering"),
+        Ok(plan) => {
+            lower_physical(&plan).expect_err("STDDEV over Utf8 must error at parse or lowering")
+        }
         Err(e) => e,
     };
     let msg = format!("{err}");
@@ -213,9 +214,7 @@ fn e2e_stddev_pop_int32_matches_hand_computed() {
     let batch = one_col_batch_int32(values.clone());
     engine.register_table("t", batch).unwrap();
 
-    let h = engine
-        .sql("SELECT STDDEV_POP(v) FROM t")
-        .expect("execute");
+    let h = engine.sql("SELECT STDDEV_POP(v) FROM t").expect("execute");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 1);
     let col = out
@@ -250,9 +249,7 @@ fn e2e_stddev_samp_int32_matches_hand_computed() {
     let batch = one_col_batch_int32(values.clone());
     engine.register_table("t", batch).unwrap();
 
-    let h = engine
-        .sql("SELECT STDDEV_SAMP(v) FROM t")
-        .expect("execute");
+    let h = engine.sql("SELECT STDDEV_SAMP(v) FROM t").expect("execute");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 1);
     let col = out
@@ -290,9 +287,7 @@ fn e2e_stddev_pop_float64_matches_hand_computed() {
     let batch = one_col_batch_f64(values.clone());
     engine.register_table("t", batch).unwrap();
 
-    let h = engine
-        .sql("SELECT STDDEV_POP(v) FROM t")
-        .expect("execute");
+    let h = engine.sql("SELECT STDDEV_POP(v) FROM t").expect("execute");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 1);
     let col = out
@@ -324,9 +319,7 @@ fn e2e_stddev_samp_float64_matches_hand_computed() {
     let batch = one_col_batch_f64(values.clone());
     engine.register_table("t", batch).unwrap();
 
-    let h = engine
-        .sql("SELECT STDDEV_SAMP(v) FROM t")
-        .expect("execute");
+    let h = engine.sql("SELECT STDDEV_SAMP(v) FROM t").expect("execute");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 1);
     let col = out

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Multi-pass prefix-scan compaction.
 //!
@@ -60,9 +60,7 @@ use crate::jit::prefix_scan_multipass::{
     compile_add_block_bases_kernel, compile_prefix_scan_u32_kernel, ADD_BASES_KERNEL_ENTRY,
     SCAN_U32_KERNEL_ENTRY,
 };
-use crate::plan::physical_plan::{
-    CompactionKernelKind, CompactionKernelSpec, PrefixScanAlgoTag,
-};
+use crate::plan::physical_plan::{CompactionKernelKind, CompactionKernelSpec, PrefixScanAlgoTag};
 
 // Same `ScanResult` shape callers already consume from `gpu_compact`. The
 // engine's `prefix_scan_mask` dispatches between single-pass and multipass
@@ -135,10 +133,7 @@ pub fn prefix_scan_mask_multipass(
 /// Splitting this out keeps the threshold check unit-testable (see
 /// [`should_host_scan`]) without dragging `prefix_scan_mask_multipass`'s GPU
 /// dependencies into the test.
-fn scan_block_sums(
-    vals: GpuVec<u32>,
-    stream: &CudaStream,
-) -> BoltResult<(GpuVec<u32>, usize)> {
+fn scan_block_sums(vals: GpuVec<u32>, stream: &CudaStream) -> BoltResult<(GpuVec<u32>, usize)> {
     if should_host_scan(vals.len()) {
         let host = vals.to_vec()?;
         let (bases, total) = host_exclusive_scan(&host)?;
@@ -174,10 +169,7 @@ pub(crate) fn should_host_scan(len: usize) -> bool {
 /// 4. Return `(local_indices, total)`. The caller's `block_bases` is OUR
 ///    `local_indices`: every entry `i` of our input array now maps to its
 ///    global exclusive prefix sum.
-fn recursive_scan_u32(
-    vals: GpuVec<u32>,
-    stream: &CudaStream,
-) -> BoltResult<(GpuVec<u32>, usize)> {
+fn recursive_scan_u32(vals: GpuVec<u32>, stream: &CudaStream) -> BoltResult<(GpuVec<u32>, usize)> {
     let n = vals.len();
     debug_assert!(
         n > BLOCK_SIZE as usize,
@@ -225,11 +217,10 @@ fn run_u8_scan(
     let spec = CompactionKernelSpec {
         kind: CompactionKernelKind::PrefixScan(PrefixScanAlgoTag::HillisSteele),
     };
-    let module = module_cache::get_or_build_module_for_compaction(
-        &spec,
-        SCAN_KERNEL_ENTRY,
-        |_s| compile_prefix_scan_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_compaction(&spec, SCAN_KERNEL_ENTRY, |_s| {
+            compile_prefix_scan_kernel()
+        })?;
     let function = module.function(SCAN_KERNEL_ENTRY)?;
 
     let mut p_mask: CUdeviceptr = mask_ptr;
@@ -290,11 +281,10 @@ fn run_u32_scan(
     let spec = CompactionKernelSpec {
         kind: CompactionKernelKind::PrefixScanU32,
     };
-    let module = module_cache::get_or_build_module_for_compaction(
-        &spec,
-        SCAN_U32_KERNEL_ENTRY,
-        |_s| compile_prefix_scan_u32_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_compaction(&spec, SCAN_U32_KERNEL_ENTRY, |_s| {
+            compile_prefix_scan_u32_kernel()
+        })?;
     let function = module.function(SCAN_U32_KERNEL_ENTRY)?;
 
     let mut p_vals: CUdeviceptr = vals.device_ptr();
@@ -347,11 +337,10 @@ fn run_add_block_bases(
     let spec = CompactionKernelSpec {
         kind: CompactionKernelKind::AddBlockBases,
     };
-    let module = module_cache::get_or_build_module_for_compaction(
-        &spec,
-        ADD_BASES_KERNEL_ENTRY,
-        |_s| compile_add_block_bases_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_compaction(&spec, ADD_BASES_KERNEL_ENTRY, |_s| {
+            compile_add_block_bases_kernel()
+        })?;
     let function = module.function(ADD_BASES_KERNEL_ENTRY)?;
 
     let mut p_indices: CUdeviceptr = indices.device_ptr();
@@ -410,9 +399,11 @@ pub(crate) fn host_exclusive_scan(sums: &[u32]) -> BoltResult<(Vec<u32>, usize)>
             "gpu_compact: accumulator overflowed u64; this should be impossible for any legal input".to_string()
         ))?;
     }
-    let total = usize::try_from(running).map_err(|_| BoltError::Other(format!(
-        "gpu_compact: total_count {running} exceeds usize::MAX on this host"
-    )))?;
+    let total = usize::try_from(running).map_err(|_| {
+        BoltError::Other(format!(
+            "gpu_compact: total_count {running} exceeds usize::MAX on this host"
+        ))
+    })?;
     Ok((bases, total))
 }
 
@@ -434,7 +425,7 @@ pub(crate) fn recursion_depth(n_rows: usize) -> usize {
     // Level 0 always happens: scan the u8 mask.
     let mut depth = 1usize;
     let mut n = n_rows.div_ceil(block_size); // size of block_sums at level 0
-    // Each additional level scans the previous block_sums.
+                                             // Each additional level scans the previous block_sums.
     while n > block_size {
         depth += 1;
         n = n.div_ceil(block_size);

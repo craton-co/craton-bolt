@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! GPU-side filter compaction: prefix-scan + gather, end-to-end.
 //!
@@ -49,9 +49,7 @@ use crate::jit::prefix_scan::{
     SCAN_KERNEL_ENTRY_BLELLOCH, SCAN_KERNEL_ENTRY_LOOKBACK,
 };
 use crate::plan::logical_plan::DataType;
-use crate::plan::physical_plan::{
-    CompactionKernelKind, CompactionKernelSpec, PrefixScanAlgoTag,
-};
+use crate::plan::physical_plan::{CompactionKernelKind, CompactionKernelSpec, PrefixScanAlgoTag};
 
 /// Build the `CompactionKernelSpec` for a `PrefixScan(algo)` cache
 /// lookup. Inline `kind: ..` construction at each call site reads
@@ -390,18 +388,22 @@ fn timestamp_array_from_i64(
     use std::sync::Arc;
     let tz_owned: Option<std::sync::Arc<str>> = tz.map(|s| Arc::from(s));
     match unit {
-        TimeUnit::Second => Arc::new(
-            arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as arrow_array::ArrayRef,
-        TimeUnit::Millisecond => Arc::new(
-            arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as arrow_array::ArrayRef,
-        TimeUnit::Microsecond => Arc::new(
-            arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as arrow_array::ArrayRef,
-        TimeUnit::Nanosecond => Arc::new(
-            arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as arrow_array::ArrayRef,
+        TimeUnit::Second => {
+            Arc::new(arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned))
+                as arrow_array::ArrayRef
+        }
+        TimeUnit::Millisecond => {
+            Arc::new(arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned))
+                as arrow_array::ArrayRef
+        }
+        TimeUnit::Microsecond => {
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned))
+                as arrow_array::ArrayRef
+        }
+        TimeUnit::Nanosecond => {
+            Arc::new(arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned))
+                as arrow_array::ArrayRef
+        }
     }
 }
 
@@ -530,10 +532,12 @@ pub fn prefix_scan_mask(
     let mut running: u64 = 0;
     let mut prev_base: u32 = 0;
     for (i, s) in sums_host.iter().enumerate() {
-        let base_u32 = u32::try_from(running).map_err(|_| BoltError::Other(format!(
-            "gpu_compact: per-block base {running} exceeds u32::MAX at block {i}; \
+        let base_u32 = u32::try_from(running).map_err(|_| {
+            BoltError::Other(format!(
+                "gpu_compact: per-block base {running} exceeds u32::MAX at block {i}; \
              this is a kernel-contract violation"
-        )))?;
+            ))
+        })?;
         // Monotonicity guard: bases must be non-decreasing. The u64 accumulator
         // can only ever grow (we add unsigned u32 values), so a decrease here
         // would be a host-arithmetic bug, not a GPU bug — surface it loudly.
@@ -544,15 +548,17 @@ pub fn prefix_scan_mask(
         }
         bases_host.push(base_u32);
         prev_base = base_u32;
-        running = running
-            .checked_add(*s as u64)
-            .ok_or_else(|| BoltError::Other(format!(
+        running = running.checked_add(*s as u64).ok_or_else(|| {
+            BoltError::Other(format!(
                 "gpu_compact: prefix-sum u64 overflow at block {i} (running={running}, +{s})"
-            )))?;
+            ))
+        })?;
     }
-    let total_count = usize::try_from(running).map_err(|_| BoltError::Other(format!(
-        "gpu_compact: total_count {running} exceeds usize::MAX on this host"
-    )))?;
+    let total_count = usize::try_from(running).map_err(|_| {
+        BoltError::Other(format!(
+            "gpu_compact: total_count {running} exceeds usize::MAX on this host"
+        ))
+    })?;
 
     let block_bases = GpuVec::<u32>::from_slice(&bases_host)?;
 
@@ -810,21 +816,20 @@ pub fn gather_one_async(
     let spec = CompactionKernelSpec {
         kind: CompactionKernelKind::Gather(dtype),
     };
-    let module = module_cache::get_or_build_module_for_compaction(
-        &spec,
-        gather_kernel_entry(dtype),
-        |s| match s.kind {
-            CompactionKernelKind::Gather(d) => compile_gather_kernel(d),
-            // Other variants never reach this closure because the
-            // `spec` we built above has `Gather(dtype)` baked in;
-            // surface a structured error rather than panic if a
-            // future refactor accidentally widens the spec.
-            other => Err(BoltError::Other(format!(
-                "gpu_compact: gather closure invoked on non-Gather spec {:?}",
-                other
-            ))),
-        },
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_compaction(&spec, gather_kernel_entry(dtype), |s| {
+            match s.kind {
+                CompactionKernelKind::Gather(d) => compile_gather_kernel(d),
+                // Other variants never reach this closure because the
+                // `spec` we built above has `Gather(dtype)` baked in;
+                // surface a structured error rather than panic if a
+                // future refactor accidentally widens the spec.
+                other => Err(BoltError::Other(format!(
+                    "gpu_compact: gather closure invoked on non-Gather spec {:?}",
+                    other
+                ))),
+            }
+        })?;
     let function = module.function(gather_kernel_entry(dtype))?;
 
     // Assemble the cuLaunchKernel argument array. Order matches the kernel
@@ -923,8 +928,7 @@ pub fn gather_bool_nullable(
     // launches on the same stream are hazard-free. See
     // `gather_one_async`'s safety comment for the full RAW/WAW argument.
     let gathered_values = gather_one_async(values_ptr, n_rows, scan, DataType::Bool, stream)?;
-    let gathered_validity =
-        gather_one_async(validity_ptr, n_rows, scan, DataType::Bool, stream)?;
+    let gathered_validity = gather_one_async(validity_ptr, n_rows, scan, DataType::Bool, stream)?;
     stream.synchronize()?;
 
     // Unwrap to the inner `GpuVec<u8>` for the new variant. Both must come
@@ -1159,18 +1163,10 @@ pub fn download_columns(
     let mut out: Vec<arrow_array::ArrayRef> = Vec::with_capacity(staged.len());
     for p in &staged {
         let arr: arrow_array::ArrayRef = match p {
-            Pinned::I32(b) => {
-                Arc::new(arrow_array::Int32Array::from(b.as_slice().to_vec()))
-            }
-            Pinned::I64(b) => {
-                Arc::new(arrow_array::Int64Array::from(b.as_slice().to_vec()))
-            }
-            Pinned::F32(b) => {
-                Arc::new(arrow_array::Float32Array::from(b.as_slice().to_vec()))
-            }
-            Pinned::F64(b) => {
-                Arc::new(arrow_array::Float64Array::from(b.as_slice().to_vec()))
-            }
+            Pinned::I32(b) => Arc::new(arrow_array::Int32Array::from(b.as_slice().to_vec())),
+            Pinned::I64(b) => Arc::new(arrow_array::Int64Array::from(b.as_slice().to_vec())),
+            Pinned::F32(b) => Arc::new(arrow_array::Float32Array::from(b.as_slice().to_vec())),
+            Pinned::F64(b) => Arc::new(arrow_array::Float64Array::from(b.as_slice().to_vec())),
             Pinned::Bool(b) => {
                 let bools: Vec<bool> = b.as_slice().iter().map(|&x| x != 0).collect();
                 Arc::new(arrow_array::BooleanArray::from(bools))
@@ -1195,9 +1191,7 @@ pub fn download_columns(
                     .collect();
                 Arc::new(a)
             }
-            Pinned::Date32(b) => {
-                Arc::new(arrow_array::Date32Array::from(b.as_slice().to_vec()))
-            }
+            Pinned::Date32(b) => Arc::new(arrow_array::Date32Array::from(b.as_slice().to_vec())),
             Pinned::Timestamp { values, unit, tz } => {
                 timestamp_array_from_i64(values.as_slice().to_vec(), *unit, *tz)
             }
@@ -1206,11 +1200,7 @@ pub fn download_columns(
                 precision,
                 scale,
             } => {
-                let arr = decimal128_array_from_interleaved(
-                    values.as_slice(),
-                    *precision,
-                    *scale,
-                )?;
+                let arr = decimal128_array_from_interleaved(values.as_slice(), *precision, *scale)?;
                 Arc::new(arr)
             }
         };
@@ -1389,11 +1379,11 @@ mod tests {
             }
             bases.push(base_u32);
             prev_base = base_u32;
-            running = running
-                .checked_add(*s as u64)
-                .ok_or_else(|| BoltError::Other(format!(
+            running = running.checked_add(*s as u64).ok_or_else(|| {
+                BoltError::Other(format!(
                     "gpu_compact: prefix-sum u64 overflow at block {i} (running={running}, +{s})"
-                )))?;
+                ))
+            })?;
         }
         if running > usize::MAX as u64 {
             return Err(BoltError::Other(format!(
@@ -1463,9 +1453,8 @@ mod tests {
         // point the checked cast must surface a structured error rather
         // than silently wrap.
         let sums = vec![u32::MAX, u32::MAX, 1];
-        let err = host_exclusive_scan_checked(&sums).expect_err(
-            "triple-u32::MAX must overflow the u32 base cast on iteration 2",
-        );
+        let err = host_exclusive_scan_checked(&sums)
+            .expect_err("triple-u32::MAX must overflow the u32 base cast on iteration 2");
         let msg = format!("{err}");
         assert!(
             msg.contains("overflowed u32") || msg.contains("u64 overflow"),
@@ -1478,8 +1467,7 @@ mod tests {
         // All-zero per-block sums is the empty-mask case: bases are all 0,
         // total is 0, and no monotonicity violation is possible.
         let sums = vec![0u32; 16];
-        let (bases, total) =
-            host_exclusive_scan_checked(&sums).expect("all-zero must pass");
+        let (bases, total) = host_exclusive_scan_checked(&sums).expect("all-zero must pass");
         assert!(bases.iter().all(|&b| b == 0));
         assert_eq!(total, 0);
     }
@@ -1532,9 +1520,12 @@ mod tests {
         let big: i128 = 1i128 << 70;
         let big_bits = big as u128;
         let host: Vec<u64> = vec![
-            1u64, 0u64, // 1
-            neg_one as u64, (neg_one >> 64) as u64, // -1
-            big_bits as u64, (big_bits >> 64) as u64, // 2^70
+            1u64,
+            0u64, // 1
+            neg_one as u64,
+            (neg_one >> 64) as u64, // -1
+            big_bits as u64,
+            (big_bits >> 64) as u64, // 2^70
         ];
         let arr = decimal128_array_from_interleaved(&host, 38, 10).expect("reassemble");
         assert_eq!(arr.len(), 3);
@@ -1745,10 +1736,8 @@ mod tests {
         let stream = CudaStream::null();
 
         // Upload mask, values, validity.
-        let mask_buf =
-            GpuVec::<u8>::from_slice(&[1u8, 1, 0, 1, 1, 0]).expect("upload mask");
-        let values_buf =
-            GpuVec::<u8>::from_slice(&[1u8, 0, 0, 1, 0, 0]).expect("upload values");
+        let mask_buf = GpuVec::<u8>::from_slice(&[1u8, 1, 0, 1, 1, 0]).expect("upload mask");
+        let values_buf = GpuVec::<u8>::from_slice(&[1u8, 0, 0, 1, 0, 0]).expect("upload values");
         let validity_buf =
             GpuVec::<u8>::from_slice(&[1u8, 0, 1, 1, 0, 1]).expect("upload validity");
 
@@ -1756,8 +1745,8 @@ mod tests {
 
         // Single prefix scan, shared by both gather launches inside
         // gather_bool_nullable.
-        let scan = prefix_scan_mask(mask_buf.device_ptr(), n_rows, &stream)
-            .expect("prefix_scan_mask");
+        let scan =
+            prefix_scan_mask(mask_buf.device_ptr(), n_rows, &stream).expect("prefix_scan_mask");
         assert_eq!(
             scan.total_count, 4,
             "mask keeps 4 of 6 rows; scan total_count must match"
@@ -1776,11 +1765,7 @@ mod tests {
         match &gathered {
             GatheredCol::BoolNullable { values, validity } => {
                 assert_eq!(values.len(), 4, "values gathered to total_count rows");
-                assert_eq!(
-                    validity.len(),
-                    4,
-                    "validity gathered to total_count rows"
-                );
+                assert_eq!(validity.len(), 4, "validity gathered to total_count rows");
             }
             _ => panic!("expected GatheredCol::BoolNullable, got a different variant"),
         }
@@ -1803,10 +1788,15 @@ mod tests {
             .downcast_ref::<arrow_array::BooleanArray>()
             .expect("BooleanArray");
         assert_eq!(ba.len(), 4);
-        let expected: Vec<Option<bool>> =
-            vec![Some(true), None, Some(true), None];
+        let expected: Vec<Option<bool>> = vec![Some(true), None, Some(true), None];
         let actual: Vec<Option<bool>> = (0..ba.len())
-            .map(|i| if ba.is_null(i) { None } else { Some(ba.value(i)) })
+            .map(|i| {
+                if ba.is_null(i) {
+                    None
+                } else {
+                    Some(ba.value(i))
+                }
+            })
             .collect();
         assert_eq!(actual, expected, "per-row validity preserved end-to-end");
         assert_eq!(ba.null_count(), 2);
@@ -1849,16 +1839,12 @@ mod tests {
         let stream = CudaStream::null();
 
         // Upload mask + three input columns of distinct dtypes.
-        let mask_buf =
-            GpuVec::<u8>::from_slice(&[1u8, 0, 1, 1, 0, 1, 0, 1]).expect("upload mask");
+        let mask_buf = GpuVec::<u8>::from_slice(&[1u8, 0, 1, 1, 0, 1, 0, 1]).expect("upload mask");
         let col_i32 =
-            GpuVec::<i32>::from_slice(&[10i32, 20, 30, 40, 50, 60, 70, 80])
-                .expect("upload i32");
-        let col_f64 =
-            GpuVec::<f64>::from_slice(&[1.5f64, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5])
-                .expect("upload f64");
-        let col_bool = GpuVec::<u8>::from_slice(&[1u8, 0, 1, 0, 1, 0, 1, 0])
-            .expect("upload bool");
+            GpuVec::<i32>::from_slice(&[10i32, 20, 30, 40, 50, 60, 70, 80]).expect("upload i32");
+        let col_f64 = GpuVec::<f64>::from_slice(&[1.5f64, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5])
+            .expect("upload f64");
+        let col_bool = GpuVec::<u8>::from_slice(&[1u8, 0, 1, 0, 1, 0, 1, 0]).expect("upload bool");
 
         let n_rows = 8usize;
         let columns = [

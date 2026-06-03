@@ -307,7 +307,7 @@ pub fn compile_segmented_scan_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tmul.wide.u32 %rd14, %r2, {rec_bytes};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd12, %rd10, %rd14;").map_err(write_err)?; // ping rec
     writeln!(ptx, "\tadd.s64 %rd13, %rd11, %rd14;").map_err(write_err)?; // pong rec
-    // Store initial (value, flag) into ping.
+                                                                         // Store initial (value, flag) into ping.
     writeln!(ptx, "\tst.shared.u64 [%rd12], %rd5;").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u32 [%rd12+8], %r5;").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
@@ -336,7 +336,7 @@ pub fn compile_segmented_scan_kernel() -> BoltResult<String> {
         // Default write = own record (the tid < offset case).
         writeln!(ptx, "\tmov.u64 %rd21, %rd20;").map_err(write_err)?; // out value
         writeln!(ptx, "\tmov.u32 %r21, %r20;").map_err(write_err)?; // out flag
-        // If tid < offset, skip the combine.
+                                                                    // If tid < offset, skip the combine.
         let p = 2 + (step % 4);
         writeln!(ptx, "\tsetp.lt.s32 %p{p}, %r2, {offset};").map_err(write_err)?;
         writeln!(ptx, "\t@%p{p} bra SEG_SKIP_{step};").map_err(write_err)?;
@@ -344,13 +344,17 @@ pub fn compile_segmented_scan_kernel() -> BoltResult<String> {
         writeln!(ptx, "\tsub.s64 %rd22, %rd12, {off_bytes};").map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u64 %rd23, [%rd22];").map_err(write_err)?; // va
         writeln!(ptx, "\tld.shared.u32 %r22, [%rd22+8];").map_err(write_err)?; // fa
-        // out_flag = fa | fb
+                                                                               // out_flag = fa | fb
         writeln!(ptx, "\tor.b32 %r21, %r22, %r20;").map_err(write_err)?;
         // out_value = fb ? vb : (va + vb)
         writeln!(ptx, "\tadd.s64 %rd24, %rd23, %rd20;").map_err(write_err)?; // va + vb
         writeln!(ptx, "\tsetp.ne.s32 %p{q}, %r20, 0;", q = 8 + (step % 4)).map_err(write_err)?; // fb != 0
-        writeln!(ptx, "\tselp.b64 %rd21, %rd20, %rd24, %p{q};", q = 8 + (step % 4))
-            .map_err(write_err)?;
+        writeln!(
+            ptx,
+            "\tselp.b64 %rd21, %rd20, %rd24, %p{q};",
+            q = 8 + (step % 4)
+        )
+        .map_err(write_err)?;
         writeln!(ptx, "SEG_SKIP_{step}:").map_err(write_err)?;
         // Write combined record into pong.
         writeln!(ptx, "\tst.shared.u64 [%rd13], %rd21;").map_err(write_err)?;

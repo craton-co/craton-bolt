@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side expression evaluator for aggregate inputs.
 //!
@@ -305,11 +305,7 @@ pub fn materialize_agg_input(
 
 /// Like `eval_expr` but does *not* coerce the result to a caller-chosen
 /// dtype. Returns the natural dtype produced by the expression.
-fn eval_inner(
-    expr: &Expr,
-    env: &ColumnEnv<'_>,
-    n_rows: usize,
-) -> BoltResult<HostColumn> {
+fn eval_inner(expr: &Expr, env: &ColumnEnv<'_>, n_rows: usize) -> BoltResult<HostColumn> {
     match expr {
         Expr::Column(name) => eval_column(name, env, n_rows),
         Expr::Literal(lit) => eval_literal(lit, n_rows),
@@ -450,8 +446,7 @@ fn eval_like(
             n_rows
         )));
     }
-    let matcher =
-        crate::exec::like::PatternMatcher::compile_ci(pattern, escape, case_insensitive)?;
+    let matcher = crate::exec::like::PatternMatcher::compile_ci(pattern, escape, case_insensitive)?;
     let out: Vec<Option<bool>> = utf8
         .iter()
         .map(|cell| match cell {
@@ -871,8 +866,10 @@ fn eval_scalar_fn(
         }
         ScalarFnKind::OctetLength => {
             let src = eval_utf8_arg(&args[0], env, n_rows, "OCTET_LENGTH")?;
-            let out: Vec<Option<i64>> =
-                src.iter().map(|c| c.as_deref().map(octet_length_str)).collect();
+            let out: Vec<Option<i64>> = src
+                .iter()
+                .map(|c| c.as_deref().map(octet_length_str))
+                .collect();
             Ok(HostColumn::I64(out))
         }
         ScalarFnKind::Position => {
@@ -907,9 +904,11 @@ fn eval_scalar_fn(
             let mut out = Vec::with_capacity(n_rows);
             for i in 0..n_rows {
                 out.push(match (&s[i], n[i]) {
-                    (Some(s), Some(n)) => {
-                        Some(if is_left { left_str(s, n) } else { right_str(s, n) })
-                    }
+                    (Some(s), Some(n)) => Some(if is_left {
+                        left_str(s, n)
+                    } else {
+                        right_str(s, n)
+                    }),
                     _ => None,
                 });
             }
@@ -944,14 +943,13 @@ fn eval_scalar_fn(
             Ok(HostColumn::Utf8(out))
         }
         // These never legitimately reach the host evaluator (see fn docs).
-        ScalarFnKind::Upper
-        | ScalarFnKind::Lower
-        | ScalarFnKind::Length
-        | ScalarFnKind::Concat => Err(BoltError::Plan(format!(
-            "expr_agg: string scalar function {} is not evaluated host-side; \
+        ScalarFnKind::Upper | ScalarFnKind::Lower | ScalarFnKind::Length | ScalarFnKind::Concat => {
+            Err(BoltError::Plan(format!(
+                "expr_agg: string scalar function {} is not evaluated host-side; \
              it has a dedicated lowering path",
-            kind.sql_name()
-        ))),
+                kind.sql_name()
+            )))
+        }
     }
 }
 
@@ -1007,11 +1005,7 @@ fn clamp_i64_to_i32(v: i64) -> i32 {
 /// Look up `name` in `env` and clone the referenced column. Validates the
 /// length against `n_rows`. The dtype is left alone — the outer
 /// `eval_expr` is responsible for the final cast.
-fn eval_column(
-    name: &str,
-    env: &ColumnEnv<'_>,
-    n_rows: usize,
-) -> BoltResult<HostColumn> {
+fn eval_column(name: &str, env: &ColumnEnv<'_>, n_rows: usize) -> BoltResult<HostColumn> {
     let col = env.get(name).ok_or_else(|| {
         BoltError::Plan(format!(
             "expr_agg: column '{name}' not found in evaluator env"
@@ -1044,7 +1038,8 @@ fn eval_literal(lit: &Literal, n_rows: usize) -> BoltResult<HostColumn> {
         Literal::Decimal128(..) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up \
-                 (host-side literal broadcast)".into(),
+                 (host-side literal broadcast)"
+                    .into(),
             ))
         }
         // v0.6 / M4: Date32 stores as i32 days; Timestamp stores as i64
@@ -1176,12 +1171,30 @@ fn eval_unary(
         };
     }
     let out: Vec<Option<bool>> = match &col {
-        HostColumn::Bool(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
-        HostColumn::I32(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
-        HostColumn::I64(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
-        HostColumn::F32(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
-        HostColumn::F64(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
-        HostColumn::Utf8(v) => v.iter().map(|c| Some(is_null_to_bool(op, c.is_none()))).collect(),
+        HostColumn::Bool(v) => v
+            .iter()
+            .map(|c| Some(is_null_to_bool(op, c.is_none())))
+            .collect(),
+        HostColumn::I32(v) => v
+            .iter()
+            .map(|c| Some(is_null_to_bool(op, c.is_none())))
+            .collect(),
+        HostColumn::I64(v) => v
+            .iter()
+            .map(|c| Some(is_null_to_bool(op, c.is_none())))
+            .collect(),
+        HostColumn::F32(v) => v
+            .iter()
+            .map(|c| Some(is_null_to_bool(op, c.is_none())))
+            .collect(),
+        HostColumn::F64(v) => v
+            .iter()
+            .map(|c| Some(is_null_to_bool(op, c.is_none())))
+            .collect(),
+        HostColumn::Utf8(v) => v
+            .iter()
+            .map(|c| Some(is_null_to_bool(op, c.is_none())))
+            .collect(),
     };
     Ok(HostColumn::Bool(out))
 }
@@ -1211,11 +1224,7 @@ fn is_null_to_bool(op: UnaryOp, was_null: bool) -> bool {
 
 /// Apply `+ - * /` after unifying numeric dtypes. The unified dtype is the
 /// output dtype; both operands are cast to it row-by-row first.
-fn eval_arithmetic(
-    op: BinaryOp,
-    lhs: HostColumn,
-    rhs: HostColumn,
-) -> BoltResult<HostColumn> {
+fn eval_arithmetic(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<HostColumn> {
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
     if !is_numeric(l_dt) || !is_numeric(r_dt) {
@@ -1295,10 +1304,16 @@ fn zip_integer_i32(op: BinaryOp, a: Vec<Option<i32>>, b: Vec<Option<i32>>) -> Ve
                 BinaryOp::BitAnd => Some(x & y),
                 BinaryOp::BitOr => Some(x | y),
                 BinaryOp::BitXor => Some(x ^ y),
-                BinaryOp::Shl => Some(if (0..32).contains(&y) { x.wrapping_shl(y as u32) } else { 0 }),
-                BinaryOp::Shr => {
-                    Some(if (0..32).contains(&y) { x >> y } else { x >> 31 })
-                }
+                BinaryOp::Shl => Some(if (0..32).contains(&y) {
+                    x.wrapping_shl(y as u32)
+                } else {
+                    0
+                }),
+                BinaryOp::Shr => Some(if (0..32).contains(&y) {
+                    x >> y
+                } else {
+                    x >> 31
+                }),
                 _ => unreachable!("non-integer op routed to zip_integer_i32"),
             },
             _ => None,
@@ -1316,10 +1331,16 @@ fn zip_integer_i64(op: BinaryOp, a: Vec<Option<i64>>, b: Vec<Option<i64>>) -> Ve
                 BinaryOp::BitAnd => Some(x & y),
                 BinaryOp::BitOr => Some(x | y),
                 BinaryOp::BitXor => Some(x ^ y),
-                BinaryOp::Shl => Some(if (0..64).contains(&y) { x.wrapping_shl(y as u32) } else { 0 }),
-                BinaryOp::Shr => {
-                    Some(if (0..64).contains(&y) { x >> y } else { x >> 63 })
-                }
+                BinaryOp::Shl => Some(if (0..64).contains(&y) {
+                    x.wrapping_shl(y as u32)
+                } else {
+                    0
+                }),
+                BinaryOp::Shr => Some(if (0..64).contains(&y) {
+                    x >> y
+                } else {
+                    x >> 63
+                }),
                 _ => unreachable!("non-integer op routed to zip_integer_i64"),
             },
             _ => None,
@@ -1467,11 +1488,7 @@ impl FloatArith for f64 {
 /// Apply `= <> < <= > >=`. Numeric operands are unified to the wider type
 /// first (matching `Codegen::emit_binary`). Bool and Utf8 compare against
 /// the same dtype only.
-fn eval_comparison(
-    op: BinaryOp,
-    lhs: HostColumn,
-    rhs: HostColumn,
-) -> BoltResult<HostColumn> {
+fn eval_comparison(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<HostColumn> {
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
 
@@ -1529,11 +1546,7 @@ where
 
 /// String version of `zip_cmp` — strings don't `Copy`, so we work with
 /// references throughout.
-fn zip_cmp_str(
-    op: BinaryOp,
-    a: &[Option<String>],
-    b: &[Option<String>],
-) -> Vec<Option<bool>> {
+fn zip_cmp_str(op: BinaryOp, a: &[Option<String>], b: &[Option<String>]) -> Vec<Option<bool>> {
     debug_assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b.iter())
@@ -1567,11 +1580,7 @@ where
 /// Apply `AND OR`. Both operands must already be `Bool`. NULL behaves
 /// per SQL three-valued logic: `NULL AND false = false`, `NULL OR true =
 /// true`, otherwise NULL.
-fn eval_logical(
-    op: BinaryOp,
-    lhs: HostColumn,
-    rhs: HostColumn,
-) -> BoltResult<HostColumn> {
+fn eval_logical(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<HostColumn> {
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
     if l_dt != DataType::Bool || r_dt != DataType::Bool {
@@ -1627,7 +1636,8 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
         DataType::Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up \
-                 (host-side cast)".into(),
+                 (host-side cast)"
+                    .into(),
             ))
         }
         DataType::Date32 | DataType::Timestamp(_, _) => {
@@ -1693,11 +1703,20 @@ fn safe_cast_to_i32(col: HostColumn) -> BoltResult<Vec<Option<i32>>> {
             .collect(),
         HostColumn::F32(v) => v
             .into_iter()
-            .map(|o| o.and_then(|x| float_to_int_checked(x as f64, i32::MIN as f64, i32::MAX as f64).map(|y| y as i32)))
+            .map(|o| {
+                o.and_then(|x| {
+                    float_to_int_checked(x as f64, i32::MIN as f64, i32::MAX as f64)
+                        .map(|y| y as i32)
+                })
+            })
             .collect(),
         HostColumn::F64(v) => v
             .into_iter()
-            .map(|o| o.and_then(|x| float_to_int_checked(x, i32::MIN as f64, i32::MAX as f64).map(|y| y as i32)))
+            .map(|o| {
+                o.and_then(|x| {
+                    float_to_int_checked(x, i32::MIN as f64, i32::MAX as f64).map(|y| y as i32)
+                })
+            })
             .collect(),
         HostColumn::Utf8(v) => v
             .into_iter()
@@ -1714,11 +1733,20 @@ fn safe_cast_to_i64(col: HostColumn) -> BoltResult<Vec<Option<i64>>> {
         HostColumn::I64(v) => v,
         HostColumn::F32(v) => v
             .into_iter()
-            .map(|o| o.and_then(|x| float_to_int_checked(x as f64, i64::MIN as f64, i64::MAX as f64).map(|y| y as i64)))
+            .map(|o| {
+                o.and_then(|x| {
+                    float_to_int_checked(x as f64, i64::MIN as f64, i64::MAX as f64)
+                        .map(|y| y as i64)
+                })
+            })
             .collect(),
         HostColumn::F64(v) => v
             .into_iter()
-            .map(|o| o.and_then(|x| float_to_int_checked(x, i64::MIN as f64, i64::MAX as f64).map(|y| y as i64)))
+            .map(|o| {
+                o.and_then(|x| {
+                    float_to_int_checked(x, i64::MIN as f64, i64::MAX as f64).map(|y| y as i64)
+                })
+            })
             .collect(),
         HostColumn::Utf8(v) => v
             .into_iter()
@@ -1984,13 +2012,7 @@ mod tests {
     #[test]
     fn eval_literal() {
         let env: ColumnEnv = HashMap::new();
-        let out = eval_expr(
-            &Expr::Literal(Literal::Int64(7)),
-            &env,
-            DataType::Int64,
-            3,
-        )
-        .unwrap();
+        let out = eval_expr(&Expr::Literal(Literal::Int64(7)), &env, DataType::Int64, 3).unwrap();
         match out {
             HostColumn::I64(v) => assert_eq!(v, vec![Some(7), Some(7), Some(7)]),
             other => panic!("expected I64, got {:?}", other.dtype()),
@@ -2088,7 +2110,10 @@ mod tests {
         let env = env_of(&[("s", &s)]);
         let expr = col("s").cast(DataType::Int32);
         let err = eval_expr(&expr, &env, DataType::Int32, 1);
-        assert!(err.is_err(), "plain CAST of bad string must error, not NULL");
+        assert!(
+            err.is_err(),
+            "plain CAST of bad string must error, not NULL"
+        );
     }
 
     /// A widening safe cast (Int32→Int64) cannot fail: identical to plain CAST.
@@ -2096,7 +2121,13 @@ mod tests {
     fn try_cast_widening_matches_plain() {
         let x = HostColumn::I32(vec![Some(1), Some(-2), None]);
         let env = env_of(&[("x", &x)]);
-        let out = eval_expr(&col("x").try_cast(DataType::Int64), &env, DataType::Int64, 3).unwrap();
+        let out = eval_expr(
+            &col("x").try_cast(DataType::Int64),
+            &env,
+            DataType::Int64,
+            3,
+        )
+        .unwrap();
         match out {
             HostColumn::I64(v) => assert_eq!(v, vec![Some(1), Some(-2), None]),
             other => panic!("expected I64, got {:?}", other.dtype()),
@@ -2189,7 +2220,11 @@ mod tests {
             HostColumn::F64(v) => {
                 let r0 = v[0].unwrap();
                 let r1 = v[1].unwrap();
-                assert!(r0.is_infinite() && r0 > 0.0, "1.0/0.0 should be +inf, got {}", r0);
+                assert!(
+                    r0.is_infinite() && r0 > 0.0,
+                    "1.0/0.0 should be +inf, got {}",
+                    r0
+                );
                 assert!(r1.is_nan(), "0.0/0.0 should be NaN, got {}", r1);
             }
             other => panic!("expected F64, got {:?}", other.dtype()),
@@ -2499,10 +2534,9 @@ mod tests {
         let expr = col("x").is_null();
         let out = eval_expr(&expr, &env, DataType::Bool, 4).unwrap();
         match out {
-            HostColumn::Bool(v) => assert_eq!(
-                v,
-                vec![Some(false), Some(true), Some(false), Some(true)]
-            ),
+            HostColumn::Bool(v) => {
+                assert_eq!(v, vec![Some(false), Some(true), Some(false), Some(true)])
+            }
             other => panic!("expected Bool, got {:?}", other.dtype()),
         }
     }
@@ -2516,10 +2550,9 @@ mod tests {
         let expr = col("x").is_not_null();
         let out = eval_expr(&expr, &env, DataType::Bool, 4).unwrap();
         match out {
-            HostColumn::Bool(v) => assert_eq!(
-                v,
-                vec![Some(true), Some(false), Some(true), Some(false)]
-            ),
+            HostColumn::Bool(v) => {
+                assert_eq!(v, vec![Some(true), Some(false), Some(true), Some(false)])
+            }
             other => panic!("expected Bool, got {:?}", other.dtype()),
         }
     }
@@ -2847,7 +2880,12 @@ mod tests {
     /// `YYYY-MM-DD` pattern.
     #[test]
     fn cast_format_string_to_date32_round_trip() {
-        let s = utf8(&[Some("1970-01-01"), Some("2000-01-01"), Some("2024-02-29"), None]);
+        let s = utf8(&[
+            Some("1970-01-01"),
+            Some("2000-01-01"),
+            Some("2024-02-29"),
+            None,
+        ]);
         let env = env_of(&[("s", &s)]);
         // string → Date32 (I32 storage)
         let to_date = cast_format(col("s"), DataType::Date32, date_pattern(), false);
@@ -2903,10 +2941,9 @@ mod tests {
         let expr = cast_format(col("ts"), DataType::Utf8, pattern, true);
         let out = eval_expr(&expr, &env, DataType::Utf8, 2).unwrap();
         match out {
-            HostColumn::Utf8(v) => assert_eq!(
-                v,
-                vec![Some("2000-01-01 13:37:09".to_string()), None]
-            ),
+            HostColumn::Utf8(v) => {
+                assert_eq!(v, vec![Some("2000-01-01 13:37:09".to_string()), None])
+            }
             other => panic!("expected Utf8, got {:?}", other.dtype()),
         }
     }

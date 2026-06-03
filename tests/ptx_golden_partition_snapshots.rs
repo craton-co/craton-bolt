@@ -50,8 +50,7 @@ use craton_bolt::jit::partition_reduce_kernel_count::{
     compile_partition_reduce_kernel_count, compile_partition_reduce_kernel_count_with_spill,
 };
 use craton_bolt::jit::partition_reduce_kernel_count_i64::{
-    compile_partition_reduce_kernel_count_i64,
-    compile_partition_reduce_kernel_count_i64_with_spill,
+    compile_partition_reduce_kernel_count_i64, compile_partition_reduce_kernel_count_i64_with_spill,
 };
 use craton_bolt::jit::partition_reduce_kernel_i64::{
     compile_partition_reduce_kernel_i64, compile_partition_reduce_kernel_i64_with_spill,
@@ -76,8 +75,7 @@ use craton_bolt::jit::partition_reduce_kernel_multi::{
     compile_partition_reduce_kernel_multi, compile_partition_reduce_kernel_multi_with_spill,
 };
 use craton_bolt::jit::partition_reduce_kernel_multi_i64::{
-    compile_partition_reduce_kernel_multi_i64,
-    compile_partition_reduce_kernel_multi_i64_with_spill,
+    compile_partition_reduce_kernel_multi_i64, compile_partition_reduce_kernel_multi_i64_with_spill,
 };
 
 // ---- PTX normalization (verbatim copy from tests/ptx_golden_tests.rs) --------
@@ -298,29 +296,29 @@ fn golden_partition_reduce_multi_i64_n2_spill() {
 
 #[test]
 fn golden_partition_reduce_minmax_min_i32() {
-    let ptx = compile_partition_reduce_kernel_minmax(MinMaxOp::Min, MinMaxDtype::Int32)
-        .expect("compile");
+    let ptx =
+        compile_partition_reduce_kernel_minmax(MinMaxOp::Min, MinMaxDtype::Int32).expect("compile");
     insta::assert_snapshot!("partition_reduce_minmax_min_i32", normalize_ptx(&ptx));
 }
 
 #[test]
 fn golden_partition_reduce_minmax_max_i32() {
-    let ptx = compile_partition_reduce_kernel_minmax(MinMaxOp::Max, MinMaxDtype::Int32)
-        .expect("compile");
+    let ptx =
+        compile_partition_reduce_kernel_minmax(MinMaxOp::Max, MinMaxDtype::Int32).expect("compile");
     insta::assert_snapshot!("partition_reduce_minmax_max_i32", normalize_ptx(&ptx));
 }
 
 #[test]
 fn golden_partition_reduce_minmax_min_i64() {
-    let ptx = compile_partition_reduce_kernel_minmax(MinMaxOp::Min, MinMaxDtype::Int64)
-        .expect("compile");
+    let ptx =
+        compile_partition_reduce_kernel_minmax(MinMaxOp::Min, MinMaxDtype::Int64).expect("compile");
     insta::assert_snapshot!("partition_reduce_minmax_min_i64", normalize_ptx(&ptx));
 }
 
 #[test]
 fn golden_partition_reduce_minmax_max_i64() {
-    let ptx = compile_partition_reduce_kernel_minmax(MinMaxOp::Max, MinMaxDtype::Int64)
-        .expect("compile");
+    let ptx =
+        compile_partition_reduce_kernel_minmax(MinMaxOp::Max, MinMaxDtype::Int64).expect("compile");
     insta::assert_snapshot!("partition_reduce_minmax_max_i64", normalize_ptx(&ptx));
 }
 
@@ -373,7 +371,10 @@ fn golden_partition_reduce_minmax_i64_min_i32_spill() {
     let ptx =
         compile_partition_reduce_kernel_minmax_i64_with_spill(MinMaxOp::Min, MinMaxDtype::Int32)
             .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_i64_min_i32_spill", normalize_ptx(&ptx));
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_i64_min_i32_spill",
+        normalize_ptx(&ptx)
+    );
 }
 
 #[test]
@@ -381,7 +382,10 @@ fn golden_partition_reduce_minmax_i64_max_i64_spill() {
     let ptx =
         compile_partition_reduce_kernel_minmax_i64_with_spill(MinMaxOp::Max, MinMaxDtype::Int64)
             .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_i64_max_i64_spill", normalize_ptx(&ptx));
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_i64_max_i64_spill",
+        normalize_ptx(&ptx)
+    );
 }
 
 // ---- MIN/MAX float (i32 key) — {Min,Max} x {Float32,Float64 value} ----------
@@ -421,7 +425,10 @@ fn golden_partition_reduce_minmax_float_min_f32_spill() {
     let ptx =
         compile_partition_reduce_kernel_minmax_float_with_spill(MinMaxOp::Min, FloatDtype::Float32)
             .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_float_min_f32_spill", normalize_ptx(&ptx));
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_float_min_f32_spill",
+        normalize_ptx(&ptx)
+    );
 }
 
 #[test]
@@ -429,41 +436,52 @@ fn golden_partition_reduce_minmax_float_max_f64_spill() {
     let ptx =
         compile_partition_reduce_kernel_minmax_float_with_spill(MinMaxOp::Max, FloatDtype::Float64)
             .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_float_max_f64_spill", normalize_ptx(&ptx));
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_float_max_f64_spill",
+        normalize_ptx(&ptx)
+    );
 }
 
 // ---- MIN/MAX float (i64 key) — {Min,Max} x {Float32,Float64 value} ----------
 
 #[test]
 fn golden_partition_reduce_minmax_float_i64_min_f32() {
-    let ptx =
-        compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Min, FloatDtype::Float32)
-            .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_float_i64_min_f32", normalize_ptx(&ptx));
+    let ptx = compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Min, FloatDtype::Float32)
+        .expect("compile");
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_float_i64_min_f32",
+        normalize_ptx(&ptx)
+    );
 }
 
 #[test]
 fn golden_partition_reduce_minmax_float_i64_max_f32() {
-    let ptx =
-        compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Max, FloatDtype::Float32)
-            .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_float_i64_max_f32", normalize_ptx(&ptx));
+    let ptx = compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Max, FloatDtype::Float32)
+        .expect("compile");
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_float_i64_max_f32",
+        normalize_ptx(&ptx)
+    );
 }
 
 #[test]
 fn golden_partition_reduce_minmax_float_i64_min_f64() {
-    let ptx =
-        compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Min, FloatDtype::Float64)
-            .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_float_i64_min_f64", normalize_ptx(&ptx));
+    let ptx = compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Min, FloatDtype::Float64)
+        .expect("compile");
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_float_i64_min_f64",
+        normalize_ptx(&ptx)
+    );
 }
 
 #[test]
 fn golden_partition_reduce_minmax_float_i64_max_f64() {
-    let ptx =
-        compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Max, FloatDtype::Float64)
-            .expect("compile");
-    insta::assert_snapshot!("partition_reduce_minmax_float_i64_max_f64", normalize_ptx(&ptx));
+    let ptx = compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Max, FloatDtype::Float64)
+        .expect("compile");
+    insta::assert_snapshot!(
+        "partition_reduce_minmax_float_i64_max_f64",
+        normalize_ptx(&ptx)
+    );
 }
 
 #[test]

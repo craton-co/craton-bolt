@@ -40,8 +40,8 @@
 //! `tests::cuda_stub_upload_helper_is_reachable_from_filter`.
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
 };
 use arrow_schema::DataType as ArrowDataType;
 
@@ -101,7 +101,9 @@ pub fn execute_filter(input: QueryHandle, predicate: &Expr) -> BoltResult<QueryH
         .iter()
         .map(|c| {
             arrow::compute::filter(c.as_ref(), &mask).map_err(|e| {
-                BoltError::Other(format!("arrow::compute::filter failed in PhysicalPlan::Filter: {e}"))
+                BoltError::Other(format!(
+                    "arrow::compute::filter failed in PhysicalPlan::Filter: {e}"
+                ))
             })
         })
         .collect::<BoltResult<Vec<_>>>()?;
@@ -183,9 +185,12 @@ pub(crate) fn arrow_array_to_host_column(arr: &dyn Array, n_rows: usize) -> Bolt
         // host evaluator (e.g. CAST ... FORMAT) can read them: Date32 -> i32
         // days, Timestamp -> i64 ticks (unit/tz are carried on the schema).
         ArrowDataType::Date32 => {
-            let a = arr.as_any().downcast_ref::<arrow_array::Date32Array>().ok_or_else(|| {
-                BoltError::Type("PhysicalPlan::Filter: expected Date32 array".into())
-            })?;
+            let a = arr
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .ok_or_else(|| {
+                    BoltError::Type("PhysicalPlan::Filter: expected Date32 array".into())
+                })?;
             let v: Vec<Option<i32>> = (0..n_rows)
                 .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
                 .collect();
@@ -249,8 +254,7 @@ mod tests {
             left: Box::new(Expr::Column("sum_v".into())),
             right: Box::new(Expr::Literal(Literal::Int64(8))),
         };
-        let out =
-            execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
+        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
         let result = out.into_record_batch();
         assert_eq!(result.num_rows(), 2);
         let k_arr = result
@@ -283,8 +287,7 @@ mod tests {
             left: Box::new(Expr::Column("k".into())),
             right: Box::new(Expr::Literal(Literal::Int32(0))),
         };
-        let out =
-            execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
+        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
         assert_eq!(out.num_rows(), 0);
     }
 
@@ -296,8 +299,7 @@ mod tests {
             left: Box::new(Expr::Column("sum_v".into())),
             right: Box::new(Expr::Literal(Literal::Int64(1_000_000))),
         };
-        let out =
-            execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
+        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("ok");
         assert_eq!(out.into_record_batch().num_rows(), 0);
     }
 
@@ -329,8 +331,8 @@ mod tests {
             op: UnaryOp::IsNull,
             operand: Box::new(Expr::Column("x".into())),
         };
-        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate)
-            .expect("filter ok");
+        let out =
+            execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("filter ok");
         let result = out.into_record_batch();
         assert_eq!(result.num_rows(), 2, "two rows have x IS NULL (id=2, id=4)");
         let id_arr = result
@@ -357,8 +359,8 @@ mod tests {
             op: UnaryOp::IsNotNull,
             operand: Box::new(Expr::Column("x".into())),
         };
-        let out = execute_filter(QueryHandle::from_record_batch(batch), &predicate)
-            .expect("filter ok");
+        let out =
+            execute_filter(QueryHandle::from_record_batch(batch), &predicate).expect("filter ok");
         let result = out.into_record_batch();
         assert_eq!(result.num_rows(), 3);
         let id_arr = result

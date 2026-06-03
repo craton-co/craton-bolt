@@ -239,7 +239,7 @@ mod tests {
         tables.insert(
             "t".to_string(),
             vec![
-                int32_batch("a", vec![Some(1), None]),   // 1 null
+                int32_batch("a", vec![Some(1), None]),       // 1 null
                 int32_batch("a", vec![None, None, Some(4)]), // 2 nulls
             ],
         );

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX → loaded CUDA module via the driver's in-process assembler.
 //!
@@ -652,15 +652,11 @@ impl CudaModule {
     /// Look up an entry point by name.
     pub fn function(&self, name: &str) -> BoltResult<CudaFunction<'_>> {
         let name_cstr = CString::new(name).map_err(|e| {
-            BoltError::Cuda(format!(
-                "kernel name contains interior NUL byte: {}",
-                e
-            ))
+            BoltError::Cuda(format!("kernel name contains interior NUL byte: {}", e))
         })?;
         let mut f: CUfunction = ptr::null_mut();
-        let code = unsafe {
-            cuda_sys::cuModuleGetFunction(&mut f, self.inner.raw, name_cstr.as_ptr())
-        };
+        let code =
+            unsafe { cuda_sys::cuModuleGetFunction(&mut f, self.inner.raw, name_cstr.as_ptr()) };
         cuda_sys::check(code).map_err(|e| {
             // Stage 5 (M3L5): forward the raw `CUresult` integer through
             // the rewrap so callers can still recognise specific driver
@@ -668,11 +664,7 @@ impl CudaModule {
             // point) without parsing the formatted string.
             BoltError::CudaWithCode {
                 code: inner_code(&e).unwrap_or(code),
-                message: format!(
-                    "cuModuleGetFunction({}) failed: {}",
-                    name,
-                    inner_msg(&e)
-                ),
+                message: format!("cuModuleGetFunction({}) failed: {}", name, inner_msg(&e)),
             }
         })?;
         Ok(CudaFunction {
@@ -886,7 +878,10 @@ mod tests {
 
         // Insert C without touching A — A is LRU and gets evicted.
         cache.insert_empty(k(2), "ptx-C".to_owned(), cap);
-        assert!(!cache.by_key.contains_key(&k(0)), "A should have been evicted");
+        assert!(
+            !cache.by_key.contains_key(&k(0)),
+            "A should have been evicted"
+        );
         assert!(cache.by_key.contains_key(&k(1)));
         assert!(cache.by_key.contains_key(&k(2)));
         assert_eq!(cache.evictions(), 1);
@@ -899,7 +894,9 @@ mod tests {
         assert!(!cache.by_key.contains_key(&k(0)));
 
         // ACCESS B → bump to MRU. C is now the LRU.
-        let _ = cache.get_and_touch(k(1), "ptx-B").expect("B is still cached");
+        let _ = cache
+            .get_and_touch(k(1), "ptx-B")
+            .expect("B is still cached");
 
         // Insert D — must evict C (LRU after the bump), NOT B.
         cache.insert_empty(k(3), "ptx-D".to_owned(), cap);
@@ -926,8 +923,14 @@ mod tests {
         let _ = cache.get_and_touch(k(10), "ptx-A").expect("A is cached");
 
         cache.insert_empty(k(13), "ptx-D".to_owned(), cap);
-        assert!(cache.by_key.contains_key(&k(10)), "A must survive — just touched");
-        assert!(!cache.by_key.contains_key(&k(11)), "B must be evicted as LRU");
+        assert!(
+            cache.by_key.contains_key(&k(10)),
+            "A must survive — just touched"
+        );
+        assert!(
+            !cache.by_key.contains_key(&k(11)),
+            "B must be evicted as LRU"
+        );
         assert!(cache.by_key.contains_key(&k(12)));
         assert!(cache.by_key.contains_key(&k(13)));
         assert_eq!(cache.evictions(), 1);

@@ -216,9 +216,7 @@ fn coalesce_lowercase_name_recognised() {
                 1,
                 "2-arg COALESCE always lowers to a 1-branch CASE (spelling: {spelling})"
             ),
-            other => panic!(
-                "expected Expr::Case for spelling '{spelling}', got {other:?}"
-            ),
+            other => panic!("expected Expr::Case for spelling '{spelling}', got {other:?}"),
         }
     }
 }
@@ -302,8 +300,7 @@ fn nullif_arity_rejected_outside_two() {
 #[test]
 fn nullif_three_arg_error_mentions_function_name() {
     let sql = "SELECT NULLIF(a, b, c) AS r FROM t";
-    let err = parse_sql(sql, &t_provider())
-        .expect_err("3-arg NULLIF must be rejected");
+    let err = parse_sql(sql, &t_provider()).expect_err("3-arg NULLIF must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.to_ascii_uppercase().contains("NULLIF"),
@@ -321,9 +318,7 @@ fn nullif_lowercase_name_recognised() {
         let exprs = first_project_exprs(&plan);
         match strip_alias(&exprs[0]) {
             Expr::Case { branches, .. } => assert_eq!(branches.len(), 1, "spelling: {spelling}"),
-            other => panic!(
-                "expected Expr::Case for spelling '{spelling}', got {other:?}"
-            ),
+            other => panic!("expected Expr::Case for spelling '{spelling}', got {other:?}"),
         }
     }
 }
@@ -429,13 +424,9 @@ fn assert_branch_is_not_null_arm(branch: &(Expr, Expr), col: &str) {
                 n, col,
                 "expected `{col} IS NOT NULL` branch condition, got Column({n})"
             ),
-            other => panic!(
-                "expected operand = Column({col}) in IS NOT NULL, got {other:?}"
-            ),
+            other => panic!("expected operand = Column({col}) in IS NOT NULL, got {other:?}"),
         },
-        other => panic!(
-            "expected branch condition = `{col} IS NOT NULL`, got {other:?}"
-        ),
+        other => panic!("expected branch condition = `{col} IS NOT NULL`, got {other:?}"),
     }
     // THEN side
     match &branch.1 {

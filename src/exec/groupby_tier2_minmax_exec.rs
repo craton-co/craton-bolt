@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **MIN / MAX at Tier 2.1** вЂ” high-cardinality executor for
 //! `SELECT key, {MIN,MAX}(val) FROM x GROUP BY key`.
@@ -38,8 +38,8 @@ use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
 use crate::jit::partition_reduce_kernel_minmax::{
     compile_partition_reduce_kernel_minmax_with_spill,
-    kernel_entry_with_spill as minmax_entry_with_spill, MinMaxDtype, MinMaxOp,
-    BLOCK_GROUPS, BLOCK_THREADS as REDUCE_BLOCK_THREADS,
+    kernel_entry_with_spill as minmax_entry_with_spill, MinMaxDtype, MinMaxOp, BLOCK_GROUPS,
+    BLOCK_THREADS as REDUCE_BLOCK_THREADS,
 };
 use crate::jit::{partition_kernel, scatter_kernel, CudaModule};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
@@ -109,7 +109,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-            KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
+            KernelSpec::PartitionShmemStaging => {
+                partition_kernel::compile_partition_kernel_shmem_staging()?
+            }
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ScatterI32ToI64 => scatter_kernel::compile_scatter_kernel_i32_to_i64()?,
             KernelSpec::ReduceMinMax(rk) => {
@@ -133,12 +135,8 @@ fn partition_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try the Tier-2.1 MIN/MAX fast path. Returns `None` on any miss.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -329,11 +327,13 @@ fn run_scatter_f64(
     stream: &CudaStream,
 ) -> BoltResult<(GpuVec<i32>, Vec<f64>)> {
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut scatter_vals_f64: GpuVec<f64> = GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut scatter_vals_f64: GpuVec<f64> =
+        GpuVec::<f64>::zeros_async(n_rows as usize, stream.raw())?;
 
     let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
     let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
-    let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     let view_keys = keys_gpu.view();
     let view_vals = vals_in_gpu.view();
@@ -377,11 +377,13 @@ fn run_scatter_i32_to_i64(
     stream: &CudaStream,
 ) -> BoltResult<(GpuVec<i32>, GpuVec<i64>)> {
     let mut scatter_keys: GpuVec<i32> = GpuVec::<i32>::zeros_async(n_rows as usize, stream.raw())?;
-    let mut scatter_vals_i64: GpuVec<i64> = GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
+    let mut scatter_vals_i64: GpuVec<i64> =
+        GpuVec::<i64>::zeros_async(n_rows as usize, stream.raw())?;
 
     let scatter_module = get_or_build_module(&KernelSpec::ScatterI32ToI64)?;
     let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY_I32_TO_I64)?;
-    let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+    let mut cursors: GpuVec<u32> =
+        GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
     let view_keys = keys_gpu.view();
     let view_vals = vals_in_gpu.view();
@@ -430,8 +432,9 @@ fn run_reduce_phase(
     // silent data loss in the per-partition reduce.
     let mut spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
 
-    let reduce_module =
-        get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::from_pair(op, val_dtype)))?;
+    let reduce_module = get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::from_pair(
+        op, val_dtype,
+    )))?;
     {
         let entry = minmax_entry_with_spill(op, val_dtype);
         let func = reduce_module.function(&entry)?;
@@ -503,9 +506,7 @@ fn run_reduce_phase(
             Arc::new(Int32Array::from(vals)),
         ],
     )
-    .map_err(|e| {
-        BoltError::Other(format!("groupby_tier2_minmax_exec(i32): build error: {e}"))
-    })
+    .map_err(|e| BoltError::Other(format!("groupby_tier2_minmax_exec(i32): build error: {e}")))
 }
 
 fn run_reduce_phase_i64(
@@ -623,8 +624,8 @@ mod tests {
     /// the f64 sibling would silently narrow any value with bit 53 set.
     #[test]
     fn int64_scatter_kernel_has_no_f64() {
-        let ptx = scatter_kernel::compile_scatter_kernel_i32_to_i64()
-            .expect("typed kernel compiles");
+        let ptx =
+            scatter_kernel::compile_scatter_kernel_i32_to_i64().expect("typed kernel compiles");
         assert!(
             !ptx.contains(".f64") && !ptx.contains("%fd"),
             "Int64 fast path must avoid f64: kernel PTX contains f64 references:\n{ptx}"
@@ -695,10 +696,10 @@ mod cache_tests {
         let _ = get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::MaxI64))
             .expect("max-i64 build");
         let baseline = LOAD_COUNT.load(Ordering::SeqCst);
-        let _ = get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::MinI32))
-            .expect("min-i32 hit");
-        let _ = get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::MaxI64))
-            .expect("max-i64 hit");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::MinI32)).expect("min-i32 hit");
+        let _ =
+            get_or_build_module(&KernelSpec::ReduceMinMax(ReduceKey::MaxI64)).expect("max-i64 hit");
         assert_eq!(
             LOAD_COUNT.load(Ordering::SeqCst),
             baseline,
@@ -715,12 +716,10 @@ mod cache_tests {
             Ok(m) => m,
             Err(_) => return,
         };
-        let _ = get_or_build_module(&KernelSpec::ScatterI32ToI64)
-            .expect("typed i64 scatter build");
+        let _ = get_or_build_module(&KernelSpec::ScatterI32ToI64).expect("typed i64 scatter build");
         let baseline = LOAD_COUNT.load(Ordering::SeqCst);
         let _ = get_or_build_module(&KernelSpec::Scatter).expect("f64 scatter hit");
-        let _ = get_or_build_module(&KernelSpec::ScatterI32ToI64)
-            .expect("typed i64 scatter hit");
+        let _ = get_or_build_module(&KernelSpec::ScatterI32ToI64).expect("typed i64 scatter hit");
         assert_eq!(
             LOAD_COUNT.load(Ordering::SeqCst),
             baseline,
@@ -756,8 +755,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Int32 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Int32,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Min(Expr::Column("v".into()))],

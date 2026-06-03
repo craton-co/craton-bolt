@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2.1 **MIN / MAX over Float32 / Float64** executor.
 //!
@@ -89,7 +89,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::Partition => partition_kernel::compile_partition_kernel()?,
-            KernelSpec::PartitionShmemStaging => partition_kernel::compile_partition_kernel_shmem_staging()?,
+            KernelSpec::PartitionShmemStaging => {
+                partition_kernel::compile_partition_kernel_shmem_staging()?
+            }
             KernelSpec::Scatter => scatter_kernel::compile_scatter_kernel()?,
             KernelSpec::ReduceMinMaxFloat(rk) => {
                 // Batch 5: route to the spill-counter-aware emitter so the
@@ -112,11 +114,7 @@ fn partition_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -258,7 +256,8 @@ fn execute_inner(
     let scatter_module = get_or_build_module(&KernelSpec::Scatter)?;
     {
         let func = scatter_module.function(scatter_kernel::KERNEL_ENTRY)?;
-        let mut cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+        let mut cursors: GpuVec<u32> =
+            GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
 
         let view_keys = keys_gpu.view();
         let view_vals = vals_gpu.view();
@@ -366,11 +365,7 @@ fn execute_inner(
             Arc::new(Float64Array::from(vals)),
         ],
     )
-    .map_err(|e| {
-        BoltError::Other(format!(
-            "groupby_tier2_minmax_float_exec: build error: {e}"
-        ))
-    })
+    .map_err(|e| BoltError::Other(format!("groupby_tier2_minmax_float_exec: build error: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -380,9 +375,9 @@ fn execute_inner(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 // ---------------------------------------------------------------------------
 // F2: host-only NaN-deferral eligibility tests. A NaN-bearing float value
@@ -409,8 +404,14 @@ mod nan_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![agg],
@@ -491,9 +492,7 @@ mod cache_tests {
 
     #[test]
     fn op_dtype_combinations_are_distinct_cache_keys() {
-        let _ = match get_or_build_module(&KernelSpec::ReduceMinMaxFloat(
-            ReduceFloatKey::MinF64,
-        )) {
+        let _ = match get_or_build_module(&KernelSpec::ReduceMinMaxFloat(ReduceFloatKey::MinF64)) {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -535,8 +534,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![AggregateExpr::Min(Expr::Column("v".into()))],
@@ -564,7 +569,11 @@ mod stage4_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let vs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             assert_eq!(vs.value(i), expected_min[ks.value(i) as usize]);
         }
@@ -590,11 +599,20 @@ mod stage4_tests {
 
         for op_is_min in [true, false] {
             // Per-group scalar reference (plain comparison; data is finite).
-            let mut expected = vec![if op_is_min { f64::INFINITY } else { f64::NEG_INFINITY }; n_groups];
+            let mut expected = vec![
+                if op_is_min {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                };
+                n_groups
+            ];
             for (i, &k) in keys.iter().enumerate() {
                 let slot = &mut expected[k as usize];
                 if op_is_min {
-                    if vals[i] < *slot { *slot = vals[i]; }
+                    if vals[i] < *slot {
+                        *slot = vals[i];
+                    }
                 } else if vals[i] > *slot {
                     *slot = vals[i];
                 }
@@ -609,8 +627,14 @@ mod stage4_tests {
                 pre: None,
                 aggregate: AggregateSpec {
                     inputs: vec![
-                        ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                        ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                        ColumnIO {
+                            name: "k".into(),
+                            dtype: DataType::Int32,
+                        },
+                        ColumnIO {
+                            name: "v".into(),
+                            dtype: DataType::Float64,
+                        },
                     ],
                     group_by: vec![0],
                     aggregates: vec![agg],
@@ -638,7 +662,11 @@ mod stage4_tests {
                 _ => return, // no GPU / declined → nothing to assert on host
             };
             let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-            let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            let vs = out
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
             for i in 0..out.num_rows() {
                 assert_eq!(
                     vs.value(i),

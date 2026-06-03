@@ -305,7 +305,7 @@ pub const STRING_HASH_BLOCK_SIZE: u32 = 256;
 /// stream-intern caller can swap host hashing for device hashing without
 /// changing the dictionary indices the kernel-side join sees.
 const FNV_OFFSET_LITERAL: &str = "-3750763034362895579"; // 0xcbf29ce484222325 as i64
-const FNV_PRIME_LITERAL: &str = "1099511628211";          // 0x100000001b3
+const FNV_PRIME_LITERAL: &str = "1099511628211"; // 0x100000001b3
 
 /// AoS slot footprint in bytes: `i64 key (8) + u32 head (4) + u32 _pad (4)
 /// = 16`. The pad keeps each slot 16-byte aligned for the `ld.global.v4.u32`
@@ -957,9 +957,9 @@ pub fn compile_probe_kernel_tiled() -> BoltResult<String> {
     // of keys_table).
     writeln!(p, "\tld.param.u32 %r5, [{entry}_param_7];").map_err(write_err)?;
     writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?; // mask = cap_mask
-    // `cap_minus_one` is the same value as the mask under our
-    // power-of-two cap invariant; we duplicate into a separate register
-    // for clarity so the wrap pre-check reads naturally.
+                                                               // `cap_minus_one` is the same value as the mask under our
+                                                               // power-of-two cap invariant; we duplicate into a separate register
+                                                               // for clarity so the wrap pre-check reads naturally.
     writeln!(p, "\tmov.u32 %r34, %r6;").map_err(write_err)?; // cap_minus_one
 
     // probe_left = MAX_PROBE_FACTOR * cap (in slots, not iterations).
@@ -1072,9 +1072,9 @@ pub fn compile_probe_kernel_tiled() -> BoltResult<String> {
     // local arithmetic; the slot is also < cap by induction).
     writeln!(p, "MATCH_SP1:").map_err(write_err)?;
     writeln!(p, "\tadd.s32 %r35, %r8, 1;").map_err(write_err)?; // matched_slot = slot+1
-    // Defensive mask: slot+1 == cap only happens at the OOB pre-check we
-    // already filtered, so this mask is a no-op in practice. Kept as belt-
-    // and-braces against future refactors that drop the pre-check.
+                                                                // Defensive mask: slot+1 == cap only happens at the OOB pre-check we
+                                                                // already filtered, so this mask is a no-op in practice. Kept as belt-
+                                                                // and-braces against future refactors that drop the pre-check.
     writeln!(p, "\tand.b32 %r35, %r35, %r6;").map_err(write_err)?;
     writeln!(p, "\tbra EMIT_MATCH;").map_err(write_err)?;
 
@@ -1407,9 +1407,9 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tld.param.u64 %rd18, [{entry}_param_6];").map_err(write_err)?; // counter
     writeln!(p, "\tcvta.to.global.u64 %rd18, %rd18;").map_err(write_err)?;
     writeln!(p, "\tld.param.u64 %rd19, [{entry}_param_7];").map_err(write_err)?; // matched
-    // We *do not* convert matched_ptr unconditionally — the host may pass a
-    // raw 0 for INNER joins, and cvta on null can trap on some drivers. We
-    // gate on rd19 != 0 below.
+                                                                                 // We *do not* convert matched_ptr unconditionally — the host may pass a
+                                                                                 // raw 0 for INNER joins, and cvta on null can trap on some drivers. We
+                                                                                 // gate on rd19 != 0 below.
 
     writeln!(p, "\tmov.s64 %rl4, {EMPTY_KEY_LITERAL};").map_err(write_err)?;
     writeln!(p, "\tmov.u32 %r21, 0;").map_err(write_err)?;
@@ -1742,7 +1742,7 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\t@%p0 bra DONE;").map_err(write_err)?;
 
     writeln!(p, "\tld.param.u32 %r5, [{entry}_param_6];").map_err(write_err)?; // cap
-    writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?;                  // mask
+    writeln!(p, "\tsub.s32 %r6, %r5, 1;").map_err(write_err)?; // mask
     writeln!(p, "\tmul.lo.u32 %r20, %r5, {MAX_PROBE_FACTOR};").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r22, [{entry}_param_7];").map_err(write_err)?; // out_capacity
 
@@ -1785,7 +1785,7 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     // `%rl6` = packed (head:u32, pad:u32) high half. Slot table is read-
     // only in the probe kernel, hence .nc.
     writeln!(p, "\tld.global.nc.v2.u64 {{%rl5, %rl6}}, [%rd6];").map_err(write_err)?;
-    writeln!(p, "\tcvt.u32.u64 %r9, %rl6;").map_err(write_err)?;          // head = low 32 bits of high half
+    writeln!(p, "\tcvt.u32.u64 %r9, %rl6;").map_err(write_err)?; // head = low 32 bits of high half
 
     // Empty slot -> no match.
     writeln!(p, "\tsetp.eq.s64 %p1, %rl5, %rl4;").map_err(write_err)?;
@@ -2061,9 +2061,7 @@ pub fn compile_string_hash_kernel(_dtype: DataType) -> BoltResult<String> {
 /// Arrow offset width so `Utf8` and `LargeUtf8` share one byte-loop
 /// body. The original (i32-only) `compile_string_hash_kernel` is now a
 /// thin trampoline over this.
-pub fn compile_string_hash_kernel_with_offsets(
-    width: StringOffsetWidth,
-) -> BoltResult<String> {
+pub fn compile_string_hash_kernel_with_offsets(width: StringOffsetWidth) -> BoltResult<String> {
     let mut p = String::new();
     writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
     writeln!(p, "{PTX_TARGET}").map_err(write_err)?;
@@ -2125,16 +2123,18 @@ pub fn compile_string_hash_kernel_with_offsets(
         StringOffsetWidth::I32 => {
             writeln!(p, "\tmul.wide.u32 %rd1, %r3, 4;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
-            writeln!(p, "\tld.global.nc.s32 %r5, [%rd2];").map_err(write_err)?;     // start
-            writeln!(p, "\tld.global.nc.s32 %r6, [%rd2 + 4];").map_err(write_err)?; // end
+            writeln!(p, "\tld.global.nc.s32 %r5, [%rd2];").map_err(write_err)?; // start
+            writeln!(p, "\tld.global.nc.s32 %r6, [%rd2 + 4];").map_err(write_err)?;
+            // end
         }
         StringOffsetWidth::I64 => {
             writeln!(p, "\tmul.wide.u32 %rd1, %r3, 8;").map_err(write_err)?;
             writeln!(p, "\tadd.s64 %rd2, %rd0, %rd1;").map_err(write_err)?;
             // V-13: i64 offsets — load start/end into b64 scratch and keep
             // them full-width (%rd9 = start, %rd10 = end). No narrowing.
-            writeln!(p, "\tld.global.nc.s64 %rd9, [%rd2];").map_err(write_err)?;     // start
-            writeln!(p, "\tld.global.nc.s64 %rd10, [%rd2 + 8];").map_err(write_err)?; // end
+            writeln!(p, "\tld.global.nc.s64 %rd9, [%rd2];").map_err(write_err)?; // start
+            writeln!(p, "\tld.global.nc.s64 %rd10, [%rd2 + 8];").map_err(write_err)?;
+            // end
         }
     }
 
@@ -2344,7 +2344,10 @@ mod tests {
     #[test]
     fn build_ptx_has_oob_guard() {
         let ptx = compile_build_kernel().unwrap();
-        assert!(ptx.contains("setp.ge.u32"), "missing OOB compare against n_rows");
+        assert!(
+            ptx.contains("setp.ge.u32"),
+            "missing OOB compare against n_rows"
+        );
         assert!(ptx.contains("bra DONE"), "missing branch to DONE label");
         assert!(ptx.contains("DONE:"), "missing DONE label");
     }
@@ -2785,7 +2788,10 @@ mod tests {
         let ptx = compile_string_hash_kernel(DataType::Utf8).unwrap();
         for i in 0..4 {
             let needle = format!("bolt_string_hash_param_{i}");
-            assert!(ptx.contains(&needle), "string hash missing param {i}\n{ptx}");
+            assert!(
+                ptx.contains(&needle),
+                "string hash missing param {i}\n{ptx}"
+            );
         }
         assert!(!ptx.contains("bolt_string_hash_param_4"));
     }
@@ -2865,14 +2871,10 @@ mod tests {
     /// `slot[s + 1]`.
     fn assert_appears_before(ptx: &str, needle_a: &str, needle_b: &str) {
         let pos_a = ptx.find(needle_a).unwrap_or_else(|| {
-            panic!(
-                "assert_appears_before: needle_a `{needle_a}` not found in PTX:\n{ptx}"
-            )
+            panic!("assert_appears_before: needle_a `{needle_a}` not found in PTX:\n{ptx}")
         });
         let pos_b = ptx.find(needle_b).unwrap_or_else(|| {
-            panic!(
-                "assert_appears_before: needle_b `{needle_b}` not found in PTX:\n{ptx}"
-            )
+            panic!("assert_appears_before: needle_b `{needle_b}` not found in PTX:\n{ptx}")
         });
         assert!(
             pos_a < pos_b,

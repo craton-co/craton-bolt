@@ -13,8 +13,7 @@ use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{
-    lower_physical, parse_sql, DataType, Field, LogicalPlan, MemTableProvider, PhysicalPlan,
-    Schema,
+    lower_physical, parse_sql, DataType, Field, LogicalPlan, MemTableProvider, PhysicalPlan, Schema,
 };
 
 // ---- Fixture ----------------------------------------------------------------
@@ -93,8 +92,8 @@ fn provider_and_batches() -> (MemTableProvider, RecordBatch, RecordBatch) {
 #[test]
 fn left_join_lowers_to_physical_join() {
     let (provider, _, _) = provider_and_batches();
-    let plan = parse_sql("SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id", &provider)
-        .expect("parse");
+    let plan =
+        parse_sql("SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id", &provider).expect("parse");
     let phys = lower_physical(&plan).expect("lower");
     fn find_phys_join(p: &PhysicalPlan) -> Option<&PhysicalPlan> {
         match p {
@@ -246,13 +245,10 @@ fn e2e_full_outer_join_emits_both_sides() {
     let left_v = out.column(v_idx);
     let right_w = out.column(w_idx);
     // Left NULL count = unmatched right rows = 1.
-    let left_nulls: usize =
-        (0..out.num_rows()).filter(|&i| left_v.is_null(i)).count();
+    let left_nulls: usize = (0..out.num_rows()).filter(|&i| left_v.is_null(i)).count();
     assert_eq!(left_nulls, 1, "FULL: one right-only row gets NULL left");
     // Right NULL count = unmatched left rows = 2.
-    let right_nulls: usize = (0..out.num_rows())
-        .filter(|&i| right_w.is_null(i))
-        .count();
+    let right_nulls: usize = (0..out.num_rows()).filter(|&i| right_w.is_null(i)).count();
     assert_eq!(right_nulls, 2, "FULL: two left-only rows get NULL right");
 }
 

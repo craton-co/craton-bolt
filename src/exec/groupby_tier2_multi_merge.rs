@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY **multi-SUM** result merger.
 //!
@@ -50,7 +50,7 @@ use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::groupby_tier2_multi_orchestrator::Tier2MultiPartial;
-use crate::plan::logical_plan::{Schema};
+use crate::plan::logical_plan::Schema;
 
 /// Concatenate per-partition multi-SUM partials into a final `RecordBatch`
 /// matching `output_schema`.
@@ -85,8 +85,7 @@ pub fn build_tier2_multi_result(
     // 2. Concatenate. Capacity pre-allocated so the extends are amortised
     //    O(total).
     let mut keys_out: Vec<i32> = Vec::with_capacity(total);
-    let mut sums_out: Vec<Vec<f64>> =
-        (0..n_vals).map(|_| Vec::with_capacity(total)).collect();
+    let mut sums_out: Vec<Vec<f64>> = (0..n_vals).map(|_| Vec::with_capacity(total)).collect();
     for (keys, sums) in per_partition.into_iter() {
         // Each partition must carry exactly n_vals inner sum columns, each
         // aligned to `keys`.
@@ -176,7 +175,6 @@ pub fn build_tier2_multi_result(
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // Host-only tests — no CUDA needed. Run via:
 //   cargo test --release groupby_tier2_multi_merge
@@ -186,7 +184,7 @@ pub fn build_tier2_multi_result(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType};
+use arrow_schema::DataType as ArrowDataType;
 
 #[cfg(test)]
 mod tests {
@@ -257,8 +255,14 @@ mod tests {
         let schema = out_schema_n(3);
         let partial = Tier2MultiPartial {
             per_partition: vec![
-                (vec![7, 4], vec![vec![70.0, 40.0], vec![71.0, 41.0], vec![72.0, 42.0]]),
-                (vec![1, 9], vec![vec![10.0, 90.0], vec![11.0, 91.0], vec![12.0, 92.0]]),
+                (
+                    vec![7, 4],
+                    vec![vec![70.0, 40.0], vec![71.0, 41.0], vec![72.0, 42.0]],
+                ),
+                (
+                    vec![1, 9],
+                    vec![vec![10.0, 90.0], vec![11.0, 91.0], vec![12.0, 92.0]],
+                ),
                 (
                     vec![5, 2, 6],
                     vec![
@@ -420,10 +424,7 @@ mod tests {
     fn schema_matches_output_schema_n4() {
         let schema = out_schema_n(4);
         let partial = Tier2MultiPartial {
-            per_partition: vec![(
-                vec![1],
-                vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]],
-            )],
+            per_partition: vec![(vec![1], vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]])],
             n_vals: 4,
         };
         let batch = build_tier2_multi_result(partial, &schema).expect("build ok");
@@ -448,9 +449,9 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA toolkit + JIT (executes Tier-2 multi-SUM pipeline + merge)"]
     fn stage6_orchestrator_plus_merge_multi_smoke() {
-        use std::collections::HashMap;
         use crate::cuda::GpuVec;
         use crate::exec::groupby_tier2_multi_orchestrator::execute_tier2_multi_sum;
+        use std::collections::HashMap;
 
         let host_keys: Vec<i32> = vec![1, 2, 1, 3, 2, 1, 4, 3];
         let host_v0: Vec<f64> = vec![10.0, 20.0, 11.0, 30.0, 21.0, 12.0, 40.0, 31.0];

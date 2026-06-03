@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Dictionary-aware string operations: `UPPER`, `LOWER`, `LENGTH`, and
 //! literal-equality on `DictionaryColumn`.
@@ -85,9 +85,7 @@ fn dedup_transformed(transformed: Vec<String>) -> BoltResult<(Vec<String>, Vec<i
             // Reserve slot before pushing so we surface overflow before the
             // dictionary grows past the i32 index space.
             let next_len = new_dict.len().checked_add(1).ok_or_else(|| {
-                BoltError::Other(
-                    "dictionary overflow: more than usize::MAX unique strings".into(),
-                )
+                BoltError::Other("dictionary overflow: more than usize::MAX unique strings".into())
             })?;
             if next_len > i32::MAX as usize {
                 return Err(BoltError::Other(format!(
@@ -225,11 +223,7 @@ pub fn length(input: &DictionaryColumn) -> BoltResult<Int64Array> {
 /// Lives as a free function so the NULL / Int64 / 3VL behaviour is unit-testable
 /// without a CUDA device (constructing a `DictionaryColumn` would upload to the
 /// driver). `dict_len` is only used to phrase the out-of-range error.
-fn length_from_indices(
-    indices: &[i32],
-    table: &[i32],
-    dict_len: usize,
-) -> BoltResult<Int64Array> {
+fn length_from_indices(indices: &[i32], table: &[i32], dict_len: usize) -> BoltResult<Int64Array> {
     // `Option<i64>`: index 0 → NULL (SQL `LENGTH(NULL) = NULL`); otherwise the
     // character count from the table. Building from `Vec<Option<i64>>` gives the
     // result array a validity bitmap so a downstream `IS NULL` / `> 0` sees the
@@ -280,10 +274,7 @@ fn length_from_indices(
 /// NULL rows still evaluate to NULL (so the result is a mix of `false`/`NULL`,
 /// not all-`false`). Returns an `n_rows`-length array even when the input is
 /// empty.
-pub fn input_eq_literal(
-    input: &DictionaryColumn,
-    literal: &str,
-) -> BoltResult<BooleanArray> {
+pub fn input_eq_literal(input: &DictionaryColumn, literal: &str) -> BoltResult<BooleanArray> {
     let indices: Vec<i32> = input.indices.to_vec()?;
     // `target` is `None` when the literal is not in the dictionary: no non-NULL
     // row can equal it, but NULL rows still propagate NULL under 3VL.
@@ -659,10 +650,8 @@ mod tests {
 
     #[test]
     fn host_concat_option_strings_basic() {
-        let l: Vec<Option<String>> =
-            vec![Some("a".into()), None, Some("c".into())];
-        let r: Vec<Option<String>> =
-            vec![Some("x".into()), Some("y".into()), None];
+        let l: Vec<Option<String>> = vec![Some("a".into()), None, Some("c".into())];
+        let r: Vec<Option<String>> = vec![Some("x".into()), Some("y".into()), None];
         let out = host_concat_option_strings(&l, &r).unwrap();
         assert_eq!(out[0], Some("ax".into()));
         assert_eq!(out[1], None);

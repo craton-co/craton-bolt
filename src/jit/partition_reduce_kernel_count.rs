@@ -232,7 +232,14 @@ pub(crate) fn emit_count_kernel(
     emit_zero_phase(&mut ptx, key_width, block_groups, block_threads)?;
 
     // ---- Phase 2: probe + atomic count over this partition's rows ---------
-    emit_probe_loop(&mut ptx, key_width, mask, max_probes, overflow_target, spill)?;
+    emit_probe_loop(
+        &mut ptx,
+        key_width,
+        mask,
+        max_probes,
+        overflow_target,
+        spill,
+    )?;
 
     if spill {
         // SPILL_BUMP: bump the spill counter, then fall to the epilogue. The
@@ -506,8 +513,12 @@ fn emit_export_phase(
     writeln!(ptx, "\tmul.lo.u32 %r40, %r0, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r41, %r2;").map_err(write_err)?;
     writeln!(ptx, "EXPORT_TOP:").map_err(write_err)?;
-    writeln!(ptx, "\tsetp.ge.u32 {loop_pred}, %r41, {bg};", bg = block_groups)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.ge.u32 {loop_pred}, %r41, {bg};",
+        bg = block_groups
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "\t@{loop_pred} bra EXPORT_DONE;").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r42, %r40, %r41;").map_err(write_err)?;
 

@@ -209,15 +209,13 @@ fn execute_setop_with_cap(
             // EXCEPT ALL: keep up to max(0, lc - rc) copies — drop a left copy
             // for each remaining right copy, keep the rest. Decrements the
             // right multiset in place (no per-call map clone).
-            (SetOpKind::Except, true) => {
-                match right_counts.get_mut(&key) {
-                    Some(c) if *c > 0 => {
-                        *c -= 1;
-                        false
-                    }
-                    _ => true,
+            (SetOpKind::Except, true) => match right_counts.get_mut(&key) {
+                Some(c) if *c > 0 => {
+                    *c -= 1;
+                    false
                 }
-            }
+                _ => true,
+            },
             // INTERSECT ALL: keep min(lc, rc) copies — keep a left copy while
             // right copies remain, drop the rest. Decrements in place.
             (SetOpKind::Intersect, true) => match right_counts.get_mut(&key) {
@@ -281,10 +279,7 @@ fn execute_setop_with_cap(
 /// when the *distinct* count crosses the cap (a right input full of
 /// duplicates still completes). Exceeding the cap returns a clean
 /// [`BoltError::Other`] rather than growing unboundedly.
-fn build_key_counts(
-    batch: &RecordBatch,
-    max_rows: usize,
-) -> BoltResult<HashMap<RowKey, usize>> {
+fn build_key_counts(batch: &RecordBatch, max_rows: usize) -> BoltResult<HashMap<RowKey, usize>> {
     let n_rows = batch.num_rows();
     // Clamp the up-front allocation to the cap (DISTINCT's `initial_cap`
     // pattern): a huge `n_rows` must not pre-allocate past the budget.
@@ -341,7 +336,13 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("Int32 column");
         (0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect()
     }
 
@@ -423,14 +424,17 @@ mod tests {
         // Right has ("a",1) only; ("a",2) is NOT in right.
         let r_s: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a"]));
         let r_n: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1]));
-        let right = QueryHandle::from_record_batch(
-            RecordBatch::try_new(schema, vec![r_s, r_n]).unwrap(),
-        );
+        let right =
+            QueryHandle::from_record_batch(RecordBatch::try_new(schema, vec![r_s, r_n]).unwrap());
         // EXCEPT (set): distinct left {(a,1),(b,2)} minus {(a,1)} = {(b,2)}.
         let out = execute_setop(left, right, SetOpKind::Except, false).unwrap();
         assert_eq!(out.num_rows(), 1);
         let batch = out.record_batch();
-        let s = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(s.value(0), "b");
     }
 

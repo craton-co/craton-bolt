@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY executor for **multiple SUM** aggregates
 //! (top-level shim).
@@ -36,10 +36,7 @@ pub const MAX_VALS: usize = 4;
 
 /// Try the Tier-2 multi-SUM fast path. Returns `None` on any precondition
 /// miss so the caller falls through to the next strategy.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     // --- Plan-shape eligibility ------------------------------------------
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -246,9 +243,18 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v1".into(), dtype: DataType::Float64 },
-                    ColumnIO { name: "v2".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v1".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v2".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![
@@ -282,8 +288,16 @@ mod stage4_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let s1 = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let s2 = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let s1 = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let s2 = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i) as usize;
             assert_eq!(s1.value(i), sum1[k]);

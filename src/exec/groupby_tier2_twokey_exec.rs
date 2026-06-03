@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY executor — **two-key (Int32, Int32)
 //! shim**.
@@ -87,10 +87,7 @@ fn pack_two_i32(col0: &[i32], col1: &[i32]) -> Vec<i64> {
 /// dangling stream. This makes per-query owned streams safe everywhere, so the
 /// orchestrators keep `null_or_default`. See memory
 /// `groupby-resident-and-hostscan-finding.md`.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     // --- 1. Plan shape: pre-less Aggregate with exactly two group keys
     //        and one aggregate.
     let (pre, aggregate) = match plan {
@@ -145,10 +142,7 @@ pub fn try_execute(
     // sentinel / sentinel-free single-key paths, both of which carry
     // proper validity handling. Stage G follow-up: native
     // partition+reduce kernels with validity bitmaps.
-    if k0_arr.null_count() > 0
-        || k1_arr.null_count() > 0
-        || val_arr.null_count() > 0
-    {
+    if k0_arr.null_count() > 0 || k1_arr.null_count() > 0 || val_arr.null_count() > 0 {
         return None;
     }
 
@@ -330,8 +324,7 @@ mod tests {
         use crate::plan::logical_plan::Literal;
         let mut plan = build_twokey_sum_plan();
         if let PhysicalPlan::Aggregate { aggregate, .. } = &mut plan {
-            aggregate.aggregates =
-                vec![AggregateExpr::Count(Expr::Literal(Literal::Null))];
+            aggregate.aggregates = vec![AggregateExpr::Count(Expr::Literal(Literal::Null))];
         }
         let batch = twokey_sum_batch(300_000);
         assert!(try_execute(&plan, &batch).is_none());
@@ -395,9 +388,18 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k1".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "k2".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
@@ -427,9 +429,21 @@ mod stage4_tests {
             Some(Ok(b)) => b,
             _ => return,
         };
-        let kc1 = out.column(0).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
-        let kc2 = out.column(1).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
-        let sv = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let kc1 = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        let kc2 = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        let sv = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let key = (kc1.value(i), kc2.value(i));
             assert_eq!(sv.value(i), *expected.get(&key).unwrap());

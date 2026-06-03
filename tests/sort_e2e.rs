@@ -223,16 +223,8 @@ fn e2e_order_by_keeps_payload_aligned() {
     let out = h.record_batch();
     assert_eq!(out.num_rows(), n);
 
-    let k = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    let v = out
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
+    let k = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let v = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
     for i in 0..n {
         assert_eq!(
             v.value(i),
@@ -327,7 +319,9 @@ fn null_first_int_with_nulls() {
     // shuffle to defeat any input-order assumptions
     let mut rng_state: u64 = 0xc0ffee;
     for i in (1..n).rev() {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (rng_state as usize) % (i + 1);
         values.swap(i, j);
     }
@@ -373,7 +367,9 @@ fn null_last_int_with_nulls() {
         .collect();
     let mut rng_state: u64 = 0xfeed;
     for i in (1..n).rev() {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (rng_state as usize) % (i + 1);
         values.swap(i, j);
     }
@@ -416,14 +412,16 @@ fn null_last_int_with_nulls() {
 #[ignore = "gpu:sort"]
 fn shmem_variant_small_input() {
     use craton_bolt::__test_only_gpu_sort::{sort_indices_on_gpu_multi, GpuSortKey, SortLayout};
-    use craton_bolt::__test_only_sort_kernel::SortDirection;
     use craton_bolt::__test_only_logical_plan::DataType;
+    use craton_bolt::__test_only_sort_kernel::SortDirection;
 
     let n = 128usize;
     let mut values: Vec<i32> = (0..n as i32).collect();
     let mut s: u64 = 0xdeafbeef;
     for i in (1..n).rev() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (s as usize) % (i + 1);
         values.swap(i, j);
     }
@@ -449,7 +447,10 @@ fn shmem_variant_small_input() {
     let sorted: Vec<i32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
     let mut expected = values.clone();
     expected.sort();
-    assert_eq!(sorted, expected, "shmem-variant output must equal sorted(input)");
+    assert_eq!(
+        sorted, expected,
+        "shmem-variant output must equal sorted(input)"
+    );
 }
 
 // ============================================================================
@@ -471,7 +472,11 @@ fn eight_key_sort() {
     let mods = [16, 8, 8, 8, 8, 8, 8, 1];
     let cols: Vec<Vec<i32>> = mods
         .iter()
-        .map(|m| (0..n as i32).map(|i| if *m > 1 { i % m } else { i }).collect())
+        .map(|m| {
+            (0..n as i32)
+                .map(|i| if *m > 1 { i % m } else { i })
+                .collect()
+        })
         .collect();
     let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
     let fields: Vec<ArrowField> = names
@@ -658,15 +663,12 @@ fn sentinel_collision_does_not_drop_row() {
         n,
         "Stage-3 padded routing must preserve every real row (including i32::MAX)"
     );
-    let arr = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
+    let arr = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
     // Count i32::MAX in output — must equal input.
     let out_max = (0..n).filter(|i| arr.value(*i) == i32::MAX).count();
     assert_eq!(
-        out_max, target_count,
+        out_max,
+        target_count,
         "Stage-3: lost {} i32::MAX rows under sentinel collision",
         target_count - out_max
     );
@@ -714,15 +716,12 @@ fn sentinel_collision_desc_i32_min_does_not_drop_row() {
         n,
         "Stage-3 padded routing must preserve every real row (including i32::MIN) under DESC"
     );
-    let arr = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
+    let arr = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
     // Count i32::MIN in output — must equal input.
     let out_min = (0..n).filter(|i| arr.value(*i) == i32::MIN).count();
     assert_eq!(
-        out_min, target_count,
+        out_min,
+        target_count,
         "Stage-3 DESC: lost {} i32::MIN rows under sentinel collision",
         target_count - out_min
     );
@@ -755,13 +754,12 @@ fn utf8_sort_via_inline_dictionary() {
     use arrow_array::StringArray;
     let mut engine = Engine::new().expect("ctx");
     let n = N_BIG; // 16_384 — above GPU_SORT_MIN_ROWS so the GPU path engages.
-    // 16 distinct strings, cycled. Pick names with mixed lengths and
-    // mixed alphabetic position so the lex order isn't a no-op of the
-    // dict-build order.
+                   // 16 distinct strings, cycled. Pick names with mixed lengths and
+                   // mixed alphabetic position so the lex order isn't a no-op of the
+                   // dict-build order.
     let alphabet = [
-        "delta", "alpha", "echo", "bravo", "foxtrot", "charlie", "golf",
-        "india", "hotel", "kilo", "juliet", "mike", "lima", "november",
-        "oscar", "papa",
+        "delta", "alpha", "echo", "bravo", "foxtrot", "charlie", "golf", "india", "hotel", "kilo",
+        "juliet", "mike", "lima", "november", "oscar", "papa",
     ];
     let strings: Vec<String> = (0..n)
         .map(|i| alphabet[i % alphabet.len()].to_string())
@@ -771,11 +769,8 @@ fn utf8_sort_via_inline_dictionary() {
         ArrowDataType::Utf8,
         false,
     )]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(StringArray::from(strings.clone()))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(strings.clone()))]).unwrap();
     engine.register_table("t", batch).unwrap();
 
     let h = engine
@@ -822,11 +817,7 @@ fn e2e_small_input_uses_host_path() {
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 100);
 
-    let arr = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
+    let arr = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
     let actual: Vec<i32> = (0..100).map(|i| arr.value(i)).collect();
     let mut expected = values;
     expected.sort();
@@ -863,11 +854,8 @@ fn high_cardinality_utf8_e2e_via_host_path() {
         ArrowDataType::Utf8,
         false,
     )]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(StringArray::from(strings.clone()))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(strings.clone()))]).unwrap();
     engine.register_table("t", batch).unwrap();
 
     let h = engine
@@ -894,7 +882,10 @@ fn high_cardinality_utf8_e2e_via_host_path() {
     let mut expected: Vec<String> = strings;
     expected.sort();
     let actual: Vec<String> = (0..n).map(|i| arr.value(i).to_string()).collect();
-    assert_eq!(actual, expected, "high-cardinality Utf8 sort must equal sorted(input)");
+    assert_eq!(
+        actual, expected,
+        "high-cardinality Utf8 sort must equal sorted(input)"
+    );
 }
 
 // ============================================================================

@@ -48,8 +48,7 @@ fn t_provider() -> MemTableProvider {
 /// underlying error on failure. Mirrors the helper pattern used in
 /// `having_test.rs` so each test reads as a single shape assertion.
 fn lp(sql: &str) -> LogicalPlan {
-    parse_sql(sql, &t_provider())
-        .unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
+    parse_sql(sql, &t_provider()).unwrap_or_else(|e| panic!("parse failed for {sql:?}: {e}"))
 }
 
 /// Recursively walk a `LogicalPlan` and return the first non-`Project` /
@@ -96,9 +95,9 @@ fn simple_aggregate_alias_renames_output() {
                 "alias must wrap the plan-assigned `sum_v` column, got {inner:?}"
             );
         }
-        other => panic!(
-            "expected Expr::Alias(Column(\"sum_v\"), \"total\") in Project, got {other:?}"
-        ),
+        other => {
+            panic!("expected Expr::Alias(Column(\"sum_v\"), \"total\") in Project, got {other:?}")
+        }
     }
     // The Project's input must be the underlying Aggregate (no other layer).
     assert!(
@@ -108,7 +107,10 @@ fn simple_aggregate_alias_renames_output() {
     // Schema sanity: the Project's output column is named `total`.
     let schema = plan.schema().expect("schema");
     assert_eq!(schema.fields.len(), 1);
-    assert_eq!(schema.fields[0].name, "total", "alias must appear in schema");
+    assert_eq!(
+        schema.fields[0].name, "total",
+        "alias must appear in schema"
+    );
 }
 
 // ---- Test 2: alias usable in ORDER BY -------------------------------------
@@ -118,9 +120,7 @@ fn simple_aggregate_alias_renames_output() {
 /// post-projection schema (where `total` is a real column).
 #[test]
 fn alias_usable_in_order_by() {
-    let plan = lp(
-        "SELECT k, SUM(v) AS total FROM t GROUP BY k ORDER BY total DESC",
-    );
+    let plan = lp("SELECT k, SUM(v) AS total FROM t GROUP BY k ORDER BY total DESC");
     let LogicalPlan::Sort { input, sort_exprs } = &plan else {
         panic!("expected Sort at top, got {plan:?}");
     };
@@ -147,7 +147,10 @@ fn alias_usable_in_order_by() {
     // Schema sanity: the top-level schema still surfaces `total`.
     let schema = plan.schema().expect("schema");
     let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
-    assert!(names.contains(&"total"), "schema must expose `total`, got {names:?}");
+    assert!(
+        names.contains(&"total"),
+        "schema must expose `total`, got {names:?}"
+    );
 }
 
 // ---- Test 3: alias usable in HAVING ---------------------------------------
@@ -159,9 +162,7 @@ fn alias_usable_in_order_by() {
 /// schema.
 #[test]
 fn alias_usable_in_having() {
-    let plan = lp(
-        "SELECT SUM(v) AS total FROM t GROUP BY k HAVING total > 10",
-    );
+    let plan = lp("SELECT SUM(v) AS total FROM t GROUP BY k HAVING total > 10");
     let LogicalPlan::Filter { input, predicate } = &plan else {
         panic!("expected Filter (HAVING) at top, got {plan:?}");
     };
@@ -189,9 +190,7 @@ fn alias_usable_in_having() {
 /// SUM-call form.
 #[test]
 fn aggregate_call_in_having_still_works_with_alias() {
-    let plan = lp(
-        "SELECT SUM(v) AS total FROM t GROUP BY k HAVING SUM(v) > 10",
-    );
+    let plan = lp("SELECT SUM(v) AS total FROM t GROUP BY k HAVING SUM(v) > 10");
     let LogicalPlan::Filter { input, predicate } = &plan else {
         panic!("expected Filter (HAVING) at top, got {plan:?}");
     };
@@ -203,9 +202,7 @@ fn aggregate_call_in_having_still_works_with_alias() {
     // alias the SELECT exposes.
     match left.as_ref() {
         Expr::Column(n) if n == "sum_v" || n == "total" => {}
-        other => panic!(
-            "HAVING SUM(v) should resolve to either `sum_v` or `total`; got {other:?}"
-        ),
+        other => panic!("HAVING SUM(v) should resolve to either `sum_v` or `total`; got {other:?}"),
     }
     assert!(
         matches!(input.as_ref(), LogicalPlan::Project { .. }),
@@ -246,11 +243,7 @@ fn e2e_aggregate_alias_round_trips() {
     // Bind the schema so the `&str` borrows outlive the statement (the
     // `SchemaRef` returned by `schema()` is otherwise a dropped temporary).
     let schema = out.schema();
-    let field_names: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert!(
         field_names.contains(&"total"),
         "output schema must expose alias `total`, got {field_names:?}"

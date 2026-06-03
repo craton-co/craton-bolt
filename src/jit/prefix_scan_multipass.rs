@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for the multi-pass prefix-scan compaction path.
 //!
@@ -216,12 +216,7 @@ pub fn compile_prefix_scan_u32_kernel() -> BoltResult<String> {
             step = step
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tsub.s64 %rd10, %rd8, {off};",
-            off = off_bytes
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tsub.s64 %rd10, %rd8, {off};", off = off_bytes).map_err(write_err)?;
         writeln!(ptx, "\tld.shared.u32 %r8, [%rd10];").map_err(write_err)?;
         writeln!(ptx, "SKIP_LOAD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tadd.s32 %r9, %r7, %r8;").map_err(write_err)?;

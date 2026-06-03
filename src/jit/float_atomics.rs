@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for GROUP BY `MIN` / `MAX` aggregates over floating-point
 //! inputs.
@@ -124,10 +124,7 @@ const SPIN_BACKOFF_NS: u32 = 32;
 /// by `hash_kernels::compile_groupby_agg_kernel`; routing the wrong case here
 /// is a programmer error and we surface it loudly instead of silently
 /// producing the wrong code.
-pub fn compile_groupby_float_atomic_kernel(
-    op: ReduceOp,
-    dtype: DataType,
-) -> BoltResult<String> {
+pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<String> {
     // Validate inputs up front so the rest of the function can assume them.
     // `ordered_cmp` is the IEEE ordered comparison used only when BOTH operands
     // are known non-NaN (we test for NaN separately to honour the NaN-as-largest
@@ -221,8 +218,7 @@ pub fn compile_groupby_float_atomic_kernel(
     // Bit-pattern registers used for the CAS itself. For f32 these are
     // `.b32 %vrN`; for f64 they are `.b64 %vrlN`. Distinct namespaces avoid
     // collisions with the `%r` / `%rl` registers above.
-    writeln!(ptx, "\t.reg .{ty}   %{rc}<8>;", ty = bits_ty, rc = bits_reg)
-        .map_err(write_err)?;
+    writeln!(ptx, "\t.reg .{ty}   %{rc}<8>;", ty = bits_ty, rc = bits_reg).map_err(write_err)?;
     // Float-typed view of the same value for the comparison + select.
     writeln!(
         ptx,
@@ -308,12 +304,7 @@ pub fn compile_groupby_float_atomic_kernel(
     // cycles here frees the warp scheduler to run peer warps that may be
     // populating slots ahead of us. The FOUND and EMPTY-sentinel paths
     // skip this via early branches above.
-    writeln!(
-        ptx,
-        "\tmov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
     writeln!(ptx, "FOUND:").map_err(write_err)?;
@@ -477,12 +468,7 @@ pub fn compile_groupby_float_atomic_kernel(
     // and our CAS; yielding SM cycles here gives that warp room to drain
     // its update instead of all warps storming the same cache line. The
     // CAS-won path skips the back-off by branching past via @%p5.
-    writeln!(
-        ptx,
-        "\t@!%p5 mov.u32 %nstime, {ns};",
-        ns = SPIN_BACKOFF_NS
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\t@!%p5 mov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\t@!%p5 nanosleep.u32 %nstime;").map_err(write_err)?;
     // If we did NOT win the race, someone updated the slot since our load —
     // retry with their value as the new baseline.

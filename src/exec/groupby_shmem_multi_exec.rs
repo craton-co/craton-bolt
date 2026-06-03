@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory pre-aggregation **executor** with multiple SUM
 //! aggregates folded into a single kernel launch (Tier-1 extension).
@@ -32,9 +32,7 @@ use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
-use crate::exec::groupby_shmem_dispatch::{
-    dispatch, AggOp, DispatchInputs, GroupByStrategy,
-};
+use crate::exec::groupby_shmem_dispatch::{dispatch, AggOp, DispatchInputs, GroupByStrategy};
 use crate::exec::groupby_shmem_launch::{tune, TuneInputs};
 use crate::exec::launch::{launch_with_geometry, CudaStream, KernelArgs};
 use crate::exec::module_cache;
@@ -50,10 +48,7 @@ use crate::plan::physical_plan::PhysicalPlan;
 /// Returns `None` when any precondition fails — the caller MUST fall through
 /// to the safe global-atomic path. Returns `Some(Err)` only on genuine GPU
 /// failures encountered after we committed to the fast path.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     // --- Plan-shape eligibility ------------------------------------------
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -269,10 +264,8 @@ fn execute_inner(
         pinned_outs.push(og.to_pinned_async(stream.raw())?);
     }
     stream.synchronize()?;
-    let host_sums_per_agg: Vec<Vec<f64>> = pinned_outs
-        .iter()
-        .map(|p| p.as_slice().to_vec())
-        .collect();
+    let host_sums_per_agg: Vec<Vec<f64>> =
+        pinned_outs.iter().map(|p| p.as_slice().to_vec()).collect();
 
     let mut present = vec![false; n_groups as usize];
     for &k in key_arr.values() {
@@ -287,8 +280,9 @@ fn execute_inner(
         .collect();
 
     let out_keys: Vec<i32> = live_slots.iter().map(|&s| s as i32).collect();
-    let mut out_sum_cols: Vec<Vec<f64>> =
-        (0..n_vals).map(|_| Vec::with_capacity(live_slots.len())).collect();
+    let mut out_sum_cols: Vec<Vec<f64>> = (0..n_vals)
+        .map(|_| Vec::with_capacity(live_slots.len()))
+        .collect();
     for &slot in &live_slots {
         for (j, agg_vec) in host_sums_per_agg.iter().enumerate() {
             out_sum_cols[j].push(agg_vec[slot]);
@@ -359,7 +353,10 @@ const _BLOCK_THREADS_REF: u32 = BLOCK_THREADS;
 // in this crate carries its own copy; consolidating them is a separate
 // refactor.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +366,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod stage4_tests {
@@ -396,9 +393,18 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "v1".into(), dtype: DataType::Float64 },
-                    ColumnIO { name: "v2".into(), dtype: DataType::Float64 },
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v1".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v2".into(),
+                        dtype: DataType::Float64,
+                    },
                 ],
                 group_by: vec![0],
                 aggregates: vec![
@@ -432,8 +438,16 @@ mod stage4_tests {
             _ => return,
         };
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let s1 = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let s2 = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let s1 = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let s2 = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i) as usize;
             assert_eq!(s1.value(i), sum1[k]);

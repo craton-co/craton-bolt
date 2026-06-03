@@ -2,34 +2,34 @@
 
 //! Logical plan IR, DataFrame builder, SQL frontend, and physical plan.
 
-pub mod logical_plan;
 pub mod dataframe;
-pub mod sql_frontend;
-pub mod physical_plan;
 pub mod explain;
-pub mod string_literal_rewrite;
-pub mod suggest;
-pub mod rewrite;
+pub mod logical_plan;
 pub mod optimizer;
+pub mod physical_plan;
+pub mod rewrite;
+pub mod sql_frontend;
 pub mod statistics;
+pub mod string_literal_rewrite;
 pub mod subquery;
 /// Substrait plan ingestion (optional, `--features substrait`).
 #[cfg(feature = "substrait")]
 pub mod substrait;
+pub mod suggest;
 
-pub use logical_plan::{
-    AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,
-    SetOpKind, TimeUnit, UnaryOp, col, lit,
-};
 pub use dataframe::{
-    DataFrame, GroupedDataFrame, avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop,
-    var_samp,
+    avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop, var_samp, DataFrame,
+    GroupedDataFrame,
 };
-pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};
+pub use explain::{format_logical, format_physical};
+pub use logical_plan::{
+    col, lit, AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind,
+    Schema, SetOpKind, TimeUnit, UnaryOp,
+};
+pub use optimizer::{default_passes, default_passes_with_estimator, RowEstimator, StatsEstimator};
 pub use physical_plan::{
     lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, StringLengthOutput,
     StringProjectOutput, Value,
 };
 pub use rewrite::PlanRewrite;
-pub use optimizer::{default_passes, default_passes_with_estimator, RowEstimator, StatsEstimator};
-pub use explain::{format_logical, format_physical};
+pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};

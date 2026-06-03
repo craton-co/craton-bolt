@@ -261,11 +261,7 @@ fn emit_global_ptr_setup(
         ..
     } = *layout;
     writeln!(ptx, "\tld.param.u64 %rd{rd_pkeys}, [{entry}_param_0];").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tcvta.to.global.u64 %rd{rd_pkeys}, %rd{rd_pkeys};"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd{rd_pkeys}, %rd{rd_pkeys};").map_err(write_err)?;
     for j in 0..n_vals {
         let rd = rd_pvals_base + j;
         let p = 1 + j;
@@ -735,7 +731,8 @@ pub(crate) fn emit_multi_kernel(
     emit_global_ptr_setup(&mut ptx, entry, n_vals, &layout)?;
     if spill {
         let p_sp = 4 + 2 * n_vals;
-        writeln!(ptx, "\tld.param.u64 %rd{rd_spill}, [{entry}_param_{p_sp}];").map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd{rd_spill}, [{entry}_param_{p_sp}];")
+            .map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd{rd_spill}, %rd{rd_spill};").map_err(write_err)?;
     }
     writeln!(ptx).map_err(write_err)?;
@@ -744,7 +741,14 @@ pub(crate) fn emit_multi_kernel(
     emit_slice_read(&mut ptx, layout.rd_poff)?;
 
     // ----------------- Phase 1: cooperative shared-mem zero ---------------
-    emit_zero_init(&mut ptx, key_width, n_vals, &layout, block_groups, block_threads)?;
+    emit_zero_init(
+        &mut ptx,
+        key_width,
+        n_vals,
+        &layout,
+        block_groups,
+        block_threads,
+    )?;
 
     // ----------------- Phase 2: probe + N-way sum -------------------------
     emit_probe_head(

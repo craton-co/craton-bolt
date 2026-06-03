@@ -184,12 +184,7 @@ pub enum Phase {
 
 impl Phase {
     /// All phases in declaration / snapshot order.
-    pub const ALL: [Phase; 4] = [
-        Phase::Parse,
-        Phase::Plan,
-        Phase::Lower,
-        Phase::Materialize,
-    ];
+    pub const ALL: [Phase; 4] = [Phase::Parse, Phase::Plan, Phase::Lower, Phase::Materialize];
 
     /// Stable snake_case name, matching the corresponding tracing span.
     pub const fn as_str(self) -> &'static str {
@@ -728,7 +723,11 @@ mod tests {
         // in that bucket.
         for i in 1..HISTOGRAM_BUCKETS - 1 {
             let ub = bucket_upper_micros(i);
-            assert_eq!(bucket_index(ub), i, "upper bound {ub} should map to bucket {i}");
+            assert_eq!(
+                bucket_index(ub),
+                i,
+                "upper bound {ub} should map to bucket {i}"
+            );
         }
     }
 
@@ -840,7 +839,10 @@ mod tests {
         let out = render_prometheus(&snap);
 
         // Trailing newline is mandatory in the exposition format.
-        assert!(out.ends_with('\n'), "exposition body must end with a newline");
+        assert!(
+            out.ends_with('\n'),
+            "exposition body must end with a newline"
+        );
         assert!(!out.is_empty());
 
         // Every counter is present as a fully-qualified three-line block, all
@@ -1025,7 +1027,10 @@ mod tests {
             1
         );
         assert_eq!(
-            type_lines.iter().filter(|l| l.ends_with(" counter")).count(),
+            type_lines
+                .iter()
+                .filter(|l| l.ends_with(" counter"))
+                .count(),
             Counter::ALL.len()
         );
     }

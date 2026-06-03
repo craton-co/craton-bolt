@@ -121,9 +121,7 @@ fn plain_case_with_else_parses() {
             else_branch,
         } => {
             assert_eq!(branches.len(), 1);
-            let else_expr = else_branch
-                .as_deref()
-                .expect("ELSE branch must be present");
+            let else_expr = else_branch.as_deref().expect("ELSE branch must be present");
             assert!(
                 matches!(else_expr, Expr::Literal(Literal::Int64(0))),
                 "expected ELSE = Int64(0), got {else_expr:?}",
@@ -213,17 +211,17 @@ fn simple_case_desugars_to_equality_per_branch() {
                                 n, "x",
                                 "Simple-CASE operand should be Column(x), got branch {i}: {left:?}"
                             ),
-                            other => panic!(
-                                "expected Column(x) on LHS of branch {i}, got {other:?}"
-                            ),
+                            other => {
+                                panic!("expected Column(x) on LHS of branch {i}, got {other:?}")
+                            }
                         }
                         match right.as_ref() {
                             Expr::Literal(Literal::Int64(v)) => {
                                 assert_eq!(*v, (i as i64) + 1, "WHEN values are 1, 2 in order")
                             }
-                            other => panic!(
-                                "expected Int64 literal on RHS of branch {i}, got {other:?}"
-                            ),
+                            other => {
+                                panic!("expected Int64 literal on RHS of branch {i}, got {other:?}")
+                            }
                         }
                     }
                     other => {
@@ -294,7 +292,9 @@ fn case_rejects_non_bool_when_condition() {
     // must error at type-check time, not at execution time.
     let sql = "SELECT CASE WHEN x THEN 1 ELSE 0 END AS s FROM t";
     let plan = parse_sql(sql, &t_provider()).expect("parse must succeed");
-    let err = plan.schema().expect_err("non-Bool WHEN must surface a Type error");
+    let err = plan
+        .schema()
+        .expect_err("non-Bool WHEN must surface a Type error");
     let msg = format!("{err}");
     assert!(
         msg.contains("CASE WHEN condition"),

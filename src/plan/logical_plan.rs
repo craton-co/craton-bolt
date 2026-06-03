@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Logical plan AST: schemas, expressions, and relational nodes.
 
@@ -374,14 +374,22 @@ pub enum BinaryOp {
 impl BinaryOp {
     /// True for `+ - * /`.
     fn is_arithmetic(self) -> bool {
-        matches!(self, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div)
+        matches!(
+            self,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+        )
     }
 
     /// True for `= <> < <= > >=`.
     fn is_comparison(self) -> bool {
         matches!(
             self,
-            BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
         )
     }
 
@@ -527,9 +535,9 @@ impl ScalarFnKind {
             ScalarFnKind::Length => "LENGTH",
             ScalarFnKind::Substring => "SUBSTRING",
             ScalarFnKind::Concat => "CONCAT",
-            ScalarFnKind::TrimBoth
-            | ScalarFnKind::TrimLeading
-            | ScalarFnKind::TrimTrailing => "TRIM",
+            ScalarFnKind::TrimBoth | ScalarFnKind::TrimLeading | ScalarFnKind::TrimTrailing => {
+                "TRIM"
+            }
             ScalarFnKind::OctetLength => "OCTET_LENGTH",
             ScalarFnKind::Position => "POSITION",
             ScalarFnKind::Replace => "REPLACE",
@@ -588,7 +596,10 @@ impl DateField {
     /// True for the intra-day fields that are only meaningful on a `Timestamp`
     /// (a bare `Date32` has no time-of-day component).
     pub fn is_intraday(self) -> bool {
-        matches!(self, DateField::Hour | DateField::Minute | DateField::Second)
+        matches!(
+            self,
+            DateField::Hour | DateField::Minute | DateField::Second
+        )
     }
 }
 
@@ -1111,9 +1122,7 @@ impl Expr {
                         let _ = unify_numeric(l, r)?;
                         Ok(DataType::Bool)
                     } else {
-                        Err(BoltError::Type(format!(
-                            "cannot compare {l:?} with {r:?}"
-                        )))
+                        Err(BoltError::Type(format!("cannot compare {l:?} with {r:?}")))
                     }
                 } else if op.is_logical() {
                     if l == DataType::Bool && r == DataType::Bool {
@@ -1403,8 +1412,8 @@ impl Expr {
                 // Tolerate a bare NULL probe (no static type to compare).
                 if !matches!(expr.as_ref(), Expr::Literal(Literal::Null)) {
                     let probe = expr.dtype_depth(schema, depth + 1)?;
-                    let comparable = probe == sub_dtype
-                        || (probe.is_numeric() && sub_dtype.is_numeric());
+                    let comparable =
+                        probe == sub_dtype || (probe.is_numeric() && sub_dtype.is_numeric());
                     if !comparable {
                         return Err(BoltError::Type(format!(
                             "IN subquery: cannot compare {probe:?} with subquery \
@@ -1422,11 +1431,7 @@ impl Expr {
 /// the arm is an untyped `Literal::Null` (which carries no static type).
 /// Any other resolvable arm returns `Some(dtype)`; resolution errors bubble
 /// through verbatim (e.g. unknown column references).
-fn case_arm_dtype(
-    arm: &Expr,
-    schema: &Schema,
-    depth: usize,
-) -> BoltResult<Option<DataType>> {
+fn case_arm_dtype(arm: &Expr, schema: &Schema, depth: usize) -> BoltResult<Option<DataType>> {
     if matches!(arm, Expr::Literal(Literal::Null)) {
         return Ok(None);
     }
@@ -1746,12 +1751,7 @@ fn scalar_fn_dtype(
 /// Bool, so NULL becomes Bool). Two NULLs on both sides still surface the
 /// original `Type("untyped NULL literal")` error — there is no peer to
 /// borrow a type from.
-fn peer_typed_dtype(
-    e: &Expr,
-    peer: &Expr,
-    schema: &Schema,
-    _op: BinaryOp,
-) -> BoltResult<DataType> {
+fn peer_typed_dtype(e: &Expr, peer: &Expr, schema: &Schema, _op: BinaryOp) -> BoltResult<DataType> {
     if matches!(e, Expr::Literal(Literal::Null)) {
         // Try to borrow the peer's dtype. If the peer itself is also a
         // bare untyped NULL the recursive call will fail with the original
@@ -2210,10 +2210,7 @@ pub fn sum_output_dtype(input: DataType) -> DataType {
         // Other non-numeric types fall through unchanged; the downstream
         // typecheck (e.g. `ReduceOp::identity_ptx`) will reject the
         // aggregate.
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Date32
-        | DataType::Timestamp(_, _) => input,
+        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => input,
     }
 }
 
@@ -2310,9 +2307,7 @@ impl WindowFunc {
     /// the ranking functions are always `Int64`.
     pub fn output_dtype(&self, input: &Schema) -> BoltResult<DataType> {
         match self {
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
-                Ok(DataType::Int64)
-            }
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Ok(DataType::Int64),
             WindowFunc::Count(_) => Ok(DataType::Int64),
             WindowFunc::Avg(e) => {
                 let _ = e.dtype(input)?;
@@ -2705,9 +2700,7 @@ impl LogicalPlan {
             }
             LogicalPlan::Union { inputs } => {
                 if inputs.is_empty() {
-                    return Err(BoltError::Plan(
-                        "UNION requires at least one input".into(),
-                    ));
+                    return Err(BoltError::Plan("UNION requires at least one input".into()));
                 }
                 let first = inputs[0].schema_depth(depth + 1)?;
                 for (i, branch) in inputs.iter().enumerate().skip(1) {
@@ -2958,10 +2951,7 @@ mod scalar_fn_typecheck_tests {
         let schema = s_schema();
         let two = Expr::ScalarFn {
             kind: ScalarFnKind::Substring,
-            args: vec![
-                Expr::Column("s".into()),
-                Expr::Literal(Literal::Int64(1)),
-            ],
+            args: vec![Expr::Column("s".into()), Expr::Literal(Literal::Int64(1))],
         };
         assert_eq!(two.dtype(&schema).unwrap(), DataType::Utf8);
 
@@ -3187,9 +3177,18 @@ mod integer_op_typecheck_tests {
     #[test]
     fn mixed_int_widths_widen_to_int64() {
         let s = schema();
-        assert_eq!(col("a").modulo(col("c")).dtype(&s).unwrap(), DataType::Int64);
-        assert_eq!(col("a").bit_and(col("c")).dtype(&s).unwrap(), DataType::Int64);
-        assert_eq!(col("c").bit_or(col("a")).dtype(&s).unwrap(), DataType::Int64);
+        assert_eq!(
+            col("a").modulo(col("c")).dtype(&s).unwrap(),
+            DataType::Int64
+        );
+        assert_eq!(
+            col("a").bit_and(col("c")).dtype(&s).unwrap(),
+            DataType::Int64
+        );
+        assert_eq!(
+            col("c").bit_or(col("a")).dtype(&s).unwrap(),
+            DataType::Int64
+        );
     }
 
     #[test]
@@ -3306,7 +3305,10 @@ mod null_handling_tests {
         let plain = Expr::Column("f".into()).cast(d);
         assert_eq!(plain.dtype(&schema).unwrap(), d);
         let safe = Expr::Column("f".into()).try_cast(d);
-        assert!(safe.dtype(&schema).is_err(), "TRY_CAST float->decimal must be rejected");
+        assert!(
+            safe.dtype(&schema).is_err(),
+            "TRY_CAST float->decimal must be rejected"
+        );
     }
 
     /// `TRY_CAST(NULL AS Int32)` type-checks to the target, just like CAST.
@@ -3498,10 +3500,7 @@ mod null_handling_tests {
     fn case_rejects_non_bool_when_condition() {
         let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
         let case = Expr::Case {
-            branches: vec![(
-                Expr::Column("x".into()),
-                Expr::Literal(Literal::Int64(1)),
-            )],
+            branches: vec![(Expr::Column("x".into()), Expr::Literal(Literal::Int64(1)))],
             else_branch: Some(Box::new(Expr::Literal(Literal::Int64(0)))),
         };
         let err = case.dtype(&schema).expect_err("non-Bool WHEN must error");
@@ -3617,7 +3616,10 @@ mod naming_consistency_tests {
         assert_eq!(aggregate_output_name(&agg), "var_samp_v");
 
         // Alias: take the alias name as the suffix.
-        let aliased = Expr::Alias(Box::new(Expr::Column("c".to_string())), "renamed".to_string());
+        let aliased = Expr::Alias(
+            Box::new(Expr::Column("c".to_string())),
+            "renamed".to_string(),
+        );
         let agg = AggregateExpr::Count(aliased);
         assert_eq!(aggregate_output_name(&agg), "count_renamed");
 
@@ -3703,7 +3705,10 @@ mod naming_consistency_tests {
         // RIGHT OUTER: left-side columns become nullable.
         let out = join_combined_schema(&left, &right, JoinType::RightOuter);
         assert!(out.fields[0].nullable, "left side widens on RIGHT");
-        assert!(!out.fields[1].nullable, "right side stays non-null on RIGHT");
+        assert!(
+            !out.fields[1].nullable,
+            "right side stays non-null on RIGHT"
+        );
 
         // FULL OUTER: both sides become nullable.
         let out = join_combined_schema(&left, &right, JoinType::FullOuter);

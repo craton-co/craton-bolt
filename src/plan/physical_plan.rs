@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Physical plan: column-ordinal-resolved, register-machine IR for GPU codegen.
 
@@ -57,7 +57,11 @@ impl Value {
     /// dtype). Mirrors the historical `Value { reg, dtype }` literal so
     /// every legacy callsite that wants a single-reg value stays terse.
     fn single(reg: Reg, dtype: DataType) -> Self {
-        Self { reg, dtype, hi_reg: None }
+        Self {
+            reg,
+            dtype,
+            hi_reg: None,
+        }
     }
 
     /// Convenience constructor for a 128-bit value (Decimal128). `reg` is
@@ -1365,9 +1369,8 @@ fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
     if a == b {
         return Ok(a);
     }
-    logical_unify_numeric(a, b).map_err(|_| {
-        BoltError::Type(format!("cannot unify {:?} and {:?}", a, b))
-    })
+    logical_unify_numeric(a, b)
+        .map_err(|_| BoltError::Type(format!("cannot unify {:?} and {:?}", a, b)))
 }
 
 /// v0.7 sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
@@ -1390,6 +1393,9 @@ fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
 /// (e.g. the precision-cap message and the Div/other-op message). No call
 /// site asserts on this text, and the Ok/Err discriminant for every input is
 /// unchanged.
+// Retained as the reference for the Decimal128 arithmetic result-dtype rule;
+// not yet wired into a live call site (the lowering computes it inline today).
+#[allow(dead_code)]
 fn decimal128_arith_result_dtype(
     op: BinaryOp,
     (p1, s1): (u8, i8),
@@ -1888,11 +1894,14 @@ impl<'a> Codegen<'a> {
             Value::pair(dst_lo, dst_hi, dtype)
         } else {
             let dst = self.fresh();
-            self.ops.push(Op::LoadColumn { dst, col_idx, dtype });
+            self.ops.push(Op::LoadColumn {
+                dst,
+                col_idx,
+                dtype,
+            });
             Value::single(dst, dtype)
         };
-        self.column_cache
-            .insert(name.to_string(), (col_idx, value));
+        self.column_cache.insert(name.to_string(), (col_idx, value));
         Ok(value)
     }
 
@@ -2444,7 +2453,11 @@ impl<'a> Codegen<'a> {
             b_lo: factor_v.reg,
             b_hi: factor_hi,
         });
-        Ok(Value::pair(dst_lo, dst_hi, DataType::Decimal128(out_p, to_s)))
+        Ok(Value::pair(
+            dst_lo,
+            dst_hi,
+            DataType::Decimal128(out_p, to_s),
+        ))
     }
 
     /// Widen an integer `Value` (`Int32`/`Int64`/`Date32`) to a
@@ -2472,11 +2485,7 @@ impl<'a> Codegen<'a> {
     ///   `Decimal128(_, 0)` then rescaled up to `target_scale`.
     /// * Any other dtype (Float/Bool/Utf8/temporal) is rejected — decimal
     ///   arithmetic with floats would lose exactness; cast explicitly.
-    fn coerce_to_decimal_scale(
-        &mut self,
-        v: Value,
-        target_scale: i8,
-    ) -> BoltResult<Value> {
+    fn coerce_to_decimal_scale(&mut self, v: Value, target_scale: i8) -> BoltResult<Value> {
         match v.dtype {
             DataType::Decimal128(p, s) => {
                 if s > target_scale {
@@ -2532,12 +2541,7 @@ impl<'a> Codegen<'a> {
     ///     raw 128-bit two's-complement values (matching
     ///     `i128::wrapping_mul`), so the scale of the result is the SUM
     ///     of the operand scales by construction.
-    fn emit_binary_decimal128(
-        &mut self,
-        op: BinaryOp,
-        l: Value,
-        r: Value,
-    ) -> BoltResult<Value> {
+    fn emit_binary_decimal128(&mut self, op: BinaryOp, l: Value, r: Value) -> BoltResult<Value> {
         // Extract the (precision, scale) of whichever side(s) are decimal,
         // and the *logical* scale to attribute to an integer operand (0).
         let dec_scale = |dt: DataType| -> Option<(u8, i8)> {
@@ -2550,9 +2554,8 @@ impl<'a> Codegen<'a> {
         let r_dec = dec_scale(r.dtype);
         // Reject the float/bool/temporal cases up front with a clear message
         // (an integer peer is allowed and coerced below).
-        let is_intish = |dt: DataType| {
-            matches!(dt, DataType::Int32 | DataType::Int64 | DataType::Date32)
-        };
+        let is_intish =
+            |dt: DataType| matches!(dt, DataType::Int32 | DataType::Int64 | DataType::Date32);
         if l_dec.is_none() && !is_intish(l.dtype) {
             return Err(BoltError::Plan(format!(
                 "Decimal128 {op:?}: left operand {:?} cannot be coerced to Decimal128 \
@@ -2591,9 +2594,23 @@ impl<'a> Codegen<'a> {
                 let dst_lo = self.fresh();
                 let dst_hi = self.fresh();
                 let new_op = if matches!(op, BinaryOp::Add) {
-                    Op::Add128 { dst_lo, dst_hi, a_lo: lv.reg, a_hi: l_hi, b_lo: rv.reg, b_hi: r_hi }
+                    Op::Add128 {
+                        dst_lo,
+                        dst_hi,
+                        a_lo: lv.reg,
+                        a_hi: l_hi,
+                        b_lo: rv.reg,
+                        b_hi: r_hi,
+                    }
                 } else {
-                    Op::Sub128 { dst_lo, dst_hi, a_lo: lv.reg, a_hi: l_hi, b_lo: rv.reg, b_hi: r_hi }
+                    Op::Sub128 {
+                        dst_lo,
+                        dst_hi,
+                        a_lo: lv.reg,
+                        a_hi: l_hi,
+                        b_lo: rv.reg,
+                        b_hi: r_hi,
+                    }
                 };
                 self.ops.push(new_op);
                 Ok(Value::pair(dst_lo, dst_hi, result_dtype))
@@ -3164,9 +3181,7 @@ struct ResolvedSource<'a> {
 /// into a single equivalent (scan, AND-folded predicate, projection list).
 /// Because the lowerer handles arbitrary chains now, no defensive guard in
 /// `DataFrame::select`/`filter` is needed.
-fn resolve_source<'a>(
-    plan: &'a LogicalPlan,
-) -> BoltResult<ResolvedSource<'a>> {
+fn resolve_source<'a>(plan: &'a LogicalPlan) -> BoltResult<ResolvedSource<'a>> {
     // Walk down from the outermost node toward the underlying `Scan`,
     // collecting each layer. We delay all substitution to the end so each
     // node's expressions stay in their *own* input namespace until we know
@@ -3325,11 +3340,7 @@ fn substitute_one(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
 /// unsubstituted is sound: any unmatched `Column(name)` simply resolves
 /// against the scan namespace, which is the existing fallback for unknown
 /// columns.
-fn substitute_one_depth(
-    expr: &Expr,
-    map: &HashMap<String, Expr>,
-    depth: usize,
-) -> Expr {
+fn substitute_one_depth(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) -> Expr {
     if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
         return expr.clone();
     }
@@ -3407,9 +3418,7 @@ fn substitute_one_depth(
                 .map(|a| substitute_one_depth(a, map, depth + 1))
                 .collect(),
         },
-        Expr::Alias(inner, name) => {
-            Expr::Alias(Box::new(substitute_one(inner, map)), name.clone())
-        }
+        Expr::Alias(inner, name) => Expr::Alias(Box::new(substitute_one(inner, map)), name.clone()),
         // Subquery nodes hold a self-contained plan over their own schema;
         // the substitution `map` rewrites *this* query's column names, which
         // do not appear inside the subplan. Clone the subquery as-is. The
@@ -3535,7 +3544,11 @@ fn build_projection_kernel(
                     continue;
                 }
                 let field = scan_schema.field(&src)?;
-                output_fields.push(Field::new(name.clone(), field.dtype.clone(), field.nullable));
+                output_fields.push(Field::new(
+                    name.clone(),
+                    field.dtype.clone(),
+                    field.nullable,
+                ));
                 outputs.push(StringProjectOutput::Passthrough { source: src });
             }
             return Ok(PhysicalPlan::StringProject {
@@ -3789,12 +3802,8 @@ fn lower_aggregate(
             .enumerate()
             .map(|(i, e)| (output_name_for(e, i), e.clone()))
             .collect();
-        let pre_plan = build_projection_kernel(
-            table,
-            scan_schema,
-            scan_predicate.as_ref(),
-            &named_feed,
-        )?;
+        let pre_plan =
+            build_projection_kernel(table, scan_schema, scan_predicate.as_ref(), &named_feed)?;
         let (pre_kernel, _pre_schema) = match pre_plan {
             PhysicalPlan::Projection {
                 kernel,
@@ -4032,9 +4041,7 @@ fn case_needs_null_output(expr: &Expr) -> bool {
             branches
                 .iter()
                 .any(|(w, t)| case_needs_null_output(w) || case_needs_null_output(t))
-                || else_branch
-                    .as_deref()
-                    .is_some_and(case_needs_null_output)
+                || else_branch.as_deref().is_some_and(case_needs_null_output)
         }
         Expr::Binary { left, right, .. } => {
             case_needs_null_output(left) || case_needs_null_output(right)
@@ -4113,9 +4120,17 @@ fn expr_contains_concat(expr: &Expr) -> bool {
         }
         Expr::Unary { operand, .. } => expr_contains_concat(operand),
         Expr::Alias(inner, _) => expr_contains_concat(inner),
-        Expr::Case { branches, else_branch } => {
-            branches.iter().any(|(w, t)| expr_contains_concat(w) || expr_contains_concat(t))
-                || else_branch.as_deref().map(expr_contains_concat).unwrap_or(false)
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches
+                .iter()
+                .any(|(w, t)| expr_contains_concat(w) || expr_contains_concat(t))
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_concat)
+                    .unwrap_or(false)
         }
         Expr::Like { expr, .. } => expr_contains_concat(expr),
         Expr::Cast { expr, .. } => expr_contains_concat(expr),
@@ -4145,19 +4160,23 @@ fn expr_contains_concat(expr: &Expr) -> bool {
 fn expr_contains_safe_cast(expr: &Expr) -> bool {
     match expr {
         Expr::Cast { expr, safe, .. } => *safe || expr_contains_safe_cast(expr),
-        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => {
-            expr_contains_safe_cast(expr)
-        }
+        Expr::Extract { expr, .. } | Expr::DateTrunc { expr, .. } => expr_contains_safe_cast(expr),
         Expr::Binary { left, right, .. } => {
             expr_contains_safe_cast(left) || expr_contains_safe_cast(right)
         }
         Expr::Unary { operand, .. } => expr_contains_safe_cast(operand),
         Expr::Alias(inner, _) => expr_contains_safe_cast(inner),
-        Expr::Case { branches, else_branch } => {
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
             branches
                 .iter()
                 .any(|(w, t)| expr_contains_safe_cast(w) || expr_contains_safe_cast(t))
-                || else_branch.as_deref().map(expr_contains_safe_cast).unwrap_or(false)
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_safe_cast)
+                    .unwrap_or(false)
         }
         Expr::Like { expr, .. } => expr_contains_safe_cast(expr),
         // A CAST FORMAT is never a safe cast (FORMAT is carried only by plain
@@ -4194,7 +4213,10 @@ fn expr_contains_cast_format(expr: &Expr) -> bool {
         }
         Expr::Unary { operand, .. } => expr_contains_cast_format(operand),
         Expr::Alias(inner, _) => expr_contains_cast_format(inner),
-        Expr::Case { branches, else_branch } => {
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
             branches
                 .iter()
                 .any(|(w, t)| expr_contains_cast_format(w) || expr_contains_cast_format(t))
@@ -4223,9 +4245,7 @@ fn expr_contains_cast_format(expr: &Expr) -> bool {
 fn expr_contains_case(expr: &Expr) -> bool {
     match expr {
         Expr::Case { .. } => true,
-        Expr::Binary { left, right, .. } => {
-            expr_contains_case(left) || expr_contains_case(right)
-        }
+        Expr::Binary { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
         Expr::Unary { operand, .. } => expr_contains_case(operand),
         Expr::Alias(inner, _) => expr_contains_case(inner),
         Expr::Like { expr, .. } => expr_contains_case(expr),
@@ -4316,7 +4336,10 @@ fn expr_contains_scalar_fn(expr: &Expr) -> bool {
         }
         Expr::Unary { operand, .. } => expr_contains_scalar_fn(operand),
         Expr::Alias(inner, _) => expr_contains_scalar_fn(inner),
-        Expr::Case { branches, else_branch } => {
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
             branches
                 .iter()
                 .any(|(w, t)| expr_contains_scalar_fn(w) || expr_contains_scalar_fn(t))
@@ -4374,7 +4397,10 @@ fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
             Expr::Binary { left, right, .. } => walk(left) && walk(right),
             Expr::Unary { operand, .. } => walk(operand),
             Expr::Alias(inner, _) => walk(inner),
-            Expr::Case { branches, else_branch } => {
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 branches.iter().all(|(w, t)| walk(w) && walk(t))
                     && else_branch.as_deref().map(walk).unwrap_or(true)
             }
@@ -4403,7 +4429,10 @@ fn first_scalar_fn_kind(exprs: &[Expr]) -> Option<ScalarFnKind> {
             Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
             Expr::Unary { operand, .. } => walk(operand),
             Expr::Alias(inner, _) => walk(inner),
-            Expr::Case { branches, else_branch } => branches
+            Expr::Case {
+                branches,
+                else_branch,
+            } => branches
                 .iter()
                 .find_map(|(w, t)| walk(w).or_else(|| walk(t)))
                 .or_else(|| else_branch.as_deref().and_then(walk)),
@@ -4607,7 +4636,10 @@ fn try_lower_string_case(
     for e in exprs {
         match peel_aliases(e) {
             Expr::Column(_) => {}
-            Expr::Case { branches, else_branch } => {
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 if e.dtype(scan_schema)? != DataType::Utf8 {
                     // A non-Utf8 CASE rides the GPU `selp` fold — not our path.
                     return Ok(None);
@@ -4619,7 +4651,10 @@ fn try_lower_string_case(
                 let nested = branches
                     .iter()
                     .any(|(w, t)| expr_contains_case(w) || expr_contains_case(t))
-                    || else_branch.as_deref().map(expr_contains_case).unwrap_or(false);
+                    || else_branch
+                        .as_deref()
+                        .map(expr_contains_case)
+                        .unwrap_or(false);
                 if nested {
                     return Ok(None);
                 }
@@ -4637,9 +4672,14 @@ fn try_lower_string_case(
     for e in exprs {
         match peel_aliases(e) {
             Expr::Column(name) => {
-                outputs.push(StringProjectOutput::Passthrough { source: name.clone() });
+                outputs.push(StringProjectOutput::Passthrough {
+                    source: name.clone(),
+                });
             }
-            Expr::Case { branches, else_branch } => {
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 outputs.push(StringProjectOutput::CaseUtf8 {
                     branches: branches.clone(),
                     else_branch: else_branch.clone(),
@@ -4711,7 +4751,10 @@ fn try_lower_string_project(
                     transform,
                 });
             }
-            Expr::ScalarFn { kind: ScalarFnKind::Substring, args } => {
+            Expr::ScalarFn {
+                kind: ScalarFnKind::Substring,
+                args,
+            } => {
                 // SUBSTRING(col FROM start [FOR length]): args are
                 // `[Column, start]` or `[Column, start, length]` where start /
                 // length are integer LITERALS. A non-column source, a non-Utf8
@@ -4749,9 +4792,7 @@ fn try_lower_string_project(
             Expr::ScalarFn { kind, args }
                 if matches!(
                     kind,
-                    ScalarFnKind::TrimBoth
-                        | ScalarFnKind::TrimLeading
-                        | ScalarFnKind::TrimTrailing
+                    ScalarFnKind::TrimBoth | ScalarFnKind::TrimLeading | ScalarFnKind::TrimTrailing
                 ) =>
             {
                 // TRIM/LTRIM/RTRIM(col): only the single-argument
@@ -4770,15 +4811,9 @@ fn try_lower_string_project(
                     return Ok(None);
                 }
                 let mode = match kind {
-                    ScalarFnKind::TrimBoth => {
-                        crate::exec::string_project::TrimMode::Both
-                    }
-                    ScalarFnKind::TrimLeading => {
-                        crate::exec::string_project::TrimMode::Leading
-                    }
-                    ScalarFnKind::TrimTrailing => {
-                        crate::exec::string_project::TrimMode::Trailing
-                    }
+                    ScalarFnKind::TrimBoth => crate::exec::string_project::TrimMode::Both,
+                    ScalarFnKind::TrimLeading => crate::exec::string_project::TrimMode::Leading,
+                    ScalarFnKind::TrimTrailing => crate::exec::string_project::TrimMode::Trailing,
                     // unreachable: the guard restricts `kind` to the three TRIMs.
                     _ => return Ok(None),
                 };
@@ -4788,7 +4823,10 @@ fn try_lower_string_project(
                     transform: StringTransform::Trim { mode },
                 });
             }
-            Expr::ScalarFn { kind: ScalarFnKind::Concat, args } => {
+            Expr::ScalarFn {
+                kind: ScalarFnKind::Concat,
+                args,
+            } => {
                 // CONCAT(col0, col1, ...): >= 2 bare Utf8 column args. Anything
                 // else (a literal arg, a computed arg, a non-Utf8 arg, < 2 args)
                 // bails so the host fallback (expr_agg / string_ops_extended)
@@ -4888,11 +4926,10 @@ fn try_lower_string_like_filter(
         _ => return Ok(None),
     };
     // The pattern must reduce to a supported single-literal-segment shape.
-    let (mode, literal) =
-        match crate::exec::string_like::decompose_like_pattern(pattern, None) {
-            Some(d) => d,
-            None => return Ok(None),
-        };
+    let (mode, literal) = match crate::exec::string_like::decompose_like_pattern(pattern, None) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
     // Require a BARE `Scan` underneath (no intervening Filter / Project that
     // could drop or reorder rows). This guarantees the executed input batch is
     // row-aligned with the source table the executor materialises to fetch the
@@ -5003,11 +5040,7 @@ fn is_scan_chain(plan: &LogicalPlan) -> bool {
 /// caller can drop the Project layer entirely (it would just clone the
 /// input batch as-is). Aliased exprs only count as identity when the alias
 /// happens to match the input column's name.
-fn project_is_identity(
-    exprs: &[Expr],
-    input_schema: &Schema,
-    output_schema: &Schema,
-) -> bool {
+fn project_is_identity(exprs: &[Expr], input_schema: &Schema, output_schema: &Schema) -> bool {
     if exprs.len() != input_schema.fields.len() {
         return false;
     }
@@ -5143,11 +5176,7 @@ fn populate_one_kernel(
         // OR with any pre-existing codegen-set flag. If the kernel was
         // built with an empty `input_has_validity` (legacy path) this
         // simplifies to just `provider_says`.
-        let existing = kernel
-            .input_has_validity
-            .get(i)
-            .copied()
-            .unwrap_or(false);
+        let existing = kernel.input_has_validity.get(i).copied().unwrap_or(false);
         flags.push(existing || provider_says);
     }
     kernel.input_has_validity = flags;
@@ -5217,7 +5246,10 @@ fn populate_aggregate_spec(
 /// rather than "silently eager on GPU".
 fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
     match e {
-        Expr::Extract { .. } | Expr::DateTrunc { .. } | Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        Expr::Extract { .. }
+        | Expr::DateTrunc { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. } => false,
         // Column refs and literals never fault.
         Expr::Column(_) | Expr::Literal(_) => true,
         Expr::Binary { op, left, right } => {
@@ -5266,8 +5298,7 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
             else_branch,
         } => {
             branches.iter().all(|(w, t)| {
-                expr_eager_safe_under_shortcircuit(w)
-                    && expr_eager_safe_under_shortcircuit(t)
+                expr_eager_safe_under_shortcircuit(w) && expr_eager_safe_under_shortcircuit(t)
             }) && else_branch
                 .as_deref()
                 .map_or(true, expr_eager_safe_under_shortcircuit)
@@ -5314,8 +5345,7 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
             {
                 return true;
             }
-            expr_has_unsafe_eager_shortcircuit(left)
-                || expr_has_unsafe_eager_shortcircuit(right)
+            expr_has_unsafe_eager_shortcircuit(left) || expr_has_unsafe_eager_shortcircuit(right)
         }
         Expr::Alias(inner, _) => expr_has_unsafe_eager_shortcircuit(inner),
         Expr::Unary { operand, .. } => expr_has_unsafe_eager_shortcircuit(operand),
@@ -5324,8 +5354,7 @@ fn expr_has_unsafe_eager_shortcircuit(e: &Expr) -> bool {
             else_branch,
         } => {
             branches.iter().any(|(w, t)| {
-                expr_has_unsafe_eager_shortcircuit(w)
-                    || expr_has_unsafe_eager_shortcircuit(t)
+                expr_has_unsafe_eager_shortcircuit(w) || expr_has_unsafe_eager_shortcircuit(t)
             }) || else_branch
                 .as_deref()
                 .is_some_and(expr_has_unsafe_eager_shortcircuit)
@@ -5415,7 +5444,13 @@ fn kernel_has_unsafe_eager_shortcircuit(kernel: &KernelSpec) -> bool {
         }
     }
     let has_logical = kernel.ops.iter().any(|op| {
-        matches!(op, Op::Binary { op: BinaryOp::And | BinaryOp::Or, .. })
+        matches!(
+            op,
+            Op::Binary {
+                op: BinaryOp::And | BinaryOp::Or,
+                ..
+            }
+        )
     });
     let has_unsafe = kernel.ops.iter().any(|op| !op_eager_safe(op));
     has_logical && has_unsafe
@@ -5449,9 +5484,7 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
     fn walk(plan: &PhysicalPlan) -> bool {
         match plan {
             PhysicalPlan::Projection { kernel, .. } => check_kernel(kernel),
-            PhysicalPlan::Aggregate { pre, .. } => {
-                pre.as_ref().map(check_kernel).unwrap_or(false)
-            }
+            PhysicalPlan::Aggregate { pre, .. } => pre.as_ref().map(check_kernel).unwrap_or(false),
             // Host-side Filter / Project (the PL-C2 fallback target) evaluate
             // their exprs row-by-row with correct short-circuit semantics, so
             // their predicate / SELECT exprs are NOT flagged. Still recurse to
@@ -5471,12 +5504,9 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             PhysicalPlan::Join {
                 left, right, on, ..
             } => {
-                on.iter()
-                    .any(|(l, r)| {
-                        expr_has_unsafe_eager_shortcircuit(l)
-                            || expr_has_unsafe_eager_shortcircuit(r)
-                    })
-                    || walk(left)
+                on.iter().any(|(l, r)| {
+                    expr_has_unsafe_eager_shortcircuit(l) || expr_has_unsafe_eager_shortcircuit(r)
+                }) || walk(left)
                     || walk(right)
             }
             // No expression IR to inspect: outputs are bare passthrough /
@@ -5609,10 +5639,15 @@ fn logical_plan_contains_unsupported_cast_target(plan: &LogicalPlan) -> Option<D
             // flagged as an unsupported GPU cast. Only recurse into its inner.
             Expr::CastFormat { expr, .. } => expr_bad_cast(expr),
             Expr::Column(_) | Expr::Literal(_) => None,
-            Expr::Binary { left, right, .. } => expr_bad_cast(left).or_else(|| expr_bad_cast(right)),
+            Expr::Binary { left, right, .. } => {
+                expr_bad_cast(left).or_else(|| expr_bad_cast(right))
+            }
             Expr::Unary { operand, .. } => expr_bad_cast(operand),
             Expr::Alias(inner, _) => expr_bad_cast(inner),
-            Expr::Case { branches, else_branch } => {
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 for (w, t) in branches {
                     if let Some(d) = expr_bad_cast(w).or_else(|| expr_bad_cast(t)) {
                         return Some(d);
@@ -5962,7 +5997,8 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     "string scalar function{} is not yet lowered to GPU; the GPU \
                      codegen exists in jit::string_kernel but is not yet wired \
                      into the executor (coming in a follow-up)",
-                    kind.map(|k| format!(" {}", k.sql_name())).unwrap_or_default()
+                    kind.map(|k| format!(" {}", k.sql_name()))
+                        .unwrap_or_default()
                 )));
             }
             // `SELECT <cols> FROM t WHERE <col> LIKE 'pattern'` over a non-dict
@@ -6046,9 +6082,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             // Utf8 columns never reach here as `Expr::Like` (the dictionary
             // rewrite already turned them into integer OR-of-equalities). See
             // `try_lower_string_like_filter`.
-            if let Some(like_filter) =
-                try_lower_string_like_filter(input, predicate, depth)?
-            {
+            if let Some(like_filter) = try_lower_string_like_filter(input, predicate, depth)? {
                 return Ok(like_filter);
             }
             // String equality/inequality on a Utf8 column that survived the
@@ -6233,9 +6267,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
         }
         LogicalPlan::Union { inputs } => {
             if inputs.is_empty() {
-                return Err(BoltError::Plan(
-                    "UNION requires at least one input".into(),
-                ));
+                return Err(BoltError::Plan("UNION requires at least one input".into()));
             }
             let mut lowered: Vec<PhysicalPlan> = Vec::with_capacity(inputs.len());
             for branch in inputs {
@@ -6278,11 +6310,8 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             // currently supported below a Join the two agree. Using the
             // physical sides keeps the stored schema in lock-step with
             // what the executor will actually see at run time.
-            let output_schema = join_combined_schema(
-                l.output_schema(),
-                r.output_schema(),
-                *join_type,
-            );
+            let output_schema =
+                join_combined_schema(l.output_schema(), r.output_schema(), *join_type);
             Ok(PhysicalPlan::Join {
                 left: Box::new(l),
                 right: Box::new(r),
@@ -6384,19 +6413,13 @@ mod tests {
         fn decimal_arith_matches_logical_across_matrix() {
             let precisions: [u8; 5] = [1, 5, 19, 37, 38];
             let scales: [i8; 4] = [0, 2, 18, 38];
-            let ops = [
-                BinaryOp::Add,
-                BinaryOp::Sub,
-                BinaryOp::Mul,
-                BinaryOp::Div,
-            ];
+            let ops = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div];
             for &op in &ops {
                 for &p1 in &precisions {
                     for &s1 in &scales {
                         for &p2 in &precisions {
                             for &s2 in &scales {
-                                let phys =
-                                    decimal128_arith_result_dtype(op, (p1, s1), (p2, s2));
+                                let phys = decimal128_arith_result_dtype(op, (p1, s1), (p2, s2));
                                 let logi = logical_decimal(
                                     op,
                                     DataType::Decimal128(p1, s1),
@@ -6449,10 +6472,9 @@ mod tests {
                         let logi = logical_temporal(op, l, r);
                         match (phys, logi) {
                             (Ok(None), None) => {}
-                            (Ok(Some(pd)), Some(Ok(ld))) => assert_eq!(
-                                pd, ld,
-                                "temporal {op:?} ({l:?},{r:?}) value drift"
-                            ),
+                            (Ok(Some(pd)), Some(Ok(ld))) => {
+                                assert_eq!(pd, ld, "temporal {op:?} ({l:?},{r:?}) value drift")
+                            }
                             (Err(_), Some(Err(_))) => {}
                             (phys, logi) => panic!(
                                 "temporal {op:?} ({l:?},{r:?}) shape drift: \
@@ -6491,10 +6513,7 @@ mod tests {
         // aggregate output name `sum_v`.
         let project = LogicalPlan::Project {
             input: Box::new(aggregate),
-            exprs: vec![
-                Expr::Column("k".into()),
-                Expr::Column("sum_v".into()),
-            ],
+            exprs: vec![Expr::Column("k".into()), Expr::Column("sum_v".into())],
         };
         // HAVING SUM(v) > 10 — the SQL frontend rewrites the SUM(v) call into
         // a reference to the aggregate-output column `sum_v`.
@@ -6763,7 +6782,10 @@ mod tests {
                         assert!(
                             matches!(
                                 left.as_ref(),
-                                Expr::Binary { op: BinaryOp::Concat, .. }
+                                Expr::Binary {
+                                    op: BinaryOp::Concat,
+                                    ..
+                                }
                             ),
                             "LHS must be a Concat, got: {left:?}",
                         );
@@ -6775,9 +6797,7 @@ mod tests {
                     other => panic!("predicate not preserved: {other:?}"),
                 }
             }
-            other => panic!(
-                "expected PhysicalPlan::Filter for WHERE-|| predicate, got {other:?}"
-            ),
+            other => panic!("expected PhysicalPlan::Filter for WHERE-|| predicate, got {other:?}"),
         }
     }
 
@@ -6862,8 +6882,7 @@ mod tests {
             input: Box::new(scan),
             predicate: pred,
         };
-        let phys = lower(&plan)
-            .expect("WHERE v > 0 AND a || b = 'foo' must lower cleanly in v0.7");
+        let phys = lower(&plan).expect("WHERE v > 0 AND a || b = 'foo' must lower cleanly in v0.7");
         assert!(
             matches!(phys, PhysicalPlan::Filter { .. }),
             "expected PhysicalPlan::Filter for AND-wrapped concat predicate, got {phys:?}",
@@ -7844,10 +7863,12 @@ mod tests {
                     right: Box::new(Expr::Column("c".into())),
                 }),
             };
-            assert!(super::super::expr_has_unsafe_eager_shortcircuit(&in_subquery(probe)));
-            assert!(!super::super::expr_has_unsafe_eager_shortcircuit(&in_subquery(
-                Expr::Column("a".into())
-            )));
+            assert!(super::super::expr_has_unsafe_eager_shortcircuit(
+                &in_subquery(probe)
+            ));
+            assert!(!super::super::expr_has_unsafe_eager_shortcircuit(
+                &in_subquery(Expr::Column("a".into()))
+            ));
         }
 
         /// `case_needs_null_output` must see a NULL-output CASE (no ELSE) inside
@@ -7857,10 +7878,7 @@ mod tests {
             // `CASE WHEN a THEN 1 END` — no ELSE → SQL NULL on the unmatched
             // path, which the GPU `selp` case emitter cannot represent.
             let probe = Expr::Case {
-                branches: vec![(
-                    Expr::Column("a".into()),
-                    Expr::Literal(Literal::Int64(1)),
-                )],
+                branches: vec![(Expr::Column("a".into()), Expr::Literal(Literal::Int64(1)))],
                 else_branch: None,
             };
             assert!(super::super::case_needs_null_output(&in_subquery(probe)));
@@ -7946,15 +7964,15 @@ mod tests {
             let sch = schema();
             let mut cg = Codegen::new(&sch);
             let case = Expr::Case {
-                branches: vec![(
-                    Expr::Column("flag".into()),
-                    Expr::Column("d1".into()),
-                )],
+                branches: vec![(Expr::Column("flag".into()), Expr::Column("d1".into()))],
                 else_branch: Some(Box::new(Expr::Column("d2".into()))),
             };
             let v = cg.emit_expr(&case).expect("emit CASE decimal");
             assert_eq!(v.dtype, dec(10, 2), "CASE result dtype preserved");
-            assert!(v.hi_reg.is_some(), "Decimal CASE result must be a (lo, hi) pair");
+            assert!(
+                v.hi_reg.is_some(),
+                "Decimal CASE result must be a (lo, hi) pair"
+            );
             let n_select128 = cg
                 .ops
                 .iter()
@@ -7976,10 +7994,7 @@ mod tests {
             let sch = schema();
             let mut cg = Codegen::new(&sch);
             let case = Expr::Case {
-                branches: vec![(
-                    Expr::Column("flag".into()),
-                    Expr::Column("d1".into()),
-                )],
+                branches: vec![(Expr::Column("flag".into()), Expr::Column("d1".into()))],
                 else_branch: None,
             };
             let err = cg.emit_expr(&case).unwrap_err();
@@ -7996,10 +8011,7 @@ mod tests {
             let sch = schema();
             let mut cg = Codegen::new(&sch);
             let case = Expr::Case {
-                branches: vec![(
-                    Expr::Column("flag".into()),
-                    Expr::Literal(Literal::Null),
-                )],
+                branches: vec![(Expr::Column("flag".into()), Expr::Literal(Literal::Null))],
                 else_branch: Some(Box::new(Expr::Column("d1".into()))),
             };
             let err = cg.emit_expr(&case).unwrap_err();
@@ -8018,7 +8030,10 @@ mod tests {
             assert_eq!(v.dtype, dec(10, 2));
             assert!(v.hi_reg.is_some(), "decimal result is a (lo, hi) pair");
             assert_eq!(
-                cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
+                cg.ops
+                    .iter()
+                    .filter(|o| matches!(o, Op::F64ToI128 { .. }))
+                    .count(),
                 1,
                 "one F64ToI128 for the float->decimal conversion"
             );
@@ -8026,7 +8041,11 @@ mod tests {
             assert!(
                 cg.ops.iter().any(|o| matches!(
                     o,
-                    Op::Binary { op: crate::plan::logical_plan::BinaryOp::Mul, dtype: DataType::Float64, .. }
+                    Op::Binary {
+                        op: crate::plan::logical_plan::BinaryOp::Mul,
+                        dtype: DataType::Float64,
+                        ..
+                    }
                 )),
                 "expected a Float64 scale multiply by 10^s"
             );
@@ -8043,10 +8062,17 @@ mod tests {
             assert_eq!(v.dtype, dec(10, 2));
             assert!(cg.ops.iter().any(|o| matches!(
                 o,
-                Op::Cast { from: DataType::Float32, to: DataType::Float64, .. }
+                Op::Cast {
+                    from: DataType::Float32,
+                    to: DataType::Float64,
+                    ..
+                }
             )));
             assert_eq!(
-                cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
+                cg.ops
+                    .iter()
+                    .filter(|o| matches!(o, Op::F64ToI128 { .. }))
+                    .count(),
                 1
             );
         }
@@ -8061,14 +8087,21 @@ mod tests {
             let v = cg.emit_expr(&cast).expect("emit CAST dec->f64");
             assert_eq!(v.dtype, DataType::Float64);
             assert_eq!(
-                cg.ops.iter().filter(|o| matches!(o, Op::I128ToF64 { .. })).count(),
+                cg.ops
+                    .iter()
+                    .filter(|o| matches!(o, Op::I128ToF64 { .. }))
+                    .count(),
                 1,
                 "one I128ToF64 for the decimal->float conversion"
             );
             assert!(
                 cg.ops.iter().any(|o| matches!(
                     o,
-                    Op::Binary { op: crate::plan::logical_plan::BinaryOp::Div, dtype: DataType::Float64, .. }
+                    Op::Binary {
+                        op: crate::plan::logical_plan::BinaryOp::Div,
+                        dtype: DataType::Float64,
+                        ..
+                    }
                 )),
                 "expected a Float64 divide by 10^s"
             );
@@ -8086,7 +8119,11 @@ mod tests {
             assert!(cg.ops.iter().any(|o| matches!(o, Op::I128ToF64 { .. })));
             assert!(cg.ops.iter().any(|o| matches!(
                 o,
-                Op::Cast { from: DataType::Float64, to: DataType::Float32, .. }
+                Op::Cast {
+                    from: DataType::Float64,
+                    to: DataType::Float32,
+                    ..
+                }
             )));
         }
 
@@ -8100,12 +8137,19 @@ mod tests {
             assert!(
                 !cg.ops.iter().any(|o| matches!(
                     o,
-                    Op::Binary { op: crate::plan::logical_plan::BinaryOp::Mul, dtype: DataType::Float64, .. }
+                    Op::Binary {
+                        op: crate::plan::logical_plan::BinaryOp::Mul,
+                        dtype: DataType::Float64,
+                        ..
+                    }
                 )),
                 "scale-0 decimal target must not emit a 10^0 multiply"
             );
             assert_eq!(
-                cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
+                cg.ops
+                    .iter()
+                    .filter(|o| matches!(o, Op::F64ToI128 { .. }))
+                    .count(),
                 1
             );
         }
@@ -8118,7 +8162,7 @@ mod tests {
     /// the shift count normalised to Int32).
     mod integer_op_lowering {
         use super::super::{op_is_integer, op_is_shift, Codegen, Op};
-        use crate::plan::logical_plan::{col, BinaryOp, DataType, Expr, Field, Schema};
+        use crate::plan::logical_plan::{col, BinaryOp, DataType, Field, Schema};
 
         fn schema() -> Schema {
             Schema::new(vec![
@@ -8134,12 +8178,23 @@ mod tests {
         fn mod_int32_lowers_to_op_binary_mod() {
             let sch = schema();
             let mut cg = Codegen::new(&sch);
-            let v = cg.emit_expr(&col("a").modulo(col("b"))).expect("emit a % b");
+            let v = cg
+                .emit_expr(&col("a").modulo(col("b")))
+                .expect("emit a % b");
             assert_eq!(v.dtype, DataType::Int32);
-            assert!(cg.ops.iter().any(|o| matches!(
-                o,
-                Op::Binary { op: BinaryOp::Mod, dtype: DataType::Int32, result_dtype: DataType::Int32, .. }
-            )), "expected Op::Binary Mod Int32, got {:?}", cg.ops);
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary {
+                        op: BinaryOp::Mod,
+                        dtype: DataType::Int32,
+                        result_dtype: DataType::Int32,
+                        ..
+                    }
+                )),
+                "expected Op::Binary Mod Int32, got {:?}",
+                cg.ops
+            );
         }
 
         /// Mixed-width `a % c` (Int32 % Int64) unifies to Int64: the operand
@@ -8148,12 +8203,23 @@ mod tests {
         fn mod_mixed_width_widens_to_int64() {
             let sch = schema();
             let mut cg = Codegen::new(&sch);
-            let v = cg.emit_expr(&col("a").modulo(col("c"))).expect("emit a % c");
+            let v = cg
+                .emit_expr(&col("a").modulo(col("c")))
+                .expect("emit a % c");
             assert_eq!(v.dtype, DataType::Int64);
-            assert!(cg.ops.iter().any(|o| matches!(
-                o,
-                Op::Binary { op: BinaryOp::Mod, dtype: DataType::Int64, result_dtype: DataType::Int64, .. }
-            )), "expected Op::Binary Mod Int64, got {:?}", cg.ops);
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary {
+                        op: BinaryOp::Mod,
+                        dtype: DataType::Int64,
+                        result_dtype: DataType::Int64,
+                        ..
+                    }
+                )),
+                "expected Op::Binary Mod Int64, got {:?}",
+                cg.ops
+            );
         }
 
         /// Each bitwise op lowers to its `Op::Binary` variant at the unified
@@ -8170,7 +8236,9 @@ mod tests {
                 let v = cg.emit_expr(&build).expect("emit bitwise");
                 assert_eq!(v.dtype, DataType::Int32);
                 assert!(
-                    cg.ops.iter().any(|o| matches!(o, Op::Binary { op, .. } if *op == want)),
+                    cg.ops
+                        .iter()
+                        .any(|o| matches!(o, Op::Binary { op, .. } if *op == want)),
                     "expected Op::Binary {want:?}, got {:?}",
                     cg.ops
                 );
@@ -8186,10 +8254,19 @@ mod tests {
             let mut cg = Codegen::new(&sch);
             let v = cg.emit_expr(&col("c").shl(col("a"))).expect("emit c << a");
             assert_eq!(v.dtype, DataType::Int64);
-            assert!(cg.ops.iter().any(|o| matches!(
-                o,
-                Op::Binary { op: BinaryOp::Shl, dtype: DataType::Int64, result_dtype: DataType::Int64, .. }
-            )), "expected Op::Binary Shl Int64, got {:?}", cg.ops);
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary {
+                        op: BinaryOp::Shl,
+                        dtype: DataType::Int64,
+                        result_dtype: DataType::Int64,
+                        ..
+                    }
+                )),
+                "expected Op::Binary Shl Int64, got {:?}",
+                cg.ops
+            );
         }
 
         /// `a << c` (Int32 << Int64): result is Int32 and the Int64 count is
@@ -8201,14 +8278,30 @@ mod tests {
             let mut cg = Codegen::new(&sch);
             let v = cg.emit_expr(&col("a").shr(col("c"))).expect("emit a >> c");
             assert_eq!(v.dtype, DataType::Int32);
-            assert!(cg.ops.iter().any(|o| matches!(
-                o,
-                Op::Cast { to: DataType::Int32, .. }
-            )), "expected shift count cast to Int32, got {:?}", cg.ops);
-            assert!(cg.ops.iter().any(|o| matches!(
-                o,
-                Op::Binary { op: BinaryOp::Shr, dtype: DataType::Int32, result_dtype: DataType::Int32, .. }
-            )), "expected Op::Binary Shr Int32, got {:?}", cg.ops);
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Cast {
+                        to: DataType::Int32,
+                        ..
+                    }
+                )),
+                "expected shift count cast to Int32, got {:?}",
+                cg.ops
+            );
+            assert!(
+                cg.ops.iter().any(|o| matches!(
+                    o,
+                    Op::Binary {
+                        op: BinaryOp::Shr,
+                        dtype: DataType::Int32,
+                        result_dtype: DataType::Int32,
+                        ..
+                    }
+                )),
+                "expected Op::Binary Shr Int32, got {:?}",
+                cg.ops
+            );
         }
 
         /// Classifier sanity: the integer ops are recognised, shifts are a

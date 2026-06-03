@@ -78,7 +78,12 @@ fn push_plan(plan: LogicalPlan) -> LogicalPlan {
 /// only needs to cover the remaining variants' children.
 fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => LogicalPlan::Window {
             input: Box::new(push_plan(*input)),
             window_exprs,
             partition_by,
@@ -135,7 +140,12 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             filter,
         },
         // EXCEPT / INTERSECT: no own predicate to push; recurse into inputs.
-        LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => LogicalPlan::SetOp {
             left: Box::new(push_plan(*left)),
             right: Box::new(push_plan(*right)),
             op,
@@ -170,7 +180,10 @@ fn push_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> LogicalPlan {
 
         // Through a projection: split conjuncts into ones referencing only
         // pass-through columns (rewritten + pushed) and the rest (kept above).
-        LogicalPlan::Project { input: proj_in, exprs } => {
+        LogicalPlan::Project {
+            input: proj_in,
+            exprs,
+        } => {
             let passthrough = passthrough_map(&exprs);
             let mut pushable = Vec::new();
             let mut kept = Vec::new();
@@ -193,7 +206,10 @@ fn push_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> LogicalPlan {
         }
 
         // Through value/row-preserving wrappers: push everything below.
-        LogicalPlan::Sort { input: inner, sort_exprs } => {
+        LogicalPlan::Sort {
+            input: inner,
+            sort_exprs,
+        } => {
             let pushed = push_conjuncts(*inner, conjuncts);
             LogicalPlan::Sort {
                 input: Box::new(pushed),
@@ -213,9 +229,12 @@ fn push_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> LogicalPlan {
 
         // Through EXCEPT / INTERSECT (incl. their ALL variants): replicate the
         // (per-branch remapped) predicate into both inputs.
-        LogicalPlan::SetOp { left, right, op, all } => {
-            push_into_setop(left, right, op, all, conjuncts)
-        }
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => push_into_setop(left, right, op, all, conjuncts),
 
         // Into a join: route single-side conjuncts to the owning input.
         LogicalPlan::Join {
@@ -368,7 +387,12 @@ fn push_into_setop(
     let out_schema = match left.schema() {
         Ok(s) => s,
         Err(_) => {
-            let set_op = LogicalPlan::SetOp { left, right, op, all };
+            let set_op = LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            };
             return wrap_filter(set_op, conjuncts);
         }
     };
@@ -379,7 +403,12 @@ fn push_into_setop(
         (Some(l), Some(r)) => (l, r),
         // A branch we can't remap (malformed plan): keep the filter above.
         _ => {
-            let set_op = LogicalPlan::SetOp { left, right, op, all };
+            let set_op = LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            };
             return wrap_filter(set_op, conjuncts);
         }
     };
@@ -550,14 +579,25 @@ fn rewrite_through_project(
 }
 
 /// Deep-copy `expr`, renaming any `Column(c)` to `Column(map[c])` when present.
-fn rename_columns(
-    expr: &Expr,
-    map: &std::collections::HashMap<String, String>,
-) -> Expr {
+fn rename_columns(expr: &Expr, map: &std::collections::HashMap<String, String>) -> Expr {
     match expr {
-        Expr::Extract { field, expr } => Expr::Extract { field: *field, expr: Box::new(rename_columns(expr, map)) },
-        Expr::DateTrunc { unit, expr } => Expr::DateTrunc { unit: *unit, expr: Box::new(rename_columns(expr, map)) },
-        Expr::InSubquery { expr, subquery, negated } => Expr::InSubquery { expr: Box::new(rename_columns(expr, map)), subquery: subquery.clone(), negated: *negated },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field: *field,
+            expr: Box::new(rename_columns(expr, map)),
+        },
+        Expr::DateTrunc { unit, expr } => Expr::DateTrunc {
+            unit: *unit,
+            expr: Box::new(rename_columns(expr, map)),
+        },
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(rename_columns(expr, map)),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
         Expr::ScalarSubquery(_) => expr.clone(),
         Expr::Column(c) => Expr::Column(map.get(c).cloned().unwrap_or_else(|| c.clone())),
         Expr::Literal(_) => expr.clone(),
@@ -600,7 +640,12 @@ fn rename_columns(
             target: *target,
             safe: *safe,
         },
-        Expr::CastFormat { expr, target, pattern, to_text } => Expr::CastFormat {
+        Expr::CastFormat {
+            expr,
+            target,
+            pattern,
+            to_text,
+        } => Expr::CastFormat {
             expr: Box::new(rename_columns(expr, map)),
             target: *target,
             pattern: pattern.clone(),
@@ -610,9 +655,7 @@ fn rename_columns(
             kind: *kind,
             args: args.iter().map(|a| rename_columns(a, map)).collect(),
         },
-        Expr::Alias(inner, name) => {
-            Expr::Alias(Box::new(rename_columns(inner, map)), name.clone())
-        }
+        Expr::Alias(inner, name) => Expr::Alias(Box::new(rename_columns(inner, map)), name.clone()),
     }
 }
 
@@ -668,8 +711,10 @@ mod tests {
         assert_eq!(before.fields.len(), after.fields.len());
         match out {
             LogicalPlan::Project { input, .. } => {
-                assert!(matches!(*input, LogicalPlan::Filter { .. }),
-                    "filter should now sit below the project");
+                assert!(
+                    matches!(*input, LogicalPlan::Filter { .. }),
+                    "filter should now sit below the project"
+                );
             }
             other => panic!("expected Project on top, got {other:?}"),
         }
@@ -715,10 +760,14 @@ mod tests {
         // Top node is the join (no residual filter left above it).
         match out {
             LogicalPlan::Join { left, right, .. } => {
-                assert!(matches!(*left, LogicalPlan::Filter { .. }),
-                    "a > 0 should land on the left input");
-                assert!(matches!(*right, LogicalPlan::Filter { .. }),
-                    "b < 10 should land on the right input");
+                assert!(
+                    matches!(*left, LogicalPlan::Filter { .. }),
+                    "a > 0 should land on the left input"
+                );
+                assert!(
+                    matches!(*right, LogicalPlan::Filter { .. }),
+                    "b < 10 should land on the right input"
+                );
             }
             other => panic!("expected Join on top, got {other:?}"),
         }
@@ -745,8 +794,10 @@ mod tests {
             },
         };
         let out = PredicatePushdown.rewrite(plan).expect("push");
-        assert!(matches!(out, LogicalPlan::Filter { .. }),
-            "cross-side conjunct stays above the join");
+        assert!(
+            matches!(out, LogicalPlan::Filter { .. }),
+            "cross-side conjunct stays above the join"
+        );
     }
 
     #[test]
@@ -766,8 +817,10 @@ mod tests {
             predicate: col("b").gt(lit(0_i64)),
         };
         let out = PredicatePushdown.rewrite(plan).expect("push");
-        assert!(matches!(out, LogicalPlan::Filter { .. }),
-            "right-side filter must stay above a LEFT join");
+        assert!(
+            matches!(out, LogicalPlan::Filter { .. }),
+            "right-side filter must stay above a LEFT join"
+        );
     }
 
     #[test]
@@ -820,8 +873,10 @@ mod tests {
             LogicalPlan::Union { inputs } => {
                 assert_eq!(inputs.len(), 2);
                 for branch in &inputs {
-                    assert!(matches!(branch, LogicalPlan::Filter { .. }),
-                        "each union branch should now carry the pushed Filter");
+                    assert!(
+                        matches!(branch, LogicalPlan::Filter { .. }),
+                        "each union branch should now carry the pushed Filter"
+                    );
                 }
             }
             other => panic!("expected Union on top with no residual Filter, got {other:?}"),
@@ -866,8 +921,11 @@ mod tests {
                 loop {
                     match node {
                         LogicalPlan::Filter { predicate, input } => {
-                            assert_eq!(cols_of(predicate), vec!["x".to_string()],
-                                "branch 1 predicate must be remapped to `x` by position");
+                            assert_eq!(
+                                cols_of(predicate),
+                                vec!["x".to_string()],
+                                "branch 1 predicate must be remapped to `x` by position"
+                            );
                             found_x = true;
                             node = input.as_ref();
                         }
@@ -898,12 +956,18 @@ mod tests {
         };
         let out = PredicatePushdown.rewrite(plan).expect("push");
         match out {
-            LogicalPlan::SetOp { left, right, op, .. } => {
+            LogicalPlan::SetOp {
+                left, right, op, ..
+            } => {
                 assert_eq!(op, SetOpKind::Except);
-                assert!(matches!(*left, LogicalPlan::Filter { .. }),
-                    "EXCEPT left input should carry the pushed Filter");
-                assert!(matches!(*right, LogicalPlan::Filter { .. }),
-                    "EXCEPT right input should carry the pushed Filter");
+                assert!(
+                    matches!(*left, LogicalPlan::Filter { .. }),
+                    "EXCEPT left input should carry the pushed Filter"
+                );
+                assert!(
+                    matches!(*right, LogicalPlan::Filter { .. }),
+                    "EXCEPT right input should carry the pushed Filter"
+                );
             }
             other => panic!("expected SetOp on top with no residual Filter, got {other:?}"),
         }
@@ -926,7 +990,12 @@ mod tests {
         };
         let out = PredicatePushdown.rewrite(plan).expect("push");
         match out {
-            LogicalPlan::SetOp { left, right, op, all } => {
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => {
                 assert_eq!(op, SetOpKind::Intersect);
                 assert!(all, "ALL flag must be preserved");
                 assert!(matches!(*left, LogicalPlan::Filter { .. }));
@@ -947,7 +1016,9 @@ mod tests {
             predicate: col("a").gt(lit(0_i64)),
         };
         let out = PredicatePushdown.rewrite(plan).expect("push");
-        assert!(matches!(out, LogicalPlan::Filter { .. }),
-            "filter must remain above a Limit");
+        assert!(
+            matches!(out, LogicalPlan::Filter { .. }),
+            "filter must remain above a Limit"
+        );
     }
 }

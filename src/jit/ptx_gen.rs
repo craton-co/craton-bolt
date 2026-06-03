@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen: lower a `KernelSpec` into a complete PTX module string.
 
@@ -277,8 +277,11 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     emit_fmt!(b, "mad.lo.s32 {}, {}, {}, {};", tid, ctaid, ntid, tid_x)?;
     // `n_rows_param_name` borrows all of `&b`, which would overlap the
     // `&mut b.body` inside the macro — compute it into a local first.
-    let n_rows_param =
-        b.n_rows_param_name(spec.inputs.len(), spec.outputs.len(), n_extra_validity_params);
+    let n_rows_param = b.n_rows_param_name(
+        spec.inputs.len(),
+        spec.outputs.len(),
+        n_extra_validity_params,
+    );
     emit_fmt!(b, "ld.param.u32 {}, [{}];", n_rows, n_rows_param)?;
     emit_fmt!(b, "setp.ge.u32 {}, {}, {};", pred_oob, tid, n_rows)?;
     emit_fmt!(b, "@{} bra DONE;", pred_oob)?;
@@ -524,7 +527,11 @@ fn emit_op(
     tid: &str,
 ) -> BoltResult<()> {
     match op {
-        Op::LoadColumn { dst, col_idx, dtype } => emit_load(b, *dst, *col_idx, *dtype, input_ptrs, tid),
+        Op::LoadColumn {
+            dst,
+            col_idx,
+            dtype,
+        } => emit_load(b, *dst, *col_idx, *dtype, input_ptrs, tid),
         Op::Const { dst, lit } => emit_const(b, *dst, lit),
         Op::Cast { dst, src, from, to } => emit_cast(b, *dst, *src, *from, *to),
         Op::Binary {
@@ -535,12 +542,23 @@ fn emit_op(
             dtype,
             result_dtype,
         } => emit_binary(b, *dst, *op, *lhs, *rhs, *dtype, *result_dtype),
-        Op::Store { src, col_idx, dtype } => emit_store(b, *src, *col_idx, *dtype, output_ptrs, tid),
+        Op::Store {
+            src,
+            col_idx,
+            dtype,
+        } => emit_store(b, *src, *col_idx, *dtype, output_ptrs, tid),
         Op::IsNullCheck {
             dst,
             validity_input,
             want_null,
-        } => emit_is_null_check(b, *dst, *validity_input, *want_null, input_validity_ptrs, tid),
+        } => emit_is_null_check(
+            b,
+            *dst,
+            *validity_input,
+            *want_null,
+            input_validity_ptrs,
+            tid,
+        ),
         Op::Select {
             dst,
             cond,
@@ -633,13 +651,19 @@ fn emit_op(
             then_hi,
             else_lo,
             else_hi,
-        } => emit_select_128(b, *dst_lo, *dst_hi, *cond, *then_lo, *then_hi, *else_lo, *else_hi),
-        Op::F64ToI128 { dst_lo, dst_hi, src } => {
-            emit_f64_to_i128(b, *dst_lo, *dst_hi, *src)
-        }
-        Op::I128ToF64 { dst, src_lo, src_hi } => {
-            emit_i128_to_f64(b, *dst, *src_lo, *src_hi)
-        }
+        } => emit_select_128(
+            b, *dst_lo, *dst_hi, *cond, *then_lo, *then_hi, *else_lo, *else_hi,
+        ),
+        Op::F64ToI128 {
+            dst_lo,
+            dst_hi,
+            src,
+        } => emit_f64_to_i128(b, *dst_lo, *dst_hi, *src),
+        Op::I128ToF64 {
+            dst,
+            src_lo,
+            src_hi,
+        } => emit_i128_to_f64(b, *dst, *src_lo, *src_hi),
     }
 }
 
@@ -1506,7 +1530,11 @@ pub(crate) fn f64_to_i128_saturating(x: f64) -> i128 {
     // Step 6: reassemble the unsigned magnitude, then two's-complement negate
     // the 128-bit pair iff the original value was negative.
     let mag_u128 = ((hi_limb as u128) << 64) | (lo_limb as u128);
-    let bits = if neg { mag_u128.wrapping_neg() } else { mag_u128 };
+    let bits = if neg {
+        mag_u128.wrapping_neg()
+    } else {
+        mag_u128
+    };
     bits as i128
 }
 
@@ -1605,7 +1633,11 @@ fn emit_is_null_check(
     // match the existing Bool ABI (see `RegAlloc::class_for(Bool)`).
     let dst_name = b.alloc.assign(dst, DataType::Bool)?;
     let pred = b.alloc.alloc("p");
-    let cmp = if want_null { "setp.eq.u32" } else { "setp.ne.u32" };
+    let cmp = if want_null {
+        "setp.eq.u32"
+    } else {
+        "setp.ne.u32"
+    };
     emit_fmt!(b, "{} {}, {}, 0;", cmp, pred, byte_reg)?;
     emit_fmt!(b, "selp.s32 {}, 1, 0, {};", dst_name, pred)?;
     Ok(())
@@ -1875,11 +1907,7 @@ fn emit_cast(
                 // both sides so the register class stays consistent.
                 Date32 => "s32",
                 Timestamp(_, _) => "s64",
-                Utf8 => {
-                    return Err(BoltError::Other(
-                        "ptx_gen: cannot cast Utf8".into(),
-                    ))
-                }
+                Utf8 => return Err(BoltError::Other("ptx_gen: cannot cast Utf8".into())),
                 Decimal128(_, _) => {
                     return Err(BoltError::Plan(
                         "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
@@ -1939,9 +1967,7 @@ fn emit_cast(
         (Float64, Int64) => format!("cvt.rzi.s64.f64 {}, {};", dst_name, src_name),
 
         (Utf8, _) | (_, Utf8) => {
-            return Err(BoltError::Other(
-                "ptx_gen: Utf8 casts not supported".into(),
-            ))
+            return Err(BoltError::Other("ptx_gen: Utf8 casts not supported".into()))
         }
 
         (Decimal128(_, _), _) | (_, Decimal128(_, _)) => {
@@ -2442,11 +2468,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         // the PTX level it's identical to the corresponding integer cmp.
         Date32 => "s32",
         Timestamp(_, _) => "s64",
-        Utf8 => {
-            return Err(BoltError::Other(
-                "ptx_gen: cannot compare Utf8".into(),
-            ))
-        }
+        Utf8 => return Err(BoltError::Other("ptx_gen: cannot compare Utf8".into())),
         Decimal128(_, _) => {
             return Err(BoltError::Plan(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
@@ -2491,9 +2513,9 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
 
 /// Byte width of `dtype`, or an error for variable-width types.
 fn byte_width(dtype: DataType) -> BoltResult<usize> {
-    dtype.byte_width().ok_or_else(|| {
-        BoltError::Other(format!("ptx_gen: variable-width dtype {:?}", dtype))
-    })
+    dtype
+        .byte_width()
+        .ok_or_else(|| BoltError::Other(format!("ptx_gen: variable-width dtype {:?}", dtype)))
 }
 
 /// Reject empty / whitespace-bearing kernel names that would break the PTX grammar.
@@ -2536,14 +2558,13 @@ pub(crate) fn validate_kernel_name(name: &str) -> BoltResult<()> {
     // either collide with the grammar outright or produce baffling assembler
     // errors downstream. Case-sensitive — PTX is case-sensitive.
     const RESERVED: &[&str] = &[
-        "bra", "ret", "mov", "entry", "ld", "st", "add", "sub", "mul", "div",
-        "mad", "cvt", "setp", "selp", "bar", "atom", "membar", "cvta", "shl",
-        "shr", "and", "or", "xor", "not", "sin", "cos", "exp2", "lg2", "sqrt",
-        "rsqrt", "rcp", "abs", "neg", "min", "max", "mma", "tex", "tld4",
-        "wmma", "cp", "callp", "ret", "exit", "trap", "brkpt", "prefetch",
-        "fma", "global", "shared", "local", "param", "const", "tex", "surf",
-        "sm", "sreg", "reg", "b8", "b16", "b32", "b64", "u8", "u16", "u32",
-        "u64", "s8", "s16", "s32", "s64", "f16", "f32", "f64", "pred",
+        "bra", "ret", "mov", "entry", "ld", "st", "add", "sub", "mul", "div", "mad", "cvt", "setp",
+        "selp", "bar", "atom", "membar", "cvta", "shl", "shr", "and", "or", "xor", "not", "sin",
+        "cos", "exp2", "lg2", "sqrt", "rsqrt", "rcp", "abs", "neg", "min", "max", "mma", "tex",
+        "tld4", "wmma", "cp", "callp", "ret", "exit", "trap", "brkpt", "prefetch", "fma", "global",
+        "shared", "local", "param", "const", "tex", "surf", "sm", "sreg", "reg", "b8", "b16",
+        "b32", "b64", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "f16", "f32", "f64",
+        "pred",
     ];
     if RESERVED.iter().any(|r| *r == name) {
         return Err(BoltError::Other(format!(
@@ -2610,7 +2631,11 @@ fn write_signature(
     writeln!(
         out,
         "\t.param .u32 {}",
-        b.n_rows_param_name(spec.inputs.len(), spec.outputs.len(), n_extra_validity_params)
+        b.n_rows_param_name(
+            spec.inputs.len(),
+            spec.outputs.len(),
+            n_extra_validity_params
+        )
     )
     .map_err(write_err)?;
     writeln!(out, ")").map_err(write_err)?;
@@ -3582,9 +3607,8 @@ mod scalar_string_fn_substrate_tests {
             output_has_validity: vec![],
         };
 
-        let err = compile(&spec, "bolt_utf8_out_blocker").expect_err(
-            "fused PTX codegen must reject a Utf8 output column",
-        );
+        let err = compile(&spec, "bolt_utf8_out_blocker")
+            .expect_err("fused PTX codegen must reject a Utf8 output column");
         let msg = format!("{err}");
         assert!(
             msg.contains("Utf8"),
@@ -3621,9 +3645,8 @@ mod scalar_string_fn_substrate_tests {
             output_has_validity: vec![],
         };
 
-        let err = compile(&spec, "bolt_utf8_in_blocker").expect_err(
-            "fused PTX codegen must reject a Utf8 input column",
-        );
+        let err = compile(&spec, "bolt_utf8_in_blocker")
+            .expect_err("fused PTX codegen must reject a Utf8 input column");
         let msg = format!("{err}");
         assert!(
             msg.contains("Utf8"),
@@ -3678,8 +3701,9 @@ mod scalar_string_fn_substrate_tests {
                 kind,
                 args: vec![s_col.clone()],
             });
-            let phys = lower(&plan)
-                .unwrap_or_else(|e| panic!("{} should lower to GPU now, got Err: {e}", kind.sql_name()));
+            let phys = lower(&plan).unwrap_or_else(|e| {
+                panic!("{} should lower to GPU now, got Err: {e}", kind.sql_name())
+            });
             assert!(
                 matches!(phys, PhysicalPlan::StringProject { .. }),
                 "{} should lower to PhysicalPlan::StringProject; got: {phys:?}",
@@ -3757,8 +3781,8 @@ mod decimal128_ir_tests {
     //! unchanged. The tests here build a `KernelSpec` by hand to drive
     //! `compile` directly.
     use super::*;
-    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
     use crate::plan::logical_plan::DataType;
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
     fn dec(prec: u8, scale: i8) -> DataType {
         DataType::Decimal128(prec, scale)
     }
@@ -4112,8 +4136,14 @@ mod decimal128_ir_tests {
         let (lo, hi) = alloc
             .assign_pair(Reg(0), Reg(1))
             .expect("assign_pair must succeed");
-        assert!(lo.starts_with("%rl"), "lo should be in the rl class, got {lo}");
-        assert!(hi.starts_with("%rl"), "hi should be in the rl class, got {hi}");
+        assert!(
+            lo.starts_with("%rl"),
+            "lo should be in the rl class, got {lo}"
+        );
+        assert!(
+            hi.starts_with("%rl"),
+            "hi should be in the rl class, got {hi}"
+        );
         assert_ne!(lo, hi, "lo and hi must be distinct physical registers");
         // Both halves resolvable via `get`.
         assert_eq!(alloc.get(Reg(0)).unwrap(), lo);
@@ -4358,14 +4388,36 @@ mod decimal128_ir_tests {
         // between the loaded decimal (THEN) and a constant (ELSE).
         let spec = KernelSpec {
             inputs: vec![
-                ColumnIO { name: "flag".into(), dtype: DataType::Bool },
-                ColumnIO { name: "d".into(), dtype: dec(18, 2) },
+                ColumnIO {
+                    name: "flag".into(),
+                    dtype: DataType::Bool,
+                },
+                ColumnIO {
+                    name: "d".into(),
+                    dtype: dec(18, 2),
+                },
             ],
-            outputs: vec![ColumnIO { name: "out".into(), dtype: dec(18, 2) }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: dec(18, 2),
+            }],
             ops: vec![
-                Op::LoadColumn { dst: Reg(0), col_idx: 0, dtype: DataType::Bool },
-                Op::LoadColumn128 { dst_lo: Reg(1), dst_hi: Reg(2), col_idx: 1 },
-                Op::Const128 { dst_lo: Reg(3), dst_hi: Reg(4), lo: 0, hi: 0 },
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Bool,
+                },
+                Op::LoadColumn128 {
+                    dst_lo: Reg(1),
+                    dst_hi: Reg(2),
+                    col_idx: 1,
+                },
+                Op::Const128 {
+                    dst_lo: Reg(3),
+                    dst_hi: Reg(4),
+                    lo: 0,
+                    hi: 0,
+                },
                 Op::Select128 {
                     dst_lo: Reg(5),
                     dst_hi: Reg(6),
@@ -4375,7 +4427,11 @@ mod decimal128_ir_tests {
                     else_lo: Reg(3),
                     else_hi: Reg(4),
                 },
-                Op::Store128 { src_lo: Reg(5), src_hi: Reg(6), col_idx: 0 },
+                Op::Store128 {
+                    src_lo: Reg(5),
+                    src_hi: Reg(6),
+                    col_idx: 0,
+                },
             ],
             predicate: None,
             register_count: 7,
@@ -4383,7 +4439,10 @@ mod decimal128_ir_tests {
             output_has_validity: vec![],
         };
         let ptx = compile(&spec, "bolt_dec128_select").expect("compile");
-        assert!(ptx.contains("setp.ne.s32"), "expected predicate from cond\n{ptx}");
+        assert!(
+            ptx.contains("setp.ne.s32"),
+            "expected predicate from cond\n{ptx}"
+        );
         assert!(
             ptx.matches("selp.b64").count() >= 2,
             "expected >=2 selp.b64 (one per i128 half)\n{ptx}"
@@ -4397,12 +4456,30 @@ mod decimal128_ir_tests {
     #[test]
     fn f64_to_i128_emits_limb_decomposition() {
         let spec = KernelSpec {
-            inputs: vec![ColumnIO { name: "f".into(), dtype: DataType::Float64 }],
-            outputs: vec![ColumnIO { name: "out".into(), dtype: dec(20, 0) }],
+            inputs: vec![ColumnIO {
+                name: "f".into(),
+                dtype: DataType::Float64,
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: dec(20, 0),
+            }],
             ops: vec![
-                Op::LoadColumn { dst: Reg(0), col_idx: 0, dtype: DataType::Float64 },
-                Op::F64ToI128 { dst_lo: Reg(1), dst_hi: Reg(2), src: Reg(0) },
-                Op::Store128 { src_lo: Reg(1), src_hi: Reg(2), col_idx: 0 },
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Float64,
+                },
+                Op::F64ToI128 {
+                    dst_lo: Reg(1),
+                    dst_hi: Reg(2),
+                    src: Reg(0),
+                },
+                Op::Store128 {
+                    src_lo: Reg(1),
+                    src_hi: Reg(2),
+                    col_idx: 0,
+                },
             ],
             predicate: None,
             register_count: 3,
@@ -4449,12 +4526,30 @@ mod decimal128_ir_tests {
     #[ignore = "gpu:f64i128 — requires a CUDA driver + BOLT_BENCH_GPU=1"]
     fn f64_to_i128_ptx_loads_into_cuda_driver() {
         let spec = KernelSpec {
-            inputs: vec![ColumnIO { name: "f".into(), dtype: DataType::Float64 }],
-            outputs: vec![ColumnIO { name: "out".into(), dtype: dec(20, 0) }],
+            inputs: vec![ColumnIO {
+                name: "f".into(),
+                dtype: DataType::Float64,
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: dec(20, 0),
+            }],
             ops: vec![
-                Op::LoadColumn { dst: Reg(0), col_idx: 0, dtype: DataType::Float64 },
-                Op::F64ToI128 { dst_lo: Reg(1), dst_hi: Reg(2), src: Reg(0) },
-                Op::Store128 { src_lo: Reg(1), src_hi: Reg(2), col_idx: 0 },
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Float64,
+                },
+                Op::F64ToI128 {
+                    dst_lo: Reg(1),
+                    dst_hi: Reg(2),
+                    src: Reg(0),
+                },
+                Op::Store128 {
+                    src_lo: Reg(1),
+                    src_hi: Reg(2),
+                    col_idx: 0,
+                },
             ],
             predicate: None,
             register_count: 3,
@@ -4516,8 +4611,14 @@ mod decimal128_ir_tests {
         // f64 cannot represent it exactly, so the result carries the nearest
         // double's value — this is the documented decimal↔float precision
         // loss, not a bug. Computed by replaying the emitter's f64 sequence.
-        assert_eq!(f2i(1.2e38), 120_000_000_000_000_008_632_251_347_034_389_348_352);
-        assert_eq!(f2i(-1.2e38), -120_000_000_000_000_008_632_251_347_034_389_348_352);
+        assert_eq!(
+            f2i(1.2e38),
+            120_000_000_000_000_008_632_251_347_034_389_348_352
+        );
+        assert_eq!(
+            f2i(-1.2e38),
+            -120_000_000_000_000_008_632_251_347_034_389_348_352
+        );
 
         // Magnitude at/above 2^127 saturates to the i128 bounds (NOT a wrapping
         // limb pattern). 2e38 > 2^127 → i128::MAX / i128::MIN.
@@ -4544,12 +4645,30 @@ mod decimal128_ir_tests {
     #[test]
     fn i128_to_f64_emits_hi_times_2pow64_plus_lo() {
         let spec = KernelSpec {
-            inputs: vec![ColumnIO { name: "d".into(), dtype: dec(20, 0) }],
-            outputs: vec![ColumnIO { name: "out".into(), dtype: DataType::Float64 }],
+            inputs: vec![ColumnIO {
+                name: "d".into(),
+                dtype: dec(20, 0),
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Float64,
+            }],
             ops: vec![
-                Op::LoadColumn128 { dst_lo: Reg(0), dst_hi: Reg(1), col_idx: 0 },
-                Op::I128ToF64 { dst: Reg(2), src_lo: Reg(0), src_hi: Reg(1) },
-                Op::Store { src: Reg(2), col_idx: 0, dtype: DataType::Float64 },
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::I128ToF64 {
+                    dst: Reg(2),
+                    src_lo: Reg(0),
+                    src_hi: Reg(1),
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Float64,
+                },
             ],
             predicate: None,
             register_count: 3,
@@ -4557,16 +4676,24 @@ mod decimal128_ir_tests {
             output_has_validity: vec![],
         };
         let ptx = compile(&spec, "bolt_i128_to_f64").expect("compile");
-        assert!(ptx.contains("cvt.rn.f64.s64"), "expected signed hi conversion\n{ptx}");
-        assert!(ptx.contains("cvt.rn.f64.u64"), "expected UNSIGNED lo conversion\n{ptx}");
-        assert!(ptx.contains("fma.rn.f64"), "expected fma for hi*2^64+lo\n{ptx}");
+        assert!(
+            ptx.contains("cvt.rn.f64.s64"),
+            "expected signed hi conversion\n{ptx}"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f64.u64"),
+            "expected UNSIGNED lo conversion\n{ptx}"
+        );
+        assert!(
+            ptx.contains("fma.rn.f64"),
+            "expected fma for hi*2^64+lo\n{ptx}"
+        );
         assert!(
             ptx.contains("0d43F0000000000000"),
             "expected the 2^64 constant\n{ptx}"
         );
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // PV-stage-d: per-output validity dataflow analysis.
@@ -4707,8 +4834,7 @@ fn walk_store_deps(
             Op::F64ToI128 { src, .. } => {
                 stack.push(src.id());
             }
-            Op::NarrowI128ToInt { src_lo, src_hi, .. }
-            | Op::I128ToF64 { src_lo, src_hi, .. } => {
+            Op::NarrowI128ToInt { src_lo, src_hi, .. } | Op::I128ToF64 { src_lo, src_hi, .. } => {
                 stack.push(src_lo.id());
                 stack.push(src_hi.id());
             }
@@ -4775,9 +4901,7 @@ fn walk_store_deps(
 /// emit that, but defensively): the result merges all of their dependencies.
 /// If no `Store` targets `col_idx`, the result is an empty Vec for that
 /// position (output has no validity dependencies — vacuously valid).
-pub fn output_input_dependencies(
-    spec: &crate::plan::physical_plan::KernelSpec,
-) -> Vec<Vec<usize>> {
+pub fn output_input_dependencies(spec: &crate::plan::physical_plan::KernelSpec) -> Vec<Vec<usize>> {
     use crate::plan::physical_plan::Op;
 
     // (a) Map every produced Reg to the Op that produced it. Since the IR
@@ -4940,7 +5064,11 @@ mod dataflow_tests {
         };
         let deps = output_input_dependencies(&spec);
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0], vec![0, 1], "output 0 should depend on inputs 0 and 1 only");
+        assert_eq!(
+            deps[0],
+            vec![0, 1],
+            "output 0 should depend on inputs 0 and 1 only"
+        );
     }
 
     /// Two outputs touching disjoint inputs must produce disjoint dep sets.
@@ -5607,7 +5735,10 @@ mod modulo_bitwise_tests {
     fn mod_int32_emits_guarded_rem_s32() {
         let spec = binop_spec(BinaryOp::Mod, DataType::Int32, DataType::Int32);
         let ptx = compile(&spec, "bolt_kernel_mod_i32").expect("compile");
-        assert!(ptx.contains("rem.s32"), "expected rem.s32 for Int32 %, got:\n{ptx}");
+        assert!(
+            ptx.contains("rem.s32"),
+            "expected rem.s32 for Int32 %, got:\n{ptx}"
+        );
         // Guard shape (mirrors emit_int_div_guarded): zero-divisor detect +
         // overflow predicate combine + selp sanitisation.
         assert!(
@@ -5621,8 +5752,14 @@ mod modulo_bitwise_tests {
     fn mod_int64_emits_rem_s64() {
         let spec = binop_spec(BinaryOp::Mod, DataType::Int64, DataType::Int64);
         let ptx = compile(&spec, "bolt_kernel_mod_i64").expect("compile");
-        assert!(ptx.contains("rem.s64"), "expected rem.s64 for Int64 %, got:\n{ptx}");
-        assert!(!ptx.contains("rem.s32"), "Int64 % must not use rem.s32:\n{ptx}");
+        assert!(
+            ptx.contains("rem.s64"),
+            "expected rem.s64 for Int64 %, got:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("rem.s32"),
+            "Int64 % must not use rem.s32:\n{ptx}"
+        );
     }
 
     /// Bitwise AND/OR/XOR lower to the untyped bit-width mnemonics at the
@@ -5637,7 +5774,10 @@ mod modulo_bitwise_tests {
         ] {
             let spec = binop_spec(op, DataType::Int32, DataType::Int32);
             let ptx = compile(&spec, "bolt_kernel_bit_i32").expect("compile");
-            assert!(ptx.contains(stem), "expected {stem} for {op:?} on Int32, got:\n{ptx}");
+            assert!(
+                ptx.contains(stem),
+                "expected {stem} for {op:?} on Int32, got:\n{ptx}"
+            );
         }
         // Int64.
         for (op, stem) in [
@@ -5647,7 +5787,10 @@ mod modulo_bitwise_tests {
         ] {
             let spec = binop_spec(op, DataType::Int64, DataType::Int64);
             let ptx = compile(&spec, "bolt_kernel_bit_i64").expect("compile");
-            assert!(ptx.contains(stem), "expected {stem} for {op:?} on Int64, got:\n{ptx}");
+            assert!(
+                ptx.contains(stem),
+                "expected {stem} for {op:?} on Int64, got:\n{ptx}"
+            );
         }
     }
 
@@ -5732,10 +5875,7 @@ mod temporal_plan_tests {
 
     fn ts_schema(unit: TimeUnit, tz: Option<&'static str>) -> Schema {
         let ty = DataType::Timestamp(unit, tz);
-        Schema::new(vec![
-            Field::new("a", ty, false),
-            Field::new("b", ty, false),
-        ])
+        Schema::new(vec![Field::new("a", ty, false), Field::new("b", ty, false)])
     }
 
     /// `a - b` over two Date32 columns must type as `Int32` (a count of
@@ -5775,16 +5915,8 @@ mod temporal_plan_tests {
     #[test]
     fn timestamp_minus_timestamp_mismatched_units_rejected() {
         let schema = Schema::new(vec![
-            Field::new(
-                "a",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new(
-                "b",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("a", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new("b", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
         ]);
         let e = Expr::Binary {
             op: BinaryOp::Sub,
@@ -5857,11 +5989,7 @@ mod temporal_plan_tests {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
                 false,
             ),
-            Field::new(
-                "b",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
+            Field::new("b", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         ]);
         let e = Expr::Binary {
             op: BinaryOp::Sub,
@@ -5880,10 +6008,7 @@ mod temporal_plan_tests {
     /// surface so the rejection error message reflects exactly what the
     /// planner produces. `AggregateExpr::output_dtype` is crate-private,
     /// hence the indirection.
-    fn avg_output(
-        agg: &AggregateExpr,
-        schema: &Schema,
-    ) -> crate::error::BoltResult<DataType> {
+    fn avg_output(agg: &AggregateExpr, schema: &Schema) -> crate::error::BoltResult<DataType> {
         use crate::plan::logical_plan::LogicalPlan;
         let scan = LogicalPlan::Scan {
             table: "t".into(),

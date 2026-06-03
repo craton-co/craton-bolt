@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! **Two-key COUNT(*) at Tier 2.1** — high-cardinality
 //! `SELECT a, b, COUNT(*) FROM x GROUP BY a, b` executor.
@@ -77,7 +77,9 @@ fn get_or_build_module(spec: &KernelSpec) -> BoltResult<CudaModule> {
     module_cache::get_or_build_module(module_path!(), format!("{:?}", spec), counter, || {
         Ok(match spec {
             KernelSpec::PartitionI64 => partition_kernel_i64::compile_partition_kernel_i64()?,
-            KernelSpec::PartitionI64ShmemStaging => partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?,
+            KernelSpec::PartitionI64ShmemStaging => {
+                partition_kernel_i64::compile_partition_kernel_i64_shmem_staging()?
+            }
             KernelSpec::ScatterI64 => scatter_kernel_i64::compile_scatter_kernel_i64()?,
             KernelSpec::ReduceCountI64 => {
                 // Batch 5: spill-counter-aware variant. The launch site
@@ -100,13 +102,9 @@ fn partition_i64_spec_for(n_rows: u32) -> KernelSpec {
     }
 }
 
-
 /// Try the two-key Tier-2.1 COUNT(*) fast path. `None` on any precondition
 /// miss so the caller falls through to the next strategy.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -195,11 +193,7 @@ pub fn try_execute(
     Some(execute_inner(plan, k1, k2))
 }
 
-fn execute_inner(
-    plan: &PhysicalPlan,
-    k1: &Int32Array,
-    k2: &Int32Array,
-) -> BoltResult<RecordBatch> {
+fn execute_inner(plan: &PhysicalPlan, k1: &Int32Array, k2: &Int32Array) -> BoltResult<RecordBatch> {
     let n_rows = k1.len() as u32;
 
     // Stage-4 (P1b): per-call stream shared across every H2D / kernel / D2H.
@@ -269,7 +263,8 @@ fn execute_inner(
     let scatter_module = get_or_build_module(&KernelSpec::ScatterI64)?;
     {
         let func = scatter_module.function(scatter_kernel_i64::KERNEL_ENTRY)?;
-        let cursors: GpuVec<u32> = GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
+        let cursors: GpuVec<u32> =
+            GpuVec::<u32>::zeros_async(num_partitions as usize, stream.raw())?;
         let mut keys_ptr = keys_gpu.device_ptr();
         let mut vals_ptr = dummy_vals_in.device_ptr();
         let mut pids_ptr = partition_ids.device_ptr();
@@ -318,8 +313,8 @@ fn execute_inner(
     let spill: GpuVec<u32> = GpuVec::<u32>::zeros_async(1, stream.raw())?;
     let reduce_module = get_or_build_module(&KernelSpec::ReduceCountI64)?;
     {
-        let func = reduce_module
-            .function(partition_reduce_kernel_count_i64::KERNEL_ENTRY_WITH_SPILL)?;
+        let func =
+            reduce_module.function(partition_reduce_kernel_count_i64::KERNEL_ENTRY_WITH_SPILL)?;
         let mut keys_ptr = scatter_keys.device_ptr();
         let mut offsets_ptr = offsets_kp1_gpu.device_ptr();
         let mut ok_ptr = out_keys_gpu.device_ptr();
@@ -424,9 +419,9 @@ fn execute_inner(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-#[cfg(test)]
 use crate::plan::logical_plan::Schema;
+#[cfg(test)]
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 #[cfg(test)]
 mod tests {
@@ -680,8 +675,14 @@ mod stage4_tests {
             pre: None,
             aggregate: AggregateSpec {
                 inputs: vec![
-                    ColumnIO { name: "k1".into(), dtype: DataType::Int32 },
-                    ColumnIO { name: "k2".into(), dtype: DataType::Int32 },
+                    ColumnIO {
+                        name: "k1".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "k2".into(),
+                        dtype: DataType::Int32,
+                    },
                 ],
                 group_by: vec![0, 1],
                 aggregates: vec![AggregateExpr::Count(Expr::Literal(Literal::Null))],

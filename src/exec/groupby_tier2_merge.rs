@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY **result merger**.
 //!
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow_array::{Float64Array, Int32Array, RecordBatch};
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{Schema};
+use crate::plan::logical_plan::Schema;
 
 /// Per-partition (deduplicated keys, per-group sums) produced by the
 /// Tier-2 orchestrator. Each partition's keys are unique (no cross-
@@ -68,10 +68,7 @@ pub fn build_tier2_result(
 
     // 3. Sort by key ASC. Zip / sort / unzip — see strategy note above.
     if keys_out.len() > 1 {
-        let mut zipped: Vec<(i32, f64)> = keys_out
-            .into_iter()
-            .zip(sums_out.into_iter())
-            .collect();
+        let mut zipped: Vec<(i32, f64)> = keys_out.into_iter().zip(sums_out.into_iter()).collect();
         zipped.sort_by_key(|(k, _)| *k);
         keys_out = Vec::with_capacity(total);
         sums_out = Vec::with_capacity(total);
@@ -108,7 +105,7 @@ pub fn build_tier2_result(
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{DataType as ArrowDataType};
+use arrow_schema::DataType as ArrowDataType;
 
 #[cfg(test)]
 mod tests {
@@ -203,11 +200,8 @@ mod tests {
     #[test]
     fn partition_with_zero_rows_is_skipped() {
         let schema = out_schema();
-        let per_part: PerPartition = vec![
-            (vec![1], vec![5.0]),
-            (vec![], vec![]),
-            (vec![2], vec![6.0]),
-        ];
+        let per_part: PerPartition =
+            vec![(vec![1], vec![5.0]), (vec![], vec![]), (vec![2], vec![6.0])];
         let batch = build_tier2_result(per_part, &schema).expect("build ok");
         let (keys, sums) = extract(&batch);
         assert_eq!(keys, vec![1, 2]);
@@ -226,13 +220,12 @@ mod tests {
     #[test]
     #[ignore = "gpu:tier2 — executes Tier-2 SUM pipeline + merge"]
     fn stage6_orchestrator_plus_merge_smoke() {
-        use std::collections::HashMap;
         use crate::cuda::GpuVec;
         use crate::exec::groupby_tier2_orchestrator::execute_tier2_sum;
+        use std::collections::HashMap;
 
         let host_keys: Vec<i32> = vec![1, 2, 1, 3, 2, 1, 4, 3, 5, 2];
-        let host_vals: Vec<f64> =
-            vec![10.0, 20.0, 11.0, 30.0, 21.0, 12.0, 40.0, 31.0, 50.0, 22.0];
+        let host_vals: Vec<f64> = vec![10.0, 20.0, 11.0, 30.0, 21.0, 12.0, 40.0, 31.0, 50.0, 22.0];
         let n_rows = host_keys.len() as u32;
 
         let keys = match GpuVec::<i32>::from_slice(&host_keys) {
@@ -250,8 +243,7 @@ mod tests {
         };
 
         let schema = out_schema();
-        let batch = build_tier2_result(partial.per_partition, &schema)
-            .expect("merge must succeed");
+        let batch = build_tier2_result(partial.per_partition, &schema).expect("merge must succeed");
         let (got_keys, got_sums) = extract(&batch);
 
         // Oracle: host HashMap reduce, then sort by key ASC (matches merger).

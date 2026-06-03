@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Test scaffolding for Tier 2 of the GROUP BY perf plan: hash-partitioned
 //! two-pass aggregation, designed for the high-cardinality regime
@@ -77,9 +77,7 @@ fn cpu_tier2_sum_model(keys: &[i32], vals: &[f64]) -> Vec<(i32, f64)> {
     // (key, val) pairs directly rather than indices because the per-partition
     // reducer in step 2 only needs the pair, and indirecting through indices
     // adds a layer of cache misses that would skew the comparison.
-    let mut buckets: Vec<Vec<(i32, f64)>> = (0..NUM_PARTITIONS)
-        .map(|_| Vec::new())
-        .collect();
+    let mut buckets: Vec<Vec<(i32, f64)>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
     for i in 0..keys.len() {
         let pid = partition_of(keys[i]) as usize;
         buckets[pid].push((keys[i], vals[i]));
@@ -167,7 +165,11 @@ fn max_relative_error(a: &[(i32, f64)], b: &[(i32, f64)]) -> f64 {
     );
     let mut worst = 0.0_f64;
     for i in 0..a.len() {
-        assert_eq!(a[i].0, b[i].0, "key mismatch at index {i}: {} vs {}", a[i].0, b[i].0);
+        assert_eq!(
+            a[i].0, b[i].0,
+            "key mismatch at index {i}: {} vs {}",
+            a[i].0, b[i].0
+        );
         let x = a[i].1;
         let y = b[i].1;
         let denom = x.abs().max(y.abs()).max(1.0);
@@ -239,7 +241,12 @@ fn model_handles_single_key() {
     }
     let model = cpu_tier2_sum_model(&keys, &vals);
     let naive = cpu_naive_sum_groupby(&keys, &vals);
-    assert_eq!(model.len(), 1, "expected exactly one output row, got {}", model.len());
+    assert_eq!(
+        model.len(),
+        1,
+        "expected exactly one output row, got {}",
+        model.len()
+    );
     assert_eq!(model[0].0, key, "expected key=42, got key={}", model[0].0);
     let err = max_relative_error(&model, &naive);
     assert!(err < 1e-12, "max rel err {err:e} exceeded 1e-12");
@@ -297,7 +304,10 @@ fn partition_function_distributes_evenly() {
     let min = *counts.iter().min().unwrap();
     let max = *counts.iter().max().unwrap();
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
-    assert_eq!(total, N as u64, "every key must land in exactly one partition");
+    assert_eq!(
+        total, N as u64,
+        "every key must land in exactly one partition"
+    );
 
     let ideal = N / NUM_PARTITIONS;
     let lo = ideal - ideal / 7; // ~ -14 %
@@ -340,16 +350,14 @@ fn tier2_pipeline_matches_cpu_model() {
         ArrowField::new("id1", ArrowDataType::Int32, false),
         ArrowField::new("v1", ArrowDataType::Float64, false),
     ]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(id1), Arc::new(v1)])
-        .expect("build RecordBatch");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(id1), Arc::new(v1)]).expect("build RecordBatch");
 
     // Stand up the engine on the default CUDA device. Mirrors the convention
     // in `tests/memory_tests.rs`: `.expect()` is fine because the test is
     // `#[ignore]`'d, so it only runs on a GPU host.
     let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
-    engine
-        .register_table("x", batch)
-        .expect("register table");
+    engine.register_table("x", batch).expect("register table");
 
     let h = engine
         .sql("SELECT id1, SUM(v1) FROM x GROUP BY id1")

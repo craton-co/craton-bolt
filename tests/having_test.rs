@@ -94,7 +94,10 @@ fn having_predicate_survives_lowering() {
     let Expr::Binary { op, left, right } = &predicate else {
         panic!("HAVING predicate must be a Binary expr, got {predicate:?}");
     };
-    assert!(matches!(op, BinaryOp::Gt), "HAVING op should be `>`, got {op:?}");
+    assert!(
+        matches!(op, BinaryOp::Gt),
+        "HAVING op should be `>`, got {op:?}"
+    );
     assert!(
         matches!(left.as_ref(), Expr::Column(n) if n == "sum_v"),
         "HAVING lhs should reference `sum_v`, got {left:?}"
@@ -108,15 +111,17 @@ fn having_predicate_survives_lowering() {
     // SELECT-order Project on top).
     match *inner {
         PhysicalPlan::Aggregate { .. } => {}
-        PhysicalPlan::Project { input: inner_inner, .. } => {
+        PhysicalPlan::Project {
+            input: inner_inner, ..
+        } => {
             assert!(
                 matches!(*inner_inner, PhysicalPlan::Aggregate { .. }),
                 "expected Aggregate under Project inside HAVING Filter"
             );
         }
-        other => panic!(
-            "expected Aggregate (or Project(Aggregate)) under HAVING Filter, got {other:?}"
-        ),
+        other => {
+            panic!("expected Aggregate (or Project(Aggregate)) under HAVING Filter, got {other:?}")
+        }
     }
 }
 

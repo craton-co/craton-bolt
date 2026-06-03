@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory **float MIN / MAX** kernel — i64-key
 //! variant (Tier 2.1 for two-key float MIN/MAX).
@@ -130,11 +130,9 @@ mod tests {
 
     #[test]
     fn uses_i64_key_load_and_compare() {
-        let ptx = compile_partition_reduce_kernel_minmax_float_i64(
-            MinMaxOp::Min,
-            FloatDtype::Float64,
-        )
-        .unwrap();
+        let ptx =
+            compile_partition_reduce_kernel_minmax_float_i64(MinMaxOp::Min, FloatDtype::Float64)
+                .unwrap();
         assert!(
             ptx.contains("ld.global.s64"),
             "i64-key float kernel must use `ld.global.s64` for keys"

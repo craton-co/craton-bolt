@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Lifetime-tracked typed handles to GPU memory ("CUDA-Oxide").
 //!
@@ -244,7 +244,8 @@ impl<T: Pod> GpuVec<T> {
     /// concurrent kernel work on the same stream.
     pub fn to_pinned_async(&self, stream: CUstream) -> BoltResult<PinnedHostBuffer<T>> {
         let mut pinned = PinnedHostBuffer::<T>::new(self.len())?;
-        self.buffer.copy_to_slice_async(pinned.as_mut_slice(), stream)?;
+        self.buffer
+            .copy_to_slice_async(pinned.as_mut_slice(), stream)?;
         // V-2: the pinned buffer is the *host* destination of this async D2H,
         // so its page-locked pages are read/written by `stream` until the copy
         // completes. Record the stream in the pinned buffer's `StreamSet` so

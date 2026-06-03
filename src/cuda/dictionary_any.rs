@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Unified wrapper over the i32- and i64-indexed dictionary variants.
 //!
@@ -232,8 +232,8 @@ impl DictionaryColumnAny {
     pub fn from_dictionary_array(
         arr: &arrow_array::DictionaryArray<arrow_array::types::Int32Type>,
     ) -> BoltResult<Self> {
-        use arrow_array::{Array, Int32Array};
         use crate::error::BoltError;
+        use arrow_array::{Array, Int32Array};
 
         let dict_vals = arr
             .values()
@@ -374,10 +374,7 @@ impl DictionaryColumnAny {
     /// dispatch and accessor logic without a CUDA-enabled machine. Production
     /// code must not use this — use [`Self::from_string_array`] instead.
     #[cfg(test)]
-    pub(crate) fn new_host_only(
-        dictionary: Vec<String>,
-        n_rows: usize,
-    ) -> BoltResult<Self> {
+    pub(crate) fn new_host_only(dictionary: Vec<String>, n_rows: usize) -> BoltResult<Self> {
         if dictionary.len() >= I32_INDEX_THRESHOLD {
             // Wide path: i64 indices. The i64 sibling's constructor is
             // fallible (mirrors its production counterpart), so propagate.
@@ -418,7 +415,10 @@ mod tests {
 
         let any = DictionaryColumnAny::new_host_only(strings, 100)
             .expect("host-only constructor must not depend on CUDA");
-        assert!(any.is_i32(), "100 distinct strings must land on the i32 path");
+        assert!(
+            any.is_i32(),
+            "100 distinct strings must land on the i32 path"
+        );
         assert!(any.as_i64().is_none());
         assert_eq!(any.n_rows(), 100);
         assert_eq!(any.dictionary().len(), 100);
@@ -472,8 +472,8 @@ mod tests {
     fn dispatch_i32_vs_i64_by_threshold() {
         // Below threshold → i32. A tiny dictionary is unambiguous.
         let narrow_dict = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let narrow = DictionaryColumnAny::new_host_only(narrow_dict, 3)
-            .expect("narrow host-only build");
+        let narrow =
+            DictionaryColumnAny::new_host_only(narrow_dict, 3).expect("narrow host-only build");
         assert!(narrow.is_i32(), "small dictionary must land on i32");
         assert_eq!(narrow.index_dtype(), DataType::Int32);
         assert!(narrow.as_i32().is_some());
@@ -484,11 +484,8 @@ mod tests {
         // wrapper by hand using the i64 sibling's host-only constructor —
         // that's what the wrapper's `new_host_only` does under the hood for
         // the wide path, just with a populated dictionary.
-        let wide_inner = DictionaryColumnI64::new_host_only(
-            vec!["only".to_string()],
-            1,
-        )
-        .expect("i64 host-only build");
+        let wide_inner = DictionaryColumnI64::new_host_only(vec!["only".to_string()], 1)
+            .expect("i64 host-only build");
         let wide = DictionaryColumnAny::I64(wide_inner);
         assert!(!wide.is_i32(), "manually-wrapped i64 must not report i32");
         assert_eq!(wide.index_dtype(), DataType::Int64);
@@ -502,20 +499,14 @@ mod tests {
     #[test]
     fn index_dtype_returns_inner() {
         // i32 side via the wrapper's host-only constructor.
-        let i32_any = DictionaryColumnAny::new_host_only(
-            vec!["x".to_string(), "y".to_string()],
-            2,
-        )
-        .expect("i32 build");
+        let i32_any = DictionaryColumnAny::new_host_only(vec!["x".to_string(), "y".to_string()], 2)
+            .expect("i32 build");
         assert_eq!(i32_any.index_dtype(), DataType::Int32);
 
         // i64 side: build the inner directly and wrap it ourselves so we
         // don't have to clear the threshold with a real-sized dictionary.
-        let i64_inner = DictionaryColumnI64::new_host_only(
-            vec!["a".to_string()],
-            1,
-        )
-        .expect("i64 inner build");
+        let i64_inner =
+            DictionaryColumnI64::new_host_only(vec!["a".to_string()], 1).expect("i64 inner build");
         let i64_any = DictionaryColumnAny::I64(i64_inner);
         assert_eq!(i64_any.index_dtype(), DataType::Int64);
     }
@@ -533,8 +524,7 @@ mod tests {
             "delta".to_string(),
         ];
         let n = dict.len();
-        let any = DictionaryColumnAny::new_host_only(dict.clone(), 42)
-            .expect("host-only build");
+        let any = DictionaryColumnAny::new_host_only(dict.clone(), 42).expect("host-only build");
 
         // The wrapper view matches both length and contents.
         assert_eq!(any.dictionary().len(), n);
@@ -552,11 +542,9 @@ mod tests {
     fn indices_satisfying_any_byte_collation() {
         use crate::plan::logical_plan::BinaryOp;
         let entries = ["delta", "apple", "Zebra", "mango"];
-        let any = DictionaryColumnAny::new_host_only(
-            entries.iter().map(|s| s.to_string()).collect(),
-            4,
-        )
-        .expect("host-only build");
+        let any =
+            DictionaryColumnAny::new_host_only(entries.iter().map(|s| s.to_string()).collect(), 4)
+                .expect("host-only build");
         assert!(any.is_i32());
 
         let oracle = |op: BinaryOp, lit: &str| -> Vec<i64> {
@@ -635,8 +623,7 @@ mod tests {
         // stays meaningful if someone "tunes" the constant.
         assert!(I32_INDEX_THRESHOLD > 0);
 
-        let any = DictionaryColumnAny::new_host_only(Vec::new(), 0)
-            .expect("empty host-only build");
+        let any = DictionaryColumnAny::new_host_only(Vec::new(), 0).expect("empty host-only build");
         assert!(any.is_i32(), "empty dictionary must land on i32 path");
         assert_eq!(any.index_dtype(), DataType::Int32);
         assert!(any.dictionary().is_empty());

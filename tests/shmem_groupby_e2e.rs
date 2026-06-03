@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Test scaffolding for Tier 1 of the GROUP BY perf plan: a per-block
 //! shared-memory pre-aggregation kernel.
@@ -258,17 +258,15 @@ fn shmem_kernel_matches_cpu_model() {
         ArrowField::new("id1", ArrowDataType::Int32, false),
         ArrowField::new("v1", ArrowDataType::Float64, false),
     ]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(id1), Arc::new(v1)])
-        .expect("build RecordBatch");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(id1), Arc::new(v1)]).expect("build RecordBatch");
 
     // Stand up the engine on the default CUDA device. Mirrors the convention
     // in `tests/memory_tests.rs`: `.expect()` is fine because the test is
     // `#[ignore]`'d, so it only runs when the operator explicitly opted in
     // with `-- --ignored` on a GPU host.
     let mut engine = craton_bolt::Engine::new().expect("CUDA engine");
-    engine
-        .register_table("x", batch)
-        .expect("register table");
+    engine.register_table("x", batch).expect("register table");
 
     let h = engine
         .sql("SELECT id1, SUM(v1) FROM x GROUP BY id1")

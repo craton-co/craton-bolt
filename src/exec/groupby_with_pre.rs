@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Fused pre-projection + GROUP BY aggregate execution.
 //!
@@ -85,9 +85,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
 
 use crate::cuda::buffer::primitive_to_gpu;
@@ -99,13 +97,12 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
+use crate::jit::compile_ptx;
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
-    compile_groupby_keys_kernel, compile_groupby_keys_kernel_with_validity,
-    groupby_block_size, packed_validity_word_count, AGG_KERNEL_ENTRY,
-    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
+    compile_groupby_keys_kernel, compile_groupby_keys_kernel_with_validity, groupby_block_size,
+    packed_validity_word_count, AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
 };
-use crate::jit::compile_ptx;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, KernelSpec, PhysicalPlan};
 
@@ -212,8 +209,8 @@ fn dispatch_native_validity(
 // pre stage, so it does NOT share the key-packing functions (`pack_keys` etc.)
 // — those stay specific to the no-pre executors. Call sites are unchanged.
 use crate::exec::groupby_common::{
-    download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64,
-    next_pow2, unique_count,
+    download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64, next_pow2,
+    unique_count,
 };
 
 /// Execute an `Aggregate` plan that has BOTH a pre kernel AND a non-empty
@@ -238,9 +235,7 @@ pub fn execute_groupby_with_pre(
     };
 
     let pre_spec = pre.as_ref().ok_or_else(|| {
-        BoltError::Other(
-            "execute_groupby_with_pre: pre kernel is None; use execute_groupby".into(),
-        )
+        BoltError::Other("execute_groupby_with_pre: pre kernel is None; use execute_groupby".into())
     })?;
 
     if aggregate.group_by.is_empty() {
@@ -416,16 +411,12 @@ pub fn execute_groupby_with_pre(
     let n_unique = unique_count(&host_keys);
     let k = next_pow2((n_unique.saturating_mul(2)).saturating_add(16)).max(64);
     let k_u32 = u32::try_from(k).map_err(|_| {
-        BoltError::Other(format!(
-            "GROUP BY hash table size {} exceeds u32::MAX",
-            k
-        ))
+        BoltError::Other(format!("GROUP BY hash table size {} exceeds u32::MAX", k))
     })?;
 
     let stream = CudaStream::null_or_default();
     let host_keys_init: Vec<i64> = vec![EMPTY_KEY; k];
-    let mut keys_table =
-        GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
+    let mut keys_table = GpuVec::<i64>::from_slice_async(&host_keys_init, stream.raw())?;
     let key_col_gpu = GpuVec::<i64>::from_slice_async(&host_keys, stream.raw())?;
 
     // Round 1 ABI: a single zero-initialised `u32` device counter shared by the
@@ -463,8 +454,7 @@ pub fn execute_groupby_with_pre(
     // validity mask to decide between native `_with_validity` and the
     // host-strip fallback. An empty (legacy / safe-default) flag vector
     // collapses to `false` so existing call sites are bit-identical.
-    let any_input_has_validity: bool =
-        pre_spec.input_has_validity.iter().any(|&v| v);
+    let any_input_has_validity: bool = pre_spec.input_has_validity.iter().any(|&v| v);
 
     let n_group_keys = aggregate.group_by.len();
     let mut acc_results: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
@@ -586,7 +576,11 @@ fn run_pre_stage(
     // and aggregation paths cannot consume them.
     for io in &spec.outputs {
         match io.dtype {
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(
                     "Bool/Utf8 in pre outputs not yet supported".into(),
                 ))
@@ -617,8 +611,7 @@ fn run_pre_stage(
 
     // -- (Option B) Detect input validity, plumb through KernelSpec.
     //    See `agg_with_pre::run_pre_stage` for the design rationale.
-    let input_has_validity: Vec<bool> =
-        input_cols.iter().map(|c| c.has_validity()).collect();
+    let input_has_validity: Vec<bool> = input_cols.iter().map(|c| c.has_validity()).collect();
     let any_input_validity: bool = input_has_validity.iter().any(|b| *b);
     let output_has_validity: Vec<bool> = if any_input_validity {
         vec![true; spec.outputs.len()]
@@ -650,8 +643,9 @@ fn run_pre_stage(
     // -- Assemble kernel parameters: inputs..., outputs...,
     //    [input_validity..., output_validity...,] n_rows u32. Order
     //    matches `ptx_gen::compile`'s param walk.
-    let mut device_ptrs: Vec<CUdeviceptr> =
-        Vec::with_capacity(input_cols.len() + output_cols.len() + input_cols.len() + output_cols.len());
+    let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(
+        input_cols.len() + output_cols.len() + input_cols.len() + output_cols.len(),
+    );
     for c in &input_cols {
         device_ptrs.push(c.device_ptr());
     }
@@ -662,8 +656,7 @@ fn run_pre_stage(
         if *has {
             let vp = input_cols[i].validity_device_ptr().ok_or_else(|| {
                 BoltError::Other(
-                    "internal: input flagged with validity has no valid_mask device pointer"
-                        .into(),
+                    "internal: input flagged with validity has no valid_mask device pointer".into(),
                 )
             })?;
             device_ptrs.push(vp);
@@ -724,8 +717,7 @@ fn run_pre_stage(
         let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
 
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
-        let input_ptrs: Vec<CUdeviceptr> =
-            input_cols.iter().map(|c| c.device_ptr()).collect();
+        let input_ptrs: Vec<CUdeviceptr> = input_cols.iter().map(|c| c.device_ptr()).collect();
         // GroupBy pre-stage predicate kernel: same situation as
         // `agg_with_pre`. The planner doesn't lower `Op::IsNullCheck`
         // through this aggregate predicate path today (only the projection-
@@ -914,8 +906,17 @@ fn launch_agg_kernel<T: Pod>(
     overflow_ptr: CUdeviceptr,
 ) -> BoltResult<()> {
     launch_agg_kernel_inner(
-        op, input_dtype, group_col, keys_table, input_col, acc_table, None, n_rows,
-        k_u32, stream, overflow_ptr,
+        op,
+        input_dtype,
+        group_col,
+        keys_table,
+        input_col,
+        acc_table,
+        None,
+        n_rows,
+        k_u32,
+        stream,
+        overflow_ptr,
     )
 }
 
@@ -980,7 +981,10 @@ fn launch_agg_kernel_inner<T: Pod>(
     let value_validity_flag = value_validity.is_some();
     let module = module_cache::get_or_build_module(
         module_path!(),
-        format!("groupby_agg:{:?}:{:?}:validity={}", op, input_dtype, value_validity_flag),
+        format!(
+            "groupby_agg:{:?}:{:?}:validity={}",
+            op, input_dtype, value_validity_flag
+        ),
         None,
         || {
             if value_validity_flag {
@@ -1124,7 +1128,9 @@ enum AccDownload {
     /// variant in `crate::exec::groupby::AccDownload::Welford` for the
     /// rationale — the (count, mean, M2) triple doesn't fit a single
     /// atomic, so per-group accumulation is folded host-side.
-    Welford { states: Vec<crate::exec::welford::WelfordState> },
+    Welford {
+        states: Vec<crate::exec::welford::WelfordState>,
+    },
 }
 
 /// Compile + launch one aggregate kernel (or, for `Avg`, two), download its
@@ -1195,15 +1201,12 @@ fn run_one_aggregate(
             // (group, ones) pair.
             let (_col_io, resolved) =
                 resolve_agg_input_slow(agg, aggregate, input_ord, name_to_pre_ord, compacted)?;
-            let (filtered_keys_gpu, n_valid) =
-                filter_keys_if_needed(host_keys, &resolved, stream)?;
-            let count_group_col: &GpuVec<i64> =
-                filtered_keys_gpu.as_ref().unwrap_or(group_col);
+            let (filtered_keys_gpu, n_valid) = filter_keys_if_needed(host_keys, &resolved, stream)?;
+            let count_group_col: &GpuVec<i64> = filtered_keys_gpu.as_ref().unwrap_or(group_col);
             let ones: Vec<i64> = vec![1i64; n_valid];
             let input_gpu = GpuVec::<i64>::from_slice_async(&ones, stream.raw())?;
             let identity_init: Vec<i64> = vec![0i64; k];
-            let mut acc_table =
-                GpuVec::<i64>::from_slice_async(&identity_init, stream.raw())?;
+            let mut acc_table = GpuVec::<i64>::from_slice_async(&identity_init, stream.raw())?;
             launch_agg_kernel::<i64>(
                 ReduceOp::Sum,
                 DataType::Int64,
@@ -1252,10 +1255,8 @@ fn run_one_aggregate(
 
             // Build the filtered key column once for this aggregate (used by
             // both the SUM and COUNT kernel launches).
-            let (filtered_keys_gpu, n_valid) =
-                filter_keys_if_needed(host_keys, &resolved, stream)?;
-            let avg_group_col: &GpuVec<i64> =
-                filtered_keys_gpu.as_ref().unwrap_or(group_col);
+            let (filtered_keys_gpu, n_valid) = filter_keys_if_needed(host_keys, &resolved, stream)?;
+            let avg_group_col: &GpuVec<i64> = filtered_keys_gpu.as_ref().unwrap_or(group_col);
 
             // Build the filtered value column at f64.
             let sum_input: Vec<f64> = match resolved.validity() {
@@ -1265,8 +1266,7 @@ fn run_one_aggregate(
             debug_assert_eq!(sum_input.len(), n_valid);
             let input_gpu = GpuVec::<f64>::from_slice_async(&sum_input, stream.raw())?;
             let sum_init: Vec<f64> = vec![0.0f64; k];
-            let mut sum_acc =
-                GpuVec::<f64>::from_slice_async(&sum_init, stream.raw())?;
+            let mut sum_acc = GpuVec::<f64>::from_slice_async(&sum_init, stream.raw())?;
             launch_agg_kernel::<f64>(
                 ReduceOp::Sum,
                 DataType::Float64,
@@ -1285,8 +1285,7 @@ fn run_one_aggregate(
             let ones: Vec<i64> = vec![1i64; n_valid];
             let count_input = GpuVec::<i64>::from_slice_async(&ones, stream.raw())?;
             let count_init: Vec<i64> = vec![0i64; k];
-            let mut count_acc =
-                GpuVec::<i64>::from_slice_async(&count_init, stream.raw())?;
+            let mut count_acc = GpuVec::<i64>::from_slice_async(&count_init, stream.raw())?;
             launch_agg_kernel::<i64>(
                 ReduceOp::Sum,
                 DataType::Int64,
@@ -1456,8 +1455,7 @@ fn run_typed_agg_native_validity(
     let host_col = resolved.as_ref();
     let validity = resolved.validity().ok_or_else(|| {
         BoltError::Other(
-            "groupby_with_pre: native-validity dispatch invoked without a validity mask"
-                .into(),
+            "groupby_with_pre: native-validity dispatch invoked without a validity mask".into(),
         )
     })?;
     if validity.len() != host_keys.len() {
@@ -1476,8 +1474,10 @@ fn run_typed_agg_native_validity(
     // Pack the validity mask into the kernel's u32-word layout. The mask
     // is `&[bool]` here; we project to the `u8` representation
     // `pack_validity_bits` consumes (1 = valid, 0 = null) and feed it.
-    let validity_bytes: Vec<u8> =
-        validity.iter().map(|&v| if v { 1u8 } else { 0u8 }).collect();
+    let validity_bytes: Vec<u8> = validity
+        .iter()
+        .map(|&v| if v { 1u8 } else { 0u8 })
+        .collect();
     let packed = pack_validity_bits(&validity_bytes);
     let validity_gpu = GpuVec::<u32>::from_slice_async(&packed, stream.raw())?;
 
@@ -1491,14 +1491,21 @@ fn run_typed_agg_native_validity(
             // Mirror the host-strip branch above.
             if matches!(op, ReduceOp::Sum) {
                 let widened: Vec<i64> = host.iter().map(|&x| x as i64).collect();
-                let input_gpu =
-                    GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
+                let input_gpu = GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
-                let mut acc =
-                    GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
+                let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
                 launch_agg_kernel_with_validity::<i64>(
-                    op, DataType::Int64, group_col, keys_table, &input_gpu,
-                    &mut acc, &validity_gpu, n_rows, k_u32, stream, overflow_ptr,
+                    op,
+                    DataType::Int64,
+                    group_col,
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    &validity_gpu,
+                    n_rows,
+                    k_u32,
+                    stream,
+                    overflow_ptr,
                 )?;
                 return Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?));
             }
@@ -1506,8 +1513,17 @@ fn run_typed_agg_native_validity(
             let init: Vec<i32> = vec![identity_i32(op); k];
             let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<i32>(
-                op, DataType::Int32, group_col, keys_table, &input_gpu, &mut acc,
-                &validity_gpu, n_rows, k_u32, stream, overflow_ptr,
+                op,
+                DataType::Int32,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                &validity_gpu,
+                n_rows,
+                k_u32,
+                stream,
+                overflow_ptr,
             )?;
             Ok(AccDownload::I32(download_pinned_i32(&acc, stream)?))
         }
@@ -1516,8 +1532,17 @@ fn run_typed_agg_native_validity(
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<i64>(
-                op, DataType::Int64, group_col, keys_table, &input_gpu, &mut acc,
-                &validity_gpu, n_rows, k_u32, stream, overflow_ptr,
+                op,
+                DataType::Int64,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                &validity_gpu,
+                n_rows,
+                k_u32,
+                stream,
+                overflow_ptr,
             )?;
             Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
         }
@@ -1529,8 +1554,17 @@ fn run_typed_agg_native_validity(
             let init: Vec<f32> = vec![identity_f32(op); k];
             let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<f32>(
-                op, DataType::Float32, group_col, keys_table, &input_gpu,
-                &mut acc, &validity_gpu, n_rows, k_u32, stream, overflow_ptr,
+                op,
+                DataType::Float32,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                &validity_gpu,
+                n_rows,
+                k_u32,
+                stream,
+                overflow_ptr,
             )?;
             Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
         }
@@ -1540,8 +1574,17 @@ fn run_typed_agg_native_validity(
             let init: Vec<f64> = vec![identity_f64(op); k];
             let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel_with_validity::<f64>(
-                op, DataType::Float64, group_col, keys_table, &input_gpu,
-                &mut acc, &validity_gpu, n_rows, k_u32, stream, overflow_ptr,
+                op,
+                DataType::Float64,
+                group_col,
+                keys_table,
+                &input_gpu,
+                &mut acc,
+                &validity_gpu,
+                n_rows,
+                k_u32,
+                stream,
+                overflow_ptr,
             )?;
             Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
@@ -1599,8 +1642,17 @@ fn run_typed_agg(
     let validity = resolved.validity();
     if dispatch_native_validity(any_input_has_validity, validity, op, col_io.dtype) {
         return run_typed_agg_native_validity(
-            op, col_io, resolved, host_keys, group_col, keys_table, n_rows, k, k_u32,
-            stream, overflow_ptr,
+            op,
+            col_io,
+            resolved,
+            host_keys,
+            group_col,
+            keys_table,
+            n_rows,
+            k,
+            k_u32,
+            stream,
+            overflow_ptr,
         );
     }
 
@@ -1642,11 +1694,9 @@ fn run_typed_agg(
                         .collect(),
                     None => host.iter().map(|&x| x as i64).collect(),
                 };
-                let input_gpu =
-                    GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
+                let input_gpu = GpuVec::<i64>::from_slice_async(&widened, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
-                let mut acc =
-                    GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
+                let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
                 launch_agg_kernel::<i64>(
                     op,
                     DataType::Int64,
@@ -1663,8 +1713,7 @@ fn run_typed_agg(
             }
 
             let filtered: Vec<i32> = filter_by_validity(host, validity);
-            let input_gpu =
-                GpuVec::<i32>::from_slice_async(&filtered, stream.raw())?;
+            let input_gpu = GpuVec::<i32>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<i32> = vec![identity_i32(op); k];
             let mut acc = GpuVec::<i32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<i32>(
@@ -1688,8 +1737,7 @@ fn run_typed_agg(
             // Stage-B reject guarded against that. Now that the gate
             // is lifted we must apply the validity mask explicitly.
             let filtered: Vec<i64> = filter_by_validity(host, validity);
-            let input_gpu =
-                GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
+            let input_gpu = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<i64>(
@@ -1713,8 +1761,7 @@ fn run_typed_agg(
                 ));
             }
             let filtered: Vec<f32> = filter_by_validity(host, validity);
-            let input_gpu =
-                GpuVec::<f32>::from_slice_async(&filtered, stream.raw())?;
+            let input_gpu = GpuVec::<f32>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
             let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<f32>(
@@ -1738,8 +1785,7 @@ fn run_typed_agg(
                 ));
             }
             let filtered: Vec<f64> = filter_by_validity(host, validity);
-            let input_gpu =
-                GpuVec::<f64>::from_slice_async(&filtered, stream.raw())?;
+            let input_gpu = GpuVec::<f64>::from_slice_async(&filtered, stream.raw())?;
             let init: Vec<f64> = vec![identity_f64(op); k];
             let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
             launch_agg_kernel::<f64>(
@@ -1878,7 +1924,13 @@ fn resolve_agg_input_slow<'a>(
         .validity
         .as_ref()
         .map(|v| v.iter().map(|b| *b != 0).collect::<Vec<bool>>());
-    Ok((col_io, ResolvedHostCol::Owned { col: host, validity }))
+    Ok((
+        col_io,
+        ResolvedHostCol::Owned {
+            col: host,
+            validity,
+        },
+    ))
 }
 
 /// Recover a pre output's name from its ordinal by reverse-searching
@@ -1886,10 +1938,7 @@ fn resolve_agg_input_slow<'a>(
 /// evaluator env from the compacted column store, which is indexed by
 /// ordinal rather than name. Linear search is fine: `pre.outputs` is small
 /// (typically O(few)).
-fn compacted_pre_output_name(
-    ord: usize,
-    name_to_pre_ord: &HashMap<String, usize>,
-) -> String {
+fn compacted_pre_output_name(ord: usize, name_to_pre_ord: &HashMap<String, usize>) -> String {
     for (name, &o) in name_to_pre_ord.iter() {
         if o == ord {
             return name.clone();
@@ -2010,10 +2059,7 @@ fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
     fn split<T: Copy + Default>(v: Vec<Option<T>>) -> (Vec<T>, Option<Vec<u8>>) {
         let any_null = v.iter().any(|x| x.is_none());
         if !any_null {
-            return (
-                v.into_iter().map(|x| x.unwrap_or_default()).collect(),
-                None,
-            );
+            return (v.into_iter().map(|x| x.unwrap_or_default()).collect(), None);
         }
         let mut values: Vec<T> = Vec::with_capacity(v.len());
         let mut validity: Vec<u8> = Vec::with_capacity(v.len());
@@ -2060,13 +2106,11 @@ fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
                 validity: valid,
             })
         }
-        expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
-            Err(BoltError::Type(
-                "groupby_with_pre: Bool/Utf8 aggregate inputs not supported by the \
+        expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => Err(BoltError::Type(
+            "groupby_with_pre: Bool/Utf8 aggregate inputs not supported by the \
                  primitive reduction path"
-                    .into(),
-            ))
-        }
+                .into(),
+        )),
     }
 }
 
@@ -2176,18 +2220,18 @@ fn build_agg_array(
         )),
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             let scalars = match other {
-                AccDownload::I32(host) => Scalars::I32(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
-                AccDownload::I64(host) => Scalars::I64(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
-                AccDownload::F32(host) => Scalars::F32(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
-                AccDownload::F64(host) => Scalars::F64(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
+                AccDownload::I32(host) => {
+                    Scalars::I32(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
+                AccDownload::I64(host) => {
+                    Scalars::I64(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
+                AccDownload::F32(host) => {
+                    Scalars::F32(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
+                AccDownload::F64(host) => {
+                    Scalars::F64(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
                 AccDownload::Avg { .. } => {
                     return Err(BoltError::Other(
                         "internal: AVG accumulator passed to non-AVG aggregate".into(),
@@ -2271,12 +2315,8 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
     match (scalars, out_dtype) {
         (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
         (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
-        (Scalars::F32(v), DataType::Float32) => {
-            Ok(Arc::new(Float32Array::from(v)) as ArrayRef)
-        }
-        (Scalars::F64(v), DataType::Float64) => {
-            Ok(Arc::new(Float64Array::from(v)) as ArrayRef)
-        }
+        (Scalars::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
+        (Scalars::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
 
         // Cross-dtype paths consistent with the scalar reducer.
         (Scalars::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
@@ -2369,7 +2409,11 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 PreColValues::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "groupby_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -2386,7 +2430,11 @@ impl PreCol {
             DataType::Int64 => PreColValues::I64(GpuVec::<i64>::zeros(n)?),
             DataType::Float32 => PreColValues::F32(GpuVec::<f32>::zeros(n)?),
             DataType::Float64 => PreColValues::F64(GpuVec::<f64>::zeros(n)?),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "groupby_with_pre: pre kernel output dtype {:?} not supported",
                     dtype
@@ -2671,14 +2719,17 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod null_propagation_tests {
@@ -2849,7 +2900,8 @@ mod null_propagation_tests {
             assert!(
                 dispatch_native_validity(true, Some(&mask[..]), op, dtype),
                 "expected native dispatch for ({:?}, {:?})",
-                op, dtype
+                op,
+                dtype
             );
         }
     }
@@ -2869,7 +2921,8 @@ mod null_propagation_tests {
             assert!(
                 !dispatch_native_validity(true, Some(&mask[..]), op, dtype),
                 "Float MIN/MAX has no _with_validity emitter; expected host-strip for ({:?}, {:?})",
-                op, dtype
+                op,
+                dtype
             );
         }
     }
@@ -2880,12 +2933,7 @@ mod null_propagation_tests {
     #[test]
     fn dispatch_native_validity_off_when_mask_all_true() {
         let mask = [true, true, true, true];
-        let chose = dispatch_native_validity(
-            true,
-            Some(&mask[..]),
-            ReduceOp::Sum,
-            DataType::Int64,
-        );
+        let chose = dispatch_native_validity(true, Some(&mask[..]), ReduceOp::Sum, DataType::Int64);
         assert!(
             !chose,
             "all-true mask means no NULLs in this batch; skip the native dispatch"
@@ -2897,12 +2945,7 @@ mod null_propagation_tests {
     /// (which is a no-op for None).
     #[test]
     fn dispatch_native_validity_off_when_mask_none() {
-        let chose = dispatch_native_validity(
-            true,
-            None,
-            ReduceOp::Sum,
-            DataType::Int64,
-        );
+        let chose = dispatch_native_validity(true, None, ReduceOp::Sum, DataType::Int64);
         assert!(!chose, "no mask -> no native dispatch");
     }
 
@@ -2923,13 +2966,23 @@ mod null_propagation_tests {
         // (the stub will Err), short-circuit — the migrated pinned path
         // simply wasn't reachable, which is fine for the "no panic"
         // contract.
-        let Ok(v_i32) = GpuVec::<i32>::from_slice_async(&[1, 2, 3, 4], stream.raw()) else { return };
+        let Ok(v_i32) = GpuVec::<i32>::from_slice_async(&[1, 2, 3, 4], stream.raw()) else {
+            return;
+        };
         let _ = download_pinned_i32(&v_i32, &stream);
-        let Ok(v_i64) = GpuVec::<i64>::from_slice_async(&[1i64, 2, 3, 4], stream.raw()) else { return };
+        let Ok(v_i64) = GpuVec::<i64>::from_slice_async(&[1i64, 2, 3, 4], stream.raw()) else {
+            return;
+        };
         let _ = download_pinned_i64(&v_i64, &stream);
-        let Ok(v_f32) = GpuVec::<f32>::from_slice_async(&[1.0f32, 2.0, 3.0, 4.0], stream.raw()) else { return };
+        let Ok(v_f32) = GpuVec::<f32>::from_slice_async(&[1.0f32, 2.0, 3.0, 4.0], stream.raw())
+        else {
+            return;
+        };
         let _ = download_pinned_f32(&v_f32, &stream);
-        let Ok(v_f64) = GpuVec::<f64>::from_slice_async(&[1.0f64, 2.0, 3.0, 4.0], stream.raw()) else { return };
+        let Ok(v_f64) = GpuVec::<f64>::from_slice_async(&[1.0f64, 2.0, 3.0, 4.0], stream.raw())
+        else {
+            return;
+        };
         let _ = download_pinned_f64(&v_f64, &stream);
     }
 
@@ -2969,21 +3022,12 @@ mod null_propagation_tests {
             Err(_) => return,
         };
         let out = h.record_batch();
-        let mut expected: std::collections::HashMap<i32, i64> =
-            std::collections::HashMap::new();
+        let mut expected: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
         for v in 0..9i64 {
             *expected.entry((v as i32) % 3).or_default() += v + v;
         }
-        let ks = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let ss = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ss = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i);
             let s = ss.value(i);

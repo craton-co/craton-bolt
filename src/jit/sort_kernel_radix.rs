@@ -248,14 +248,16 @@ impl RadixFlavour {
                 return Err(BoltError::Other(
                     "sort_kernel_radix: Bool keys have only 2 distinct values; \
                      a single-pass counting sort is strictly cheaper. \
-                     Fall back to host or bitonic sort.".into(),
+                     Fall back to host or bitonic sort."
+                        .into(),
                 ))
             }
             DataType::Utf8 => {
                 return Err(BoltError::Other(
                     "sort_kernel_radix: Utf8 keys must be dictionary-decoded \
                      into a fixed-width index before any device-side sort. \
-                     Fall back to host or bitonic sort.".into(),
+                     Fall back to host or bitonic sort."
+                        .into(),
                 ))
             }
             DataType::Decimal128(_, _) => {
@@ -504,8 +506,7 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     writeln!(p, "{{").map_err(write_err)?;
 
     // -- Shared-memory private histogram. 16 u32 buckets per block. ---------
-    writeln!(p, "\t.shared .align 4 .b32 s_hist[{}];", RADIX_BUCKETS)
-        .map_err(write_err)?;
+    writeln!(p, "\t.shared .align 4 .b32 s_hist[{}];", RADIX_BUCKETS).map_err(write_err)?;
 
     // -- Register declarations ---------------------------------------
     writeln!(p, "\t.reg .pred %p<4>;").map_err(write_err)?;
@@ -551,8 +552,7 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
     //
     // load key, then extract digit = (key >> shift) & 0xF
     if flavour.byte_width == 4 {
-        writeln!(p, "\t@%p0 ld.global.{} %r6, [%rd2];", flavour.ld_st_suffix)
-            .map_err(write_err)?;
+        writeln!(p, "\t@%p0 ld.global.{} %r6, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
         writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
         writeln!(p, "\tand.b32 %r8, %r7, 15;").map_err(write_err)?;
     } else {
@@ -667,13 +667,8 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     // the loaded key in %r6 (b32) / %rd3 (b64). `active` predicate is %p0.
     let key_w = flavour.byte_width as i64;
     emit_block_stable_scatter_prologue(
-        &mut p,
-        &flavour,
-        &entry,
-        /* keys_in_param  */ 0,
-        /* offsets_param  */ 2,
-        /* n_rows_param   */ 3,
-        /* shift_param    */ 4,
+        &mut p, &flavour, &entry, /* keys_in_param  */ 0, /* offsets_param  */ 2,
+        /* n_rows_param   */ 3, /* shift_param    */ 4,
     )?;
 
     // keys_out_ptr -> %rd8; out_addr = keys_out_ptr + out_idx * byte_width.
@@ -686,8 +681,12 @@ pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
         writeln!(p, "\t@%p0 st.global.{} [%rd10], %r6;", flavour.ld_st_suffix)
             .map_err(write_err)?;
     } else {
-        writeln!(p, "\t@%p0 st.global.{} [%rd10], %rd3;", flavour.ld_st_suffix)
-            .map_err(write_err)?;
+        writeln!(
+            p,
+            "\t@%p0 st.global.{} [%rd10], %rd3;",
+            flavour.ld_st_suffix
+        )
+        .map_err(write_err)?;
     }
 
     writeln!(p, "DONE:").map_err(write_err)?;
@@ -728,8 +727,7 @@ fn emit_block_stable_scatter_prologue(
     const INACTIVE: u32 = 0xFFFF;
 
     // -- Shared state -------------------------------------------------
-    writeln!(p, "\t.shared .align 4 .b32 s_digit[{}];", RADIX_BLOCK_SIZE)
-        .map_err(write_err)?;
+    writeln!(p, "\t.shared .align 4 .b32 s_digit[{}];", RADIX_BLOCK_SIZE).map_err(write_err)?;
     writeln!(p, "\t.shared .align 4 .b32 s_hist[{}];", RADIX_BUCKETS).map_err(write_err)?;
     writeln!(p, "\t.shared .align 4 .b32 s_base[{}];", RADIX_BUCKETS).map_err(write_err)?;
 
@@ -765,8 +763,7 @@ fn emit_block_stable_scatter_prologue(
     // Default digit to INACTIVE; active lanes overwrite with the real digit.
     writeln!(p, "\tmov.u32 %r8, {INACTIVE};").map_err(write_err)?;
     if flavour.byte_width == 4 {
-        writeln!(p, "\t@%p0 ld.global.{} %r6, [%rd2];", flavour.ld_st_suffix)
-            .map_err(write_err)?;
+        writeln!(p, "\t@%p0 ld.global.{} %r6, [%rd2];", flavour.ld_st_suffix).map_err(write_err)?;
         writeln!(p, "\tshr.u32 %r7, %r6, %r5;").map_err(write_err)?;
         writeln!(p, "\t@%p0 and.b32 %r8, %r7, 15;").map_err(write_err)?;
     } else {
@@ -817,8 +814,8 @@ fn emit_block_stable_scatter_prologue(
     writeln!(p, "\tadd.s64 %rd10, %rd8, %rd9;").map_err(write_err)?; // &block_offsets[..]
     writeln!(p, "\tmov.u32 %r12, 0;").map_err(write_err)?;
     writeln!(p, "\t@%p1 ld.global.u32 %r12, [%rd10];").map_err(write_err)?; // run base
-    // s_base[lane] = run base (write for all 16 lanes; inactive/empty buckets
-    // store whatever they read, never consulted by an active thread).
+                                                                            // s_base[lane] = run base (write for all 16 lanes; inactive/empty buckets
+                                                                            // store whatever they read, never consulted by an active thread).
     writeln!(p, "\tadd.s64 %rd10, %rd7, %rd11;").map_err(write_err)?; // &s_base[lane]
     writeln!(p, "\t@%p1 st.shared.u32 [%rd10], %r12;").map_err(write_err)?;
     writeln!(p, "\tbar.sync 0;").map_err(write_err)?;
@@ -913,13 +910,8 @@ pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String>
     // the row-index payload in %r16 / %rd16.. below without a second `.reg`.
     let key_w = flavour.byte_width as i64;
     emit_block_stable_scatter_prologue(
-        &mut p,
-        &flavour,
-        &entry,
-        /* keys_in_param  */ 0,
-        /* offsets_param  */ 4,
-        /* n_rows_param   */ 5,
-        /* shift_param    */ 6,
+        &mut p, &flavour, &entry, /* keys_in_param  */ 0, /* offsets_param  */ 4,
+        /* n_rows_param   */ 5, /* shift_param    */ 6,
     )?;
 
     // vals_in_ptr -> %rd16; load the u32 row-index payload for active lanes.
@@ -939,8 +931,12 @@ pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String>
         writeln!(p, "\t@%p0 st.global.{} [%rd21], %r6;", flavour.ld_st_suffix)
             .map_err(write_err)?;
     } else {
-        writeln!(p, "\t@%p0 st.global.{} [%rd21], %rd3;", flavour.ld_st_suffix)
-            .map_err(write_err)?;
+        writeln!(
+            p,
+            "\t@%p0 st.global.{} [%rd21], %rd3;",
+            flavour.ld_st_suffix
+        )
+        .map_err(write_err)?;
     }
 
     // vals_out_ptr -> %rd22; vout_addr = vals_out_ptr + out_idx * 4
@@ -1142,10 +1138,7 @@ mod tests {
     /// here.)
     #[test]
     fn unsupported_dtypes_rejected() {
-        for dty in [
-            DataType::Bool,
-            DataType::Utf8,
-        ] {
+        for dty in [DataType::Bool, DataType::Utf8] {
             assert!(
                 !radix_supports_dtype(dty),
                 "dtype {:?} should not be supported by the radix kernel",
@@ -1228,11 +1221,8 @@ mod tests {
         assert!(f32_hist.contains("ld.global.b32"));
         assert!(!f32_hist.contains("ld.global.f32"));
 
-        let f32_scatter =
-            compile_radix_scatter_with_indices(DataType::Float32).unwrap();
-        assert!(
-            f32_scatter.contains(".visible .entry bolt_radix_scatter_f32_with_indices(")
-        );
+        let f32_scatter = compile_radix_scatter_with_indices(DataType::Float32).unwrap();
+        assert!(f32_scatter.contains(".visible .entry bolt_radix_scatter_f32_with_indices("));
         assert!(f32_scatter.contains("ld.global.b32"));
         assert!(f32_scatter.contains("st.global.b32"));
 

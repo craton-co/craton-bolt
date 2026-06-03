@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory GROUP BY **COUNT** kernel (Tier 1 fast path).
 //!
@@ -164,12 +164,7 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     // ----------------------------------------------------------------------
     writeln!(ptx, "\tmov.u32 %r10, %r2;").map_err(write_err)?;
     writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r10, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r10, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
     // block_count[%r10] = 0  (u64 zero)
     writeln!(ptx, "\tmul.wide.u32 %rd10, %r10, 8;").map_err(write_err)?;
@@ -179,12 +174,7 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tcvt.u64.u32 %rd12, %r10;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd13, %rd1, %rd12;").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u8 [%rd13], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r10, %r10, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r10, %r10, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
     writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
@@ -216,12 +206,7 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
 
     // Overflow check: unsigned compare so a (defensively-allowed) negative
     // key takes the safe global path instead of corrupting a shared slot.
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p2, %r12, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
     // Shared increment.  block_count[key] += 1
@@ -258,12 +243,7 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     // ----------------------------------------------------------------------
     writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
     writeln!(ptx, "MERGE_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p3, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p3, %r20, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra MERGE_DONE;").map_err(write_err)?;
 
     // Load block_set[%r20] (zero-extended into 32-bit %r21).
@@ -281,12 +261,7 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tatom.global.add.u64 %rd6, [%rd17], %rd16;").map_err(write_err)?;
 
     writeln!(ptx, "MERGE_NEXT:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra MERGE_TOP;").map_err(write_err)?;
     writeln!(ptx, "MERGE_DONE:").map_err(write_err)?;
 

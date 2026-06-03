@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Aggregate execution with a pre-projection / filter pass.
 //!
@@ -42,9 +42,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
 
 use crate::cuda::buffer::primitive_to_gpu;
@@ -58,8 +56,8 @@ use crate::exec::launch::CudaStream;
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::{
-    compile_avg_reduction_kernel, compile_reduction_kernel, ReduceOp, AVG_KERNEL_ENTRY,
-    BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
+    compile_avg_reduction_kernel, compile_reduction_kernel, ReduceOp, AVG_KERNEL_ENTRY, BLOCK_SIZE,
+    REDUCTION_KERNEL_ENTRY,
 };
 use crate::jit::compile_ptx;
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
@@ -124,9 +122,8 @@ pub fn execute_aggregate_with_pre(
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     let arrays = build_scalar_aggregates(aggregate, pre_spec, &compacted)?;
 
-    RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        BoltError::Other(format!("failed to build aggregate RecordBatch: {e}"))
-    })
+    RecordBatch::try_new(arrow_schema, arrays)
+        .map_err(|e| BoltError::Other(format!("failed to build aggregate RecordBatch: {e}")))
 }
 
 /// Resident, fully **on-device** fast path for `pre.is_some()` scalar
@@ -456,8 +453,7 @@ fn run_pre_stage(
     // -- (Option B) Detect which inputs carry validity. If any do, every
     //    output must also carry validity so the kernel has a target buffer
     //    for the per-row combined AND.
-    let input_has_validity: Vec<bool> =
-        input_cols.iter().map(|c| c.has_validity()).collect();
+    let input_has_validity: Vec<bool> = input_cols.iter().map(|c| c.has_validity()).collect();
     let any_input_validity: bool = input_has_validity.iter().any(|b| *b);
     let output_has_validity: Vec<bool> = if any_input_validity {
         vec![true; spec.outputs.len()]
@@ -495,8 +491,9 @@ fn run_pre_stage(
     // -- Assemble kernel parameters: inputs..., outputs...,
     //    [input_validity..., output_validity...,] n_rows u32. Order matches
     //    `ptx_gen::compile`'s param walk.
-    let mut device_ptrs: Vec<CUdeviceptr> =
-        Vec::with_capacity(input_cols.len() + output_cols.len() + input_cols.len() + output_cols.len());
+    let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(
+        input_cols.len() + output_cols.len() + input_cols.len() + output_cols.len(),
+    );
     for c in &input_cols {
         device_ptrs.push(c.device_ptr());
     }
@@ -508,8 +505,7 @@ fn run_pre_stage(
         if *has {
             let vp = input_cols[i].validity_device_ptr().ok_or_else(|| {
                 BoltError::Other(
-                    "internal: input flagged with validity has no valid_mask device pointer"
-                        .into(),
+                    "internal: input flagged with validity has no valid_mask device pointer".into(),
                 )
             })?;
             device_ptrs.push(vp);
@@ -570,8 +566,7 @@ fn run_pre_stage(
         let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
 
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
-        let input_ptrs: Vec<CUdeviceptr> =
-            input_cols.iter().map(|c| c.device_ptr()).collect();
+        let input_ptrs: Vec<CUdeviceptr> = input_cols.iter().map(|c| c.device_ptr()).collect();
         // Aggregate pre-stage predicate kernel: today's planner doesn't lower
         // `Op::IsNullCheck` through this path (only the projection-scan-chain
         // path uses it), so we pass an empty validity slice — the
@@ -648,8 +643,7 @@ fn build_one_aggregate(
     match agg {
         AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
             let op = ReduceOp::from_agg(agg)?;
-            let resolved =
-                resolve_agg_input_col(expr, pre_spec, compacted, out_field.dtype)?;
+            let resolved = resolve_agg_input_col(expr, pre_spec, compacted, out_field.dtype)?;
             let scalar = reduce_host_col(op, resolved.as_ref())?;
             scalar_to_array(scalar, out_field.dtype)
         }
@@ -662,8 +656,7 @@ fn build_one_aggregate(
             // produce NULLs so it matches the full row count.
             //
             // We materialise at Int64 since that's the COUNT result dtype.
-            let resolved =
-                resolve_agg_input_col(expr, pre_spec, compacted, DataType::Int64)?;
+            let resolved = resolve_agg_input_col(expr, pre_spec, compacted, DataType::Int64)?;
             let count = resolved.non_null_count() as i64;
             scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
@@ -681,12 +674,8 @@ fn build_one_aggregate(
             // `expected_dtype` is Float64 because Welford accumulates
             // in f64 — but the helper still validates the cast for
             // narrower dtypes, so we don't lose the type-error surface.
-            let resolved = resolve_agg_input_col(
-                expr.as_ref(),
-                pre_spec,
-                compacted,
-                DataType::Float64,
-            )?;
+            let resolved =
+                resolve_agg_input_col(expr.as_ref(), pre_spec, compacted, DataType::Float64)?;
             let host_col = resolved.as_ref();
             let stripped = strip_nulls_borrowed(host_col);
             let mut state = crate::exec::welford::WelfordState::empty();
@@ -701,11 +690,7 @@ fn build_one_aggregate(
                 AggregateExpr::StddevSamp(_) => crate::exec::welford::StddevKind::Samp,
                 _ => unreachable!("matched in outer arm"),
             };
-            stddev_to_array_with_pre(
-                crate::exec::welford::finalize(&state, kind),
-                agg,
-                out_field,
-            )
+            stddev_to_array_with_pre(crate::exec::welford::finalize(&state, kind), agg, out_field)
         }
         AggregateExpr::Avg(expr) => {
             // AVG via the **fused** kernel: one launch produces both the
@@ -724,8 +709,7 @@ fn build_one_aggregate(
             // output field is nullable we surface that NULL; otherwise we keep
             // 0.0 (a null in a non-nullable column would be rejected by
             // RecordBatch::try_new). Mirrors the scalar path in `aggregate.rs`.
-            let resolved =
-                resolve_agg_input_col(expr, pre_spec, compacted, DataType::Float64)?;
+            let resolved = resolve_agg_input_col(expr, pre_spec, compacted, DataType::Float64)?;
             let (sum_f64, count_u64) = fused_avg_host_col(resolved.as_ref())?;
             Ok(crate::exec::aggregate::avg_result_array(
                 sum_f64,
@@ -738,12 +722,8 @@ fn build_one_aggregate(
             // pre-aggregation column, materialised at Float64. Matches
             // the scalar-aggregate path in `aggregate.rs` so the two
             // entry points produce identical results for a given input.
-            let resolved = resolve_agg_input_col(
-                expr.as_ref(),
-                pre_spec,
-                compacted,
-                DataType::Float64,
-            )?;
+            let resolved =
+                resolve_agg_input_col(expr.as_ref(), pre_spec, compacted, DataType::Float64)?;
             let xs = host_col_as_f64(resolved.as_ref())?;
             let is_pop = matches!(agg, AggregateExpr::VarPop(_));
             let result: Option<f64> = if is_pop {
@@ -977,10 +957,7 @@ fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
     fn split<T: Copy + Default>(v: Vec<Option<T>>) -> (Vec<T>, Option<Vec<u8>>) {
         let any_null = v.iter().any(|x| x.is_none());
         if !any_null {
-            return (
-                v.into_iter().map(|x| x.unwrap_or_default()).collect(),
-                None,
-            );
+            return (v.into_iter().map(|x| x.unwrap_or_default()).collect(), None);
         }
         let mut values: Vec<T> = Vec::with_capacity(v.len());
         let mut validity: Vec<u8> = Vec::with_capacity(v.len());
@@ -1027,13 +1004,11 @@ fn from_expr_host(c: expr_agg::HostColumn) -> BoltResult<HostCol> {
                 validity: valid,
             })
         }
-        expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => {
-            Err(BoltError::Type(
-                "agg_with_pre: Bool/Utf8 aggregate inputs not supported by the \
+        expr_agg::HostColumn::Bool(_) | expr_agg::HostColumn::Utf8(_) => Err(BoltError::Type(
+            "agg_with_pre: Bool/Utf8 aggregate inputs not supported by the \
                  primitive reduction path"
-                    .into(),
-            ))
-        }
+                .into(),
+        )),
     }
 }
 
@@ -1393,7 +1368,11 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 PreColValues::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -1420,7 +1399,11 @@ impl PreCol {
             DataType::Int64 => PreColValues::I64(GpuVec::<i64>::zeros(n)?),
             DataType::Float32 => PreColValues::F32(GpuVec::<f32>::zeros(n)?),
             DataType::Float64 => PreColValues::F64(GpuVec::<f64>::zeros(n)?),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel output dtype {:?} not supported",
                     dtype
@@ -1681,8 +1664,7 @@ impl ReduceScalar for i32 {
                         Some(s) => s,
                         None => {
                             return Err(BoltError::Type(
-                                "SUM(integer) overflow: accumulator exceeds i64 range"
-                                    .to_string(),
+                                "SUM(integer) overflow: accumulator exceeds i64 range".to_string(),
                             ));
                         }
                     };
@@ -1728,8 +1710,7 @@ impl ReduceScalar for i64 {
                         Some(s) => s,
                         None => {
                             return Err(BoltError::Type(
-                                "SUM(integer) overflow: accumulator exceeds i64 range"
-                                    .to_string(),
+                                "SUM(integer) overflow: accumulator exceeds i64 range".to_string(),
                             ));
                         }
                     };
@@ -1852,7 +1833,10 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Scalar (no GROUP BY) aggregate execution.
 //!
@@ -105,9 +105,7 @@ use arrow_array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch,
 };
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
@@ -116,12 +114,12 @@ use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
-use crate::jit::agg_kernels::{
-    compile_avg_reduction_kernel, compile_reduction_kernel,
-    compile_reduction_kernel_with_validity, ReduceOp, AVG_KERNEL_ENTRY, BLOCK_SIZE,
-    REDUCTION_KERNEL_ENTRY, REDUCTION_KERNEL_WITH_VALIDITY_ENTRY,
-};
 use crate::exec::validity_audit::packed_validity_for;
+use crate::jit::agg_kernels::{
+    compile_avg_reduction_kernel, compile_reduction_kernel, compile_reduction_kernel_with_validity,
+    ReduceOp, AVG_KERNEL_ENTRY, BLOCK_SIZE, REDUCTION_KERNEL_ENTRY,
+    REDUCTION_KERNEL_WITH_VALIDITY_ENTRY,
+};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema, TimeUnit};
 
 // `CudaModule` import dropped: every load site now routes through
@@ -174,8 +172,7 @@ pub fn execute_aggregate(
     }
     if pre.is_some() {
         return Err(BoltError::Other(
-            "aggregate with projection/filter not yet implemented in scalar reduction path"
-                .into(),
+            "aggregate with projection/filter not yet implemented in scalar reduction path".into(),
         ));
     }
 
@@ -183,9 +180,8 @@ pub fn execute_aggregate(
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
     let arrays = build_scalar_aggregates(aggregate, table_batch, n_rows)?;
 
-    RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        BoltError::Other(format!("failed to build aggregate RecordBatch: {e}"))
-    })
+    RecordBatch::try_new(arrow_schema, arrays)
+        .map_err(|e| BoltError::Other(format!("failed to build aggregate RecordBatch: {e}")))
 }
 
 /// Build one Arrow scalar array per `AggregateExpr`, in `aggregate.aggregates`
@@ -228,7 +224,9 @@ fn build_one_aggregate(
             if let Ok(col_io) = resolve_input(inputs, col_name) {
                 if crate::exec::extended_agg::handles(agg, col_io.dtype) {
                     return crate::exec::extended_agg::execute_extended_scalar(
-                        agg, out_field, table_batch,
+                        agg,
+                        out_field,
+                        table_batch,
                     );
                 }
             }
@@ -252,9 +250,7 @@ fn build_one_aggregate(
             // somehow non-nullable we fall through to the legacy identity so
             // `RecordBatch::try_new` doesn't reject a null in a non-nullable
             // column.)
-            if out_field.nullable
-                && non_null_count_for_input(col_io, table_batch)? == 0
-            {
+            if out_field.nullable && non_null_count_for_input(col_io, table_batch)? == 0 {
                 return null_scalar_array(out_field.dtype);
             }
             // Decimal128: SUM via the dedicated i128 GPU block-reduce kernel
@@ -271,7 +267,12 @@ fn build_one_aggregate(
                     }
                     ReduceOp::Min | ReduceOp::Max => {
                         return minmax_decimal128_from_batch(
-                            op, col_io, table_batch, p, s, out_field,
+                            op,
+                            col_io,
+                            table_batch,
+                            p,
+                            s,
+                            out_field,
                         );
                     }
                     ReduceOp::Count => {}
@@ -338,8 +339,7 @@ fn build_one_aggregate(
             // remains a planner-side change tracked separately.
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
-            let (sum_f64, count_u64) =
-                fused_avg_from_batch(col_io, table_batch, n_rows)?;
+            let (sum_f64, count_u64) = fused_avg_from_batch(col_io, table_batch, n_rows)?;
             Ok(avg_result_array(sum_f64, count_u64, out_field.nullable))
         }
         AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
@@ -370,10 +370,7 @@ fn build_one_aggregate(
 /// Used by the host-side Welford path; mirrors the NULL-filtering done
 /// by `reduce_column_from_batch` for SUM/MIN/MAX but always upcasts to
 /// the f64 accumulator dtype.
-fn column_as_f64_no_nulls(
-    col_io: &ColumnIO,
-    batch: &RecordBatch,
-) -> BoltResult<Vec<f64>> {
+fn column_as_f64_no_nulls(col_io: &ColumnIO, batch: &RecordBatch) -> BoltResult<Vec<f64>> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
             "aggregate input '{}' not present in table batch: {}",
@@ -394,40 +391,36 @@ fn column_as_f64_no_nulls(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Int32Type>(
-                pa,
-                |v| v as f64,
-            ))
+            Ok(primitive_to_f64_dropping_nulls::<
+                arrow_array::types::Int32Type,
+            >(pa, |v| v as f64))
         }
         DataType::Int64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Int64Type>(
-                pa,
-                |v| v as f64,
-            ))
+            Ok(primitive_to_f64_dropping_nulls::<
+                arrow_array::types::Int64Type,
+            >(pa, |v| v as f64))
         }
         DataType::Float32 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Float32Type>(
-                pa,
-                |v| v as f64,
-            ))
+            Ok(primitive_to_f64_dropping_nulls::<
+                arrow_array::types::Float32Type,
+            >(pa, |v| v as f64))
         }
         DataType::Float64 => {
             let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            Ok(primitive_to_f64_dropping_nulls::<arrow_array::types::Float64Type>(
-                pa,
-                |v| v,
-            ))
+            Ok(primitive_to_f64_dropping_nulls::<
+                arrow_array::types::Float64Type,
+            >(pa, |v| v))
         }
         DataType::Bool
         | DataType::Utf8
@@ -464,10 +457,7 @@ where
 
 /// Count of non-NULL rows for `col_io` in `batch`. Used by COUNT(col) and as
 /// the AVG denominator so neither includes garbage at NULL positions.
-fn non_null_count_for_input(
-    col_io: &ColumnIO,
-    batch: &RecordBatch,
-) -> BoltResult<usize> {
+fn non_null_count_for_input(col_io: &ColumnIO, batch: &RecordBatch) -> BoltResult<usize> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
             "aggregate input '{}' not present in table batch: {}",
@@ -496,15 +486,12 @@ fn agg_inner_expr(agg: &AggregateExpr) -> Option<&Expr> {
 
 /// Resolve `name` to its `(index, ColumnIO)` within `inputs`.
 fn resolve_input<'a>(inputs: &'a [ColumnIO], name: &str) -> BoltResult<&'a ColumnIO> {
-    inputs
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| {
-            BoltError::Plan(format!(
-                "aggregate input column '{}' not found in plan inputs",
-                name
-            ))
-        })
+    inputs.iter().find(|c| c.name == name).ok_or_else(|| {
+        BoltError::Plan(format!(
+            "aggregate input column '{}' not found in plan inputs",
+            name
+        ))
+    })
 }
 
 /// Extract the column name from a bare-column-ref expression. The first cut
@@ -515,8 +502,7 @@ fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
         Expr::Column(name) => Ok(name.as_str()),
         Expr::Alias(inner, _) => bare_column_name(inner),
         _ => Err(BoltError::Other(
-            "aggregate input must be a bare column reference in the scalar reduction path"
-                .into(),
+            "aggregate input must be a bare column reference in the scalar reduction path".into(),
         )),
     }
 }
@@ -708,11 +694,21 @@ fn reduce_column_from_batch(
                 let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 if matches!(op, ReduceOp::Sum) {
                     reduce_gpu_vec_widened_with_validity::<i32, i64>(
-                        op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                        op,
+                        col_io.dtype,
+                        &dev,
+                        &validity_gpu,
+                        n_rows,
+                        &stream,
                     )
                 } else {
                     reduce_gpu_vec_with_validity::<i32>(
-                        op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                        op,
+                        col_io.dtype,
+                        &dev,
+                        &validity_gpu,
+                        n_rows,
+                        &stream,
                     )
                 }
             } else {
@@ -722,9 +718,7 @@ fn reduce_column_from_batch(
                 // `primitive_to_gpu`+`from_buffer` pair here.
                 let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 if matches!(op, ReduceOp::Sum) {
-                    reduce_gpu_vec_widened::<i32, i64>(
-                        op, col_io.dtype, &dev, n_rows, &stream,
-                    )
+                    reduce_gpu_vec_widened::<i32, i64>(op, col_io.dtype, &dev, n_rows, &stream)
                 } else {
                     reduce_gpu_vec::<i32>(op, col_io.dtype, &dev, n_rows, &stream)
                 }
@@ -739,7 +733,12 @@ fn reduce_column_from_batch(
                 let validity_gpu = upload_validity_async(arr, &stream)?;
                 let dev = upload_primitive_values_async::<i64>(pa.values(), &stream)?;
                 reduce_gpu_vec_with_validity::<i64>(
-                    op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                    op,
+                    col_io.dtype,
+                    &dev,
+                    &validity_gpu,
+                    n_rows,
+                    &stream,
                 )
             } else {
                 let dev = upload_primitive_values_async::<i64>(pa.values(), &stream)?;
@@ -755,7 +754,12 @@ fn reduce_column_from_batch(
                 let validity_gpu = upload_validity_async(arr, &stream)?;
                 let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
                 reduce_gpu_vec_with_validity::<f32>(
-                    op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                    op,
+                    col_io.dtype,
+                    &dev,
+                    &validity_gpu,
+                    n_rows,
+                    &stream,
                 )
             } else {
                 let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
@@ -771,7 +775,12 @@ fn reduce_column_from_batch(
                 let validity_gpu = upload_validity_async(arr, &stream)?;
                 let dev = upload_primitive_values_async::<f64>(pa.values(), &stream)?;
                 reduce_gpu_vec_with_validity::<f64>(
-                    op, col_io.dtype, &dev, &validity_gpu, n_rows, &stream,
+                    op,
+                    col_io.dtype,
+                    &dev,
+                    &validity_gpu,
+                    n_rows,
+                    &stream,
                 )
             } else {
                 let dev = upload_primitive_values_async::<f64>(pa.values(), &stream)?;
@@ -803,7 +812,12 @@ fn reduce_column_from_batch(
                 let validity_gpu = upload_validity_async(arr, &stream)?;
                 let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 reduce_gpu_vec_with_validity::<i32>(
-                    op, DataType::Int32, &dev, &validity_gpu, n_rows, &stream,
+                    op,
+                    DataType::Int32,
+                    &dev,
+                    &validity_gpu,
+                    n_rows,
+                    &stream,
                 )
             } else {
                 let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
@@ -826,19 +840,24 @@ fn reduce_column_from_batch(
                 let validity_gpu = upload_validity_async(arr, &stream)?;
                 let dev = upload_primitive_values_async::<i64>(&pa, &stream)?;
                 reduce_gpu_vec_with_validity::<i64>(
-                    op, DataType::Int64, &dev, &validity_gpu, n_rows, &stream,
+                    op,
+                    DataType::Int64,
+                    &dev,
+                    &validity_gpu,
+                    n_rows,
+                    &stream,
                 )
             } else {
                 let dev = upload_primitive_values_async::<i64>(&pa, &stream)?;
                 reduce_gpu_vec::<i64>(op, DataType::Int64, &dev, n_rows, &stream)
             }
         }
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Decimal128(_, _) => Err(BoltError::Type(format!(
-            "aggregate input dtype {:?} not supported (column '{}')",
-            col_io.dtype, col_io.name
-        ))),
+        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) => {
+            Err(BoltError::Type(format!(
+                "aggregate input dtype {:?} not supported (column '{}')",
+                col_io.dtype, col_io.name
+            )))
+        }
     }
 }
 
@@ -848,10 +867,7 @@ fn reduce_column_from_batch(
 /// `PrimitiveArray<_>` over an `i64` native, so we copy the values buffer.
 /// (We return an owned `Vec` rather than a `&[i64]` slice because the concrete
 /// array type differs per unit and cannot be unified behind one borrow.)
-fn timestamp_values_i64(
-    arr: &arrow_array::ArrayRef,
-    name: &str,
-) -> BoltResult<Vec<i64>> {
+fn timestamp_values_i64(arr: &arrow_array::ArrayRef, name: &str) -> BoltResult<Vec<i64>> {
     use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
     macro_rules! ts_vals {
         ($ty:ty, $label:literal) => {{
@@ -867,10 +883,16 @@ fn timestamp_values_i64(
             ts_vals!(arrow_array::TimestampSecondArray, "TimestampSecond")
         }
         ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, _) => {
-            ts_vals!(arrow_array::TimestampMillisecondArray, "TimestampMillisecond")
+            ts_vals!(
+                arrow_array::TimestampMillisecondArray,
+                "TimestampMillisecond"
+            )
         }
         ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, _) => {
-            ts_vals!(arrow_array::TimestampMicrosecondArray, "TimestampMicrosecond")
+            ts_vals!(
+                arrow_array::TimestampMicrosecondArray,
+                "TimestampMicrosecond"
+            )
         }
         ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, _) => {
             ts_vals!(arrow_array::TimestampNanosecondArray, "TimestampNanosecond")
@@ -894,11 +916,7 @@ fn timestamp_values_i64(
 /// back to `0.0` (a null in a non-nullable column would be rejected by
 /// `RecordBatch::try_new`). Shared by the scalar and pre-stage AVG paths so
 /// the empty-input semantics stay identical.
-pub(crate) fn avg_result_array(
-    sum_f64: f64,
-    count_u64: u64,
-    out_nullable: bool,
-) -> ArrayRef {
+pub(crate) fn avg_result_array(sum_f64: f64, count_u64: u64, out_nullable: bool) -> ArrayRef {
     if count_u64 == 0 {
         if out_nullable {
             return Arc::new(Float64Array::from(vec![Option::<f64>::None])) as ArrayRef;
@@ -1344,12 +1362,10 @@ fn decimal_minmax_gpu(op: ReduceOp, host: &[i128]) -> BoltResult<Option<i128>> {
     let partials = GpuVec::<i128>::zeros_async(grid_x as usize, stream.raw())?;
 
     // Cache key embeds the entry name so MIN and MAX get distinct module slots.
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        entry.to_string(),
-        None,
-        || compile_decimal_minmax_kernel(which),
-    )?;
+    let module =
+        module_cache::get_or_build_module(module_path!(), entry.to_string(), None, || {
+            compile_decimal_minmax_kernel(which)
+        })?;
     let function = module.function(entry)?;
 
     let mut input_ptr: CUdeviceptr = dev.device_ptr();
@@ -1622,11 +1638,10 @@ where
         op: reduce_op_to_scalar_agg_op(op),
         input_dtype: dtype,
     };
-    let module = module_cache::get_or_build_module_for_scalar_agg(
-        &spec,
-        REDUCTION_KERNEL_ENTRY,
-        |_| compile_reduction_kernel(op, dtype),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_scalar_agg(&spec, REDUCTION_KERNEL_ENTRY, |_| {
+            compile_reduction_kernel(op, dtype)
+        })?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
     // Assemble the kernel parameter list (input_ptr, output_ptr, n_rows).
@@ -1741,11 +1756,10 @@ where
         op: reduce_op_to_scalar_agg_op(op),
         input_dtype: dtype,
     };
-    let module = module_cache::get_or_build_module_for_scalar_agg(
-        &spec,
-        REDUCTION_KERNEL_ENTRY,
-        |_| compile_reduction_kernel(op, dtype),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_scalar_agg(&spec, REDUCTION_KERNEL_ENTRY, |_| {
+            compile_reduction_kernel(op, dtype)
+        })?;
     let function = module.function(REDUCTION_KERNEL_ENTRY)?;
 
     let mut input_ptr: CUdeviceptr = input.device_ptr();
@@ -2092,8 +2106,7 @@ impl ReduceScalar for i64 {
                         Some(s) => s,
                         None => {
                             return Err(BoltError::Type(
-                                "SUM(integer) overflow: accumulator exceeds i64 range"
-                                    .to_string(),
+                                "SUM(integer) overflow: accumulator exceeds i64 range".to_string(),
                             ));
                         }
                     };
@@ -2395,18 +2408,22 @@ fn timestamp_scalar_array(
     let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
     let cell: Vec<Option<i64>> = vec![if is_null { None } else { Some(value) }];
     match unit {
-        TimeUnit::Second => Arc::new(
-            arrow_array::TimestampSecondArray::from(cell).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
-        TimeUnit::Millisecond => Arc::new(
-            arrow_array::TimestampMillisecondArray::from(cell).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
-        TimeUnit::Microsecond => Arc::new(
-            arrow_array::TimestampMicrosecondArray::from(cell).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
-        TimeUnit::Nanosecond => Arc::new(
-            arrow_array::TimestampNanosecondArray::from(cell).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
+        TimeUnit::Second => {
+            Arc::new(arrow_array::TimestampSecondArray::from(cell).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
+        TimeUnit::Millisecond => {
+            Arc::new(arrow_array::TimestampMillisecondArray::from(cell).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
+        TimeUnit::Microsecond => {
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(cell).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
+        TimeUnit::Nanosecond => {
+            Arc::new(arrow_array::TimestampNanosecondArray::from(cell).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
     }
 }
 
@@ -2450,7 +2467,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod tests {
@@ -2471,14 +2488,7 @@ mod tests {
         // The underlying values buffer for a NULL position is arbitrary; here
         // it's `i32::MAX`, a value that would visibly corrupt MIN/SUM if it
         // leaked through.
-        let arr = Int32Array::from(vec![
-            Some(1i32),
-            None,
-            Some(2),
-            None,
-            Some(3),
-            None,
-        ]);
+        let arr = Int32Array::from(vec![Some(1i32), None, Some(2), None, Some(3), None]);
         let host = filter_primitive_to_vec::<arrow_array::types::Int32Type>(&arr);
         assert_eq!(host, vec![1, 2, 3]);
     }
@@ -2668,11 +2678,7 @@ mod tests {
 
     #[test]
     fn non_null_count_for_input_all_nulls_is_zero() {
-        let arr: ArrayRef = Arc::new(Int64Array::from(vec![
-            Option::<i64>::None,
-            None,
-            None,
-        ]));
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Option::<i64>::None, None, None]));
         let batch = batch_one("v", arr);
         let col_io = ColumnIO {
             name: "v".to_string(),
@@ -2937,8 +2943,8 @@ mod tests {
         let col = dec128_col("price", 10, 2);
         // Wrong declared output dtype must surface a loud Type error.
         let bad_field = Field::new("m", DataType::Int64, true);
-        let err =
-            minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &bad_field).unwrap_err();
+        let err = minmax_decimal128_from_batch(ReduceOp::Min, &col, &batch, 10, 2, &bad_field)
+            .unwrap_err();
         assert!(matches!(err, BoltError::Type(_)));
     }
 
@@ -2995,14 +3001,26 @@ mod tests {
         let max_gpu = decimal_minmax_gpu(ReduceOp::Max, &host).unwrap();
         assert_eq!(min_gpu, Some(-1000));
         assert_eq!(max_gpu, Some(999));
-        assert_eq!(min_gpu, Some(decimal_minmax_host(ReduceOp::Min, &host).unwrap()));
-        assert_eq!(max_gpu, Some(decimal_minmax_host(ReduceOp::Max, &host).unwrap()));
+        assert_eq!(
+            min_gpu,
+            Some(decimal_minmax_host(ReduceOp::Min, &host).unwrap())
+        );
+        assert_eq!(
+            max_gpu,
+            Some(decimal_minmax_host(ReduceOp::Max, &host).unwrap())
+        );
 
         // A value that straddles the 2^64 boundary must compare correctly on
         // device too (high-half dominates).
         let wide: Vec<i128> = vec![1i128 << 64, (1i128 << 64) - 1, -(1i128 << 70)];
-        assert_eq!(decimal_minmax_gpu(ReduceOp::Min, &wide).unwrap(), Some(-(1i128 << 70)));
-        assert_eq!(decimal_minmax_gpu(ReduceOp::Max, &wide).unwrap(), Some(1i128 << 64));
+        assert_eq!(
+            decimal_minmax_gpu(ReduceOp::Min, &wide).unwrap(),
+            Some(-(1i128 << 70))
+        );
+        assert_eq!(
+            decimal_minmax_gpu(ReduceOp::Max, &wide).unwrap(),
+            Some(1i128 << 64)
+        );
     }
 
     /// `packed_validity_for` produces the Arrow-LE packed-bit bitmap the
@@ -3054,9 +3072,8 @@ mod tests {
             dtype: DataType::Int64,
             nullable: false,
         };
-        let arr_out =
-            build_one_aggregate(&agg, &out_field, &inputs, &batch, batch.num_rows())
-                .expect("count ok");
+        let arr_out = build_one_aggregate(&agg, &out_field, &inputs, &batch, batch.num_rows())
+            .expect("count ok");
         let col = arr_out
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -3078,17 +3095,14 @@ mod tests {
         }];
         // COUNT(*) lowers to a literal-ish expression that doesn't resolve to
         // a column, so the COUNT arm returns the full row count.
-        let agg = AggregateExpr::Count(Expr::Literal(
-            crate::plan::logical_plan::Literal::Int64(1),
-        ));
+        let agg = AggregateExpr::Count(Expr::Literal(crate::plan::logical_plan::Literal::Int64(1)));
         let out_field = Field {
             name: "cnt".to_string(),
             dtype: DataType::Int64,
             nullable: false,
         };
-        let arr_out =
-            build_one_aggregate(&agg, &out_field, &inputs, &batch, batch.num_rows())
-                .expect("count ok");
+        let arr_out = build_one_aggregate(&agg, &out_field, &inputs, &batch, batch.num_rows())
+            .expect("count ok");
         let col = arr_out
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -3127,11 +3141,7 @@ mod tests {
         let h = engine.sql("SELECT SUM(v) FROM t").expect("execute");
         let out = h.record_batch();
         assert_eq!(out.num_rows(), 1);
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(col.value(0), expected);
     }
 
@@ -3204,8 +3214,7 @@ mod tests {
     fn fused_avg_kernel_emits_both_partials() {
         use crate::jit::agg_kernels::{compile_avg_reduction_kernel, AVG_KERNEL_ENTRY};
 
-        let ptx = compile_avg_reduction_kernel(DataType::Float64)
-            .expect("AVG PTX should compile");
+        let ptx = compile_avg_reduction_kernel(DataType::Float64).expect("AVG PTX should compile");
         // One entry, four params (input, sums, counts, n_rows).
         assert!(
             ptx.contains(&format!(".visible .entry {}(", AVG_KERNEL_ENTRY)),
@@ -3438,14 +3447,9 @@ mod tests {
                 AggregateExpr::Max(Expr::Column("v".to_string())),
             ] {
                 let out_field = Field::new("m", in_dt.clone(), true);
-                let out = build_one_aggregate(
-                    &agg,
-                    &out_field,
-                    std::slice::from_ref(&col),
-                    &batch,
-                    4,
-                )
-                .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) all-null: {e:?}"));
+                let out =
+                    build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 4)
+                        .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) all-null: {e:?}"));
                 assert_eq!(out.len(), 1);
                 assert!(
                     out.is_null(0),
@@ -3485,19 +3489,11 @@ mod tests {
                 AggregateExpr::Max(Expr::Column("v".to_string())),
             ] {
                 let out_field = Field::new("m", in_dt.clone(), true);
-                let out = build_one_aggregate(
-                    &agg,
-                    &out_field,
-                    std::slice::from_ref(&col),
-                    &batch,
-                    0,
-                )
-                .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) empty: {e:?}"));
+                let out =
+                    build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 0)
+                        .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) empty: {e:?}"));
                 assert_eq!(out.len(), 1);
-                assert!(
-                    out.is_null(0),
-                    "MIN/MAX({in_dt:?}) over empty must be NULL"
-                );
+                assert!(out.is_null(0), "MIN/MAX({in_dt:?}) over empty must be NULL");
             }
             let out_field = Field::new("s", sum_out_dt.clone(), true);
             let agg = AggregateExpr::Sum(Expr::Column("v".to_string()));
@@ -3584,9 +3580,9 @@ mod tests {
     /// `timestamp_values_i64` extracts the raw i64 tick buffer for each unit.
     #[test]
     fn timestamp_values_i64_extracts_ticks() {
-        let arr: ArrayRef = Arc::new(
-            arrow_array::TimestampMillisecondArray::from(vec![10i64, 20, 30]),
-        );
+        let arr: ArrayRef = Arc::new(arrow_array::TimestampMillisecondArray::from(vec![
+            10i64, 20, 30,
+        ]));
         let v = timestamp_values_i64(&arr, "ts").expect("extract");
         assert_eq!(v, vec![10, 20, 30]);
     }
@@ -3605,8 +3601,9 @@ mod tests {
         let err = reduce_column_from_batch(ReduceOp::Sum, &dcol, &dbatch, 3).unwrap_err();
         assert!(matches!(err, BoltError::Type(_)));
 
-        let ts: ArrayRef =
-            Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![1i64, 2, 3]));
+        let ts: ArrayRef = Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
+            1i64, 2, 3,
+        ]));
         let tbatch = batch_one("t", ts);
         let tcol = ColumnIO {
             name: "t".to_string(),
@@ -3622,8 +3619,9 @@ mod tests {
     #[ignore = "gpu: MIN/MAX(Date32) reduction allocates on device"]
     fn gpu_minmax_date32_end_to_end() {
         let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
-        let arr: ArrayRef =
-            Arc::new(arrow_array::Date32Array::from(vec![19_005i32, 19_000, 19_010, 19_002]));
+        let arr: ArrayRef = Arc::new(arrow_array::Date32Array::from(vec![
+            19_005i32, 19_000, 19_010, 19_002,
+        ]));
         let batch = batch_one("d", arr);
         let col = ColumnIO {
             name: "d".to_string(),
@@ -3665,8 +3663,11 @@ mod tests {
             name: "ts".to_string(),
             dtype: DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
         };
-        let out_field =
-            Field::new("m", DataType::Timestamp(TimeUnit::Microsecond, Some(tz)), true);
+        let out_field = Field::new(
+            "m",
+            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
+            true,
+        );
         let agg = AggregateExpr::Min(Expr::Column("ts".to_string()));
         let min_out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 3)
             .expect("min ok");

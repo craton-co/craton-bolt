@@ -42,7 +42,11 @@ fn sales_batch(n: usize) -> RecordBatch {
         ArrowField::new("price", ArrowDataType::Float64, false),
         ArrowField::new("tax", ArrowDataType::Float64, false),
     ]));
-    RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(price), Arc::new(tax)]).unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(region), Arc::new(price), Arc::new(tax)],
+    )
+    .unwrap()
 }
 
 // ---- offline tests (no GPU) -------------------------------------------------
@@ -102,7 +106,9 @@ fn collect_surfaces_builder_validation_error() {
 fn collect_projection_returns_record_batch() {
     let mut engine = Engine::new().expect("engine");
     let batch = sales_batch(1024);
-    engine.register_table("sales", batch.clone()).expect("register");
+    engine
+        .register_table("sales", batch.clone())
+        .expect("register");
 
     let df = DataFrame::scan("sales", sales_schema()).select(vec![col("price")]);
     let out = df.collect(&mut engine).expect("collect");
@@ -131,7 +137,9 @@ fn collect_projection_returns_record_batch() {
 fn collect_arithmetic_projection_matches_host() {
     let mut engine = Engine::new().expect("engine");
     let batch = sales_batch(4096);
-    engine.register_table("sales", batch.clone()).expect("register");
+    engine
+        .register_table("sales", batch.clone())
+        .expect("register");
 
     let df = DataFrame::scan("sales", sales_schema())
         .select(vec![col("price").mul(col("tax")).alias("revenue")]);
@@ -156,10 +164,7 @@ fn collect_arithmetic_projection_matches_host() {
     for i in 0..4096 {
         let want = price.value(i) * tax.value(i);
         let got = actual.value(i);
-        assert!(
-            (got - want).abs() < 1e-9,
-            "row {i}: got {got}, want {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "row {i}: got {got}, want {want}");
     }
 }
 
@@ -232,7 +237,9 @@ fn collect_group_by_aggregate_runs_through_engine() {
 fn collect_filter_then_select_runs_predicate() {
     let mut engine = Engine::new().expect("engine");
     let batch = sales_batch(2048);
-    engine.register_table("sales", batch.clone()).expect("register");
+    engine
+        .register_table("sales", batch.clone())
+        .expect("register");
 
     let df = DataFrame::scan("sales", sales_schema())
         .filter(col("region_id").eq(craton_bolt::plan::lit(1_i32)))
@@ -258,8 +265,16 @@ fn collect_filter_then_select_runs_predicate() {
         .filter(|&i| region.value(i) == 1)
         .map(|i| price.value(i))
         .collect();
-    assert_eq!(out.num_rows(), expected.len(), "compacted row count = #matches");
-    assert_eq!(out.num_rows(), 512, "region_id = 1 matches 512 of 2048 rows");
+    assert_eq!(
+        out.num_rows(),
+        expected.len(),
+        "compacted row count = #matches"
+    );
+    assert_eq!(
+        out.num_rows(),
+        512,
+        "region_id = 1 matches 512 of 2048 rows"
+    );
     for (i, want) in expected.iter().enumerate() {
         assert_eq!(actual.value(i), *want, "compacted row {i}");
     }

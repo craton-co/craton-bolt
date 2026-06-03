@@ -59,7 +59,8 @@ fn assert_err_contains<T: std::fmt::Debug>(result: Result<T, String>, needle: &s
     match result {
         Ok(v) => panic!("expected error containing {needle:?}, got Ok({v:?})"),
         Err(msg) => assert!(
-            msg.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()),
+            msg.to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()),
             "expected error to contain {needle:?}, got: {msg}"
         ),
     }
@@ -148,13 +149,14 @@ fn substring_from_for_parses_to_scalarfn_substring_with_three_args() {
         }
         other => panic!("expected ScalarFn(Substring), got {other:?}"),
     }
-    plan.schema().expect("SUBSTRING(s FROM 1 FOR 3) must type-check");
+    plan.schema()
+        .expect("SUBSTRING(s FROM 1 FOR 3) must type-check");
 }
 
 #[test]
 fn substring_comma_syntax_parses_to_scalarfn_substring() {
-    let plan = parse("SELECT SUBSTRING(s, 1, 3) FROM txt")
-        .expect("SUBSTRING(s, 1, 3) should parse");
+    let plan =
+        parse("SELECT SUBSTRING(s, 1, 3) FROM txt").expect("SUBSTRING(s, 1, 3) should parse");
     let top = first_project_expr(&plan);
     match strip_alias(top) {
         Expr::ScalarFn { kind, args } => {
@@ -197,8 +199,8 @@ fn concat_two_args_parses_to_scalarfn_concat() {
 
 #[test]
 fn concat_variadic_three_args_parses() {
-    let plan = parse("SELECT CONCAT(s, s, s) FROM txt")
-        .expect("CONCAT(s, s, s) (variadic) should parse");
+    let plan =
+        parse("SELECT CONCAT(s, s, s) FROM txt").expect("CONCAT(s, s, s) (variadic) should parse");
     let top = first_project_expr(&plan);
     match strip_alias(top) {
         Expr::ScalarFn { kind, args } => {
@@ -243,8 +245,8 @@ fn substring_rejects_non_utf8_first_argument() {
 
 #[test]
 fn concat_rejects_non_utf8_argument() {
-    let plan = parse("SELECT CONCAT(s, n) FROM txt")
-        .expect("CONCAT(s, n) should parse (lowers fine)");
+    let plan =
+        parse("SELECT CONCAT(s, n) FROM txt").expect("CONCAT(s, n) should parse (lowers fine)");
     let res: Result<_, _> = plan.schema().map_err(|e| format!("{e}"));
     assert_err_contains(res, "CONCAT");
 }
@@ -303,7 +305,9 @@ fn length_with_passthrough_column_lowers_to_string_length() {
     match phys {
         PhysicalPlan::StringLength { outputs, .. } => {
             assert_eq!(outputs.len(), 2);
-            assert!(matches!(&outputs[0], StringLengthOutput::Passthrough { source } if source == "n"));
+            assert!(
+                matches!(&outputs[0], StringLengthOutput::Passthrough { source } if source == "n")
+            );
             assert!(matches!(&outputs[1], StringLengthOutput::Length { source } if source == "s"));
         }
         other => panic!("expected StringLength, got {other:?}"),
@@ -688,18 +692,18 @@ fn trim_runs_end_to_end() {
 /// Shared fixture: register a plain (non-dict) Utf8 column `s` and return the
 /// engine + the values, so each LIKE test can assert against a known set.
 fn like_e2e_engine() -> craton_bolt::Engine {
-    use std::sync::Arc;
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
 
     let mut engine = craton_bolt::Engine::new().expect("CUDA ctx");
     let s = StringArray::from(vec![
-        Some("foobar"),  // prefix foo, contains foo
-        Some("xfoo"),    // suffix foo, contains foo
-        Some("foo"),     // exact foo
-        Some("bar"),     // none
-        None,            // NULL stays NULL under both LIKE and NOT LIKE
-        Some("afoob"),   // contains foo only
+        Some("foobar"), // prefix foo, contains foo
+        Some("xfoo"),   // suffix foo, contains foo
+        Some("foo"),    // exact foo
+        Some("bar"),    // none
+        None,           // NULL stays NULL under both LIKE and NOT LIKE
+        Some("afoob"),  // contains foo only
     ]);
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "s",

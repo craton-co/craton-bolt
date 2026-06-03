@@ -80,7 +80,9 @@ impl FlightService for FlightSqlServer {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<arrow_flight::PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info is not yet supported"))
+        Err(Status::unimplemented(
+            "poll_flight_info is not yet supported",
+        ))
     }
 
     /// Resolve a [`FlightDescriptor`] into a [`FlightInfo`] — the schema plus
@@ -120,9 +122,7 @@ impl FlightService for FlightSqlServer {
             .map_err(|e| Status::internal(format!("failed to encode schema: {e}")))?
             .with_descriptor(descriptor)
             .with_endpoint(endpoint)
-            .with_total_records(
-                result.batches.iter().map(|b| b.num_rows() as i64).sum(),
-            )
+            .with_total_records(result.batches.iter().map(|b| b.num_rows() as i64).sum())
             .with_total_bytes(-1);
 
         Ok(Response::new(info))
@@ -211,9 +211,7 @@ fn command_bytes(descriptor: &FlightDescriptor) -> Result<bytes::Bytes, Status> 
         Ok(DescriptorType::Path) => Err(Status::unimplemented(
             "PATH descriptors are not supported; use a Flight SQL command descriptor",
         )),
-        _ => Err(Status::invalid_argument(
-            "unknown FlightDescriptor type",
-        )),
+        _ => Err(Status::invalid_argument("unknown FlightDescriptor type")),
     }
 }
 

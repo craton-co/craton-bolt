@@ -523,9 +523,9 @@ pub enum OperatorKind {
 /// `Streamable` only when correctness is *guaranteed* under morsel splitting.
 pub fn classify_operator(kind: OperatorKind) -> StreamCapability {
     match kind {
-        OperatorKind::Projection
-        | OperatorKind::Filter
-        | OperatorKind::PartialAggregate => StreamCapability::Streamable,
+        OperatorKind::Projection | OperatorKind::Filter | OperatorKind::PartialAggregate => {
+            StreamCapability::Streamable
+        }
         OperatorKind::AggregateFinal
         | OperatorKind::Sort
         | OperatorKind::Distinct
@@ -846,8 +846,7 @@ pub fn merge_grouped_partials(
             .collect::<BoltResult<_>>()?;
 
         for row in 0..batch.num_rows() {
-            let key: Vec<RowKeyValue> =
-                key_readers.iter().map(|r| r.value_at(row)).collect();
+            let key: Vec<RowKeyValue> = key_readers.iter().map(|r| r.value_at(row)).collect();
             // Track first-seen order before the (borrowing) entry lookup.
             if !groups.contains_key(&key) {
                 order.push(key.clone());
@@ -873,14 +872,11 @@ pub fn merge_grouped_partials(
             .map(|c| ColumnReader::new(batch.column(c).as_ref()))
             .collect::<BoltResult<_>>()?;
         for row in 0..batch.num_rows() {
-            let key: Vec<RowKeyValue> =
-                key_readers.iter().map(|r| r.value_at(row)).collect();
+            let key: Vec<RowKeyValue> = key_readers.iter().map(|r| r.value_at(row)).collect();
             // Borrow the stored key slice (stable in `groups`) as the map key so
             // we don't re-allocate; first occurrence wins.
             if let Some((stored_key, _)) = groups.get_key_value(&key) {
-                key_source
-                    .entry(stored_key.as_slice())
-                    .or_insert((p, row));
+                key_source.entry(stored_key.as_slice()).or_insert((p, row));
             }
         }
     }
@@ -891,12 +887,9 @@ pub fn merge_grouped_partials(
     // first-occurrence (partial, row) of each ordered key.
     if n_group_cols > 0 {
         for c in 0..n_group_cols {
-            let arrays: Vec<&dyn Array> =
-                partials.iter().map(|b| b.column(c).as_ref()).collect();
-            let indices: Vec<(usize, usize)> = order
-                .iter()
-                .map(|k| key_source[k.as_slice()])
-                .collect();
+            let arrays: Vec<&dyn Array> = partials.iter().map(|b| b.column(c).as_ref()).collect();
+            let indices: Vec<(usize, usize)> =
+                order.iter().map(|k| key_source[k.as_slice()]).collect();
             let col = arrow::compute::interleave(&arrays, &indices).map_err(|e| {
                 BoltError::Other(format!(
                     "merge_grouped_partials: interleave of group-key column {c} failed: {e}"
@@ -909,18 +902,12 @@ pub fn merge_grouped_partials(
     // Aggregate columns: finalise the folded accumulators in key order.
     for a in 0..n_aggs {
         let target = schema.field(n_group_cols + a).data_type();
-        let vals: Vec<Option<MergeNum>> = order
-            .iter()
-            .map(|k| groups[k].accums[a])
-            .collect();
+        let vals: Vec<Option<MergeNum>> = order.iter().map(|k| groups[k].accums[a]).collect();
         out_cols.push(build_agg_column(&vals, target)?);
     }
 
-    RecordBatch::try_new(schema, out_cols).map_err(|e| {
-        BoltError::Other(format!(
-            "merge_grouped_partials: result build failed: {e}"
-        ))
-    })
+    RecordBatch::try_new(schema, out_cols)
+        .map_err(|e| BoltError::Other(format!("merge_grouped_partials: result build failed: {e}")))
 }
 
 // ===========================================================================
@@ -1006,12 +993,7 @@ fn primitive_byte_width(dt: &arrow_schema::DataType) -> Option<usize> {
         D::Int8 | D::UInt8 => 1,
         D::Int16 | D::UInt16 => 2,
         D::Int32 | D::UInt32 | D::Float32 | D::Date32 | D::Time32(_) => 4,
-        D::Int64
-        | D::UInt64
-        | D::Float64
-        | D::Date64
-        | D::Time64(_)
-        | D::Timestamp(_, _) => 8,
+        D::Int64 | D::UInt64 | D::Float64 | D::Date64 | D::Time64(_) | D::Timestamp(_, _) => 8,
         _ => return None,
     })
 }
@@ -1187,9 +1169,7 @@ impl MorselDriver {
             let batch = item?;
             // Process this source batch's morsels, then drop it before pulling
             // the next — bounded host residency.
-            let n = self.for_each_morsel(std::slice::from_ref(&batch), |m, b| {
-                on_morsel(m, b)
-            })?;
+            let n = self.for_each_morsel(std::slice::from_ref(&batch), |m, b| on_morsel(m, b))?;
             count += n;
         }
         Ok(count)
@@ -1213,11 +1193,7 @@ impl MorselDriver {
     /// host-side budget/iteration logic is covered by the `cuda-stub` unit
     /// tests, and the device round-trip is covered by the
     /// `#[ignore = "gpu:stream"]` tests.
-    pub fn upload_each<F>(
-        &mut self,
-        batches: &[RecordBatch],
-        mut on_device: F,
-    ) -> BoltResult<usize>
+    pub fn upload_each<F>(&mut self, batches: &[RecordBatch], mut on_device: F) -> BoltResult<usize>
     where
         F: FnMut(&DeviceMorsel) -> BoltResult<()>,
     {
@@ -1383,11 +1359,7 @@ mod tests {
         let collected: Vec<Vec<i32>> = stream
             .morsels()
             .map(|m| {
-                let a = m
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
+                let a = m.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 (0..a.len()).map(|i| a.value(i)).collect()
             })
             .collect();
@@ -1483,11 +1455,8 @@ mod tests {
 
     #[test]
     fn table_source_streaming_drains_lazily_and_replays() {
-        let producer: BatchProducer = Box::new(|| {
-            Box::new(
-                vec![Ok(int_batch(4)), Ok(int_batch(1))].into_iter(),
-            )
-        });
+        let producer: BatchProducer =
+            Box::new(|| Box::new(vec![Ok(int_batch(4)), Ok(int_batch(1))].into_iter()));
         let src = TableSource::Streaming(producer);
         assert!(src.is_streaming());
         // First drain.
@@ -1501,13 +1470,7 @@ mod tests {
     #[test]
     fn table_source_streaming_propagates_error() {
         let producer: BatchProducer = Box::new(|| {
-            Box::new(
-                vec![
-                    Ok(int_batch(2)),
-                    Err(BoltError::Plan("boom".to_string())),
-                ]
-                .into_iter(),
-            )
+            Box::new(vec![Ok(int_batch(2)), Err(BoltError::Plan("boom".to_string()))].into_iter())
         });
         let src = TableSource::Streaming(producer);
         let err = src.drain_to_batches("t").unwrap_err();
@@ -1675,7 +1638,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 3);
-        assert_eq!(seen.iter().map(|(r, _)| *r).collect::<Vec<_>>(), vec![4, 4, 2]);
+        assert_eq!(
+            seen.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![4, 4, 2]
+        );
         // Each morsel reserved nonzero bytes...
         assert!(seen.iter().all(|(_, b)| *b > 0));
         // ...and all reservations were released after the loop.
@@ -1743,9 +1709,8 @@ mod tests {
     fn driver_drive_producer_pulls_lazily_and_counts_morsels() {
         // Producer of two batches: 6 rows + 3 rows. Morsel 4 ->
         // batch0: [4,2], batch1: [3]  => 3 morsels total.
-        let producer: BatchProducer = Box::new(|| {
-            Box::new(vec![Ok(int_batch(6)), Ok(int_batch(3))].into_iter())
-        });
+        let producer: BatchProducer =
+            Box::new(|| Box::new(vec![Ok(int_batch(6)), Ok(int_batch(3))].into_iter()));
         let mut driver = MorselDriver::new(4, None).unwrap();
         let mut rows = Vec::new();
         let mut cb = |m: &RecordBatch, _b: usize| {
@@ -1761,9 +1726,7 @@ mod tests {
     #[test]
     fn driver_drive_producer_propagates_producer_error() {
         let producer: BatchProducer = Box::new(|| {
-            Box::new(
-                vec![Ok(int_batch(4)), Err(BoltError::Plan("src boom".into()))].into_iter(),
-            )
+            Box::new(vec![Ok(int_batch(4)), Err(BoltError::Plan("src boom".into()))].into_iter())
         });
         let mut driver = MorselDriver::new(4, None).unwrap();
         let mut cb = |_m: &RecordBatch, _b: usize| Ok(());
@@ -1819,8 +1782,7 @@ mod tests {
         ]));
         let ints = Int32Array::from(vec![1, 2, 3, 4]);
         let strs = StringArray::from(vec!["a", "b", "c", "d"]);
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(ints), Arc::new(strs)]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ints), Arc::new(strs)]).unwrap();
         let mut driver = MorselDriver::new(2, None).unwrap();
         driver
             .upload_each(&[batch], |dm| {
@@ -1840,10 +1802,7 @@ mod tests {
     /// Build a grouped partial batch: one Int64 key column `g`, then `n_aggs`
     /// Int64 aggregate columns. `rows` is `(key, [agg cells])` — a `None` key
     /// cell models a NULL group key; a `None` agg cell models a NULL partial.
-    fn grouped_partial(
-        n_aggs: usize,
-        rows: &[(Option<i64>, Vec<Option<i64>>)],
-    ) -> RecordBatch {
+    fn grouped_partial(n_aggs: usize, rows: &[(Option<i64>, Vec<Option<i64>>)]) -> RecordBatch {
         let mut fields = vec![ArrowField::new("g", ArrowDataType::Int64, true)];
         for i in 0..n_aggs {
             fields.push(ArrowField::new(format!("a{i}"), ArrowDataType::Int64, true));
@@ -1865,12 +1824,28 @@ mod tests {
     /// Pull (key, agg0) out of a single-agg merged batch into a sorted map for
     /// order-independent comparison. NULL key -> i64::MIN sentinel.
     fn collect_single_agg(batch: &RecordBatch) -> Vec<(i64, Option<i64>)> {
-        let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let agg = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let agg = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let mut out: Vec<(i64, Option<i64>)> = (0..batch.num_rows())
             .map(|r| {
-                let k = if keys.is_null(r) { i64::MIN } else { keys.value(r) };
-                let a = if agg.is_null(r) { None } else { Some(agg.value(r)) };
+                let k = if keys.is_null(r) {
+                    i64::MIN
+                } else {
+                    keys.value(r)
+                };
+                let a = if agg.is_null(r) {
+                    None
+                } else {
+                    Some(agg.value(r))
+                };
                 (k, a)
             })
             .collect();
@@ -1900,10 +1875,7 @@ mod tests {
         let p0 = grouped_partial(1, &[(Some(1), vec![Some(3)]), (Some(2), vec![Some(1)])]);
         let p1 = grouped_partial(1, &[(Some(1), vec![Some(2)])]);
         let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
-        assert_eq!(
-            collect_single_agg(&out),
-            vec![(1, Some(5)), (2, Some(1))]
-        );
+        assert_eq!(collect_single_agg(&out), vec![(1, Some(5)), (2, Some(1))]);
     }
 
     #[test]
@@ -1921,8 +1893,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(collect_single_agg(&min), vec![(1, Some(3))]);
-        let max =
-            merge_grouped_partials(&[p0, p1, p2], 1, &[GroupedFold::Max]).unwrap();
+        let max = merge_grouped_partials(&[p0, p1, p2], 1, &[GroupedFold::Max]).unwrap();
         assert_eq!(collect_single_agg(&max), vec![(1, Some(7))]);
     }
 
@@ -1951,7 +1922,10 @@ mod tests {
         );
         // The NULL key cell must actually be NULL in the output.
         let keys = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert!((0..out.num_rows()).any(|r| keys.is_null(r)), "a NULL group key");
+        assert!(
+            (0..out.num_rows()).any(|r| keys.is_null(r)),
+            "a NULL group key"
+        );
     }
 
     #[test]
@@ -1961,8 +1935,7 @@ mod tests {
         let p0 = grouped_partial(2, &[(Some(1), vec![Some(2), Some(9)])]);
         let p1 = grouped_partial(2, &[(Some(1), vec![Some(3), Some(4)])]);
         let out =
-            merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add, GroupedFold::Max])
-                .unwrap();
+            merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add, GroupedFold::Max]).unwrap();
         assert_eq!(out.num_rows(), 1);
         let cnt = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let max = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1979,18 +1952,17 @@ mod tests {
         ]));
         let mk = |rows: &[(i64, f64)]| {
             let keys: Int64Array = rows.iter().map(|(k, _)| *k).collect::<Vec<_>>().into();
-            let vals: Float64Array =
-                rows.iter().map(|(_, v)| *v).collect::<Vec<_>>().into();
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(keys), Arc::new(vals)],
-            )
-            .unwrap()
+            let vals: Float64Array = rows.iter().map(|(_, v)| *v).collect::<Vec<_>>().into();
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(keys), Arc::new(vals)]).unwrap()
         };
         let p0 = mk(&[(1, 1.5), (2, 2.0)]);
         let p1 = mk(&[(1, 0.25)]);
         let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
-        let agg = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let agg = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let keys = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let mut got: Vec<(i64, f64)> = (0..out.num_rows())
             .map(|r| (keys.value(r), agg.value(r)))
@@ -2021,9 +1993,7 @@ mod tests {
     fn merge_grouped_rejects_fold_count_mismatch() {
         let p = grouped_partial(1, &[(Some(1), vec![Some(1)])]);
         // 2 folds declared for 1 aggregate column.
-        assert!(
-            merge_grouped_partials(&[p], 1, &[GroupedFold::Add, GroupedFold::Max]).is_err()
-        );
+        assert!(merge_grouped_partials(&[p], 1, &[GroupedFold::Add, GroupedFold::Max]).is_err());
     }
 
     #[test]

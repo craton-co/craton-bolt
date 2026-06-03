@@ -74,7 +74,9 @@ fn e2e_gpu_inner_join_int32_basic() {
     let build_keys: Vec<i32> = (0..N_BUILD as i32).collect();
     let build_payload: Vec<i32> = build_keys.iter().map(|k| 1000 + k).collect();
     // Probe: keys cycle 0..(N_BUILD*2) so half match.
-    let probe_keys: Vec<i32> = (0..N_PROBE as i32).map(|i| i % (N_BUILD as i32 * 2)).collect();
+    let probe_keys: Vec<i32> = (0..N_PROBE as i32)
+        .map(|i| i % (N_BUILD as i32 * 2))
+        .collect();
     let probe_payload: Vec<i32> = (0..N_PROBE as i32).map(|i| 10_000 + i).collect();
 
     let t1 = int32_batch("k", "bv", build_keys.clone(), build_payload.clone());
@@ -88,7 +90,10 @@ fn e2e_gpu_inner_join_int32_basic() {
     let out = h.record_batch();
 
     // Expected match count: probe rows whose key < N_BUILD.
-    let expected: usize = probe_keys.iter().filter(|k| (**k as usize) < N_BUILD).count();
+    let expected: usize = probe_keys
+        .iter()
+        .filter(|k| (**k as usize) < N_BUILD)
+        .count();
     assert_eq!(
         out.num_rows(),
         expected,
@@ -142,7 +147,9 @@ fn e2e_gpu_inner_join_int64_basic() {
 
     let build_keys: Vec<i64> = (0..N_BUILD as i64).collect();
     let build_payload: Vec<i64> = build_keys.iter().map(|k| 1000 + k).collect();
-    let probe_keys: Vec<i64> = (0..N_PROBE as i64).map(|i| i % (N_BUILD as i64 * 2)).collect();
+    let probe_keys: Vec<i64> = (0..N_PROBE as i64)
+        .map(|i| i % (N_BUILD as i64 * 2))
+        .collect();
     let probe_payload: Vec<i64> = (0..N_PROBE as i64).map(|i| 10_000 + i).collect();
 
     let t1 = int64_batch("k", "bv", build_keys.clone(), build_payload.clone());
@@ -155,7 +162,10 @@ fn e2e_gpu_inner_join_int64_basic() {
         .expect("INNER JOIN");
     let out = h.record_batch();
 
-    let expected: usize = probe_keys.iter().filter(|k| (**k as usize) < N_BUILD).count();
+    let expected: usize = probe_keys
+        .iter()
+        .filter(|k| (**k as usize) < N_BUILD)
+        .count();
     assert_eq!(
         out.num_rows(),
         expected,
@@ -253,8 +263,16 @@ fn e2e_gpu_inner_join_build_larger_than_probe() {
     // Spot-check the equi-join invariant.
     let av_idx = out.schema().index_of("av").unwrap();
     let bv_idx = out.schema().index_of("bv").unwrap();
-    let av = out.column(av_idx).as_any().downcast_ref::<Int32Array>().unwrap();
-    let bv = out.column(bv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    let av = out
+        .column(av_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let bv = out
+        .column(bv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     for i in 0..out.num_rows() {
         // av = 200 + k, bv = 500 + k -> bv - av = 300 for every matched row.
         assert_eq!(
@@ -314,10 +332,22 @@ fn two_key_inner_join() {
     // the rest use disjoint (a, b) tuples (a += 1000 to push them out of
     // range).
     let p_a: Vec<i32> = (0..n_probe as i32)
-        .map(|i| if (i as usize) < n_build { i / 64 } else { 1000 + i / 64 })
+        .map(|i| {
+            if (i as usize) < n_build {
+                i / 64
+            } else {
+                1000 + i / 64
+            }
+        })
         .collect();
     let p_b: Vec<i32> = (0..n_probe as i32)
-        .map(|i| if (i as usize) < n_build { i % 64 } else { i % 64 })
+        .map(|i| {
+            if (i as usize) < n_build {
+                i % 64
+            } else {
+                i % 64
+            }
+        })
         .collect();
     let p_v: Vec<i32> = (0..n_probe as i32).map(|i| 50_000 + i).collect();
 
@@ -333,7 +363,11 @@ fn two_key_inner_join() {
 
     // Expected: exactly the first n_build probe rows match (each on a
     // unique (a,b) build tuple).
-    assert_eq!(out.num_rows(), n_build, "two-key INNER: half-match expected");
+    assert_eq!(
+        out.num_rows(),
+        n_build,
+        "two-key INNER: half-match expected"
+    );
 }
 
 /// LEFT OUTER JOIN: every left row appears at least once. Probe rows
@@ -612,7 +646,9 @@ fn cross_join_on_gpu() {
     engine.register_table("t1", t1).unwrap();
     engine.register_table("t2", t2).unwrap();
 
-    let h = engine.sql("SELECT * FROM t1 CROSS JOIN t2").expect("CROSS JOIN");
+    let h = engine
+        .sql("SELECT * FROM t1 CROSS JOIN t2")
+        .expect("CROSS JOIN");
     let out = h.record_batch();
 
     // Cartesian product row count.
@@ -746,10 +782,22 @@ fn lossy_twoi64_host_verify_drops_false_positives() {
     // candidates whose i64 fold matches even when (a, b) differ — at scale
     // splitmix collisions on uniform inputs are inevitable.
     let p_a: Vec<i64> = (0..n_probe as i64)
-        .map(|i| if (i as usize) < n_build { i / 2 } else { 99_999 + i })
+        .map(|i| {
+            if (i as usize) < n_build {
+                i / 2
+            } else {
+                99_999 + i
+            }
+        })
         .collect();
     let p_b: Vec<i64> = (0..n_probe as i64)
-        .map(|i| if (i as usize) < n_build { i * 3 + 1 } else { 88_888 + i })
+        .map(|i| {
+            if (i as usize) < n_build {
+                i * 3 + 1
+            } else {
+                88_888 + i
+            }
+        })
         .collect();
     let p_v: Vec<i64> = (0..n_probe as i64).map(|i| 5000 + i).collect();
 
@@ -843,7 +891,9 @@ fn streaming_intern_high_cardinality_utf8() {
     // hash prefixes.
     const N: usize = 100_000;
     let build_keys: Vec<String> = (0..N).map(|i| format!("k-{:08x}", i)).collect();
-    let probe_keys: Vec<String> = (0..N).map(|i| format!("k-{:08x}", i ^ 0x5AA5_5AA5)).collect();
+    let probe_keys: Vec<String> = (0..N)
+        .map(|i| format!("k-{:08x}", i ^ 0x5AA5_5AA5))
+        .collect();
     let build_vals: Vec<i32> = (0..N as i32).collect();
     let probe_vals: Vec<i32> = (0..N as i32).map(|i| i + 1_000_000).collect();
 
@@ -887,7 +937,10 @@ fn streaming_intern_high_cardinality_utf8() {
     // Expected match count: intersect of the two unique-string sets.
     let build_set: std::collections::HashSet<&str> =
         build_keys.iter().map(String::as_str).collect();
-    let expected = probe_keys.iter().filter(|s| build_set.contains(s.as_str())).count();
+    let expected = probe_keys
+        .iter()
+        .filter(|s| build_set.contains(s.as_str()))
+        .count();
     assert_eq!(
         out.num_rows(),
         expected,
@@ -903,7 +956,11 @@ fn streaming_intern_high_cardinality_utf8() {
         .enumerate()
         .filter_map(|(i, f)| if f.name() == "k" { Some(i) } else { None })
         .collect();
-    assert_eq!(k_indices.len(), 2, "output schema must carry both 'k' columns");
+    assert_eq!(
+        k_indices.len(),
+        2,
+        "output schema must carry both 'k' columns"
+    );
     let left_k = out
         .column(k_indices[0])
         .as_any()
@@ -977,12 +1034,24 @@ fn aos_build_layout_no_regression() {
     // caught here even though the AoS path isn't engine-wired yet.
     let bv_idx = out.schema().index_of("bv").unwrap();
     let pv_idx = out.schema().index_of("pv").unwrap();
-    let bv = out.column(bv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
-    let pv = out.column(pv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    let bv = out
+        .column(bv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let pv = out
+        .column(pv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     for i in 0..out.num_rows() {
         let probe_row = (pv.value(i) - 10_000) as usize;
         let probe_key = probe_keys[probe_row];
-        assert_eq!(bv.value(i), 1000 + probe_key, "row {i}: equi-join invariant");
+        assert_eq!(
+            bv.value(i),
+            1000 + probe_key,
+            "row {i}: equi-join invariant"
+        );
     }
 }
 
@@ -1073,7 +1142,8 @@ fn lossy_twoi64_left_outer_host_verify() {
     // Conversely, 2_048 LEFT rows must surface with rv == NULL.
     let n_unmatched = (0..out.num_rows()).filter(|&i| rv.is_null(i)).count();
     assert_eq!(
-        n_unmatched, N - 2_048,
+        n_unmatched,
+        N - 2_048,
         "exactly {} LEFT rows must surface with rv = NULL (got {n_unmatched})",
         N - 2_048
     );
@@ -1139,7 +1209,8 @@ fn utf8_batch(name_k: &str, name_v: &str, keys: Vec<String>, vals: Vec<i32>) -> 
         ArrowField::new(name_k, ArrowDataType::Utf8, false),
         ArrowField::new(name_v, ArrowDataType::Int32, false),
     ]));
-    let key_arr: StringArray = StringArray::from(keys.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let key_arr: StringArray =
+        StringArray::from(keys.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     RecordBatch::try_new(
         schema,
         vec![
@@ -1255,8 +1326,16 @@ fn aos_routing_probe_heavy() {
     // Equi-join invariant: bv = 1000 + probe_key for every matched row.
     let bv_idx = out.schema().index_of("bv").unwrap();
     let pv_idx = out.schema().index_of("pv").unwrap();
-    let bv = out.column(bv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
-    let pv = out.column(pv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    let bv = out
+        .column(bv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let pv = out
+        .column(pv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     for i in 0..out.num_rows() {
         let probe_row = (pv.value(i) - 50_000) as usize;
         let probe_key = probe_keys[probe_row];
@@ -1308,8 +1387,16 @@ fn aos_routing_balanced_picks_soa() {
     // Equi-join invariant.
     let bv_idx = out.schema().index_of("bv").unwrap();
     let pv_idx = out.schema().index_of("pv").unwrap();
-    let bv = out.column(bv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
-    let pv = out.column(pv_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+    let bv = out
+        .column(bv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let pv = out
+        .column(pv_idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     for i in 0..out.num_rows() {
         let probe_row = (pv.value(i) - 50_000) as usize;
         let probe_key = probe_keys[probe_row];
@@ -1346,7 +1433,9 @@ fn device_string_hash_matches_host_via_engine() {
     let n_probe = 8192usize;
     let build_keys: Vec<String> = (0..n_build).map(|i| format!("k-{:05}", i)).collect();
     let build_vals: Vec<i32> = (0..n_build as i32).collect();
-    let probe_keys: Vec<String> = (0..n_probe).map(|i| format!("k-{:05}", i % (n_build * 2))).collect();
+    let probe_keys: Vec<String> = (0..n_probe)
+        .map(|i| format!("k-{:05}", i % (n_build * 2)))
+        .collect();
     let probe_vals: Vec<i32> = (0..n_probe as i32).collect();
 
     let t1 = utf8_batch("k", "bv", build_keys, build_vals);

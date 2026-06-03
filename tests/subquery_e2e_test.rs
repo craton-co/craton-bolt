@@ -57,7 +57,10 @@ fn col_int32(batch: &RecordBatch, c: usize) -> &Int32Array {
 #[allow(dead_code)]
 fn collect_int32(batch: &RecordBatch, c: usize) -> Vec<i32> {
     let a = col_int32(batch, c);
-    (0..a.len()).filter(|&i| !a.is_null(i)).map(|i| a.value(i)).collect()
+    (0..a.len())
+        .filter(|&i| !a.is_null(i))
+        .map(|i| a.value(i))
+        .collect()
 }
 
 /// Register a probe table `t(k)` and a subquery-source table `other(id)`,
@@ -72,8 +75,8 @@ fn engine_with_probe_and_set(probe: Vec<Option<i32>>, set: Vec<Option<i32>>) -> 
         ArrowDataType::Int32,
         true,
     )]));
-    let t = RecordBatch::try_new(t_schema, vec![Arc::new(Int32Array::from(probe))])
-        .expect("t batch");
+    let t =
+        RecordBatch::try_new(t_schema, vec![Arc::new(Int32Array::from(probe))]).expect("t batch");
     engine.register_table("t", t).expect("register t");
 
     let o_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -81,8 +84,8 @@ fn engine_with_probe_and_set(probe: Vec<Option<i32>>, set: Vec<Option<i32>>) -> 
         ArrowDataType::Int32,
         true,
     )]));
-    let o = RecordBatch::try_new(o_schema, vec![Arc::new(Int32Array::from(set))])
-        .expect("other batch");
+    let o =
+        RecordBatch::try_new(o_schema, vec![Arc::new(Int32Array::from(set))]).expect("other batch");
     engine.register_table("other", o).expect("register other");
     engine
 }
@@ -143,7 +146,11 @@ fn in_subquery_with_duplicate_set_dedups_and_matches() {
         .expect("IN (2, 5)");
 
     let got_sub = collect_int32(via_sub.record_batch(), 0);
-    assert_eq!(got_sub, vec![2, 5], "duplicate-returning subquery still selects {{2,5}}");
+    assert_eq!(
+        got_sub,
+        vec![2, 5],
+        "duplicate-returning subquery still selects {{2,5}}"
+    );
     assert_eq!(
         got_sub,
         collect_int32(via_list.record_batch(), 0),

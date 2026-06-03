@@ -159,11 +159,7 @@ fn collect_table_factor_scope(
             if let Some(last) = name.0.last() {
                 scope.qualifiers.insert(last.value.to_ascii_lowercase());
             }
-            let table_name = name
-                .0
-                .last()
-                .map(|i| i.value.clone())
-                .unwrap_or_default();
+            let table_name = name.0.last().map(|i| i.value.clone()).unwrap_or_default();
             if let Some(a) = alias {
                 scope.qualifiers.insert(a.name.value.to_ascii_lowercase());
             }
@@ -339,8 +335,7 @@ fn check_expr_correlation(
                 if !scope.has_qualifier(qualifier) {
                     return Err(correlated_err(&format!(
                         "'{}.{}'",
-                        qualifier,
-                        parts[1].value
+                        qualifier, parts[1].value
                     )));
                 }
             }
@@ -985,9 +980,7 @@ mod tests {
     fn conjunct_correlations_union_outer_and_inner() {
         // `o.a > (SELECT max(v) FROM s WHERE sk = o.k)`: the conjunct-level
         // `o.a` AND the subquery-internal `o.k` are both collected.
-        let w = where_expr(
-            "SELECT 1 FROM o WHERE o.a > (SELECT MAX(v) FROM s WHERE sk = o.k)",
-        );
+        let w = where_expr("SELECT 1 FROM o WHERE o.a > (SELECT MAX(v) FROM s WHERE sk = o.k)");
         let corrs = collect_conjunct_correlations(&w, &outer_cols(), &provider()).unwrap();
         let cols: HashSet<&str> = corrs.iter().map(|c| c.column.as_str()).collect();
         assert!(cols.contains("a"), "conjunct-level o.a is a correlation");

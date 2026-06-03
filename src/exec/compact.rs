@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Host-side filter compaction.
 //!
@@ -132,9 +132,8 @@ pub fn apply_mask(arr: &ArrayRef, mask: &[bool]) -> BoltResult<ArrayRef> {
     // definite keep / drop — so `filter` only ever propagates nulls that
     // already lived in `arr`.
     let predicate = BooleanArray::from(mask.to_vec());
-    let filtered = filter(arr.as_ref(), &predicate).map_err(|e| {
-        BoltError::Other(format!("arrow::compute::filter failed: {e}"))
-    })?;
+    let filtered = filter(arr.as_ref(), &predicate)
+        .map_err(|e| BoltError::Other(format!("arrow::compute::filter failed: {e}")))?;
     // `filter` returns `ArrayRef` (== `Arc<dyn Array>`) directly in arrow 53;
     // no extra wrap needed.
     Ok(filtered)
@@ -208,8 +207,7 @@ pub fn launch_predicate_kernel(
 
     // Build the *mut c_void array the driver expects. Each entry points at
     // the storage of one kernel argument (a CUdeviceptr or the n_rows u32).
-    let mut kernel_params: Vec<*mut std::ffi::c_void> =
-        Vec::with_capacity(device_ptrs.len() + 1);
+    let mut kernel_params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(device_ptrs.len() + 1);
     for p in device_ptrs.iter_mut() {
         kernel_params.push(p as *mut CUdeviceptr as *mut std::ffi::c_void);
     }
@@ -313,8 +311,7 @@ mod tests {
         // We compare to an `Option<bool>` list rather than poking
         // `is_null` / `value` separately so the assertion failure
         // message names the offending row directly.
-        let expected: Vec<Option<bool>> =
-            vec![Some(true), None, Some(true), None];
+        let expected: Vec<Option<bool>> = vec![Some(true), None, Some(true), None];
         let actual: Vec<Option<bool>> = (0..out_bool.len())
             .map(|i| {
                 if out_bool.is_null(i) {
@@ -336,8 +333,7 @@ mod tests {
     /// all-`null`.
     #[test]
     fn compact_bool_all_nulls_stay_null() {
-        let src: ArrayRef =
-            Arc::new(BooleanArray::from(vec![None, None, None]));
+        let src: ArrayRef = Arc::new(BooleanArray::from(vec![None, None, None]));
         let mask = vec![true, true, true];
         let out = apply_mask(&src, &mask).expect("apply_mask");
         let out_bool = out
@@ -374,8 +370,8 @@ mod tests {
     #[test]
     fn download_mask_zero_rows_skips_cuda() {
         let stream = CudaStream::null();
-        let out = download_mask(0 as CUdeviceptr, 0, &stream)
-            .expect("zero-row download must not error");
+        let out =
+            download_mask(0 as CUdeviceptr, 0, &stream).expect("zero-row download must not error");
         assert!(out.is_empty(), "expected empty Vec<bool>");
     }
 

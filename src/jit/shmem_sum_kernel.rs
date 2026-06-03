@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory GROUP BY SUM kernel (Tier 1 of the GROUP BY perf
 //! plan).
@@ -213,12 +213,7 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     // 0.0 == 0) and `block_set[s] = 0` as `st.shared.u8 [.], 0`.
     writeln!(ptx, "\tmov.u32 %r10, %r2;").map_err(write_err)?;
     writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r10, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r10, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
     // block_acc[%r10] = 0.0  (f64 zero == u64 zero in bits)
     writeln!(ptx, "\tmul.wide.u32 %rd10, %r10, 8;").map_err(write_err)?;
@@ -228,12 +223,7 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tcvt.u64.u32 %rd12, %r10;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd13, %rd1, %rd12;").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u8 [%rd13], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r10, %r10, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r10, %r10, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
     writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
@@ -270,12 +260,7 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     // caller bounds keys to [0, n_groups)) would otherwise wrap into the
     // shared table and corrupt arbitrary slots. Treating it as unsigned makes
     // any out-of-range key (negative or >= BLOCK_GROUPS) take the safe path.
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p2, %r12, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
     // Shared accumulate.
@@ -320,12 +305,7 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     // ----------------------------------------------------------------------
     writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
     writeln!(ptx, "MERGE_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p3, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p3, %r20, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra MERGE_DONE;").map_err(write_err)?;
 
     // Load block_set[%r20] (zero-extended into 32-bit %r21).
@@ -343,12 +323,7 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tatom.global.add.f64 %fd4, [%rd28], %fd3;").map_err(write_err)?;
 
     writeln!(ptx, "MERGE_NEXT:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra MERGE_TOP;").map_err(write_err)?;
     writeln!(ptx, "MERGE_DONE:").map_err(write_err)?;
 
@@ -508,8 +483,8 @@ mod tests {
     #[ignore]
     fn ptx_loads_into_cuda_driver() {
         let ptx = compile_shmem_sum_kernel().expect("kernel compiles");
-        let module = crate::jit::CudaModule::from_ptx(&ptx)
-            .expect("PTX should load via cuModuleLoadDataEx");
+        let module =
+            crate::jit::CudaModule::from_ptx(&ptx).expect("PTX should load via cuModuleLoadDataEx");
         // The entry point must also be resolvable via cuModuleGetFunction —
         // a typo'd `.visible .entry` name only fails here, not at load time.
         let _fn = module

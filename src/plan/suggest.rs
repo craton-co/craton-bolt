@@ -51,7 +51,11 @@ pub fn edit_distance_within(a: &str, b: &str, limit: usize) -> Option<usize> {
         cur[0] = i;
         let mut row_min = cur[0];
         for j in 1..=lb {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
             let del = prev[j] + 1;
             let ins = cur[j - 1] + 1;
             let sub = prev[j - 1] + cost;
@@ -68,7 +72,11 @@ pub fn edit_distance_within(a: &str, b: &str, limit: usize) -> Option<usize> {
         std::mem::swap(&mut prev, &mut cur);
     }
     let dist = prev[lb];
-    if dist <= limit { Some(dist) } else { None }
+    if dist <= limit {
+        Some(dist)
+    } else {
+        None
+    }
 }
 
 /// Find the closest candidate to `needle` within edit distance 2 (case-
@@ -167,10 +175,7 @@ mod tests {
             Some("email")
         );
         // Too far -> no suggestion.
-        assert_eq!(
-            closest_match("zzzzzzz", candidates.iter().copied()),
-            None
-        );
+        assert_eq!(closest_match("zzzzzzz", candidates.iter().copied()), None);
         // Empty needle -> no suggestion.
         assert_eq!(closest_match("", candidates.iter().copied()), None);
     }
@@ -191,9 +196,6 @@ mod tests {
             did_you_mean_suffix("naem", candidates.iter().copied()),
             " (did you mean 'name'?)"
         );
-        assert_eq!(
-            did_you_mean_suffix("zzzz", candidates.iter().copied()),
-            ""
-        );
+        assert_eq!(did_you_mean_suffix("zzzz", candidates.iter().copied()), "");
     }
 }

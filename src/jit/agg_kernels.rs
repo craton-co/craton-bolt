@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! PTX codegen for scalar reduction kernels.
 //!
@@ -147,7 +147,8 @@ impl ReduceOp {
             )),
             AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => Err(BoltError::Other(
                 "agg_kernels: STDDEV_POP / STDDEV_SAMP do not lower to a \
-                 single ReduceOp; handled via the Welford state path".into(),
+                 single ReduceOp; handled via the Welford state path"
+                    .into(),
             )),
         }
     }
@@ -185,10 +186,12 @@ impl ReduceOp {
             // `reduction_storage_dtype` has already collapsed Date32/Timestamp
             // to Int32/Int64 (or errored for SUM(temporal)); only the truly
             // unsupported dtypes remain here.
-            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => Err(BoltError::Type(format!(
-                "agg_kernels: reduction over dtype {:?} is not supported",
-                dtype
-            ))),
+            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => {
+                Err(BoltError::Type(format!(
+                    "agg_kernels: reduction over dtype {:?} is not supported",
+                    dtype
+                )))
+            }
         }
     }
 
@@ -266,10 +269,7 @@ pub fn compile_reduction_kernel(op: ReduceOp, dtype: DataType) -> BoltResult<Str
 ///
 /// `dtype` is the *input* column dtype; the accumulator / output dtype is
 /// [`reduction_output_dtype`] as in the no-validity variant.
-pub fn compile_reduction_kernel_with_validity(
-    op: ReduceOp,
-    dtype: DataType,
-) -> BoltResult<String> {
+pub fn compile_reduction_kernel_with_validity(op: ReduceOp, dtype: DataType) -> BoltResult<String> {
     emit_reduction_kernel(op, dtype, /* with_validity = */ true)
 }
 
@@ -279,11 +279,7 @@ pub fn compile_reduction_kernel_with_validity(
 /// `.param .u64 validity_ptr` (Arrow LE packed-bit bitmap, one bit per row)
 /// and emits a bit-test in the per-thread load that routes NULL rows to the
 /// identity.
-fn emit_reduction_kernel(
-    op: ReduceOp,
-    dtype: DataType,
-    with_validity: bool,
-) -> BoltResult<String> {
+fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> BoltResult<String> {
     // F7: a temporal input column reduces at its underlying integer width
     // (Date32 -> Int32 day count, Timestamp -> Int64 tick count). Normalise
     // the input dtype up front so every downstream helper here
@@ -319,8 +315,16 @@ fn emit_reduction_kernel(
     // use distinct rl/f/fd banks, which is why only Int32 reductions were
     // wrong. Applied to both the accumulator and (for SUM(Int32)->Int64) the
     // widening input load.
-    let acc_reg_class = if acc_reg_class == "r" { "rv" } else { acc_reg_class };
-    let input_reg_class = if input_reg_class == "r" { "rv" } else { input_reg_class };
+    let acc_reg_class = if acc_reg_class == "r" {
+        "rv"
+    } else {
+        acc_reg_class
+    };
+    let input_reg_class = if input_reg_class == "r" {
+        "rv"
+    } else {
+        input_reg_class
+    };
     let widens = acc_dtype != dtype;
 
     // Identity and combine are computed against the ACCUMULATOR dtype: the
@@ -396,8 +400,7 @@ fn emit_reduction_kernel(
     // declared above and doesn't coincide with the accumulator bank — otherwise
     // it's another duplicate `.reg` of the same class.
     if widens && !is_general_bank(input_reg_class) && input_reg_class != acc_reg_class {
-        writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class)
-            .map_err(write_err)?;
+        writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class).map_err(write_err)?;
     }
     writeln!(ptx).map_err(write_err)?;
 
@@ -406,20 +409,10 @@ fn emit_reduction_kernel(
     writeln!(ptx, "\tmov.u32 %r1, %ntid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r2, %tid.x;").map_err(write_err)?;
     writeln!(ptx, "\tmad.lo.s32 %r3, %r0, %r1, %r2;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u32 %r4, [{}_param_2];",
-        entry
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u32 %r4, [{}_param_2];", entry).map_err(write_err)?;
 
     // Load this thread's value (or the identity if it's past the end).
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd0, [{}_param_0];",
-        entry
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd0, [{}_param_0];", entry).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd0, %rd0;").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p0, %r3, %r4;").map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra LOAD_IDENTITY;").map_err(write_err)?;
@@ -430,8 +423,7 @@ fn emit_reduction_kernel(
     // bits (bit `tid % 8` of byte `tid / 8`). Uses high registers / %p7 to
     // stay clear of the reduction body's namespace.
     if with_validity {
-        writeln!(ptx, "\tld.param.u64 %rd15, [{}_param_3];", entry)
-            .map_err(write_err)?;
+        writeln!(ptx, "\tld.param.u64 %rd15, [{}_param_3];", entry).map_err(write_err)?;
         writeln!(ptx, "\tcvta.to.global.u64 %rd15, %rd15;").map_err(write_err)?;
         // byte_idx = tid >> 3 ; bit_off = tid & 7
         writeln!(ptx, "\tshr.u32 %r12, %r3, 3;").map_err(write_err)?;
@@ -489,8 +481,12 @@ fn emit_reduction_kernel(
     writeln!(ptx, "\tbra AFTER_LOAD;").map_err(write_err)?;
     writeln!(ptx, "LOAD_IDENTITY:").map_err(write_err)?;
     // Identity is in accumulator dtype.
-    writeln!(ptx, "\tmov.{} %{}0, {};", acc_imm_ty, acc_reg_class, identity)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmov.{} %{}0, {};",
+        acc_imm_ty, acc_reg_class, identity
+    )
+    .map_err(write_err)?;
     writeln!(ptx, "AFTER_LOAD:").map_err(write_err)?;
 
     // Stash the value into shared memory. Shared memory is sized and indexed
@@ -712,12 +708,7 @@ fn emit_reduction_kernel(
     // it straight to global memory without round-tripping through sdata[0].
     writeln!(ptx, "\tsetp.ne.s32 %p5, %r2, 0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p5 bra DONE;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd8, [{}_param_1];",
-        entry
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd8, [{}_param_1];", entry).map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
     writeln!(
         ptx,
@@ -748,7 +739,13 @@ fn emit_reduction_kernel(
 /// need to differ.
 fn ptx_type_info(
     dtype: DataType,
-) -> BoltResult<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
+) -> BoltResult<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+)> {
     Ok(match dtype {
         DataType::Int32 => ("s32", "s32", "r", "b32", "s32"),
         DataType::Int64 => ("s64", "s64", "rl", "b64", "s64"),
@@ -827,7 +824,11 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
     // slot. Route the (transient) Int32 input load through the distinct %rv
     // b32 bank, matching emit_reduction_kernel. Int64/Float inputs already use
     // distinct rl/f banks.
-    let input_reg_class = if input_reg_class == "r" { "rv" } else { input_reg_class };
+    let input_reg_class = if input_reg_class == "r" {
+        "rv"
+    } else {
+        input_reg_class
+    };
     let input_elem_bytes = dtype.byte_width().ok_or_else(|| {
         BoltError::Other(format!(
             "agg_kernels: variable-width dtype {:?} not supported in AVG kernel",
@@ -878,8 +879,7 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
     // above, so emitting a dedicated decl would be a duplicate-definition PTX
     // error; only a distinct FLOAT input bank (`%f`) needs its own declaration.
     if dtype != DataType::Float64 && !matches!(input_reg_class, "r" | "rd") {
-        writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class)
-            .map_err(write_err)?;
+        writeln!(ptx, "\t.reg .{}   %{}<4>;", input_reg_ty, input_reg_class).map_err(write_err)?;
     }
     writeln!(ptx).map_err(write_err)?;
 
@@ -938,12 +938,7 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
 
     writeln!(ptx, "AVG_LOAD_IDENTITY:").map_err(write_err)?;
     // Sum identity is +0.0; count identity is 0.
-    writeln!(
-        ptx,
-        "\tmov.f64 %fd0, 0d{:016X};",
-        0f64.to_bits()
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tmov.f64 %fd0, 0d{:016X};", 0f64.to_bits()).map_err(write_err)?;
     writeln!(ptx, "\tmov.u32 %r5, 0;").map_err(write_err)?;
     writeln!(ptx, "AVG_AFTER_LOAD:").map_err(write_err)?;
 
@@ -1235,14 +1230,17 @@ mod temporal_reduction_tests {
     fn min_date32_emits_int32_kernel() {
         let date = compile_reduction_kernel(ReduceOp::Min, DataType::Date32)
             .expect("MIN(Date32) should compile via the Int32 path");
-        let i32_ref = compile_reduction_kernel(ReduceOp::Min, DataType::Int32)
-            .expect("MIN(Int32) reference");
+        let i32_ref =
+            compile_reduction_kernel(ReduceOp::Min, DataType::Int32).expect("MIN(Int32) reference");
         assert_eq!(
             date, i32_ref,
             "MIN(Date32) PTX must match MIN(Int32) PTX byte-for-byte"
         );
         // s32 MIN combine + i32::MAX identity must be present.
-        assert!(date.contains("min.s32"), "expected min.s32 combine:\n{date}");
+        assert!(
+            date.contains("min.s32"),
+            "expected min.s32 combine:\n{date}"
+        );
         assert!(
             date.contains(&i32::MAX.to_string()),
             "expected i32::MAX MIN identity:\n{date}"
@@ -1255,8 +1253,8 @@ mod temporal_reduction_tests {
     fn max_timestamp_emits_int64_kernel() {
         let ts = compile_reduction_kernel(ReduceOp::Max, TS_US)
             .expect("MAX(Timestamp) should compile via the Int64 path");
-        let i64_ref = compile_reduction_kernel(ReduceOp::Max, DataType::Int64)
-            .expect("MAX(Int64) reference");
+        let i64_ref =
+            compile_reduction_kernel(ReduceOp::Max, DataType::Int64).expect("MAX(Int64) reference");
         assert_eq!(
             ts, i64_ref,
             "MAX(Timestamp) PTX must match MAX(Int64) PTX byte-for-byte"
@@ -1286,7 +1284,10 @@ mod temporal_reduction_tests {
         let i32_ref = compile_reduction_kernel_with_validity(ReduceOp::Min, DataType::Int32)
             .expect("MIN(Int32) with validity reference");
         assert_eq!(date, i32_ref);
-        assert!(date.contains("bfe.u32"), "validity gate must survive:\n{date}");
+        assert!(
+            date.contains("bfe.u32"),
+            "validity gate must survive:\n{date}"
+        );
     }
 
     /// SUM over a temporal dtype is undefined SQL and must be rejected at both
@@ -1310,8 +1311,14 @@ mod temporal_reduction_tests {
     #[test]
     fn identity_and_combine_accept_temporal_minmax_count() {
         // Date32 -> Int32 mnemonics.
-        assert_eq!(ReduceOp::Min.combine_ptx(DataType::Date32).unwrap(), "min.s32");
-        assert_eq!(ReduceOp::Max.combine_ptx(DataType::Date32).unwrap(), "max.s32");
+        assert_eq!(
+            ReduceOp::Min.combine_ptx(DataType::Date32).unwrap(),
+            "min.s32"
+        );
+        assert_eq!(
+            ReduceOp::Max.combine_ptx(DataType::Date32).unwrap(),
+            "max.s32"
+        );
         assert_eq!(
             ReduceOp::Min.identity_ptx(DataType::Date32).unwrap(),
             i32::MAX.to_string()
@@ -1331,11 +1338,7 @@ mod temporal_reduction_tests {
     /// normalisation must not accidentally let them through.
     #[test]
     fn still_rejects_bool_utf8_decimal() {
-        for dt in [
-            DataType::Bool,
-            DataType::Utf8,
-            DataType::Decimal128(10, 2),
-        ] {
+        for dt in [DataType::Bool, DataType::Utf8, DataType::Decimal128(10, 2)] {
             assert!(compile_reduction_kernel(ReduceOp::Min, dt).is_err());
             assert!(compile_reduction_kernel(ReduceOp::Max, dt).is_err());
             assert!(compile_reduction_kernel(ReduceOp::Sum, dt).is_err());

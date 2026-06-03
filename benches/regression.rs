@@ -144,9 +144,21 @@ const Q_FILTER: &str = "SELECT price FROM t WHERE price > 50";
 
 fn schema() -> Schema {
     Schema::new(vec![
-        Field { name: "region".into(), dtype: DataType::Int32, nullable: false },
-        Field { name: "price".into(), dtype: DataType::Float64, nullable: false },
-        Field { name: "tax".into(), dtype: DataType::Float64, nullable: false },
+        Field {
+            name: "region".into(),
+            dtype: DataType::Int32,
+            nullable: false,
+        },
+        Field {
+            name: "price".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
+        Field {
+            name: "tax".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        },
     ])
 }
 
@@ -357,7 +369,12 @@ fn to_json(medians: &BTreeMap<String, f64>) -> String {
         let comma = if i + 1 < medians.len() { "," } else { "" };
         // Keys are our own ASCII bench ids ('/', alnum, '_') — no escaping
         // needed, but go through the escaper for safety/future-proofing.
-        s.push_str(&format!("  \"{}\": {}{}\n", json_escape(k), fmt_num(*v), comma));
+        s.push_str(&format!(
+            "  \"{}\": {}{}\n",
+            json_escape(k),
+            fmt_num(*v),
+            comma
+        ));
     }
     s.push_str("}\n");
     s
@@ -478,13 +495,7 @@ fn parse_flat_json(input: &str) -> Result<BTreeMap<String, f64>, String> {
         let start = i;
         while i < n {
             let c = bytes[i] as char;
-            if c.is_ascii_digit()
-                || c == '-'
-                || c == '+'
-                || c == '.'
-                || c == 'e'
-                || c == 'E'
-            {
+            if c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
                 i += 1;
             } else {
                 break;
@@ -599,15 +610,11 @@ fn compare_baseline(path: &str, current: &BTreeMap<String, f64>) {
                 }
             }
             Some(_) => {
-                eprintln!(
-                    "[regression-guard] SKIP       {id}: baseline value is non-positive"
-                );
+                eprintln!("[regression-guard] SKIP       {id}: baseline value is non-positive");
             }
             None => {
                 missing_in_baseline += 1;
-                eprintln!(
-                    "[regression-guard] NEW        {id}: {cur:.1} ns (not in baseline)"
-                );
+                eprintln!("[regression-guard] NEW        {id}: {cur:.1} ns (not in baseline)");
             }
         }
     }
@@ -643,8 +650,12 @@ fn compare_baseline(path: &str, current: &BTreeMap<String, f64>) {
 /// it does not define any Criterion benchmarks — it takes `&mut Criterion`
 /// only to fit the `criterion_group!` signature.
 fn regression_guard(_c: &mut Criterion) {
-    let write_path = std::env::var(ENV_WRITE_BASELINE).ok().filter(|s| !s.is_empty());
-    let compare_path = std::env::var(ENV_COMPARE_BASELINE).ok().filter(|s| !s.is_empty());
+    let write_path = std::env::var(ENV_WRITE_BASELINE)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let compare_path = std::env::var(ENV_COMPARE_BASELINE)
+        .ok()
+        .filter(|s| !s.is_empty());
 
     if write_path.is_none() && compare_path.is_none() {
         // Default path: no guard env vars set — behave exactly as the
@@ -652,9 +663,7 @@ fn regression_guard(_c: &mut Criterion) {
         return;
     }
 
-    eprintln!(
-        "[regression-guard] running manual timing pass ({GUARD_ITERS} iters/id)..."
-    );
+    eprintln!("[regression-guard] running manual timing pass ({GUARD_ITERS} iters/id)...");
     let medians = collect_medians();
 
     if let Some(path) = write_path.as_deref() {
@@ -665,5 +674,11 @@ fn regression_guard(_c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_parse, bench_lower, bench_ptx_gen, regression_guard);
+criterion_group!(
+    benches,
+    bench_parse,
+    bench_lower,
+    bench_ptx_gen,
+    regression_guard
+);
 criterion_main!(benches);

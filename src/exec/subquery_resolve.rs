@@ -447,9 +447,7 @@ where
         } => Expr::Case {
             branches: branches
                 .into_iter()
-                .map(|(w, t)| {
-                    Ok::<_, BoltError>((resolve_expr(w, exec)?, resolve_expr(t, exec)?))
-                })
+                .map(|(w, t)| Ok::<_, BoltError>((resolve_expr(w, exec)?, resolve_expr(t, exec)?)))
                 .collect::<BoltResult<Vec<_>>>()?,
             else_branch: else_branch
                 .map(|e| Ok::<_, BoltError>(Box::new(resolve_expr(*e, exec)?)))
@@ -473,7 +471,12 @@ where
             target,
             safe,
         },
-        Expr::CastFormat { expr, target, pattern, to_text } => Expr::CastFormat {
+        Expr::CastFormat {
+            expr,
+            target,
+            pattern,
+            to_text,
+        } => Expr::CastFormat {
             expr: Box::new(resolve_expr(*expr, exec)?),
             target,
             pattern,
@@ -491,9 +494,7 @@ where
             unit,
             expr: Box::new(resolve_expr(*expr, exec)?),
         },
-        Expr::Alias(inner, name) => {
-            Expr::Alias(Box::new(resolve_expr(*inner, exec)?), name)
-        }
+        Expr::Alias(inner, name) => Expr::Alias(Box::new(resolve_expr(*inner, exec)?), name),
         Expr::ScalarSubquery(subplan) => {
             // Resolve inner subqueries first, then execute, then fold.
             let resolved = resolve_plan(*subplan, exec)?;
@@ -624,7 +625,11 @@ mod tests {
         // `Expr` doesn't implement `PartialEq`, so destructure and compare the
         // structure / scalar leaves (which do) instead of `assert_eq!`.
         match got {
-            Expr::Binary { op: BinaryOp::Or, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
                 check_cmp(&left, "x", BinaryOp::Eq, Literal::Int32(1));
                 check_cmp(&right, "x", BinaryOp::Eq, Literal::Int32(2));
             }
@@ -635,7 +640,11 @@ mod tests {
     /// Asserts `e` is `Binary { op, Column(col), Literal(lit) }`.
     fn check_cmp(e: &Expr, col: &str, op: BinaryOp, lit: Literal) {
         match e {
-            Expr::Binary { op: got_op, left, right } => {
+            Expr::Binary {
+                op: got_op,
+                left,
+                right,
+            } => {
                 assert_eq!(*got_op, op, "binary op");
                 match (&**left, &**right) {
                     (Expr::Column(name), Expr::Literal(got_lit)) => {
@@ -657,10 +666,17 @@ mod tests {
         // IS NOT NULL guard drops NULL probe rows (SQL 3VL: NULL NOT IN ... is
         // UNKNOWN → excluded under WHERE).
         match got {
-            Expr::Binary { op: BinaryOp::And, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
                 // right-hand operand is the IS NOT NULL guard over the probe.
                 match &*right {
-                    Expr::Unary { op: UnaryOp::IsNotNull, operand } => match &**operand {
+                    Expr::Unary {
+                        op: UnaryOp::IsNotNull,
+                        operand,
+                    } => match &**operand {
                         Expr::Column(name) => assert_eq!(name.as_str(), "x"),
                         other => panic!("expected Column in IS NOT NULL, got {other:?}"),
                     },
@@ -668,7 +684,11 @@ mod tests {
                 }
                 // left-hand operand is the AND-of-inequalities.
                 match &*left {
-                    Expr::Binary { op: BinaryOp::And, left: l2, right: r2 } => {
+                    Expr::Binary {
+                        op: BinaryOp::And,
+                        left: l2,
+                        right: r2,
+                    } => {
                         check_cmp(l2, "x", BinaryOp::NotEq, Literal::Int32(1));
                         check_cmp(r2, "x", BinaryOp::NotEq, Literal::Int32(2));
                     }
@@ -682,11 +702,7 @@ mod tests {
     #[test]
     fn in_predicate_drops_nulls_keeps_non_null() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(
-            &probe,
-            &[Literal::Int32(7), Literal::Null],
-            false,
-        );
+        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false);
         // Single non-null element → bare equality, no OR fold.
         check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
     }
@@ -729,21 +745,31 @@ mod tests {
     #[test]
     fn not_in_without_null_builds_and_of_inequalities() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(
-            &probe,
-            &[Literal::Int32(1), Literal::Int32(2)],
-            true,
-        );
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true);
         // `(x <> 1 AND x <> 2) AND x IS NOT NULL` — the IS NOT NULL guard drops
         // NULL probe rows (SQL 3VL); the inequality fold is over the non-NULL set.
         match got {
-            Expr::Binary { op: BinaryOp::And, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
                 assert!(
-                    matches!(&*right, Expr::Unary { op: UnaryOp::IsNotNull, .. }),
+                    matches!(
+                        &*right,
+                        Expr::Unary {
+                            op: UnaryOp::IsNotNull,
+                            ..
+                        }
+                    ),
                     "expected trailing IS NOT NULL guard, got {right:?}"
                 );
                 match &*left {
-                    Expr::Binary { op: BinaryOp::And, left: l2, right: r2 } => {
+                    Expr::Binary {
+                        op: BinaryOp::And,
+                        left: l2,
+                        right: r2,
+                    } => {
                         check_cmp(l2, "x", BinaryOp::NotEq, Literal::Int32(1));
                         check_cmp(r2, "x", BinaryOp::NotEq, Literal::Int32(2));
                     }
@@ -760,11 +786,7 @@ mod tests {
     #[test]
     fn in_with_null_in_set_keeps_non_null_membership() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(
-            &probe,
-            &[Literal::Int32(7), Literal::Null],
-            false,
-        );
+        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false);
         // Single non-null element → bare equality (the NULL is dropped).
         check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
     }
@@ -782,12 +804,14 @@ mod tests {
         let probe = Expr::Literal(Literal::Null);
         let got = build_in_predicate(&probe, &[Literal::Int32(3)], false);
         match got {
-            Expr::Binary { op: BinaryOp::Eq, left, right } => {
-                match (&*left, &*right) {
-                    (Expr::Literal(Literal::Null), Expr::Literal(Literal::Int32(3))) => {}
-                    other => panic!("expected (NULL = 3), got {other:?}"),
-                }
-            }
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => match (&*left, &*right) {
+                (Expr::Literal(Literal::Null), Expr::Literal(Literal::Int32(3))) => {}
+                other => panic!("expected (NULL = 3), got {other:?}"),
+            },
             other => panic!("expected Eq fold over probe, got {other:?}"),
         }
     }

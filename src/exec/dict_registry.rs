@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-table dictionary registry that drives the string-literal predicate
 //! rewrite.
@@ -191,10 +191,7 @@ impl DictRegistry {
         let table = table.into();
         let column = column.into();
         let dict = DictionaryColumnAny::from_dictionary_array(dict_arr)?;
-        self.by_table
-            .entry(table)
-            .or_default()
-            .insert(column, dict);
+        self.by_table.entry(table).or_default().insert(column, dict);
         Ok(())
     }
 
@@ -429,11 +426,7 @@ impl DictRegistry {
     /// path can keep working — it currently only knows how to ship `i32*`
     /// kernel arguments — until the orchestrator teaches that path to
     /// dispatch on [`DictionaryColumnAny::index_dtype`].
-    pub fn dictionary_i32(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> Option<&DictionaryColumn> {
+    pub fn dictionary_i32(&self, table: &str, column: &str) -> Option<&DictionaryColumn> {
         self.dictionary(table, column).and_then(|d| d.as_i32())
     }
 
@@ -443,12 +436,9 @@ impl DictRegistry {
     /// Used by the engine's upload path to decide between `DeviceCol::I32`
     /// and `DeviceCol::I64` when shipping the index column to the device.
     /// Returns `None` if either the table or the column is not registered.
-    pub fn dict_index_dtype(
-        &self,
-        table: &str,
-        original_col: &str,
-    ) -> Option<DataType> {
-        self.dictionary(table, original_col).map(|d| d.index_dtype())
+    pub fn dict_index_dtype(&self, table: &str, original_col: &str) -> Option<DataType> {
+        self.dictionary(table, original_col)
+            .map(|d| d.index_dtype())
     }
 }
 
@@ -522,16 +512,20 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
             // CAST ... FORMAT is host-materialised (host evaluator), like a
             // scalar string fn.
             Expr::CastFormat { .. } => true,
-            Expr::Binary { op: BinaryOp::Concat, .. } => true,
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                ..
+            } => true,
             Expr::Binary { left, right, .. } => {
                 is_host_bound_string_expr(left) || is_host_bound_string_expr(right)
             }
             Expr::Unary { operand, .. } => is_host_bound_string_expr(operand),
             Expr::Alias(inner, _) => is_host_bound_string_expr(inner),
-            Expr::Cast { expr, .. } | Expr::Like { expr, .. } => {
-                is_host_bound_string_expr(expr)
-            }
-            Expr::Case { branches, else_branch } => {
+            Expr::Cast { expr, .. } | Expr::Like { expr, .. } => is_host_bound_string_expr(expr),
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 branches
                     .iter()
                     .any(|(w, t)| is_host_bound_string_expr(w) || is_host_bound_string_expr(t))
@@ -568,7 +562,10 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
                     collect_column_refs(a, out);
                 }
             }
-            Expr::Case { branches, else_branch } => {
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 for (w, t) in branches {
                     collect_column_refs(w, out);
                     collect_column_refs(t, out);
@@ -612,8 +609,7 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
                     walk(inp, out);
                 }
             }
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::SetOp { left, right, .. } => {
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
             }
@@ -641,8 +637,7 @@ fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
                     walk(inp, out);
                 }
             }
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::SetOp { left, right, .. } => {
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
             }
@@ -828,8 +823,7 @@ mod tests {
         ]));
         let region = Arc::new(StringArray::from(vec!["US", "EU", "US", "JP"]));
         let price = Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]));
-        let batch =
-            RecordBatch::try_new(schema, vec![region, price]).expect("build batch");
+        let batch = RecordBatch::try_new(schema, vec![region, price]).expect("build batch");
 
         let mut reg = DictRegistry::new();
         reg.register_table("orders", &batch).expect("register");
@@ -864,8 +858,7 @@ mod tests {
             false,
         )]));
         let region = Arc::new(StringArray::from(vec!["US", "EU"]));
-        let batch =
-            RecordBatch::try_new(arrow_schema, vec![region]).expect("build batch");
+        let batch = RecordBatch::try_new(arrow_schema, vec![region]).expect("build batch");
 
         let mut reg = DictRegistry::new();
         reg.register_table("orders", &batch).expect("register");
@@ -916,8 +909,7 @@ mod tests {
             false,
         )]));
         let region = Arc::new(StringArray::from(vec!["US"]));
-        let batch =
-            RecordBatch::try_new(arrow_schema, vec![region]).expect("build batch");
+        let batch = RecordBatch::try_new(arrow_schema, vec![region]).expect("build batch");
 
         let mut reg = DictRegistry::new();
         reg.register_table("orders", &batch).expect("register");
@@ -1126,7 +1118,10 @@ mod tests {
         let c: Vec<String> = vec!["JP".into(), "AU".into()];
         let d: Vec<String> = vec!["EU".into(), "US".into()]; // same set, diff order
 
-        assert!(a == b, "identical dictionaries must compare equal (no conflict)");
+        assert!(
+            a == b,
+            "identical dictionaries must compare equal (no conflict)"
+        );
         assert!(a != c, "different values must differ (conflict)");
         assert!(
             a != d,
@@ -1251,7 +1246,12 @@ mod tests {
         // cross-dictionary universe.
         reg.register_table(
             "t",
-            &utf8_batch2("a", &["delta", "apple", "mango"], "b", &["cherry", "Zebra", "apple"]),
+            &utf8_batch2(
+                "a",
+                &["delta", "apple", "mango"],
+                "b",
+                &["cherry", "Zebra", "apple"],
+            ),
         )
         .expect("register t");
 
@@ -1273,15 +1273,29 @@ mod tests {
             panic!("expected Filter at root");
         };
         // Top-level shape: AND( AND(__rank_a >= 0, __rank_b >= 0), __rank_a < __rank_b ).
-        let Expr::Binary { op: BinaryOp::And, left: guards, right: ordering } = &predicate else {
+        let Expr::Binary {
+            op: BinaryOp::And,
+            left: guards,
+            right: ordering,
+        } = &predicate
+        else {
             panic!("expected NULL-safe AND, got {predicate:?}");
         };
-        let Expr::Binary { op: BinaryOp::And, left: ga, right: gb } = &**guards else {
+        let Expr::Binary {
+            op: BinaryOp::And,
+            left: ga,
+            right: gb,
+        } = &**guards
+        else {
             panic!("expected two NULL guards, got {guards:?}");
         };
         for (g, name) in [(&**ga, "__rank_a"), (&**gb, "__rank_b")] {
             match g {
-                Expr::Binary { op: BinaryOp::GtEq, left, right } => {
+                Expr::Binary {
+                    op: BinaryOp::GtEq,
+                    left,
+                    right,
+                } => {
                     assert!(matches!(&**left, Expr::Column(n) if n == name));
                     assert!(matches!(&**right, Expr::Literal(Literal::Int64(0))));
                 }
@@ -1289,7 +1303,11 @@ mod tests {
             }
         }
         match &**ordering {
-            Expr::Binary { op: BinaryOp::Lt, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Lt,
+                left,
+                right,
+            } => {
                 assert!(matches!(&**left, Expr::Column(n) if n == "__rank_a"));
                 assert!(matches!(&**right, Expr::Column(n) if n == "__rank_b"));
             }

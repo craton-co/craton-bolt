@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Negative parser/lower tests for the SQL frontend.
 //!
@@ -59,21 +59,17 @@ fn fixture_table() -> MemTableProvider {
 /// Same `sales` shape plus a sibling `sales2` table for JOIN tests.
 fn fixture_with_sales2() -> MemTableProvider {
     let mut provider = fixture_table();
-    let sales2 = Schema::new(vec![
-        Field {
-            name: "id".into(),
-            dtype: DataType::Int32,
-            nullable: false,
-        },
-    ]);
+    let sales2 = Schema::new(vec![Field {
+        name: "id".into(),
+        dtype: DataType::Int32,
+        nullable: false,
+    }]);
     provider.register("sales2", sales2);
-    let sales_id = Schema::new(vec![
-        Field {
-            name: "id".into(),
-            dtype: DataType::Int32,
-            nullable: false,
-        },
-    ]);
+    let sales_id = Schema::new(vec![Field {
+        name: "id".into(),
+        dtype: DataType::Int32,
+        nullable: false,
+    }]);
     // Overwrite `sales` with an id-bearing variant so the JOIN predicate has columns to bind to.
     provider.register("sales", sales_id);
     provider
@@ -98,7 +94,8 @@ fn assert_err_contains(result: Result<(), String>, needle: &str) {
     match result {
         Ok(()) => panic!("expected error containing {needle:?}, got Ok"),
         Err(msg) => assert!(
-            msg.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()),
+            msg.to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()),
             "expected error to contain {needle:?}, got: {msg}"
         ),
     }
@@ -175,10 +172,12 @@ fn select_with_limit_parses() {
 #[test]
 fn select_with_having_parses() {
     let provider = fixture_table();
-    let sql =
-        "SELECT region_id, COUNT(*) FROM sales GROUP BY region_id HAVING COUNT(*) > 1";
+    let sql = "SELECT region_id, COUNT(*) FROM sales GROUP BY region_id HAVING COUNT(*) > 1";
     let res = try_plan(sql, &provider);
-    assert!(res.is_ok(), "HAVING with aggregate should parse and lower: {res:?}");
+    assert!(
+        res.is_ok(),
+        "HAVING with aggregate should parse and lower: {res:?}"
+    );
 }
 
 #[test]
@@ -203,7 +202,10 @@ fn inner_join_parses() {
         "SELECT * FROM sales INNER JOIN sales2 ON sales.id = sales2.id",
         &provider,
     );
-    assert!(res.is_ok(), "INNER JOIN with equi-predicate should parse and lower: {res:?}");
+    assert!(
+        res.is_ok(),
+        "INNER JOIN with equi-predicate should parse and lower: {res:?}"
+    );
 }
 
 #[test]
@@ -233,7 +235,10 @@ fn full_outer_join_parses() {
         "SELECT * FROM sales FULL OUTER JOIN sales2 ON sales.id = sales2.id",
         &provider,
     );
-    assert!(res.is_ok(), "FULL OUTER JOIN should parse and lower: {res:?}");
+    assert!(
+        res.is_ok(),
+        "FULL OUTER JOIN should parse and lower: {res:?}"
+    );
 }
 
 #[test]
@@ -270,7 +275,10 @@ fn cte_is_supported() {
     // unsupported `WITH RECURSIVE` form is pinned by `with_recursive_rejected`.)
     let provider = fixture_table();
     let res = try_plan("WITH t AS (SELECT * FROM sales) SELECT * FROM t", &provider);
-    assert!(res.is_ok(), "non-recursive WITH/CTE should parse and lower: {res:?}");
+    assert!(
+        res.is_ok(),
+        "non-recursive WITH/CTE should parse and lower: {res:?}"
+    );
 
     // The CTE is inlined, so the plan type-checks and exposes the CTE body's
     // schema (the full `sales` row, since the body is `SELECT *`).
@@ -317,7 +325,10 @@ fn qualified_column_unknown_field_errors() {
 #[test]
 fn integer_overflow_errors() {
     let provider = fixture_table();
-    let res = try_plan("SELECT * FROM sales WHERE qty = 99999999999999999999", &provider);
+    let res = try_plan(
+        "SELECT * FROM sales WHERE qty = 99999999999999999999",
+        &provider,
+    );
     assert_err_contains(res, "i64");
 }
 
@@ -328,9 +339,7 @@ fn bare_boolean_predicate_works() {
     let provider = fixture_table();
     let res = try_plan("SELECT * FROM sales WHERE active", &provider);
     if let Err(msg) = &res {
-        panic!(
-            "bare Bool column should be a valid WHERE predicate but got error: {msg}"
-        );
+        panic!("bare Bool column should be a valid WHERE predicate but got error: {msg}");
     }
 }
 
@@ -483,10 +492,7 @@ fn join_select_bare_colliding_name_picks_left() {
     // so a future "make bare collision an error" change has to consciously
     // update this expectation.
     let provider = join_provider_collision();
-    let res = try_plan(
-        "SELECT a FROM t1 INNER JOIN t2 ON t1.k = t2.k",
-        &provider,
-    );
+    let res = try_plan("SELECT a FROM t1 INNER JOIN t2 ON t1.k = t2.k", &provider);
     assert!(res.is_ok(), "bare `a` should resolve to left side: {res:?}");
 }
 
@@ -524,7 +530,10 @@ fn join_where_uses_qualified_column() {
         "SELECT t1.a FROM t1 INNER JOIN t2 ON t1.k = t2.k WHERE t2.b > 0",
         &provider,
     );
-    assert!(res.is_ok(), "WHERE with qualified column should work: {res:?}");
+    assert!(
+        res.is_ok(),
+        "WHERE with qualified column should work: {res:?}"
+    );
 }
 
 // ---- NOT unary operator (v0.5) ---------------------------------------------
@@ -559,15 +568,14 @@ fn not_unary_parses_and_lowers_to_unary_not() {
 
     let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
     match pred {
-        Expr::Unary { op: UnaryOp::Not, operand } => match operand.as_ref() {
+        Expr::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } => match operand.as_ref() {
             Expr::Binary { .. } => {} // `qty > 5` inside the NOT — good.
-            other => panic!(
-                "expected `qty > 5` (Binary) under NOT, got {other:?}"
-            ),
+            other => panic!("expected `qty > 5` (Binary) under NOT, got {other:?}"),
         },
-        other => panic!(
-            "expected Expr::Unary(Not, _) at Filter predicate, got {other:?}"
-        ),
+        other => panic!("expected Expr::Unary(Not, _) at Filter predicate, got {other:?}"),
     }
 }
 
@@ -584,7 +592,13 @@ fn not_unary_on_bare_bool_column_works() {
 
     let pred = find_filter_predicate(&plan).expect("Filter on the plan spine");
     assert!(
-        matches!(pred, Expr::Unary { op: UnaryOp::Not, .. }),
+        matches!(
+            pred,
+            Expr::Unary {
+                op: UnaryOp::Not,
+                ..
+            }
+        ),
         "expected NOT at Filter predicate, got {pred:?}"
     );
 }
@@ -779,7 +793,9 @@ fn scalar_subquery_multi_column_rejected() {
     )
     .expect_err("multi-column scalar subquery must be rejected at parse time");
     assert!(
-        format!("{err}").to_ascii_lowercase().contains("exactly one column"),
+        format!("{err}")
+            .to_ascii_lowercase()
+            .contains("exactly one column"),
         "expected arity error, got: {err}"
     );
 }
@@ -837,10 +853,18 @@ fn count_distinct_lowers_to_distinct_over_project() {
     };
     assert_eq!(exprs.len(), 1);
     // Below it: Aggregate(COUNT) over a Distinct.
-    let LogicalPlan::Aggregate { input, aggregates, group_by } = input.as_ref() else {
+    let LogicalPlan::Aggregate {
+        input,
+        aggregates,
+        group_by,
+    } = input.as_ref()
+    else {
         panic!("expected Aggregate under Project, got {input:?}");
     };
-    assert!(group_by.is_empty(), "COUNT(DISTINCT) must have no group keys");
+    assert!(
+        group_by.is_empty(),
+        "COUNT(DISTINCT) must have no group keys"
+    );
     assert_eq!(aggregates.len(), 1);
     let LogicalPlan::Distinct { input } = input.as_ref() else {
         panic!("expected Distinct under Aggregate, got {input:?}");
@@ -1034,7 +1058,11 @@ fn except_by_name_rejected() {
 /// `emp(id, dept_id, name)`, `dept(dept_id, dname)` (share `dept_id`), and
 /// `widget(wid, color)` (disjoint from `emp`) for the USING / NATURAL tests.
 fn join_fixture() -> MemTableProvider {
-    let i32f = |n: &str| Field { name: n.into(), dtype: DataType::Int32, nullable: false };
+    let i32f = |n: &str| Field {
+        name: n.into(),
+        dtype: DataType::Int32,
+        nullable: false,
+    };
     let emp = Schema::new(vec![i32f("id"), i32f("dept_id"), i32f("name")]);
     let dept = Schema::new(vec![i32f("dept_id"), i32f("dname")]);
     let widget = Schema::new(vec![i32f("wid"), i32f("color")]);
@@ -1063,10 +1091,7 @@ fn join_on_pairs(plan: &LogicalPlan) -> &[(Expr, Expr)] {
 #[test]
 fn join_using_single_column_desugars_to_equi_pair() {
     let provider = join_fixture();
-    let plan = plan_ok(
-        "SELECT id FROM emp JOIN dept USING (dept_id)",
-        &provider,
-    );
+    let plan = plan_ok("SELECT id FROM emp JOIN dept USING (dept_id)", &provider);
     let on = join_on_pairs(&plan);
     assert_eq!(on.len(), 1, "one USING column -> one equi pair");
     // Both sides reference the (un-renamed) `dept_id` column. `Expr` has no
@@ -1088,7 +1113,10 @@ fn join_using_single_column_desugars_to_equi_pair() {
 fn join_using_lowers_physically() {
     let provider = join_fixture();
     let res = try_plan("SELECT id FROM emp JOIN dept USING (dept_id)", &provider);
-    assert!(res.is_ok(), "JOIN ... USING should parse and lower: {res:?}");
+    assert!(
+        res.is_ok(),
+        "JOIN ... USING should parse and lower: {res:?}"
+    );
 }
 
 #[test]

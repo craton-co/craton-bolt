@@ -26,8 +26,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn read_to_string(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
 /// Extract the `[package]` `version = "X"` value from `Cargo.toml`.

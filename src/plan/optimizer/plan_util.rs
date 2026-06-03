@@ -20,7 +20,12 @@ where
     A: Fn(AggregateExpr) -> AggregateExpr,
 {
     match plan {
-        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => LogicalPlan::Window {
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => LogicalPlan::Window {
             input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
             window_exprs,
             partition_by: partition_by.into_iter().map(map_expr).collect(),
@@ -90,7 +95,12 @@ where
         },
         // EXCEPT / INTERSECT carry no scalar / aggregate expressions of their
         // own — just recurse into both inputs.
-        LogicalPlan::SetOp { left, right, op, all } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => LogicalPlan::SetOp {
             left: Box::new(map_plan_exprs(*left, map_expr, map_agg)),
             right: Box::new(map_plan_exprs(*right, map_expr, map_agg)),
             op,

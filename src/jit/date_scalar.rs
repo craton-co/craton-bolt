@@ -391,7 +391,7 @@ fn emit_civil_from_days(ptx: &mut String) -> BoltResult<()> {
     writeln!(ptx, "\tadd.s64 %rd31, %rd31, %rd32;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd31, %rd31, %rd33;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd34, %rd23, %rd31;").map_err(write_err)?; // %rd34 = doy
-                                                                        // mp = (5*doy + 2) / 153
+                                                                         // mp = (5*doy + 2) / 153
     writeln!(ptx, "\tmul.lo.s64 %rd35, %rd34, 5;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd35, %rd35, 2;").map_err(write_err)?;
     writeln!(ptx, "\tdiv.s64 %rd36, %rd35, 153;").map_err(write_err)?; // %rd36 = mp
@@ -406,7 +406,7 @@ fn emit_civil_from_days(ptx: &mut String) -> BoltResult<()> {
     writeln!(ptx, "\tadd.s64 %rd38, %rd36, 3;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd39, %rd36, 9;").map_err(write_err)?;
     writeln!(ptx, "\tselp.b64 %rd11, %rd38, %rd39, %p3;").map_err(write_err)?; // %rd11 = month
-                                                                              // year = m <= 2 ? y + 1 : y
+                                                                               // year = m <= 2 ? y + 1 : y
     writeln!(ptx, "\tsetp.le.s64 %p3, %rd11, 2;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd10, %rd30, 1;").map_err(write_err)?;
     writeln!(ptx, "\tselp.b64 %rd10, %rd10, %rd30, %p3;").map_err(write_err)?; // %rd10 = year
@@ -421,17 +421,17 @@ fn emit_days_from_civil(ptx: &mut String) -> BoltResult<()> {
     writeln!(ptx, "\tsetp.le.s64 %p3, %rd11, 2;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd20, %rd10, 1;").map_err(write_err)?;
     writeln!(ptx, "\tselp.b64 %rd20, %rd20, %rd10, %p3;").map_err(write_err)?; // %rd20 = y
-                                                                              // era = floor_div(y, 400)
+                                                                               // era = floor_div(y, 400)
     emit_floor_div_imm(ptx, "%rd21", "%rd20", 400)?;
     // yoe = y - era*400
     writeln!(ptx, "\tmul.lo.s64 %rd22, %rd21, 400;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd23, %rd20, %rd22;").map_err(write_err)?; // %rd23 = yoe
-                                                                        // mp = month > 2 ? month - 3 : month + 9
+                                                                         // mp = month > 2 ? month - 3 : month + 9
     writeln!(ptx, "\tsetp.gt.s64 %p3, %rd11, 2;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd24, %rd11, 3;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd25, %rd11, 9;").map_err(write_err)?;
     writeln!(ptx, "\tselp.b64 %rd26, %rd24, %rd25, %p3;").map_err(write_err)?; // %rd26 = mp
-                                                                              // doy = (153*mp + 2)/5 + day - 1
+                                                                               // doy = (153*mp + 2)/5 + day - 1
     writeln!(ptx, "\tmul.lo.s64 %rd27, %rd26, 153;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd27, %rd27, 2;").map_err(write_err)?;
     writeln!(ptx, "\tdiv.s64 %rd27, %rd27, 5;").map_err(write_err)?;
@@ -444,7 +444,7 @@ fn emit_days_from_civil(ptx: &mut String) -> BoltResult<()> {
     writeln!(ptx, "\tadd.s64 %rd28, %rd28, %rd29;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd28, %rd28, %rd30;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd28, %rd28, %rd27;").map_err(write_err)?; // %rd28 = doe
-                                                                        // days = era*146097 + doe - 719468
+                                                                         // days = era*146097 + doe - 719468
     writeln!(ptx, "\tmul.lo.s64 %rd31, %rd21, 146097;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd13, %rd31, %rd28;").map_err(write_err)?;
     writeln!(ptx, "\tsub.s64 %rd13, %rd13, 719468;").map_err(write_err)?; // %rd13 = days
@@ -490,7 +490,7 @@ pub fn compile_extract_kernel(field: DateField, src: DataType) -> BoltResult<Str
         emit_floor_div_imm(&mut ptx, "%rd5", "%rd1", tpd)?;
         writeln!(ptx, "\tmul.lo.s64 %rd6, %rd5, {tpd};", tpd = tpd).map_err(write_err)?;
         writeln!(ptx, "\tsub.s64 %rd7, %rd1, %rd6;").map_err(write_err)?; // %rd7 = tod
-                                                                         // seconds-of-day = tod / tps
+                                                                          // seconds-of-day = tod / tps
         writeln!(ptx, "\tdiv.s64 %rd8, %rd7, {tps};", tps = tps).map_err(write_err)?;
         let result = match field {
             DateField::Hour => {
@@ -557,7 +557,8 @@ pub fn compile_date_trunc_kernel(unit: DateTruncUnit, src: DataType) -> BoltResu
                     // fields to 1 and rebuild the day count.
                     writeln!(ptx, "\tmov.u64 %rd12, 1;").map_err(write_err)?; // day = 1
                     if matches!(unit, DateTruncUnit::Year) {
-                        writeln!(ptx, "\tmov.u64 %rd11, 1;").map_err(write_err)?; // month = 1
+                        writeln!(ptx, "\tmov.u64 %rd11, 1;").map_err(write_err)?;
+                        // month = 1
                     }
                     emit_days_from_civil(&mut ptx)?;
                     "%rd13"
@@ -581,7 +582,8 @@ pub fn compile_date_trunc_kernel(unit: DateTruncUnit, src: DataType) -> BoltResu
                         emit_civil_from_days(&mut ptx)?;
                         writeln!(ptx, "\tmov.u64 %rd12, 1;").map_err(write_err)?; // day = 1
                         if matches!(unit, DateTruncUnit::Year) {
-                            writeln!(ptx, "\tmov.u64 %rd11, 1;").map_err(write_err)?; // month = 1
+                            writeln!(ptx, "\tmov.u64 %rd11, 1;").map_err(write_err)?;
+                            // month = 1
                         }
                         emit_days_from_civil(&mut ptx)?;
                         "%rd13"
@@ -605,12 +607,8 @@ pub fn compile_date_trunc_kernel(unit: DateTruncUnit, src: DataType) -> BoltResu
                     };
                     // floor_div(ticks, bucket) * bucket
                     emit_floor_div_imm(&mut ptx, "%rd14", "%rd1", bucket)?;
-                    writeln!(
-                        ptx,
-                        "\tmul.lo.s64 %rd15, %rd14, {bucket};",
-                        bucket = bucket
-                    )
-                    .map_err(write_err)?;
+                    writeln!(ptx, "\tmul.lo.s64 %rd15, %rd14, {bucket};", bucket = bucket)
+                        .map_err(write_err)?;
                     "%rd15"
                 }
             };
@@ -656,7 +654,17 @@ mod tests {
     /// including pre-epoch negatives and leap days.
     #[test]
     fn civil_roundtrip() {
-        for days in [-100_000i64, -25_567, -1, 0, 1, 10_957, 11_016, 18_687, 100_000] {
+        for days in [
+            -100_000i64,
+            -25_567,
+            -1,
+            0,
+            1,
+            10_957,
+            11_016,
+            18_687,
+            100_000,
+        ] {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days, "roundtrip failed at {days}");
         }
@@ -767,9 +775,15 @@ mod tests {
         assert!(ptx.contains("_param_0"));
         assert!(ptx.contains("_param_2"));
         // The +719468 epoch shift is the civil-decomposition fingerprint.
-        assert!(ptx.contains("add.s64 %rd20, %rd1, 719468;"), "missing epoch shift");
+        assert!(
+            ptx.contains("add.s64 %rd20, %rd1, 719468;"),
+            "missing epoch shift"
+        );
         // Date32 input is sign-extended from s32.
-        assert!(ptx.contains("cvt.s64.s32 %rd1, %r5;"), "missing s32->s64 widen");
+        assert!(
+            ptx.contains("cvt.s64.s32 %rd1, %r5;"),
+            "missing s32->s64 widen"
+        );
         // EXTRACT output is Int64.
         assert!(ptx.contains("st.global.s64"), "EXTRACT must store s64");
         assert!(!ptx.contains("st.global.s32"), "EXTRACT must not store s32");
@@ -787,7 +801,10 @@ mod tests {
             "HOUR extract must not run the civil decomposition"
         );
         // hour = sod / 3600.
-        assert!(ptx.contains("div.s64 %rd9, %rd8, 3600;"), "missing hour divide");
+        assert!(
+            ptx.contains("div.s64 %rd9, %rd8, 3600;"),
+            "missing hour divide"
+        );
         // 8-byte Timestamp load (no s32 widen).
         assert!(ptx.contains("ld.global.nc.s64 %rd1, [%rd3];"));
     }
@@ -805,11 +822,23 @@ mod tests {
     fn date_trunc_year_date32_ptx_shape() {
         let ptx = compile_date_trunc_kernel(DateTruncUnit::Year, DataType::Date32).unwrap();
         // Output narrows back to s32 for the Date32 column.
-        assert!(ptx.contains("st.global.s32"), "Date32 DATE_TRUNC stores s32");
-        assert!(!ptx.contains("st.global.s64"), "Date32 DATE_TRUNC must not store s64");
+        assert!(
+            ptx.contains("st.global.s32"),
+            "Date32 DATE_TRUNC stores s32"
+        );
+        assert!(
+            !ptx.contains("st.global.s64"),
+            "Date32 DATE_TRUNC must not store s64"
+        );
         // Both directions of the civil math appear (decompose + recompose).
-        assert!(ptx.contains("add.s64 %rd20, %rd1, 719468;"), "missing decompose");
-        assert!(ptx.contains("sub.s64 %rd13, %rd13, 719468;"), "missing recompose");
+        assert!(
+            ptx.contains("add.s64 %rd20, %rd1, 719468;"),
+            "missing decompose"
+        );
+        assert!(
+            ptx.contains("sub.s64 %rd13, %rd13, 719468;"),
+            "missing recompose"
+        );
         // Year truncation sets month and day to 1.
         assert!(ptx.contains("mov.u64 %rd11, 1;"), "year-trunc sets month=1");
         assert!(ptx.contains("mov.u64 %rd12, 1;"), "year-trunc sets day=1");
@@ -836,8 +865,7 @@ mod tests {
     /// DATE_TRUNC(hour, Date32) is rejected — a date has no sub-day component.
     #[test]
     fn date_trunc_hour_date32_rejected() {
-        let err =
-            compile_date_trunc_kernel(DateTruncUnit::Hour, DataType::Date32).unwrap_err();
+        let err = compile_date_trunc_kernel(DateTruncUnit::Hour, DataType::Date32).unwrap_err();
         assert!(matches!(err, BoltError::Type(_)));
     }
 

@@ -154,9 +154,7 @@ mod tests {
         let plan = fixture_scan_project();
         let before = plan.schema().expect("input plan must type-check");
         let after_plan = r.rewrite(plan).expect("identity rewrite must succeed");
-        let after = after_plan
-            .schema()
-            .expect("rewritten plan must type-check");
+        let after = after_plan.schema().expect("rewritten plan must type-check");
         assert_eq!(after.fields.len(), before.fields.len());
         for (b, a) in before.fields.iter().zip(after.fields.iter()) {
             assert_eq!(a.name, b.name);

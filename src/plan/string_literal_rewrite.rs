@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! String-literal predicate rewriting.
 //!
@@ -125,9 +125,7 @@ use std::collections::HashMap;
 
 use crate::cuda::dictionary_any::DictionaryColumnAny;
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{
-    BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
-};
+use crate::plan::logical_plan::{BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema};
 
 /// Convention: the index column for a Utf8 column named `c` is `__idx_<c>`.
 /// The engine uploads the dictionary indices under this name. The integer
@@ -321,11 +319,7 @@ pub trait LiteralResolver {
     /// implementation) is complete and unit-tested so the wiring is a localised
     /// change. The default returns `None` so non-dict resolvers keep the host
     /// path.
-    fn col_vs_col_rank_maps(
-        &self,
-        col_a: &str,
-        col_b: &str,
-    ) -> Option<ColVsColRankPlan> {
+    fn col_vs_col_rank_maps(&self, col_a: &str, col_b: &str) -> Option<ColVsColRankPlan> {
         let _ = (col_a, col_b);
         None
     }
@@ -525,11 +519,7 @@ impl<'a> StringPredicateRewriter<'a> {
     /// Register a Utf8 column's dictionary. The mangled index-column name
     /// defaults to `__idx_<original>`. Accepts either an i32- or i64-indexed
     /// dictionary via the [`DictionaryColumnAny`] wrapper.
-    pub fn register(
-        &mut self,
-        original_name: impl Into<String>,
-        dict: &'a DictionaryColumnAny,
-    ) {
+    pub fn register(&mut self, original_name: impl Into<String>, dict: &'a DictionaryColumnAny) {
         let n = original_name.into();
         let mangled = index_column_name(&n);
         self.dicts.insert(n.clone(), dict);
@@ -636,7 +626,10 @@ fn collect_rank_needed_columns<R: LiteralResolver>(
                     walk_expr(a, r, out, depth + 1);
                 }
             }
-            Expr::Case { branches, else_branch } => {
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
                 for (w, t) in branches {
                     walk_expr(w, r, out, depth + 1);
                     walk_expr(t, r, out, depth + 1);
@@ -760,11 +753,7 @@ impl<'a> LiteralResolver for StringPredicateRewriter<'a> {
         Some(out)
     }
 
-    fn col_vs_col_rank_maps(
-        &self,
-        col_a: &str,
-        col_b: &str,
-    ) -> Option<ColVsColRankPlan> {
+    fn col_vs_col_rank_maps(&self, col_a: &str, col_b: &str) -> Option<ColVsColRankPlan> {
         // Both sides must be registered dictionary columns; otherwise there is
         // no dictionary to rank against and the comparison stays host-side.
         let dict_a = self.dicts.get(col_a)?;
@@ -1032,7 +1021,11 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             let inner = rewrite_expr_with(inner, r, depth + 1)?;
             Ok(Expr::Alias(Box::new(inner), name.clone()))
         }
-        Expr::Cast { expr: inner, target, safe } => {
+        Expr::Cast {
+            expr: inner,
+            target,
+            safe,
+        } => {
             // CAST has no string-literal comparison surface to rewrite —
             // it converts a numeric / boolean expression into another
             // primitive type. Recurse so any rewritable sub-expression
@@ -1044,7 +1037,12 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                 safe: *safe,
             })
         }
-        Expr::CastFormat { expr: inner, target, pattern, to_text } => {
+        Expr::CastFormat {
+            expr: inner,
+            target,
+            pattern,
+            to_text,
+        } => {
             // Like CAST, recurse into the operand to normalise any rewritable
             // sub-expression; the FORMAT pattern itself has no rewrite surface.
             let new_inner = rewrite_expr_with(inner, r, depth + 1)?;
@@ -1227,9 +1225,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             // string path. We NEVER emit a rank comparison the executor can't
             // back with materialised rank columns: the recorded plan and the
             // emitted predicate come from the same `plan_col_vs_col_rank` call.
-            if let Some((rank_op, plan)) =
-                plan_col_vs_col_rank(*op, &new_left, &new_right, r)
-            {
+            if let Some((rank_op, plan)) = plan_col_vs_col_rank(*op, &new_left, &new_right, r) {
                 // Hand the precomputed unified rank tables to the executor via
                 // the resolver side-channel, keyed by the `__rank_<col>` names.
                 r.record_rank_plan(&plan);
@@ -1305,9 +1301,7 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
                     // so keep the real `Expr::Like` for the per-row
                     // `StringLikeFilter` / host path. See the trait method doc.
                     if r.knows(col_name) && r.predicate_rewrite_allowed(col_name) {
-                        if let Some(indices) =
-                            r.like_match_indices(col_name, pattern, *escape)
-                        {
+                        if let Some(indices) = r.like_match_indices(col_name, pattern, *escape) {
                             let mangled = r.index_column_name(col_name);
                             return Ok(build_index_membership(&mangled, &indices));
                         }
@@ -1515,7 +1509,11 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 input: Box::new(new_input),
             })
         }
-        LogicalPlan::Limit { input, limit, offset } => {
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
             let new_input = rewrite_plan_with(input, r, depth + 1)?;
             Ok(LogicalPlan::Limit {
                 input: Box::new(new_input),
@@ -1555,7 +1553,13 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 .collect::<BoltResult<Vec<_>>>()?;
             Ok(LogicalPlan::Union { inputs: new_inputs })
         }
-        LogicalPlan::Join { left, right, join_type, on, filter } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => {
             let new_left = rewrite_plan_with(left, r, depth + 1)?;
             let new_right = rewrite_plan_with(right, r, depth + 1)?;
             Ok(LogicalPlan::Join {
@@ -1566,7 +1570,12 @@ fn rewrite_plan_with<R: LiteralResolver>(
                 filter: filter.clone(),
             })
         }
-        LogicalPlan::SetOp { left, right, op, all } => {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
             let new_left = rewrite_plan_with(left, r, depth + 1)?;
             let new_right = rewrite_plan_with(right, r, depth + 1)?;
             Ok(LogicalPlan::SetOp {
@@ -1665,8 +1674,7 @@ mod tests {
         /// Register `col` as i64-indexed and map `lit` → `idx`.
         fn with_i64(mut self, col: &str, lit: &str, idx: i64) -> Self {
             self.columns.insert(col.to_string(), MockWidth::I64);
-            self.entries
-                .insert((col.to_string(), lit.to_string()), idx);
+            self.entries.insert((col.to_string(), lit.to_string()), idx);
             self
         }
 
@@ -1760,17 +1768,12 @@ mod tests {
             Some(out)
         }
 
-        fn col_vs_col_rank_maps(
-            &self,
-            col_a: &str,
-            col_b: &str,
-        ) -> Option<ColVsColRankPlan> {
+        fn col_vs_col_rank_maps(&self, col_a: &str, col_b: &str) -> Option<ColVsColRankPlan> {
             // Mirror the production path: both columns must have scannable
             // dictionary entries; rank both against the shared sorted union.
             let dict_a = self.dict_entries.get(col_a)?;
             let dict_b = self.dict_entries.get(col_b)?;
-            let (rank_a, rank_b) =
-                crate::cuda::dictionary::unified_rank_maps_of(dict_a, dict_b);
+            let (rank_a, rank_b) = crate::cuda::dictionary::unified_rank_maps_of(dict_a, dict_b);
             Some(ColVsColRankPlan {
                 rank_a,
                 rank_b,
@@ -1881,15 +1884,22 @@ mod tests {
     /// per-column literal dtypes in a single predicate tree.
     #[test]
     fn mixed_columns_each_get_own_dtype() {
-        let r = MockResolver::new()
-            .with_i32("region", "US", 5)
-            .with_i64("user_id", "alice", 1_234_567_890_123);
+        let r = MockResolver::new().with_i32("region", "US", 5).with_i64(
+            "user_id",
+            "alice",
+            1_234_567_890_123,
+        );
         // `region = 'US' AND user_id = 'alice'`
         let expr = col("region")
             .eq(lit("US"))
             .and(col("user_id").eq(lit("alice")));
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
-        let Expr::Binary { op: and_op, left, right } = out else {
+        let Expr::Binary {
+            op: and_op,
+            left,
+            right,
+        } = out
+        else {
             panic!("expected top-level AND");
         };
         assert_eq!(and_op, BinaryOp::And);
@@ -2097,7 +2107,12 @@ mod tests {
             other => panic!("expected Scan under Filter, got {other:?}"),
         }
         // Top-level AND survives; left side rewritten, right side untouched.
-        let Expr::Binary { op: and_op, left, right } = predicate else {
+        let Expr::Binary {
+            op: and_op,
+            left,
+            right,
+        } = predicate
+        else {
             panic!("expected Binary AND");
         };
         assert_eq!(and_op, BinaryOp::And);
@@ -2110,7 +2125,11 @@ mod tests {
             other => panic!("expected rewritten Eq, got {other:?}"),
         }
         match *right {
-            Expr::Binary { op, left, right: r2 } => {
+            Expr::Binary {
+                op,
+                left,
+                right: r2,
+            } => {
                 assert_eq!(op, BinaryOp::Gt);
                 assert_column(&left, "price");
                 match *r2 {
@@ -2191,8 +2210,7 @@ mod tests {
         let pre_fix = MockResolver::new()
             .with_i32("s", "a", 1)
             .with_i32("s", "b", 2);
-        let unfolded =
-            rewrite_expr_with(&col("s").eq(lit("c")), &pre_fix, 0).unwrap();
+        let unfolded = rewrite_expr_with(&col("s").eq(lit("c")), &pre_fix, 0).unwrap();
         match unfolded {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
@@ -2204,9 +2222,9 @@ mod tests {
                     other => panic!("expected preserved Utf8 literal 'c', got {other:?}"),
                 }
             }
-            other => panic!(
-                "incomplete dict must NOT fold absent literal to a constant, got {other:?}"
-            ),
+            other => {
+                panic!("incomplete dict must NOT fold absent literal to a constant, got {other:?}")
+            }
         }
 
         // Post-fix engine state: registry rebuilt from union of batch 0
@@ -2216,17 +2234,14 @@ mod tests {
             .with_i32("s", "a", 1)
             .with_i32("s", "b", 2)
             .with_i32("s", "c", 3);
-        let rewritten =
-            rewrite_expr_with(&col("s").eq(lit("c")), &post_fix, 0).unwrap();
+        let rewritten = rewrite_expr_with(&col("s").eq(lit("c")), &post_fix, 0).unwrap();
         match rewritten {
             Expr::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Eq);
                 assert_column(&left, "__idx_s");
                 assert_int32_lit(&right, 3);
             }
-            other => panic!(
-                "post-fix: union dict must resolve 'c' to its index, got {other:?}"
-            ),
+            other => panic!("post-fix: union dict must resolve 'c' to its index, got {other:?}"),
         }
     }
 
@@ -2343,12 +2358,8 @@ mod tests {
         let plain = rewrite_expr_with(&col("region").eq(lit("US")), &r, 0).unwrap();
 
         // Aliased: `(col AS x) = 'US'` — must fold identically.
-        let aliased_left = rewrite_expr_with(
-            &col("region").alias("r").eq(lit("US")),
-            &r,
-            0,
-        )
-        .unwrap();
+        let aliased_left =
+            rewrite_expr_with(&col("region").alias("r").eq(lit("US")), &r, 0).unwrap();
         assert_eq!(
             format!("{:?}", aliased_left),
             format!("{:?}", plain),
@@ -2356,12 +2367,8 @@ mod tests {
         );
 
         // Aliased on the literal side too: `col = (lit('US') AS x)`.
-        let aliased_right = rewrite_expr_with(
-            &col("region").eq(lit("US").alias("v")),
-            &r,
-            0,
-        )
-        .unwrap();
+        let aliased_right =
+            rewrite_expr_with(&col("region").eq(lit("US").alias("v")), &r, 0).unwrap();
         assert_eq!(
             format!("{:?}", aliased_right),
             format!("{:?}", plain),
@@ -2369,12 +2376,8 @@ mod tests {
         );
 
         // Aliased on both sides, reversed shape: `(lit AS l) = (col AS c)`.
-        let aliased_both_reversed = rewrite_expr_with(
-            &lit("US").alias("l").eq(col("region").alias("c")),
-            &r,
-            0,
-        )
-        .unwrap();
+        let aliased_both_reversed =
+            rewrite_expr_with(&lit("US").alias("l").eq(col("region").alias("c")), &r, 0).unwrap();
         assert_eq!(
             format!("{:?}", aliased_both_reversed),
             format!("{:?}", plain),
@@ -2447,7 +2450,11 @@ mod tests {
     fn collect_membership_i32(e: &Expr, column: &str) -> Vec<i32> {
         match e {
             // Leaf: `col = Int32(n)`.
-            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
                 assert_column(left, column);
                 match right.as_ref() {
                     Expr::Literal(Literal::Int32(n)) => vec![*n],
@@ -2455,7 +2462,11 @@ mod tests {
                 }
             }
             // Interior: `<acc> OR <eq>`.
-            Expr::Binary { op: BinaryOp::Or, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
                 let mut v = collect_membership_i32(left, column);
                 v.extend(collect_membership_i32(right, column));
                 v
@@ -2497,7 +2508,11 @@ mod tests {
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
-            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
                 assert_column(&left, "__idx_region");
                 assert_int32_lit(&right, 2);
             }
@@ -2549,8 +2564,10 @@ mod tests {
     fn like_over_i64_dict_emits_int64_indices() {
         let mut r = MockResolver::new();
         r.columns.insert("uid".into(), MockWidth::I64);
-        r.dict_entries
-            .insert("uid".into(), vec!["bob".into(), "bart".into(), "ann".into()]);
+        r.dict_entries.insert(
+            "uid".into(),
+            vec!["bob".into(), "bart".into(), "ann".into()],
+        );
         let expr = Expr::Like {
             expr: Box::new(col("uid")),
             pattern: "b%".into(), // matches bob(1), bart(2)
@@ -2562,14 +2579,22 @@ mod tests {
         // Walk the OR tree collecting Int64 literals.
         fn collect_i64(e: &Expr) -> Vec<i64> {
             match e {
-                Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } => {
                     assert_column(left, "__idx_uid");
                     match right.as_ref() {
                         Expr::Literal(Literal::Int64(n)) => vec![*n],
                         other => panic!("expected Int64 index, got {other:?}"),
                     }
                 }
-                Expr::Binary { op: BinaryOp::Or, left, right } => {
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    left,
+                    right,
+                } => {
                     let mut v = collect_i64(left);
                     v.extend(collect_i64(right));
                     v
@@ -2595,7 +2620,13 @@ mod tests {
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
-            Expr::Like { expr: inner, pattern, escape, negated, case_insensitive } => {
+            Expr::Like {
+                expr: inner,
+                pattern,
+                escape,
+                negated,
+                case_insensitive,
+            } => {
                 assert_column(&inner, "name");
                 assert_eq!(pattern, "a%");
                 assert!(escape.is_none());
@@ -2662,7 +2693,11 @@ mod tests {
         };
         let out = rewrite_expr_with(&expr, &r, 0).unwrap();
         match out {
-            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
                 assert_column(&left, "__idx_region");
                 assert_int32_lit(&right, 1); // alpha(1)
             }
@@ -2858,10 +2893,7 @@ mod tests {
                 got.sort_unstable();
                 let mut want = oracle_indices(&entries, op, lit);
                 want.sort_unstable();
-                assert_eq!(
-                    got, want,
-                    "indices_satisfying({op:?}, {lit:?}) mismatch"
-                );
+                assert_eq!(got, want, "indices_satisfying({op:?}, {lit:?}) mismatch");
             }
         }
     }
@@ -3003,11 +3035,9 @@ mod tests {
     fn f10_real_rewriter_orders_from_dictionary() {
         use crate::cuda::dictionary_any::DictionaryColumnAny;
         let entries = ["delta", "apple", "Zebra", "mango"];
-        let dict = DictionaryColumnAny::new_host_only(
-            entries.iter().map(|s| s.to_string()).collect(),
-            4,
-        )
-        .expect("host-only dict");
+        let dict =
+            DictionaryColumnAny::new_host_only(entries.iter().map(|s| s.to_string()).collect(), 4)
+                .expect("host-only dict");
         let mut rw = StringPredicateRewriter::new();
         rw.register("region", &dict);
 
@@ -3105,9 +3135,11 @@ mod tests {
         let r = MockResolver::new()
             .with_dict("a", &dict)
             .with_dict("b", &dict);
-        let (_, plan) =
-            plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).expect("plan");
-        assert_eq!(plan.rank_a, plan.rank_b, "identical dicts → identical ranks");
+        let (_, plan) = plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).expect("plan");
+        assert_eq!(
+            plan.rank_a, plan.rank_b,
+            "identical dicts → identical ranks"
+        );
         for (i, a_s) in dict.iter().enumerate() {
             for (j, b_s) in dict.iter().enumerate() {
                 assert_eq!(
@@ -3158,12 +3190,8 @@ mod tests {
         let r = MockResolver::new()
             .with_dict("a", &["x", "y"])
             .with_dict("b", &["x", "y"]);
-        let plan = plan_col_vs_col_rank(
-            BinaryOp::Lt,
-            &col("a").alias("l"),
-            &col("b").alias("r"),
-            &r,
-        );
+        let plan =
+            plan_col_vs_col_rank(BinaryOp::Lt, &col("a").alias("l"), &col("b").alias("r"), &r);
         assert!(plan.is_some(), "aliased columns must still match the shape");
     }
 
@@ -3173,15 +3201,30 @@ mod tests {
     /// preserved. Panics with a descriptive message on any structural mismatch.
     fn assert_rank_comparison(e: &Expr, rank_a: &str, rank_b: &str) -> BinaryOp {
         // Top: AND( AND(guard_a, guard_b), ordering ).
-        let Expr::Binary { op: BinaryOp::And, left: guards, right: ordering } = e else {
+        let Expr::Binary {
+            op: BinaryOp::And,
+            left: guards,
+            right: ordering,
+        } = e
+        else {
             panic!("expected top-level AND, got {e:?}");
         };
-        let Expr::Binary { op: BinaryOp::And, left: ga, right: gb } = &**guards else {
+        let Expr::Binary {
+            op: BinaryOp::And,
+            left: ga,
+            right: gb,
+        } = &**guards
+        else {
             panic!("expected AND of two NULL guards, got {guards:?}");
         };
         // guard_a: rank_a >= 0
         let check_guard = |g: &Expr, name: &str| {
-            let Expr::Binary { op: BinaryOp::GtEq, left, right } = g else {
+            let Expr::Binary {
+                op: BinaryOp::GtEq,
+                left,
+                right,
+            } = g
+            else {
                 panic!("expected `{name} >= 0` guard, got {g:?}");
             };
             assert_column(left, name);
@@ -3253,7 +3296,11 @@ mod tests {
             };
             let out = rewrite_expr_with(&expr, &r, 0).unwrap();
             match out {
-                Expr::Binary { op: got_op, left, right } => {
+                Expr::Binary {
+                    op: got_op,
+                    left,
+                    right,
+                } => {
                     assert_eq!(got_op, op);
                     assert_column(&left, "a");
                     assert_column(&right, "b");
@@ -3303,7 +3350,9 @@ mod tests {
             };
             let pred = rewrite_expr_with(&expr, &r, 0).unwrap();
             // Recover the unified rank tables the way the executor would.
-            let plan = plan_col_vs_col_rank(op, &col("a"), &col("b"), &r).unwrap().1;
+            let plan = plan_col_vs_col_rank(op, &col("a"), &col("b"), &r)
+                .unwrap()
+                .1;
 
             for (&(sa, ia), &(sb, ib)) in rows_a.iter().zip(rows_b.iter()) {
                 // Materialise per-row ranks: rank_table[gpu_index].
@@ -3332,9 +3381,11 @@ mod tests {
     /// without a CUDA device.
     fn eval_rank_pred(e: &Expr, rank_a: i64, rank_b: i64) -> bool {
         match e {
-            Expr::Binary { op: BinaryOp::And, left, right } => {
-                eval_rank_pred(left, rank_a, rank_b) && eval_rank_pred(right, rank_a, rank_b)
-            }
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => eval_rank_pred(left, rank_a, rank_b) && eval_rank_pred(right, rank_a, rank_b),
             Expr::Binary { op, left, right } => {
                 let lv = match &**left {
                     Expr::Column(n) if n == "__rank_a" => rank_a,
@@ -3367,16 +3418,12 @@ mod tests {
         use crate::cuda::dictionary_any::DictionaryColumnAny;
         let dict_a = ["delta", "apple", "mango"];
         let dict_b = ["cherry", "Zebra", "apple"];
-        let da = DictionaryColumnAny::new_host_only(
-            dict_a.iter().map(|s| s.to_string()).collect(),
-            3,
-        )
-        .expect("da");
-        let db = DictionaryColumnAny::new_host_only(
-            dict_b.iter().map(|s| s.to_string()).collect(),
-            3,
-        )
-        .expect("db");
+        let da =
+            DictionaryColumnAny::new_host_only(dict_a.iter().map(|s| s.to_string()).collect(), 3)
+                .expect("da");
+        let db =
+            DictionaryColumnAny::new_host_only(dict_b.iter().map(|s| s.to_string()).collect(), 3)
+                .expect("db");
         let mut rw = StringPredicateRewriter::new();
         rw.register("a", &da);
         rw.register("b", &db);
@@ -3409,16 +3456,12 @@ mod tests {
         use crate::cuda::dictionary_any::DictionaryColumnAny;
         let dict_a = ["delta", "apple", "mango"];
         let dict_b = ["cherry", "Zebra", "apple"];
-        let da = DictionaryColumnAny::new_host_only(
-            dict_a.iter().map(|s| s.to_string()).collect(),
-            3,
-        )
-        .expect("da");
-        let db = DictionaryColumnAny::new_host_only(
-            dict_b.iter().map(|s| s.to_string()).collect(),
-            3,
-        )
-        .expect("db");
+        let da =
+            DictionaryColumnAny::new_host_only(dict_a.iter().map(|s| s.to_string()).collect(), 3)
+                .expect("da");
+        let db =
+            DictionaryColumnAny::new_host_only(dict_b.iter().map(|s| s.to_string()).collect(), 3)
+                .expect("db");
         let mut rw = StringPredicateRewriter::new();
         rw.register("a", &da);
         rw.register("b", &db);
@@ -3452,14 +3495,17 @@ mod tests {
     #[test]
     fn f12_rewriter_records_nothing_on_host_fallback() {
         use crate::cuda::dictionary_any::DictionaryColumnAny;
-        let da = DictionaryColumnAny::new_host_only(vec!["x".into(), "y".into()], 2)
-            .expect("da");
+        let da = DictionaryColumnAny::new_host_only(vec!["x".into(), "y".into()], 2).expect("da");
         let mut rw = StringPredicateRewriter::new();
         rw.register("a", &da); // only `a` is a dict column
         let out = rewrite_expr_with(&col("a").lt(col("b")), &rw, 0).unwrap();
         // Preserved Utf8 comparison.
         match out {
-            Expr::Binary { op: BinaryOp::Lt, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Lt,
+                left,
+                right,
+            } => {
                 assert_column(&left, "a");
                 assert_column(&right, "b");
             }
@@ -3478,14 +3524,16 @@ mod tests {
         let r = MockResolver::new()
             .with_dict("a", &["x", "y", "z"])
             .with_dict("b", &["x", "y", "z"]);
-        let (_, plan) =
-            plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).expect("plan");
+        let (_, plan) = plan_col_vs_col_rank(BinaryOp::Lt, &col("a"), &col("b"), &r).expect("plan");
         assert_eq!(plan.rank_a[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
         assert_eq!(plan.rank_b[0], crate::cuda::dictionary::NULL_RANK_SENTINEL);
         // Every real rank is >= 0, so the sentinel is strictly smaller.
         for &rk in &plan.rank_a[1..] {
             assert!(rk >= 0, "real ranks are non-negative");
-            assert!(plan.rank_a[0] < rk, "sentinel must be below every real rank");
+            assert!(
+                plan.rank_a[0] < rk,
+                "sentinel must be below every real rank"
+            );
         }
     }
 }

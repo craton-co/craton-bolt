@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-partition shared-memory GROUP BY **MIN / MAX** kernel (Tier 2.1).
 //!
@@ -32,8 +32,8 @@
 
 use std::fmt::Write;
 
-use crate::error::{BoltError, BoltResult};
 use super::partition_reduce_kernel::KeyWidth;
+use crate::error::{BoltError, BoltResult};
 
 pub const BLOCK_GROUPS: u32 = 1024;
 pub const BLOCK_THREADS: u32 = 256;
@@ -248,7 +248,11 @@ pub(crate) fn emit_minmax_kernel(
     // Phase 3: export. The base predicates are `%p5`/`%p6`. ONLY the spill
     // variants shift to `%p6`/`%p7`: their null-checked `SPILL_BUMP` consumes
     // `%p5`.
-    let (p_export, p_set) = if spill { ("%p6", "%p7") } else { ("%p5", "%p6") };
+    let (p_export, p_set) = if spill {
+        ("%p6", "%p7")
+    } else {
+        ("%p5", "%p6")
+    };
     emit_export(&mut ptx, &layout, p_export, p_set)?;
 
     Ok(ptx)
@@ -356,7 +360,11 @@ fn emit_prologue(
     let vbpw = layout.vbpw;
     let i64_key = layout.key_width == KeyWidth::I64;
     let keys_align = if i64_key { 8 } else { 4 };
-    let keys_bytes = if i64_key { BLOCK_GROUPS * 8 } else { BLOCK_GROUPS * 4 };
+    let keys_bytes = if i64_key {
+        BLOCK_GROUPS * 8
+    } else {
+        BLOCK_GROUPS * 4
+    };
     let vals_bytes = BLOCK_GROUPS * vbpw;
     let set_bytes = BLOCK_GROUPS * 4;
     let sfx = layout.buf_suffix;
@@ -648,12 +656,7 @@ fn layout_load(val_reg: &str) -> &'static str {
 /// width + the set-offset scratch-register order + the per-key export key
 /// register; the spill divergence is the two predicate register numbers, which
 /// the caller passes in (`%p5`/`%p6` non-spill; `%p6`/`%p7` spill).
-fn emit_export(
-    ptx: &mut String,
-    layout: &Layout,
-    p_export: &str,
-    p_set: &str,
-) -> BoltResult<()> {
+fn emit_export(ptx: &mut String, layout: &Layout, p_export: &str, p_set: &str) -> BoltResult<()> {
     let block_groups = layout.block_groups;
     let block_threads = layout.block_threads;
     let vbpw = layout.vbpw;
@@ -794,7 +797,11 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), 4, "expected 4 distinct entry names, got {sorted:?}");
+        assert_eq!(
+            sorted.len(),
+            4,
+            "expected 4 distinct entry names, got {sorted:?}"
+        );
     }
 
     #[test]
@@ -871,11 +878,9 @@ mod tests {
 
     #[test]
     fn with_spill_has_seven_params_and_global_atomic() {
-        let ptx = compile_partition_reduce_kernel_minmax_with_spill(
-            MinMaxOp::Min,
-            MinMaxDtype::Int32,
-        )
-        .unwrap();
+        let ptx =
+            compile_partition_reduce_kernel_minmax_with_spill(MinMaxOp::Min, MinMaxDtype::Int32)
+                .unwrap();
         let count = ptx.matches(".param .u64 ").count();
         assert_eq!(count, 7, "expected 7 .u64 params, got {count}");
         assert!(ptx.contains("atom.global.add.u32"));

@@ -78,8 +78,12 @@ fn full_batch(n: usize) -> RecordBatch {
     RecordBatch::try_new(
         s,
         vec![
-            Arc::new(id1c), Arc::new(id2c), Arc::new(id3c),
-            Arc::new(v1c), Arc::new(v2c), Arc::new(v3c),
+            Arc::new(id1c),
+            Arc::new(id2c),
+            Arc::new(id3c),
+            Arc::new(v1c),
+            Arc::new(v2c),
+            Arc::new(v3c),
         ],
     )
     .unwrap()
@@ -95,10 +99,20 @@ fn host_ref(n: usize) -> HashMap<i32, f64> {
 }
 
 fn assert_q1(engine: &craton_bolt::Engine, n: usize) {
-    let h = engine.sql("SELECT id1, SUM(v1) FROM x GROUP BY id1").expect("q1");
+    let h = engine
+        .sql("SELECT id1, SUM(v1) FROM x GROUP BY id1")
+        .expect("q1");
     let b = h.record_batch();
-    let keys = b.column(0).as_any().downcast_ref::<Int32Array>().expect("id1");
-    let sums = b.column(1).as_any().downcast_ref::<Float64Array>().expect("sum");
+    let keys = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id1");
+    let sums = b
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("sum");
     let mut got = HashMap::new();
     for i in 0..b.num_rows() {
         got.insert(keys.value(i), sums.value(i));
@@ -106,9 +120,14 @@ fn assert_q1(engine: &craton_bolt::Engine, n: usize) {
     let want = host_ref(n);
     assert_eq!(got.len(), want.len(), "group count mismatch at n={n}");
     for (k, &w) in &want {
-        let g = *got.get(k).unwrap_or_else(|| panic!("missing group {k} at n={n}"));
+        let g = *got
+            .get(k)
+            .unwrap_or_else(|| panic!("missing group {k} at n={n}"));
         let rel = (g - w).abs() / w.abs().max(1.0);
-        assert!(rel < 1e-9, "group {k}: got {g} want {w} (rel {rel:e}) at n={n}");
+        assert!(
+            rel < 1e-9,
+            "group {k}: got {g} want {w} (rel {rel:e}) at n={n}"
+        );
     }
 }
 
@@ -162,7 +181,9 @@ fn resident_groupby_survives_mixed_shape_sequence_then_replace() {
     let big = 2_000_000;
 
     let mut engine = craton_bolt::Engine::new().expect("engine");
-    engine.register_table("x", full_batch(small)).expect("register");
+    engine
+        .register_table("x", full_batch(small))
+        .expect("register");
 
     // Run all five shapes at the small size (the bench's equivalence step). We
     // don't assert their values here (other tests cover correctness); the point
@@ -175,7 +196,9 @@ fn resident_groupby_survives_mixed_shape_sequence_then_replace() {
         "SELECT id1, AVG(v1), AVG(v2), AVG(v3) FROM x GROUP BY id1",
         "SELECT id3, SUM(v1) FROM x GROUP BY id3",
     ] {
-        engine.sql(q).unwrap_or_else(|e| panic!("query failed: {q}: {e}"));
+        engine
+            .sql(q)
+            .unwrap_or_else(|e| panic!("query failed: {q}: {e}"));
     }
 
     // Swap in the big dataset (frees the small resident buffers) and re-run the

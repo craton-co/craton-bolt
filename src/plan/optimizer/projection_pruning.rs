@@ -35,9 +35,7 @@
 use std::collections::BTreeSet;
 
 use crate::error::BoltResult;
-use crate::plan::logical_plan::{
-    join_combined_schema, AggregateExpr, Expr, LogicalPlan, Schema,
-};
+use crate::plan::logical_plan::{join_combined_schema, AggregateExpr, Expr, LogicalPlan, Schema};
 use crate::plan::rewrite::PlanRewrite;
 
 use super::expr_util::{collect_agg_columns, collect_columns};
@@ -69,11 +67,24 @@ impl PlanRewrite for ProjectionPruning {
 /// column names the parent still needs from `plan`'s output.
 fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
     match plan {
-        LogicalPlan::Window { input, window_exprs, partition_by, order_by } => {
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+            partition_by,
+            order_by,
+        } => {
             let mut child_req = required.clone();
-            for e in &partition_by { add_expr_cols(e, &mut child_req); }
-            for se in &order_by { add_expr_cols(&se.expr, &mut child_req); }
-            for we in &window_exprs { if let Some(a) = we.func.arg() { add_expr_cols(a, &mut child_req); } }
+            for e in &partition_by {
+                add_expr_cols(e, &mut child_req);
+            }
+            for se in &order_by {
+                add_expr_cols(&se.expr, &mut child_req);
+            }
+            for we in &window_exprs {
+                if let Some(a) = we.func.arg() {
+                    add_expr_cols(a, &mut child_req);
+                }
+            }
             LogicalPlan::Window {
                 input: Box::new(prune(*input, &child_req)),
                 window_exprs,
@@ -183,7 +194,12 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
             }
         }
 
-        LogicalPlan::SetOp { left, right, op, all } => {
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
             // EXCEPT / INTERSECT compare *whole rows* across both inputs, so
             // neither side may have columns pruned (dropping a column would
             // change the row-equality relation and the result schema). Keep
@@ -382,8 +398,8 @@ fn add_agg_cols(agg: &AggregateExpr, set: &mut BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::logical_plan::{DataType, Field};
     use crate::plan::col;
+    use crate::plan::logical_plan::{DataType, Field};
 
     fn wide_scan() -> LogicalPlan {
         LogicalPlan::Scan {
@@ -441,7 +457,10 @@ mod tests {
             LogicalPlan::Scan { projection, .. } => {
                 let p = projection.expect("should be pruned");
                 assert_eq!(p, vec!["a".to_string(), "b".to_string()]);
-                assert!(!p.contains(&"c".to_string()), "c is unused and should be dropped");
+                assert!(
+                    !p.contains(&"c".to_string()),
+                    "c is unused and should be dropped"
+                );
             }
             other => panic!("expected Scan, got {other:?}"),
         }
@@ -607,9 +626,18 @@ mod tests {
         // Right side keeps `a` (required as `right.a`) and `k` (join key), and
         // drops the unused `x`.
         let rp = right_proj.expect("right scan should be pruned to [k, a]");
-        assert!(rp.contains(&"a".to_string()), "right scan must keep `a`; got {rp:?}");
-        assert!(rp.contains(&"k".to_string()), "right scan must keep `k`; got {rp:?}");
-        assert!(!rp.contains(&"x".to_string()), "right scan must drop unused `x`; got {rp:?}");
+        assert!(
+            rp.contains(&"a".to_string()),
+            "right scan must keep `a`; got {rp:?}"
+        );
+        assert!(
+            rp.contains(&"k".to_string()),
+            "right scan must keep `k`; got {rp:?}"
+        );
+        assert!(
+            !rp.contains(&"x".to_string()),
+            "right scan must drop unused `x`; got {rp:?}"
+        );
 
         // Left side keeps `k` (join key) and `a` (the collision ANCHOR — its
         // presence is what makes the right `a` render as `right.a`; dropping it
@@ -617,11 +645,17 @@ mod tests {
         // genuinely-unused `x`, proving the pass narrows scans without breaking
         // the renamed output schema.
         let lp = left_proj.expect("left scan should be pruned to [k, a]");
-        assert!(lp.contains(&"k".to_string()), "left scan must keep `k`; got {lp:?}");
+        assert!(
+            lp.contains(&"k".to_string()),
+            "left scan must keep `k`; got {lp:?}"
+        );
         assert!(
             lp.contains(&"a".to_string()),
             "left scan must keep collision anchor `a`; got {lp:?}",
         );
-        assert!(!lp.contains(&"x".to_string()), "left scan must drop unused `x`; got {lp:?}");
+        assert!(
+            !lp.contains(&"x".to_string()),
+            "left scan must drop unused `x`; got {lp:?}"
+        );
     }
 }

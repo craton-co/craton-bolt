@@ -172,7 +172,10 @@ pub fn err_unsupported_dtype(dtype_dbg: &str, op: &str) -> BoltError {
 
 /// Ensure `dtype` is one of the four numeric primitives the Welford push
 /// helpers accept.
-pub fn ensure_numeric_dtype(dtype: crate::plan::logical_plan::DataType, op: &str) -> BoltResult<()> {
+pub fn ensure_numeric_dtype(
+    dtype: crate::plan::logical_plan::DataType,
+    op: &str,
+) -> BoltResult<()> {
     use crate::plan::logical_plan::DataType::*;
     match dtype {
         Int32 | Int64 | Float32 | Float64 => Ok(()),

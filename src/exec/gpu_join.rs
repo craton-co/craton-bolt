@@ -193,8 +193,8 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, UInt32Array,
 };
 use arrow_schema::Schema as ArrowSchema;
 
@@ -210,10 +210,10 @@ use crate::jit::hash_join_kernel::{
     compile_cross_kernel, compile_probe_aos_kernel, compile_probe_collision_kernel,
     compile_probe_kernel, compile_probe_kernel_tiled, compile_string_hash_kernel,
     compile_unmatched_build_kernel, KeyShape, AOS_SLOT_BYTES, BUILD_AOS_KERNEL_ENTRY,
-    BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY,
-    HASH_JOIN_BLOCK_SIZE, PROBE_AOS_KERNEL_ENTRY, PROBE_COLLISION_KERNEL_ENTRY,
-    PROBE_KERNEL_ENTRY, PROBE_KERNEL_TILED_ENTRY, STRING_HASH_BLOCK_SIZE,
-    STRING_HASH_KERNEL_ENTRY, UNMATCHED_BUILD_KERNEL_ENTRY,
+    BUILD_COLLISION_KERNEL_ENTRY, BUILD_KERNEL_ENTRY, CROSS_KERNEL_ENTRY, HASH_JOIN_BLOCK_SIZE,
+    PROBE_AOS_KERNEL_ENTRY, PROBE_COLLISION_KERNEL_ENTRY, PROBE_KERNEL_ENTRY,
+    PROBE_KERNEL_TILED_ENTRY, STRING_HASH_BLOCK_SIZE, STRING_HASH_KERNEL_ENTRY,
+    UNMATCHED_BUILD_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::DataType;
 use crate::plan::physical_plan::{HashJoinKernelKind, HashJoinKernelSpec};
@@ -276,8 +276,7 @@ pub fn get_sentinel_i64_min_vec(cap: usize) -> &'static [i64] {
             // the hash-table capacity discipline) so we don't realloc on the
             // very next request that bumps cap by 1.
             let new_cap = cap.next_power_of_two().max(cap);
-            let leaked: &'static mut [i64] =
-                Vec::leak(vec![SENTINEL_I64_MIN; new_cap]);
+            let leaked: &'static mut [i64] = Vec::leak(vec![SENTINEL_I64_MIN; new_cap]);
             *guard = leaked;
         }
         // Copy out the `&'static [i64]` so we can drop the guard and still
@@ -296,8 +295,7 @@ pub fn get_sentinel_u32_max_vec(cap: usize) -> &'static [u32] {
         let mut guard = SENTINEL_U32_MAX_POOL.lock();
         if cap > guard.len() {
             let new_cap = cap.next_power_of_two().max(cap);
-            let leaked: &'static mut [u32] =
-                Vec::leak(vec![SENTINEL_U32_MAX; new_cap]);
+            let leaked: &'static mut [u32] = Vec::leak(vec![SENTINEL_U32_MAX; new_cap]);
             *guard = leaked;
         }
         *guard
@@ -351,7 +349,9 @@ fn alloc_u32_max_table_async(len: usize, stream: &CudaStream) -> BoltResult<GpuV
         let buf = GpuVec::<u32>::zeros_async(len, stream.raw())?;
         if len > 0 {
             let byte_len = len.checked_mul(std::mem::size_of::<u32>()).ok_or_else(|| {
-                BoltError::Other(format!("gpu_join: u32::MAX table size overflow ({len} * 4)"))
+                BoltError::Other(format!(
+                    "gpu_join: u32::MAX table size overflow ({len} * 4)"
+                ))
             })?;
             // SAFETY: `buf` was just allocated with at least `byte_len` bytes
             // in the currently-bound context; nothing else references the
@@ -480,9 +480,7 @@ fn hash_table_byte_cap() -> usize {
         //    to the driver-detected cap, so the env var only takes effect
         //    when set to a valid integer.
         if let Some(cap) = parse_env_cap() {
-            log::info!(
-                "gpu_join: hash-table byte cap set via {CAP_ENV_VAR} = {cap} bytes"
-            );
+            log::info!("gpu_join: hash-table byte cap set via {CAP_ENV_VAR} = {cap} bytes");
             return cap;
         }
         // 2. Driver-detected cap.
@@ -583,17 +581,12 @@ fn compute_capacity(n_build_rows: usize) -> BoltResult<usize> {
 /// Inner helper exposed for unit tests so we can plug an explicit slot cap
 /// without depending on a CUDA device being present (the runtime cap query
 /// is OnceLock'd, which makes test ordering brittle).
-fn compute_capacity_with_slot_cap(
-    n_build_rows: usize,
-    slot_cap: usize,
-) -> BoltResult<usize> {
-    let target = n_build_rows
-        .checked_mul(LOAD_FACTOR_DENOM)
-        .ok_or_else(|| {
-            BoltError::Other(format!(
-                "gpu_join: capacity calc overflowed (n_build_rows={n_build_rows})"
-            ))
-        })?;
+fn compute_capacity_with_slot_cap(n_build_rows: usize, slot_cap: usize) -> BoltResult<usize> {
+    let target = n_build_rows.checked_mul(LOAD_FACTOR_DENOM).ok_or_else(|| {
+        BoltError::Other(format!(
+            "gpu_join: capacity calc overflowed (n_build_rows={n_build_rows})"
+        ))
+    })?;
     // next_power_of_two on 1 returns 1; we want a minimum of 2 so the mask
     // (cap - 1) has at least one valid bit. Probe loop assumes cap >= 2.
     let target = target.max(2);
@@ -723,10 +716,7 @@ fn canonical_f32_bits(v: f32) -> u64 {
 /// Returns `Err` if any encoded value collides with the `i64::MIN`
 /// empty-slot sentinel — the host then surfaces that to the caller, which
 /// falls back to the host path for the whole query.
-pub fn encode_keys_for_shape(
-    columns: &[&dyn Array],
-    shape: KeyShape,
-) -> BoltResult<Vec<i64>> {
+pub fn encode_keys_for_shape(columns: &[&dyn Array], shape: KeyShape) -> BoltResult<Vec<i64>> {
     if columns.is_empty() {
         return Err(BoltError::Other(
             "gpu_join: encode_keys_for_shape called with zero columns".into(),
@@ -835,7 +825,8 @@ pub fn encode_keys_for_shape(
             // bytes-out layer, callers must intern before reaching here.
             return Err(BoltError::Other(
                 "gpu_join: SingleUtf8 must be interned to i32 dict indices before encoding; \
-                 see intern_utf8_columns".into(),
+                 see intern_utf8_columns"
+                    .into(),
             ));
         }
         KeyShape::SingleI32Candidate => {
@@ -846,7 +837,8 @@ pub fn encode_keys_for_shape(
             // contract that the host must re-verify pairs.
             return Err(BoltError::Other(
                 "gpu_join: SingleI32Candidate must be interned via streaming-intern before \
-                 encoding; see intern_utf8_columns_streaming_parallel".into(),
+                 encoding; see intern_utf8_columns_streaming_parallel"
+                    .into(),
             ));
         }
         KeyShape::TwoI64 | KeyShape::MultiI32(_) => {
@@ -935,11 +927,10 @@ fn launch_build_kernel(
         key_dtype: DataType::Int64,
         string_hash_returns_i64: false,
     };
-    let module = module_cache::get_or_build_module_for_hash_join(
-        &spec,
-        BUILD_KERNEL_ENTRY,
-        |_| compile_build_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_hash_join(&spec, BUILD_KERNEL_ENTRY, |_| {
+            compile_build_kernel()
+        })?;
     let function = module.function(BUILD_KERNEL_ENTRY)?;
 
     let mut build_keys_ptr: CUdeviceptr = build_keys_dev.device_ptr();
@@ -1060,15 +1051,15 @@ fn launch_probe_kernel(
         key_dtype: DataType::Int64,
         string_hash_returns_i64: false,
     };
-    let module = module_cache::get_or_build_module_for_hash_join(
-        &spec,
-        entry,
-        |_| if tiled { compile_probe_kernel_tiled() } else { compile_probe_kernel() },
-    )?;
+    let module = module_cache::get_or_build_module_for_hash_join(&spec, entry, |_| {
+        if tiled {
+            compile_probe_kernel_tiled()
+        } else {
+            compile_probe_kernel()
+        }
+    })?;
     let function = module.function(entry)?;
-    log::debug!(
-        "gpu_join probe: tiled={tiled} n_probe={n_probe_rows} cap={cap}"
-    );
+    log::debug!("gpu_join probe: tiled={tiled} n_probe={n_probe_rows} cap={cap}");
 
     let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
     let mut keys_table_ptr: CUdeviceptr = keys_table_dev.device_ptr();
@@ -1136,9 +1127,9 @@ fn launch_probe_kernel(
 /// `atom.cas.b64` against the key word and would treat 0 as a live key.
 #[allow(dead_code)] // reason: GJ-stage4 AoS helper; planner-level routing to AoS path lands in Stage 5.
 fn alloc_aos_slots(cap: usize) -> BoltResult<GpuVec<u8>> {
-    let bytes = cap
-        .checked_mul(AOS_SLOT_BYTES as usize)
-        .ok_or_else(|| BoltError::Other(format!("gpu_join: AoS slot bytes overflow (cap={cap})")))?;
+    let bytes = cap.checked_mul(AOS_SLOT_BYTES as usize).ok_or_else(|| {
+        BoltError::Other(format!("gpu_join: AoS slot bytes overflow (cap={cap})"))
+    })?;
     // Build the initialiser host-side. Each 16-byte slot starts with the
     // i64::MIN sentinel; the remaining 8 bytes (head + pad) are zero.
     let mut init: Vec<u8> = vec![0u8; bytes];
@@ -1169,11 +1160,10 @@ fn launch_build_aos_kernel(
         key_dtype: DataType::Int64,
         string_hash_returns_i64: false,
     };
-    let module = module_cache::get_or_build_module_for_hash_join(
-        &spec,
-        BUILD_AOS_KERNEL_ENTRY,
-        |_| compile_build_aos_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_hash_join(&spec, BUILD_AOS_KERNEL_ENTRY, |_| {
+            compile_build_aos_kernel()
+        })?;
     let function = module.function(BUILD_AOS_KERNEL_ENTRY)?;
 
     let mut build_keys_ptr: CUdeviceptr = build_keys_dev.device_ptr();
@@ -1237,11 +1227,10 @@ fn launch_probe_aos_kernel(
         key_dtype: DataType::Int64,
         string_hash_returns_i64: false,
     };
-    let module = module_cache::get_or_build_module_for_hash_join(
-        &spec,
-        PROBE_AOS_KERNEL_ENTRY,
-        |_| compile_probe_aos_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_hash_join(&spec, PROBE_AOS_KERNEL_ENTRY, |_| {
+            compile_probe_aos_kernel()
+        })?;
     let function = module.function(PROBE_AOS_KERNEL_ENTRY)?;
 
     let mut probe_keys_ptr: CUdeviceptr = probe_keys_dev.device_ptr();
@@ -1345,7 +1334,13 @@ pub fn hash_join_indices_on_gpu_aos(
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
 
-    launch_build_aos_kernel(&build_keys_dev, &mut slots_dev, n_build_u32, cap_u32, &stream)?;
+    launch_build_aos_kernel(
+        &build_keys_dev,
+        &mut slots_dev,
+        n_build_u32,
+        cap_u32,
+        &stream,
+    )?;
     let n_matches_raw = launch_probe_aos_kernel(
         &probe_keys_dev,
         &slots_dev,
@@ -1732,7 +1727,7 @@ pub fn hash_join_indices_on_gpu_with_shape(
     // clear planner-level error.
     if build_key_columns.is_empty() || probe_key_columns.is_empty() {
         return Err(BoltError::Plan(
-            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into()
+            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into(),
         ));
     }
     if !shape.is_exact_in_i64() {
@@ -1899,7 +1894,7 @@ pub fn execute_outer_join_indices_on_gpu(
     // clear planner-level error.
     if build_key_columns.is_empty() || probe_key_columns.is_empty() {
         return Err(BoltError::Plan(
-            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into()
+            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into(),
         ));
     }
     let needs_verify = shape.needs_host_post_verify();
@@ -2025,16 +2020,8 @@ pub fn execute_outer_join_indices_on_gpu(
     // the verified pair set is the kernel's emitted pair set, byte-stable
     // with the Stage-3 OUTER behaviour.
     let (probe_idx_verified, build_idx_verified) = if needs_verify {
-        let candidate_build: Vec<u32> = build_idx_full
-            .iter()
-            .take(n_matches)
-            .copied()
-            .collect();
-        let candidate_probe: Vec<u32> = probe_idx_full
-            .iter()
-            .take(n_matches)
-            .copied()
-            .collect();
+        let candidate_build: Vec<u32> = build_idx_full.iter().take(n_matches).copied().collect();
+        let candidate_probe: Vec<u32> = probe_idx_full.iter().take(n_matches).copied().collect();
         let (kept_build, kept_probe) = verify_pairs_on_host(
             build_key_columns,
             probe_key_columns,
@@ -2147,8 +2134,7 @@ pub fn execute_outer_join_indices_on_gpu(
             // synchronized `stream` to read its counter back, so the kernel's
             // writes are visible; this D2H is the final readback before
             // returning to the host.
-            let unmatched_full =
-                download_to_host_pinned::<u32>(&out_unmatched_dev, &stream)?;
+            let unmatched_full = download_to_host_pinned::<u32>(&out_unmatched_dev, &stream)?;
             for &b in unmatched_full.iter().take(n_unmatched) {
                 build.push(Some(b));
                 probe.push(None);
@@ -2209,8 +2195,12 @@ fn launch_build_collision_kernel(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
-            grid_x, 1, 1,
-            block, 1, 1,
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2307,8 +2297,12 @@ fn launch_probe_collision_kernel(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
-            grid_x, 1, 1,
-            block, 1, 1,
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2372,8 +2366,12 @@ fn launch_unmatched_build_kernel(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
-            grid_x, 1, 1,
-            block, 1, 1,
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -2548,12 +2546,18 @@ pub fn intern_utf8_columns(
     build: &dyn Array,
     probe: &dyn Array,
 ) -> BoltResult<InternedUtf8Columns> {
-    let b = build.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        BoltError::Other("gpu_join: intern_utf8_columns build is not StringArray".into())
-    })?;
-    let p = probe.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        BoltError::Other("gpu_join: intern_utf8_columns probe is not StringArray".into())
-    })?;
+    let b = build
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other("gpu_join: intern_utf8_columns build is not StringArray".into())
+        })?;
+    let p = probe
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other("gpu_join: intern_utf8_columns probe is not StringArray".into())
+        })?;
 
     // Single-pass union dict build. Keys borrow into the StringArray's
     // backing buffer, so the HashMap holds no extra heap copies of the
@@ -2699,22 +2703,27 @@ pub fn intern_utf8_columns_streaming(
     build: &dyn Array,
     probe: &dyn Array,
 ) -> BoltResult<InternedUtf8Columns> {
-    let b = build.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        BoltError::Other(
-            "gpu_join: intern_utf8_columns_streaming build is not StringArray".into(),
-        )
-    })?;
-    let p = probe.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        BoltError::Other(
-            "gpu_join: intern_utf8_columns_streaming probe is not StringArray".into(),
-        )
-    })?;
+    let b = build
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other(
+                "gpu_join: intern_utf8_columns_streaming build is not StringArray".into(),
+            )
+        })?;
+    let p = probe
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other(
+                "gpu_join: intern_utf8_columns_streaming probe is not StringArray".into(),
+            )
+        })?;
 
     // Hash-keyed dict. Sized to roughly the unique-string count — over-shoot
     // is harmless (just unused capacity) and prevents the worst-case rehash
     // chain during chunked growth.
-    let mut dict: HashMap<u64, i32> =
-        HashMap::with_capacity((b.len() + p.len()) / 2);
+    let mut dict: HashMap<u64, i32> = HashMap::with_capacity((b.len() + p.len()) / 2);
     let mut next_idx: i32 = 0;
 
     /// Inner helper: stream `arr` in `STREAMING_INTERN_CHUNK_ROWS`-row
@@ -2890,11 +2899,10 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
         key_dtype: DataType::Utf8,
         string_hash_returns_i64: false,
     };
-    let module = module_cache::get_or_build_module_for_hash_join(
-        &spec,
-        STRING_HASH_KERNEL_ENTRY,
-        |_| compile_string_hash_kernel(DataType::Utf8),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_hash_join(&spec, STRING_HASH_KERNEL_ENTRY, |_| {
+            compile_string_hash_kernel(DataType::Utf8)
+        })?;
     let function = module.function(STRING_HASH_KERNEL_ENTRY)?;
 
     let mut offsets_ptr: CUdeviceptr = offsets_dev.device_ptr();
@@ -2993,8 +3001,7 @@ pub fn compute_device_string_hashes_large(
             )
         },
     )?;
-    let function =
-        module.function(crate::jit::hash_join_kernel::STRING_HASH_KERNEL_ENTRY_I64)?;
+    let function = module.function(crate::jit::hash_join_kernel::STRING_HASH_KERNEL_ENTRY_I64)?;
 
     let mut offsets_ptr: CUdeviceptr = offsets_dev.device_ptr();
     let mut values_ptr: CUdeviceptr = values_dev.device_ptr();
@@ -3069,16 +3076,22 @@ pub fn intern_utf8_columns_streaming_parallel(
     build: &dyn Array,
     probe: &dyn Array,
 ) -> BoltResult<InternedUtf8Columns> {
-    let b = build.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        BoltError::Other(
-            "gpu_join: intern_utf8_columns_streaming_parallel build is not StringArray".into(),
-        )
-    })?;
-    let p = probe.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        BoltError::Other(
-            "gpu_join: intern_utf8_columns_streaming_parallel probe is not StringArray".into(),
-        )
-    })?;
+    let b = build
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other(
+                "gpu_join: intern_utf8_columns_streaming_parallel build is not StringArray".into(),
+            )
+        })?;
+    let p = probe
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            BoltError::Other(
+                "gpu_join: intern_utf8_columns_streaming_parallel probe is not StringArray".into(),
+            )
+        })?;
 
     // Phase 1: parallel hash-each-row.
     //
@@ -3303,12 +3316,7 @@ fn verify_pairs_on_host(
 /// Row-level equality on Arrow scalars. Returns true iff both values are
 /// non-NULL and bit-equal. Used by [`verify_pairs_on_host`] — equi-join
 /// semantics treats NULL = NULL as UNKNOWN (drops the pair).
-fn arrow_row_eq(
-    a: &dyn Array,
-    ai: usize,
-    b: &dyn Array,
-    bi: usize,
-) -> BoltResult<bool> {
+fn arrow_row_eq(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> BoltResult<bool> {
     if a.is_null(ai) || b.is_null(bi) {
         return Ok(false);
     }
@@ -3461,7 +3469,7 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     // `execute_inner_join_on_gpu_with_shape_and_verify` entry point.)
     if build_key_columns.is_empty() || probe_key_columns.is_empty() {
         return Err(BoltError::Plan(
-            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into()
+            "join: build_key_columns and probe_key_columns must be non-empty (review C4)".into(),
         ));
     }
     // Re-route exact shapes through the existing verified entry point so
@@ -3607,9 +3615,7 @@ pub fn execute_cross_join_on_gpu(
     }
 
     let total = (n_left as u64).checked_mul(n_right as u64).ok_or_else(|| {
-        BoltError::Other(format!(
-            "gpu_join: CROSS overflow ({n_left} × {n_right})"
-        ))
+        BoltError::Other(format!("gpu_join: CROSS overflow ({n_left} × {n_right})"))
     })?;
     if total >= CROSS_JOIN_GPU_CELL_CAP {
         return Err(BoltError::Other(format!(
@@ -3618,9 +3624,7 @@ pub fn execute_cross_join_on_gpu(
     }
     let total_usize = total as usize;
     let total_u32 = u32::try_from(total).map_err(|_| {
-        BoltError::Other(format!(
-            "gpu_join: CROSS total {total} doesn't fit in u32"
-        ))
+        BoltError::Other(format!("gpu_join: CROSS total {total} doesn't fit in u32"))
     })?;
     let n_build_u32 = n_rows_to_u32(n_right)?; // "build" = right side here
 
@@ -3638,11 +3642,10 @@ pub fn execute_cross_join_on_gpu(
         key_dtype: DataType::Bool,
         string_hash_returns_i64: false,
     };
-    let module = module_cache::get_or_build_module_for_hash_join(
-        &spec,
-        CROSS_KERNEL_ENTRY,
-        |_| compile_cross_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module_for_hash_join(&spec, CROSS_KERNEL_ENTRY, |_| {
+            compile_cross_kernel()
+        })?;
     let function = module.function(CROSS_KERNEL_ENTRY)?;
 
     let mut out_probe_idx_ptr: CUdeviceptr = out_probe_idx_dev.device_ptr();
@@ -3663,8 +3666,12 @@ pub fn execute_cross_join_on_gpu(
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
-            grid_x, 1, 1,
-            block, 1, 1,
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
             0,
             stream.raw(),
             params.as_mut_ptr(),
@@ -3736,8 +3743,8 @@ pub fn execute_utf8_inner_join_on_gpu(
     // sequential variant wins (thread-spawn cost dominates).
     let streaming = streaming_intern_enabled();
     let interned = if streaming {
-        let total = build_batch.column(build_key_idx).len()
-            + probe_batch.column(probe_key_idx).len();
+        let total =
+            build_batch.column(build_key_idx).len() + probe_batch.column(probe_key_idx).len();
         if total >= STREAMING_INTERN_PARALLEL_THRESHOLD {
             intern_utf8_columns_streaming_parallel(
                 build_batch.column(build_key_idx).as_ref(),
@@ -3856,10 +3863,7 @@ pub fn execute_utf8_outer_join_on_gpu(
     // Stage-5 byte-borrowed dict. Streaming intern would require a
     // candidate-filter pipeline analogous to TwoI64 OUTER (see Stage-6
     // follow-up in the module docs).
-    let interned = intern_utf8_columns(
-        build_str_col.as_ref(),
-        probe_str_col.as_ref(),
-    )?;
+    let interned = intern_utf8_columns(build_str_col.as_ref(), probe_str_col.as_ref())?;
 
     let build_cols: Vec<&dyn Array> = vec![&interned.build_indices];
     let probe_cols: Vec<&dyn Array> = vec![&interned.probe_indices];
@@ -4155,9 +4159,8 @@ mod tests {
                 .expect("host-download gpu join");
 
         // Device-resident path, then explicit download.
-        let resident =
-            hash_join_indices_on_gpu_resident(&build_col, &probe_col, DataType::Int32)
-                .expect("resident gpu join");
+        let resident = hash_join_indices_on_gpu_resident(&build_col, &probe_col, DataType::Int32)
+            .expect("resident gpu join");
         assert_eq!(
             resident.n_matches,
             host_build.len(),
@@ -4194,9 +4197,8 @@ mod tests {
     fn gpu_resident_inner_join_empty_probe() {
         let build_col = Int32Array::from((0..1024i32).collect::<Vec<_>>());
         let probe_col = Int32Array::from(Vec::<i32>::new());
-        let resident =
-            hash_join_indices_on_gpu_resident(&build_col, &probe_col, DataType::Int32)
-                .expect("resident gpu join (empty probe)");
+        let resident = hash_join_indices_on_gpu_resident(&build_col, &probe_col, DataType::Int32)
+            .expect("resident gpu join (empty probe)");
         assert_eq!(resident.n_matches, 0);
         let (b, p) = resident.download().expect("download");
         assert_eq!(b.len(), 0);
@@ -4253,7 +4255,11 @@ mod tests {
         )
         .expect("gpu join");
 
-        assert_eq!(build_idx.len(), probe_idx.len(), "matched pair count must agree");
+        assert_eq!(
+            build_idx.len(),
+            probe_idx.len(),
+            "matched pair count must agree"
+        );
 
         // Reconstruct the host-side expected set.
         let mut expected: Vec<(u32, u32)> = Vec::new();
@@ -4332,21 +4338,20 @@ mod tests {
         // Expected match count: probe rows whose key < n_build = 2000.
         // probe_keys = 0..4000 % 3000 -> keys 0..2999 each appear at least
         // once; specifically the matches are those probe_keys < 2000.
-        let expected: usize = probe_keys.iter().filter(|k| (**k as usize) < n_build).count();
-        assert_eq!(out.num_rows(), expected, "match count must match host estimate");
+        let expected: usize = probe_keys
+            .iter()
+            .filter(|k| (**k as usize) < n_build)
+            .count();
+        assert_eq!(
+            out.num_rows(),
+            expected,
+            "match count must match host estimate"
+        );
 
         // Spot-check that every output row satisfies the equi-join:
         // build_payload column (col 1) = build_key + 1000 = probe_key + 1000.
-        let bp_col = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let pk_col = out
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        let bp_col = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let pk_col = out.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
         for i in 0..out.num_rows() {
             assert_eq!(
                 bp_col.value(i),
@@ -4419,7 +4424,10 @@ mod tests {
             encode_keys_for_shape(&[&a as &dyn Array, &b as &dyn Array], KeyShape::TwoI32).unwrap();
         assert_eq!(enc[0], ((1u32 as u64) << 32 | (2u32 as u64)) as i64);
         // -1 high, -2 low → both as u32, OR'd at the right offset.
-        assert_eq!(enc[1], (((-1i32) as u32 as u64) << 32 | ((-2i32) as u32 as u64)) as i64);
+        assert_eq!(
+            enc[1],
+            (((-1i32) as u32 as u64) << 32 | ((-2i32) as u32 as u64)) as i64
+        );
         assert_eq!(enc[2], (0u64 << 32 | 5u64) as i64);
         assert_eq!(
             enc[3],
@@ -4545,7 +4553,11 @@ mod tests {
         let cb = UInt32Array::from(vec![0u32, 1, 2]);
         let cp = UInt32Array::from(vec![0u32, 1, 2]);
         let (kept_b, _) = verify_pairs_on_host(&build_cols, &probe_cols, &cb, &cp).unwrap();
-        assert_eq!(kept_b.len(), 2, "pair (b1,p1) must be dropped on col-2 mismatch");
+        assert_eq!(
+            kept_b.len(),
+            2,
+            "pair (b1,p1) must be dropped on col-2 mismatch"
+        );
         assert_eq!(kept_b.value(0), 0);
         assert_eq!(kept_b.value(1), 2);
     }
@@ -4572,7 +4584,10 @@ mod tests {
 
         // Garbage → ignored.
         std::env::set_var(CAP_ENV_VAR, "not-a-number");
-        assert!(parse_env_cap().is_none(), "garbage env value must be ignored");
+        assert!(
+            parse_env_cap().is_none(),
+            "garbage env value must be ignored"
+        );
 
         // Restore.
         match prev {
@@ -4684,7 +4699,10 @@ mod tests {
         assert!(!probe_tiled_enabled(), "'false' env: tiled OFF");
 
         std::env::set_var(PROBE_TILED_ENV_VAR, "FALSE");
-        assert!(!probe_tiled_enabled(), "'FALSE' env (case-insensitive): tiled OFF");
+        assert!(
+            !probe_tiled_enabled(),
+            "'FALSE' env (case-insensitive): tiled OFF"
+        );
 
         std::env::set_var(PROBE_TILED_ENV_VAR, "1");
         assert!(probe_tiled_enabled(), "'1' env: tiled ON");
@@ -4722,20 +4740,17 @@ mod tests {
 
         for slot in 0..cap {
             let off = slot * bytes_per_slot;
-            let key_word =
-                i64::from_le_bytes(init[off..off + 8].try_into().unwrap());
+            let key_word = i64::from_le_bytes(init[off..off + 8].try_into().unwrap());
             assert_eq!(
                 key_word,
                 i64::MIN,
                 "slot {slot}: key word must be EMPTY_KEY (= i64::MIN) on init"
             );
             // Head word at offset 8.
-            let head_word =
-                u32::from_le_bytes(init[off + 8..off + 12].try_into().unwrap());
+            let head_word = u32::from_le_bytes(init[off + 8..off + 12].try_into().unwrap());
             assert_eq!(head_word, 0, "slot {slot}: head word must be zero on init");
             // Pad word at offset 12.
-            let pad_word =
-                u32::from_le_bytes(init[off + 12..off + 16].try_into().unwrap());
+            let pad_word = u32::from_le_bytes(init[off + 12..off + 16].try_into().unwrap());
             assert_eq!(pad_word, 0, "slot {slot}: pad word must be zero on init");
         }
     }
@@ -4750,14 +4765,12 @@ mod tests {
         let n_build = 2_000usize;
         let n_probe = 4_000usize;
         let build_keys: Vec<i32> = (0..n_build as i32).collect();
-        let probe_keys: Vec<i32> =
-            (0..n_probe as i32).map(|i| i % 3_000).collect();
+        let probe_keys: Vec<i32> = (0..n_probe as i32).map(|i| i % 3_000).collect();
 
         let bk = Int32Array::from(build_keys);
         let pk = Int32Array::from(probe_keys);
 
-        let (b_soa, p_soa) =
-            hash_join_indices_on_gpu(&bk, &pk, DataType::Int32).expect("SoA path");
+        let (b_soa, p_soa) = hash_join_indices_on_gpu(&bk, &pk, DataType::Int32).expect("SoA path");
         let (b_aos, p_aos) =
             hash_join_indices_on_gpu_aos(&bk, &pk, DataType::Int32).expect("AoS path");
 
@@ -4768,10 +4781,12 @@ mod tests {
             b_soa.len(),
             b_aos.len()
         );
-        let mut soa: Vec<(u32, u32)> =
-            (0..b_soa.len()).map(|i| (p_soa.value(i), b_soa.value(i))).collect();
-        let mut aos: Vec<(u32, u32)> =
-            (0..b_aos.len()).map(|i| (p_aos.value(i), b_aos.value(i))).collect();
+        let mut soa: Vec<(u32, u32)> = (0..b_soa.len())
+            .map(|i| (p_soa.value(i), b_soa.value(i)))
+            .collect();
+        let mut aos: Vec<(u32, u32)> = (0..b_aos.len())
+            .map(|i| (p_aos.value(i), b_aos.value(i)))
+            .collect();
         soa.sort_unstable();
         aos.sort_unstable();
         assert_eq!(soa, aos, "AoS match set must equal SoA match set");
@@ -4789,15 +4804,27 @@ mod tests {
         assert_eq!(AOS_ROUTING_PROBE_BUILD_RATIO, 8);
 
         // Edge: exactly at the threshold → SoA wins.
-        assert!(!should_route_aos(8 * 1000, 1000), "ratio == 8 must stay SoA");
+        assert!(
+            !should_route_aos(8 * 1000, 1000),
+            "ratio == 8 must stay SoA"
+        );
         // Past the threshold → AoS.
-        assert!(should_route_aos(8 * 1000 + 1, 1000), "ratio just past 8 must pick AoS");
+        assert!(
+            should_route_aos(8 * 1000 + 1, 1000),
+            "ratio just past 8 must pick AoS"
+        );
         // Way past → AoS.
         assert!(should_route_aos(100_000, 1_000), "100x ratio must pick AoS");
         // Balanced sizes → SoA.
-        assert!(!should_route_aos(50_000, 50_000), "balanced sides must stay SoA");
+        assert!(
+            !should_route_aos(50_000, 50_000),
+            "balanced sides must stay SoA"
+        );
         // Build-heavy → SoA.
-        assert!(!should_route_aos(1_000, 100_000), "build-heavy must stay SoA");
+        assert!(
+            !should_route_aos(1_000, 100_000),
+            "build-heavy must stay SoA"
+        );
         // Degenerate empty build → SoA (avoids divide-by-zero).
         assert!(!should_route_aos(1_000_000, 0), "empty build must stay SoA");
     }
@@ -4812,30 +4839,31 @@ mod tests {
         // collision — the verify pass downstream handles those — but we DO
         // require that distinct strings get distinct indices, identical
         // strings share an index.
-        let build: Vec<&str> = (0..1024).map(|i| {
-            // Use a small string pool so dedup actually happens.
-            match i % 4 {
-                0 => "alice",
-                1 => "bob",
-                2 => "carol",
-                _ => "dave",
-            }
-        }).collect();
-        let probe: Vec<&str> = (0..2048).map(|i| {
-            match i % 5 {
+        let build: Vec<&str> = (0..1024)
+            .map(|i| {
+                // Use a small string pool so dedup actually happens.
+                match i % 4 {
+                    0 => "alice",
+                    1 => "bob",
+                    2 => "carol",
+                    _ => "dave",
+                }
+            })
+            .collect();
+        let probe: Vec<&str> = (0..2048)
+            .map(|i| match i % 5 {
                 0 => "alice",
                 1 => "bob",
                 2 => "eve",
                 3 => "frank",
                 _ => "carol",
-            }
-        }).collect();
+            })
+            .collect();
         let b = StringArray::from(build);
         let p = StringArray::from(probe);
 
         let seq = intern_utf8_columns_streaming(&b, &p).expect("seq");
-        let par =
-            intern_utf8_columns_streaming_parallel(&b, &p).expect("par");
+        let par = intern_utf8_columns_streaming_parallel(&b, &p).expect("par");
 
         assert_eq!(seq.build_indices.len(), par.build_indices.len());
         assert_eq!(seq.probe_indices.len(), par.probe_indices.len());
@@ -4891,8 +4919,7 @@ mod tests {
         p.append_value("y");
         let probe = p.finish();
 
-        let par =
-            intern_utf8_columns_streaming_parallel(&build, &probe).expect("par");
+        let par = intern_utf8_columns_streaming_parallel(&build, &probe).expect("par");
 
         assert_eq!(par.build_indices.value(1), -1, "NULL build row must get -1");
         assert_eq!(par.build_indices.value(0), par.probe_indices.value(0));
@@ -4998,11 +5025,7 @@ mod tests {
         // assert on the error variant — the exact mapping is owned by
         // `cuda_sys::check` and may change without breaking the
         // executor's host-fallback path (which catches any `Err(_)`).
-        let result = hash_join_indices_on_gpu(
-            &build_arr,
-            &probe_arr,
-            DataType::Int32,
-        );
+        let result = hash_join_indices_on_gpu(&build_arr, &probe_arr, DataType::Int32);
         assert!(
             result.is_err(),
             "under cuda-stub, hash_join_indices_on_gpu must return Err so \
@@ -5024,8 +5047,7 @@ mod tests {
         let b: &dyn Array = &build_arr;
         let p: &dyn Array = &probe_arr;
 
-        let result =
-            hash_join_indices_on_gpu_with_shape(&[b], &[p], KeyShape::SingleI32);
+        let result = hash_join_indices_on_gpu_with_shape(&[b], &[p], KeyShape::SingleI32);
         assert!(
             result.is_err(),
             "under cuda-stub, hash_join_indices_on_gpu_with_shape must \

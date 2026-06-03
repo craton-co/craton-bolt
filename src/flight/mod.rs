@@ -52,8 +52,8 @@ pub mod server;
 // them; their public items follow the ABI in the module docs / integration
 // notes. Until those modules land, the orchestrator wires these `mod`
 // declarations (and this comment serves as the contract).
-pub mod sql;
 pub mod encode;
+pub mod sql;
 
 /// A Flight SQL service backed by a single shared [`Engine`].
 ///

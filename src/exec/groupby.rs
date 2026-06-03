@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! GROUP BY aggregate execution.
 //!
@@ -90,9 +90,7 @@ use arrow_array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch,
 };
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
@@ -113,9 +111,9 @@ use crate::jit::agg_kernels::ReduceOp;
 // remains correct.
 use crate::jit::hash_kernels::{
     compile_groupby_agg_kernel, compile_groupby_agg_kernel_with_validity,
-    compile_groupby_decimal_kernel, compile_groupby_keys_kernel_dispatched,
-    groupby_block_size, GroupedDecimalOp, AGG_DECIMAL_KERNEL_ENTRY, AGG_KERNEL_ENTRY,
-    I64_EMPTY_SENTINEL, KEYS_KERNEL_ENTRY,
+    compile_groupby_decimal_kernel, compile_groupby_keys_kernel_dispatched, groupby_block_size,
+    GroupedDecimalOp, AGG_DECIMAL_KERNEL_ENTRY, AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL,
+    KEYS_KERNEL_ENTRY,
 };
 use crate::plan::logical_plan::{
     sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema, TimeUnit,
@@ -263,8 +261,8 @@ fn column_should_use_native_validity(
 // `groupby_with_pre.rs`. They now live in `crate::exec::groupby_common` (see
 // that module's header for the drift-bug rationale, incl. V-17 pack_keys).
 use crate::exec::groupby_common::{
-    decode_key, download_pinned_f32, download_pinned_f64, download_pinned_i32,
-    download_pinned_i64, next_pow2, pack_keys, unique_count, KeyComponent, KeyValue,
+    decode_key, download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64,
+    next_pow2, pack_keys, unique_count, KeyComponent, KeyValue,
 };
 
 /// Resident on-device GROUP BY fast path — the perf companion to
@@ -294,10 +292,7 @@ pub fn try_execute_groupby_resident(
 /// `plan` must be `PhysicalPlan::Aggregate` with non-empty `group_by`.
 /// Supports single-column (Int32/Int64/Float32/Float64) and a limited set of
 /// 2-column packings whose combined width fits in 64 bits; see module docs.
-pub fn execute_groupby(
-    plan: &PhysicalPlan,
-    table_batch: &RecordBatch,
-) -> BoltResult<RecordBatch> {
+pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltResult<RecordBatch> {
     // R1-utf8-groupby: Utf8 (string) GROUP BY keys. The classic + tier
     // integer kernels only key on i32/i64/float, so a string key column
     // previously fell through to `groupby_wide`, which REJECTS Utf8. We now
@@ -357,59 +352,109 @@ pub fn execute_groupby(
             }
         };
     }
-    try_fast_path!(crate::exec::groupby_shmem_exec::try_execute(plan, table_batch));
-    try_fast_path!(crate::exec::groupby_shmem_multi_exec::try_execute(plan, table_batch));
-    try_fast_path!(crate::exec::groupby_shmem_avg_exec::try_execute(plan, table_batch));
-    try_fast_path!(crate::exec::groupby_tier2_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_shmem_exec::try_execute(
+        plan,
+        table_batch
+    ));
+    try_fast_path!(crate::exec::groupby_shmem_multi_exec::try_execute(
+        plan,
+        table_batch
+    ));
+    try_fast_path!(crate::exec::groupby_shmem_avg_exec::try_execute(
+        plan,
+        table_batch
+    ));
+    try_fast_path!(crate::exec::groupby_tier2_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Multi-SUM Tier-2: enabled with `MULTI_SUM_MIN_GROUPS = 100_000` floor
     // in the executor itself. Below 100K groups the global-atomic baseline
     // wins (q2 / 10K groups regressed 444 ms → 1.05 s when this path was
     // unconditional); the gate now lets q2 fall through cleanly while
     // capturing future workloads with more groups.
-    try_fast_path!(crate::exec::groupby_tier2_multi_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_multi_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Two-key Tier-2: enabled now that `partition_reduce_kernel_i64`
     // replaces the host-HashMap pass-2 (Tier 2.1 for two-key).
-    try_fast_path!(crate::exec::groupby_tier2_twokey_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_twokey_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Two-key MULTI-aggregate Tier-2.1: `SELECT a, b, SUM(v1), SUM(v2)
     // FROM x GROUP BY a, b` — combines i64 partitioning with
     // multi-value reduce. Two-key single-SUM falls through to the line
     // above first.
-    try_fast_path!(crate::exec::groupby_tier2_twokey_multi_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_twokey_multi_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // AVG-at-Tier-2.1: SUM (via multi-SUM reduce) + COUNT (via count
     // reduce) → divide host-side. High-cardinality AVG over Float64.
-    try_fast_path!(crate::exec::groupby_tier2_avg_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_avg_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Two-key multi-AVG Tier-2.1: `SELECT a, b, AVG(v1), AVG(v2), ...
     // FROM x GROUP BY a, b`. Same shape as the single-key AVG path but
     // with i64-packed (Int32, Int32) keys.
-    try_fast_path!(crate::exec::groupby_tier2_twokey_avg_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_twokey_avg_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // COUNT(*) at Tier-2.1: high-cardinality `SELECT k, COUNT(*) FROM x
     // GROUP BY k`. Reuses partition + scatter; one COUNT reduce launch.
-    try_fast_path!(crate::exec::groupby_tier2_count_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_count_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Two-key COUNT(*) Tier-2.1: `SELECT a, b, COUNT(*) FROM x GROUP BY
     // a, b`. Same shape as the single-key COUNT path but with i64-packed
     // (Int32, Int32) keys.
-    try_fast_path!(crate::exec::groupby_tier2_twokey_count_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_twokey_count_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Two-key integer MIN/MAX at Tier-2.1: `SELECT a, b, {MIN,MAX}(v)
     // FROM x GROUP BY a, b` with Int32 / Int64 value column. Routes
     // through partition_reduce_kernel_minmax_i64. Must come before the
     // single-key minmax path so the two-key shape isn't mishandled.
-    try_fast_path!(crate::exec::groupby_tier2_twokey_minmax_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_twokey_minmax_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Two-key float MIN/MAX at Tier-2.1: same shape, Float64 value
     // column, CAS-loop kernel (partition_reduce_kernel_minmax_float_i64).
-    try_fast_path!(crate::exec::groupby_tier2_twokey_minmax_float_exec::try_execute(plan, table_batch));
+    try_fast_path!(
+        crate::exec::groupby_tier2_twokey_minmax_float_exec::try_execute(plan, table_batch)
+    );
     // MIN/MAX at Tier-2.1: high-cardinality integer MIN/MAX. Float
     // MIN/MAX is deferred — needs a CAS-loop kernel and no workload
     // demands it yet.
-    try_fast_path!(crate::exec::groupby_tier2_minmax_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_minmax_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Float MIN/MAX: routes through partition_reduce_kernel_minmax_float
     // (CAS-loop kernel). Integer MIN/MAX above catches first; this
     // handles the float-value-column path.
-    try_fast_path!(crate::exec::groupby_tier2_minmax_float_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_tier2_minmax_float_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Tier-1 COUNT(*): low-cardinality COUNT GROUP BY.
-    try_fast_path!(crate::exec::groupby_shmem_count_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_shmem_count_exec::try_execute(
+        plan,
+        table_batch
+    ));
     // Tier-1 MIN/MAX: low-cardinality integer MIN/MAX. Float MIN/MAX
     // is deferred — needs a CAS-loop kernel.
-    try_fast_path!(crate::exec::groupby_shmem_minmax_exec::try_execute(plan, table_batch));
+    try_fast_path!(crate::exec::groupby_shmem_minmax_exec::try_execute(
+        plan,
+        table_batch
+    ));
 
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -447,15 +492,12 @@ pub fn execute_groupby(
                 aggregate.inputs.len()
             ))
         })?;
-        let col_idx = table_batch
-            .schema()
-            .index_of(&io.name)
-            .map_err(|_| {
-                BoltError::Plan(format!(
-                    "execute_groupby: GROUP BY key '{}' not present in input batch schema",
-                    io.name
-                ))
-            })?;
+        let col_idx = table_batch.schema().index_of(&io.name).map_err(|_| {
+            BoltError::Plan(format!(
+                "execute_groupby: GROUP BY key '{}' not present in input batch schema",
+                io.name
+            ))
+        })?;
         let key_array: &dyn Array = table_batch.column(col_idx).as_ref();
         if key_array_contains_sentinel(key_array)? {
             log::warn!(
@@ -521,7 +563,9 @@ pub fn execute_groupby(
     // NULL-group synthesis. We check only genuine keys (via the keep mask),
     // since NULL positions in `packed.keys_i64` carry undefined bits.
     if synthesise_null_group {
-        let mask = key_valid.as_ref().expect("synthesise_null_group implies Some");
+        let mask = key_valid
+            .as_ref()
+            .expect("synthesise_null_group implies Some");
         let genuine_hits_sentinel = packed
             .keys_i64
             .iter()
@@ -541,7 +585,9 @@ pub fn execute_groupby(
         // Single-column + nulls present: remap NULL-key rows to the NULL
         // sentinel, keep every row (preserve row alignment with the agg
         // value columns), and drop the now-redundant key-null mask.
-        let mask = key_valid.as_ref().expect("synthesise_null_group implies Some");
+        let mask = key_valid
+            .as_ref()
+            .expect("synthesise_null_group implies Some");
         let remapped: Vec<i64> = packed
             .keys_i64
             .iter()
@@ -590,10 +636,7 @@ pub fn execute_groupby(
     let n_unique = unique_count(&host_keys);
     let k = next_pow2((n_unique.saturating_mul(2)).saturating_add(16)).max(64);
     let k_u32 = u32::try_from(k).map_err(|_| {
-        BoltError::Other(format!(
-            "GROUP BY hash table size {} exceeds u32::MAX",
-            k
-        ))
+        BoltError::Other(format!("GROUP BY hash table size {} exceeds u32::MAX", k))
     })?;
 
     // Stage-3: mint a per-call stream up front so the host->device
@@ -626,7 +669,14 @@ pub fn execute_groupby(
     let overflow_ptr: CUdeviceptr = overflow_counter.device_ptr();
 
     // Launch the keys-only kernel.
-    launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream, overflow_ptr)?;
+    launch_keys_kernel(
+        &key_col_gpu,
+        &mut keys_table,
+        n_rows,
+        k_u32,
+        &stream,
+        overflow_ptr,
+    )?;
 
     // For each aggregate, prepare its accumulator and launch the agg kernel.
     // We collect (input_dtype_for_acc, downloaded acc vector as a typed enum)
@@ -639,8 +689,7 @@ pub fn execute_groupby(
     // native `_with_validity` kernel and the host-strip fallback. An empty
     // flag vector (legacy default) collapses to `false` so existing
     // construction sites remain bit-identical.
-    let any_input_has_validity: bool =
-        aggregate.input_has_validity.iter().any(|&v| v);
+    let any_input_has_validity: bool = aggregate.input_has_validity.iter().any(|&v| v);
     // PERF L3 (fused multi-agg): when `aggregate.aggregates.len() > 1`, the
     // keys are shared across every aggregate, so the N per-agg launches below
     // re-hash + re-probe the key column N times. The fused kernel hashes the
@@ -740,15 +789,20 @@ pub fn execute_groupby(
     let mut groups: Vec<(i64, usize)> = host_keys_table
         .iter()
         .enumerate()
-        .filter_map(|(slot, &k)| if k == EMPTY_KEY { None } else { Some((k, slot)) })
+        .filter_map(|(slot, &k)| {
+            if k == EMPTY_KEY {
+                None
+            } else {
+                Some((k, slot))
+            }
+        })
         .collect();
     groups.sort_unstable_by_key(|(k, _)| *k);
 
     // Assemble the output RecordBatch.
     let n_groups = groups.len();
     let m_keys = key_components.len();
-    let mut arrays: Vec<ArrayRef> =
-        Vec::with_capacity(m_keys + aggregate.aggregates.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(m_keys + aggregate.aggregates.len());
 
     // Columns 0..M: one per group-by column, decoded from the packed i64 key.
     let key_arrays = build_key_arrays(&groups, &key_components)?;
@@ -759,8 +813,11 @@ pub fn execute_groupby(
     // Columns M..M+N: one per aggregate, taken from the corresponding
     // accumulator.
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
-        let out_field =
-            aggregate.output_schema.fields.get(m_keys + i).ok_or_else(|| {
+        let out_field = aggregate
+            .output_schema
+            .fields
+            .get(m_keys + i)
+            .ok_or_else(|| {
                 BoltError::Other(format!(
                     "execute_groupby: output_schema missing field for aggregate index {}",
                     i
@@ -771,9 +828,8 @@ pub fn execute_groupby(
     }
 
     let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
-    RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-        BoltError::Other(format!("failed to build GROUP BY RecordBatch: {e}"))
-    })
+    RecordBatch::try_new(arrow_schema, arrays)
+        .map_err(|e| BoltError::Other(format!("failed to build GROUP BY RecordBatch: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -826,19 +882,18 @@ fn launch_keys_kernel(
         })
         .unwrap_or(false);
     let (spec_id, kernel_entry) = if want_rh {
-        ("groupby_keys_rh", crate::jit::hash_kernels::KEYS_KERNEL_RH_ENTRY)
+        (
+            "groupby_keys_rh",
+            crate::jit::hash_kernels::KEYS_KERNEL_RH_ENTRY,
+        )
     } else {
         ("groupby_keys", KEYS_KERNEL_ENTRY)
     };
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        spec_id.to_string(),
-        None,
-        || {
+    let module =
+        module_cache::get_or_build_module(module_path!(), spec_id.to_string(), None, || {
             let (ptx, _e) = compile_groupby_keys_kernel_dispatched()?;
             Ok(ptx)
-        },
-    )?;
+        })?;
     let function = module.function(kernel_entry)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
@@ -1190,7 +1245,12 @@ fn launch_decimal_agg_kernel(
     let overflowed = flag_pinned.as_slice().first().copied().unwrap_or(0) != 0;
     drop(flag_pinned);
     let _ = (
-        group_ptr, keys_ptr, input_ptr, acc_ptr, lock_ptr, sum_overflow_flag_ptr,
+        group_ptr,
+        keys_ptr,
+        input_ptr,
+        acc_ptr,
+        lock_ptr,
+        sum_overflow_flag_ptr,
         overflow_counter,
     );
     drop(lock_table);
@@ -1244,7 +1304,9 @@ enum AccDownload {
     /// [`crate::exec::welford::WelfordState::push`]. Numerically stable by
     /// construction (single-pass Welford, no `sum_sq - n*mean^2`
     /// cancellation).
-    Welford { states: Vec<crate::exec::welford::WelfordState> },
+    Welford {
+        states: Vec<crate::exec::welford::WelfordState>,
+    },
 }
 
 /// Compile + launch one aggregate kernel (or, for `Avg`, two), download its
@@ -1280,15 +1342,24 @@ fn run_one_aggregate(
     overflow_ptr: CUdeviceptr,
 ) -> BoltResult<AccDownload> {
     match agg {
-        AggregateExpr::Sum(expr)
-        | AggregateExpr::Min(expr)
-        | AggregateExpr::Max(expr) => {
+        AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
             let op = ReduceOp::from_agg(agg)?;
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
             run_typed_agg(
-                op, col_io, group_col, keys_table, batch, n_rows, k, k_u32, stream,
-                key_valid, cached_host_keys, any_input_has_validity, overflow_ptr,
+                op,
+                col_io,
+                group_col,
+                keys_table,
+                batch,
+                n_rows,
+                k,
+                k_u32,
+                stream,
+                key_valid,
+                cached_host_keys,
+                any_input_has_validity,
+                overflow_ptr,
             )
         }
 
@@ -1353,15 +1424,7 @@ fn run_one_aggregate(
             let col_name = bare_column_name(expr.as_ref())?;
             let col_io = resolve_input(inputs, col_name)?;
             run_welford_aggregate(
-                col_io,
-                group_col,
-                keys_table,
-                batch,
-                n_rows,
-                k,
-                k_u32,
-                stream,
-                key_valid,
+                col_io, group_col, keys_table, batch, n_rows, k, k_u32, stream, key_valid,
             )
         }
 
@@ -1530,12 +1593,8 @@ fn run_welford_aggregate(
     // The shared helper `load_input_column_as_f64_filtered` does exactly
     // that (drops rows whose key is NULL AND/OR whose value is NULL).
     let value_valid = column_null_mask(col_io, batch)?;
-    let values_f64 = load_input_column_as_f64_filtered(
-        col_io,
-        batch,
-        key_valid,
-        value_valid.as_deref(),
-    )?;
+    let values_f64 =
+        load_input_column_as_f64_filtered(col_io, batch, key_valid, value_valid.as_deref())?;
 
     // After load_input_column_as_f64_filtered, `values_f64.len()` is the
     // count of rows that survive BOTH key_valid AND value_valid. To match
@@ -1593,10 +1652,7 @@ fn run_welford_aggregate(
 
 /// Return the per-row validity mask for `col_io` in `batch`, or `None` if
 /// the column has no nulls (saves the per-row allocation in the hot path).
-fn column_null_mask(
-    col_io: &ColumnIO,
-    batch: &RecordBatch,
-) -> BoltResult<Option<Vec<bool>>> {
+fn column_null_mask(col_io: &ColumnIO, batch: &RecordBatch) -> BoltResult<Option<Vec<bool>>> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
             "aggregate input '{}' not present in table batch: {}",
@@ -1622,11 +1678,19 @@ enum FilteredKeys<'a> {
     /// per-query cached host image of that same column (bit-identical to a
     /// D2H of `group_col`) so the host-side overflow check can read the
     /// per-row group assignment without a device round-trip.
-    Borrowed { group_col: &'a GpuVec<i64>, host_keys: &'a [i64], n_rows: usize },
+    Borrowed {
+        group_col: &'a GpuVec<i64>,
+        host_keys: &'a [i64],
+        n_rows: usize,
+    },
     /// Freshly-uploaded smaller column applying a value-NULL filter on top
     /// of `key_valid`. The owned vec must live across the kernel launch.
     /// `host_keys` owns the matching host image used to build it.
-    Owned { group_col: GpuVec<i64>, host_keys: Vec<i64>, n_rows: usize },
+    Owned {
+        group_col: GpuVec<i64>,
+        host_keys: Vec<i64>,
+        n_rows: usize,
+    },
 }
 
 impl<'a> FilteredKeys<'a> {
@@ -1811,7 +1875,11 @@ fn prepare_filtered_keys<'a>(
     stream: &CudaStream,
 ) -> BoltResult<FilteredKeys<'a>> {
     if value_valid.is_none() {
-        return Ok(FilteredKeys::Borrowed { group_col, host_keys: cached_host_keys, n_rows });
+        return Ok(FilteredKeys::Borrowed {
+            group_col,
+            host_keys: cached_host_keys,
+            n_rows,
+        });
     }
 
     // Project `value_valid` (indexed by ORIGINAL row position) through the
@@ -1848,7 +1916,11 @@ fn prepare_filtered_keys<'a>(
     // after this upload without a separate barrier. Replaces the prior
     // synchronous `GpuVec::from_slice` here.
     let owned = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
-    Ok(FilteredKeys::Owned { group_col: owned, host_keys: filtered, n_rows: filtered_n })
+    Ok(FilteredKeys::Owned {
+        group_col: owned,
+        host_keys: filtered,
+        n_rows: filtered_n,
+    })
 }
 
 /// Common path for SUM/MIN/MAX. Uploads the typed input column, allocates a
@@ -1964,10 +2036,11 @@ fn run_typed_agg(
             let widened_dtype = sum_output_dtype(DataType::Int32);
             let widen_to_i64 = matches!(op, ReduceOp::Sum) && widened_dtype == DataType::Int64;
             if widen_to_i64 {
-                let host: Vec<i64> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref())
-                    .into_iter()
-                    .map(|v| v as i64)
-                    .collect();
+                let host: Vec<i64> =
+                    collect_filtered_primitive(pa, key_valid, value_valid.as_deref())
+                        .into_iter()
+                        .map(|v| v as i64)
+                        .collect();
                 debug_assert_eq!(host.len(), n);
                 // V-10 (grouped): error on per-group i64 overflow before the
                 // wrapping u64 atomic can silently produce a wrong answer,
@@ -1994,7 +2067,8 @@ fn run_typed_agg(
                 )?;
                 Ok(AccDownload::I64(download_pinned_i64(&acc, stream)?))
             } else {
-                let host: Vec<i32> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+                let host: Vec<i32> =
+                    collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
                 debug_assert_eq!(host.len(), n);
                 let input_gpu = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
                 let init: Vec<i32> = vec![identity_i32(op); k];
@@ -2117,8 +2191,7 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<arrow_array::Date32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Date32"))?;
-            let host: Vec<i32> =
-                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            let host: Vec<i32> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i32> = vec![identity_i32(op); k];
@@ -2149,8 +2222,12 @@ fn run_typed_agg(
                     col_io.name
                 )));
             }
-            let host: Vec<i64> =
-                collect_filtered_timestamp(arr.as_ref(), &col_io.name, key_valid, value_valid.as_deref())?;
+            let host: Vec<i64> = collect_filtered_timestamp(
+                arr.as_ref(),
+                &col_io.name,
+                key_valid,
+                value_valid.as_deref(),
+            )?;
             debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
@@ -2307,7 +2384,11 @@ fn collect_filtered_timestamp(
     }
     match arr.data_type() {
         ArrowDataType::Timestamp(ArrowTimeUnit::Second, _) => {
-            collect_ts!(TimestampSecondType, arrow_array::TimestampSecondArray, "TimestampSecond")
+            collect_ts!(
+                TimestampSecondType,
+                arrow_array::TimestampSecondArray,
+                "TimestampSecond"
+            )
         }
         ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, _) => collect_ts!(
             TimestampMillisecondType,
@@ -2513,7 +2594,11 @@ fn run_typed_agg_native_validity(
             let _ = validity_gpu;
             Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "native-validity dispatch reached unsupported dtype {:?} (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2593,7 +2678,11 @@ fn load_input_column_as_f64_filtered(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "AVG input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2657,7 +2746,11 @@ fn build_key_arrays(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype
@@ -2798,7 +2891,11 @@ fn build_agg_array(
         // `minmax_decimal128_from_batch` / `decimal_sum_from_batch` guards.
         (
             AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_),
-            AccDownload::Decimal128 { acc, precision, scale },
+            AccDownload::Decimal128 {
+                acc,
+                precision,
+                scale,
+            },
         ) => {
             let (out_p, out_s) = match out_field.dtype {
                 DataType::Decimal128(p, s) => (p, s),
@@ -2828,28 +2925,26 @@ fn build_agg_array(
         }
         (AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_), other) => {
             let scalars = match other {
-                AccDownload::I32(host) => Scalars::I32(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
-                AccDownload::I64(host) => Scalars::I64(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
-                AccDownload::F32(host) => Scalars::F32(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
-                AccDownload::F64(host) => Scalars::F64(
-                    groups.iter().map(|(_, slot)| host[*slot]).collect(),
-                ),
+                AccDownload::I32(host) => {
+                    Scalars::I32(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
+                AccDownload::I64(host) => {
+                    Scalars::I64(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
+                AccDownload::F32(host) => {
+                    Scalars::F32(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
+                AccDownload::F64(host) => {
+                    Scalars::F64(groups.iter().map(|(_, slot)| host[*slot]).collect())
+                }
                 AccDownload::Avg { .. } => {
                     return Err(BoltError::Other(
-                        "internal: AVG accumulator passed to non-AVG aggregate"
-                            .into(),
+                        "internal: AVG accumulator passed to non-AVG aggregate".into(),
                     ))
                 }
                 AccDownload::Welford { .. } => {
                     return Err(BoltError::Other(
-                        "internal: Welford accumulator passed to SUM/MIN/MAX aggregate"
-                            .into(),
+                        "internal: Welford accumulator passed to SUM/MIN/MAX aggregate".into(),
                     ))
                 }
                 // Decimal128 is handled by the dedicated arm above; reaching
@@ -2896,8 +2991,7 @@ fn build_agg_array(
             | AggregateExpr::StddevSamp(_),
             _,
         ) => Err(BoltError::Other(
-            "internal: VAR/STDDEV aggregate received a non-Welford accumulator"
-                .into(),
+            "internal: VAR/STDDEV aggregate received a non-Welford accumulator".into(),
         )),
         (_, _) => Err(BoltError::Other(
             "internal: aggregate / accumulator-variant mismatch".into(),
@@ -2975,12 +3069,8 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
     match (scalars, out_dtype) {
         (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
         (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
-        (Scalars::F32(v), DataType::Float32) => {
-            Ok(Arc::new(Float32Array::from(v)) as ArrayRef)
-        }
-        (Scalars::F64(v), DataType::Float64) => {
-            Ok(Arc::new(Float64Array::from(v)) as ArrayRef)
-        }
+        (Scalars::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
+        (Scalars::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
 
         // Cross-dtype paths the scalar reducer also accepts.
         (Scalars::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
@@ -3024,25 +3114,25 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
 /// timezone. Mirror of `gpu_compact::timestamp_array_from_i64`, kept local so
 /// `pack_array` can rebuild the grouped MIN/MAX result with the correct unit +
 /// tz.
-fn timestamp_array_from_i64(
-    host: Vec<i64>,
-    unit: TimeUnit,
-    tz: Option<&'static str>,
-) -> ArrayRef {
+fn timestamp_array_from_i64(host: Vec<i64>, unit: TimeUnit, tz: Option<&'static str>) -> ArrayRef {
     let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
     match unit {
-        TimeUnit::Second => Arc::new(
-            arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
-        TimeUnit::Millisecond => Arc::new(
-            arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
-        TimeUnit::Microsecond => Arc::new(
-            arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
-        TimeUnit::Nanosecond => Arc::new(
-            arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned),
-        ) as ArrayRef,
+        TimeUnit::Second => {
+            Arc::new(arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
+        TimeUnit::Millisecond => {
+            Arc::new(arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
+        TimeUnit::Microsecond => {
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
+        TimeUnit::Nanosecond => {
+            Arc::new(arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned))
+                as ArrayRef
+        }
     }
 }
 
@@ -3201,9 +3291,7 @@ pub(crate) mod utf8_groupby {
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
     use crate::error::{BoltError, BoltResult};
-    use crate::plan::logical_plan::{
-        AggregateExpr, DataType, Expr, Field, Schema,
-    };
+    use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
     use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
 
     /// Above this distinct-string count we abandon the i32-dict-code GPU path
@@ -3274,10 +3362,7 @@ pub(crate) mod utf8_groupby {
     /// for any other Arrow type (i.e. this column is not a string key).
     fn as_string_array(arr: &dyn Array) -> Option<StringArray> {
         match arr.data_type() {
-            ArrowDataType::Utf8 => arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .cloned(),
+            ArrowDataType::Utf8 => arr.as_any().downcast_ref::<StringArray>().cloned(),
             ArrowDataType::Dictionary(_, val_t) if val_t.as_ref() == &ArrowDataType::Utf8 => {
                 // Materialise the dictionary into a flat StringArray.
                 let casted = arrow::compute::cast(arr, &ArrowDataType::Utf8).ok()?;
@@ -3412,8 +3497,7 @@ pub(crate) mod utf8_groupby {
         let m_keys = aggregate.group_by.len();
         if aggregate.output_schema.fields.len() < m_keys {
             return Err(BoltError::Other(
-                "execute_groupby (utf8): output_schema has fewer fields than GROUP BY keys"
-                    .into(),
+                "execute_groupby (utf8): output_schema has fewer fields than GROUP BY keys".into(),
             ));
         }
         let mut new_fields: Vec<Field> = aggregate.output_schema.fields.clone();
@@ -3460,7 +3544,12 @@ pub(crate) mod utf8_groupby {
         let int_result = super::execute_groupby(&rewritten_plan, &new_batch)?;
 
         // --- Reconstruct: map the Int32 key code columns back to Utf8. ---
-        reconstruct(&int_result, &dicts, &orig_key_fields, &aggregate.output_schema)
+        reconstruct(
+            &int_result,
+            &dicts,
+            &orig_key_fields,
+            &aggregate.output_schema,
+        )
     }
 
     /// Build a new `RecordBatch` identical to `table_batch` except that each
@@ -3698,11 +3787,15 @@ pub(crate) mod utf8_groupby {
         // Compute each aggregate host-side into per-output-row buffers.
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(aggregate.aggregates.len());
         for (ai, agg) in aggregate.aggregates.iter().enumerate() {
-            let out_field = aggregate.output_schema.fields.get(m_keys + ai).ok_or_else(|| {
-                BoltError::Other(format!(
+            let out_field = aggregate
+                .output_schema
+                .fields
+                .get(m_keys + ai)
+                .ok_or_else(|| {
+                    BoltError::Other(format!(
                     "execute_groupby (utf8 host): output_schema missing field for aggregate {ai}"
                 ))
-            })?;
+                })?;
             let arr = compute_host_aggregate(
                 agg,
                 aggregate,
@@ -3781,7 +3874,13 @@ pub(crate) mod utf8_groupby {
                 ArrowDataType::Int32 => {
                     let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
                     (0..a.len())
-                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) })
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i) as i64)
+                            }
+                        })
                         .collect()
                 }
                 ArrowDataType::Int64 => {
@@ -3810,7 +3909,7 @@ pub(crate) mod utf8_groupby {
     /// Arrow array in the SORTED output-row order given by `remap`.
     fn compute_host_aggregate(
         agg: &AggregateExpr,
-        aggregate: &AggregateSpec,
+        _aggregate: &AggregateSpec,
         table_batch: &RecordBatch,
         group_of_row: &[usize],
         remap: &[usize],
@@ -3835,7 +3934,10 @@ pub(crate) mod utf8_groupby {
         // unused and valid is always true.
         let (vals, valid): (Vec<f64>, Vec<bool>) = match &col_name {
             Some(name) => load_f64_column(table_batch, name)?,
-            None => (vec![0.0; group_of_row.len()], vec![true; group_of_row.len()]),
+            None => (
+                vec![0.0; group_of_row.len()],
+                vec![true; group_of_row.len()],
+            ),
         };
 
         match agg {
@@ -3978,10 +4080,7 @@ pub(crate) mod utf8_groupby {
 
     /// Load a numeric column as host `(values_f64, validity)`. Supports the
     /// integer / float value dtypes the GPU group-by aggregates accept.
-    fn load_f64_column(
-        batch: &RecordBatch,
-        name: &str,
-    ) -> BoltResult<(Vec<f64>, Vec<bool>)> {
+    fn load_f64_column(batch: &RecordBatch, name: &str) -> BoltResult<(Vec<f64>, Vec<bool>)> {
         let idx = batch.schema().index_of(name).map_err(|e| {
             BoltError::Plan(format!(
                 "execute_groupby (utf8 host): aggregate input '{name}' not in batch: {e}"
@@ -4000,7 +4099,10 @@ pub(crate) mod utf8_groupby {
                 (0..n).map(|i| a.value(i) as f64).collect()
             }
             ArrowDataType::Float32 => {
-                let a = arr.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap();
                 (0..n).map(|i| a.value(i) as f64).collect()
             }
             ArrowDataType::Float64 => {
@@ -4047,7 +4149,10 @@ pub(crate) mod utf8_groupby {
             AggregateSpec {
                 inputs: inputs
                     .into_iter()
-                    .map(|(n, d)| ColumnIO { name: n.to_string(), dtype: d })
+                    .map(|(n, d)| ColumnIO {
+                        name: n.to_string(),
+                        dtype: d,
+                    })
                     .collect(),
                 group_by,
                 aggregates,
@@ -4065,16 +4170,13 @@ pub(crate) mod utf8_groupby {
         /// non-null strings, and encodes each row to its code (NULL preserved).
         #[test]
         fn lex_dict_build_is_lex_ranked() {
-            let arr = StringArray::from(vec![
-                Some("US"),
-                Some("EU"),
-                Some("US"),
-                None,
-                Some("AU"),
-            ]);
+            let arr = StringArray::from(vec![Some("US"), Some("EU"), Some("US"), None, Some("AU")]);
             let (dict, codes) = LexDict::build(&arr);
             // Distinct sorted: AU, EU, US => codes 0, 1, 2.
-            assert_eq!(dict.decode, vec!["AU".to_string(), "EU".into(), "US".into()]);
+            assert_eq!(
+                dict.decode,
+                vec!["AU".to_string(), "EU".into(), "US".into()]
+            );
             assert_eq!(
                 codes,
                 vec![Some(2), Some(1), Some(2), None, Some(0)],
@@ -4106,8 +4208,7 @@ pub(crate) mod utf8_groupby {
         /// key. Groups emit in lex order (EU, US) with the correct sums.
         #[test]
         fn host_fallback_sum_by_string_key() {
-            let s = Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US"]))
-                as ArrayRef;
+            let s = Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US"])) as ArrayRef;
             let x = Arc::new(Int64Array::from(vec![1i64, 10, 2, 20, 3])) as ArrayRef;
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("s", ArrowDataType::Utf8, true),
@@ -4132,11 +4233,7 @@ pub(crate) mod utf8_groupby {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
-            let sums = out
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let sums = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
             // Lex order: EU first (10+20=30), then US (1+2+3=6).
             assert_eq!(keys.value(0), "EU");
             assert_eq!(sums.value(0), 30);
@@ -4180,11 +4277,7 @@ pub(crate) mod utf8_groupby {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
-            let cnt = out
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let cnt = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
             // NULL sorts first, then 'a', then 'b'.
             assert!(keys.is_null(0), "NULL group sorts first");
             assert_eq!(cnt.value(0), 2, "two NULL-key rows");
@@ -4199,15 +4292,13 @@ pub(crate) mod utf8_groupby {
         #[test]
         fn reconstruct_decodes_codes_to_strings() {
             // Integer-keyed result: codes [0, 1, NULL] + a SUM column.
-            let codes = Arc::new(Int32Array::from(vec![Some(0), Some(1), None]))
-                as ArrayRef;
+            let codes = Arc::new(Int32Array::from(vec![Some(0), Some(1), None])) as ArrayRef;
             let sums = Arc::new(Int64Array::from(vec![5i64, 7, 9])) as ArrayRef;
             let int_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("s", ArrowDataType::Int32, true),
                 ArrowField::new("sum_x", ArrowDataType::Int64, true),
             ]));
-            let int_result =
-                RecordBatch::try_new(int_schema, vec![codes, sums]).unwrap();
+            let int_result = RecordBatch::try_new(int_schema, vec![codes, sums]).unwrap();
 
             let dict = LexDict {
                 decode: vec!["AU".to_string(), "EU".to_string()],
@@ -4230,11 +4321,7 @@ pub(crate) mod utf8_groupby {
             assert_eq!(keys.value(1), "EU");
             assert!(keys.is_null(2), "NULL code -> NULL string");
             // Aggregate column carried through unchanged.
-            let sums = out
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let sums = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
             assert_eq!(sums.value(2), 9);
             // Output schema's key field is restored to Utf8.
             assert_eq!(out.schema().field(0).data_type(), &ArrowDataType::Utf8);
@@ -4249,7 +4336,7 @@ pub(crate) mod utf8_groupby {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod tests {
@@ -4265,9 +4352,7 @@ mod tests {
     /// bitmaps (used by the H1 NULL tests below).
     fn one_col_batch(name: &str, arr: ArrayRef) -> RecordBatch {
         let dt = arr.data_type().clone();
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            name, dt, true,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(name, dt, true)]));
         RecordBatch::try_new(schema, vec![arr]).expect("one-col batch")
     }
 
@@ -4356,8 +4441,7 @@ mod tests {
         };
         assert!(column_null_mask(&io, &batch).unwrap().is_none());
 
-        let arr2: ArrayRef =
-            Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
+        let arr2: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
         let batch2 = one_col_batch("v", arr2);
         let mask = column_null_mask(&io, &batch2).unwrap().expect("mask");
         assert_eq!(mask, vec![true, false, true]);
@@ -4374,20 +4458,14 @@ mod tests {
         let arr = Int32Array::from(vec![Some(1i32), None, Some(3), Some(4)]);
         // value_valid derived from arrow: [T, F, T, T]
         let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
-        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
-            &arr,
-            None,
-            Some(&vv),
-        );
+        let out =
+            collect_filtered_primitive::<arrow_array::types::Int32Type>(&arr, None, Some(&vv));
         assert_eq!(out, vec![1, 3, 4]);
 
         // With a key_valid that ALSO drops row 0, only rows 2 and 3 survive.
         let kv = vec![false, true, true, true];
-        let out2 = collect_filtered_primitive::<arrow_array::types::Int32Type>(
-            &arr,
-            Some(&kv),
-            Some(&vv),
-        );
+        let out2 =
+            collect_filtered_primitive::<arrow_array::types::Int32Type>(&arr, Some(&kv), Some(&vv));
         assert_eq!(out2, vec![3, 4]);
     }
 
@@ -4397,12 +4475,10 @@ mod tests {
     fn filter_iter_to_f64_drops_and_casts() {
         let arr = Int32Array::from(vec![Some(2i32), None, Some(4), Some(6)]);
         let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
-        let out = filter_iter_to_f64::<arrow_array::types::Int32Type, _>(
-            &arr,
-            None,
-            Some(&vv),
-            |v| v as f64,
-        );
+        let out =
+            filter_iter_to_f64::<arrow_array::types::Int32Type, _>(&arr, None, Some(&vv), |v| {
+                v as f64
+            });
         assert_eq!(out, vec![2.0f64, 4.0, 6.0]);
     }
 
@@ -4441,16 +4517,8 @@ mod tests {
             .expect("execute");
         let out = h.record_batch();
         assert_eq!(out.num_rows(), 3);
-        let ks = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let ss = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ss = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         // Build a host-side expected map and compare.
         let mut expected = std::collections::HashMap::<i32, i64>::new();
         for v in 0..12i64 {
@@ -4459,13 +4527,7 @@ mod tests {
         for i in 0..3 {
             let k = ks.value(i);
             let s = ss.value(i);
-            assert_eq!(
-                Some(&s),
-                expected.get(&k).map(|x| x),
-                "key={} sum={}",
-                k,
-                s
-            );
+            assert_eq!(Some(&s), expected.get(&k).map(|x| x), "key={} sum={}", k, s);
         }
     }
 
@@ -4560,11 +4622,7 @@ mod tests {
         let out = h.record_batch();
         assert_eq!(out.num_rows(), 2);
 
-        let ks = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let avgs = out
             .column(1)
             .as_any()
@@ -4624,16 +4682,8 @@ mod tests {
         let out = h.record_batch();
         assert_eq!(out.num_rows(), 2);
 
-        let ks = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let cs = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let cs = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
 
         let mut expected_counts = std::collections::HashMap::<i32, i64>::new();
         for (k, v) in keys.iter().zip(vals.iter()) {
@@ -4647,7 +4697,6 @@ mod tests {
             assert_eq!(c, expected_counts[&k], "k={k}");
         }
     }
-
 
     // ----- v0.7: GROUP BY VAR/STDDEV finaliser (host-only) ---------------
     //
@@ -4668,13 +4717,8 @@ mod tests {
         // groups: one entry, key = 7, lives at slot 0.
         let groups = vec![(7i64, 0usize)];
         let out_field = Field::new("var_pop", DataType::Float64, true);
-        let arr = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::VarPop,
-            &out_field,
-        )
-        .expect("finalize ok");
+        let arr = finalize_welford_array(&states, &groups, WelfordOutKind::VarPop, &out_field)
+            .expect("finalize ok");
         let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(a.len(), 1);
         // var_pop([1,2,3]) = 2/3
@@ -4693,13 +4737,8 @@ mod tests {
         states[0].push(42.0);
         let groups = vec![(0i64, 0usize)];
         let out_field = Field::new("var_samp", DataType::Float64, true);
-        let arr = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::VarSamp,
-            &out_field,
-        )
-        .expect("finalize ok");
+        let arr = finalize_welford_array(&states, &groups, WelfordOutKind::VarSamp, &out_field)
+            .expect("finalize ok");
         let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(a.is_null(0), "VAR_SAMP(single) must be SQL NULL");
     }
@@ -4712,13 +4751,8 @@ mod tests {
         let states = vec![WelfordState::empty(); 1];
         let groups = vec![(0i64, 0usize)];
         let out_field = Field::new("var_pop", DataType::Float64, true);
-        let arr = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::VarPop,
-            &out_field,
-        )
-        .expect("finalize ok");
+        let arr = finalize_welford_array(&states, &groups, WelfordOutKind::VarPop, &out_field)
+            .expect("finalize ok");
         let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(a.is_null(0), "VAR_POP(empty) must be SQL NULL");
     }
@@ -4734,13 +4768,8 @@ mod tests {
         states[0].push(3.0);
         let groups = vec![(0i64, 0usize)];
         let out_field = Field::new("stddev_pop", DataType::Float64, true);
-        let arr = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::StddevPop,
-            &out_field,
-        )
-        .expect("finalize ok");
+        let arr = finalize_welford_array(&states, &groups, WelfordOutKind::StddevPop, &out_field)
+            .expect("finalize ok");
         let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         let expected = (2.0_f64 / 3.0).sqrt();
         assert!((a.value(0) - expected).abs() < 1e-12);
@@ -4757,13 +4786,8 @@ mod tests {
         states[0].push(3.0);
         let groups = vec![(0i64, 0usize)];
         let out_field = Field::new("stddev_samp", DataType::Float64, true);
-        let arr = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::StddevSamp,
-            &out_field,
-        )
-        .expect("finalize ok");
+        let arr = finalize_welford_array(&states, &groups, WelfordOutKind::StddevSamp, &out_field)
+            .expect("finalize ok");
         let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!((a.value(0) - 1.0).abs() < 1e-12);
         assert!(!a.is_null(0));
@@ -4787,13 +4811,8 @@ mod tests {
         // slot 3: empty -> NULL
         let groups = vec![(10i64, 0usize), (20i64, 2usize), (30i64, 3usize)];
         let out_field = Field::new("var_pop", DataType::Float64, true);
-        let arr = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::VarPop,
-            &out_field,
-        )
-        .expect("finalize ok");
+        let arr = finalize_welford_array(&states, &groups, WelfordOutKind::VarPop, &out_field)
+            .expect("finalize ok");
         let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(a.len(), 3);
         assert!((a.value(0) - (2.0 / 3.0)).abs() < 1e-12);
@@ -4811,12 +4830,7 @@ mod tests {
         let states = vec![WelfordState::empty(); 1];
         let groups = vec![(0i64, 0usize)];
         let out_field = Field::new("bad", DataType::Int64, true);
-        let r = finalize_welford_array(
-            &states,
-            &groups,
-            WelfordOutKind::VarPop,
-            &out_field,
-        );
+        let r = finalize_welford_array(&states, &groups, WelfordOutKind::VarPop, &out_field);
         assert!(r.is_err(), "non-Float64 output dtype must be rejected");
     }
 
@@ -4840,7 +4854,10 @@ mod tests {
             &spill,
             BoltError::Other(msg) if msg.starts_with(PARTITION_REDUCE_SPILL_PREFIX)
         );
-        assert!(is_spill, "spill error must match the soft-miss sentinel prefix");
+        assert!(
+            is_spill,
+            "spill error must match the soft-miss sentinel prefix"
+        );
 
         // The two-key AVG variant uses a different trailing detail but the
         // same prefix — still recognised.
@@ -4867,8 +4884,8 @@ mod tests {
     /// i32-normalized accumulator) as a `Date32Array`.
     #[test]
     fn pack_array_rebuilds_date32() {
-        let arr = pack_array(DataType::Date32, Scalars::I32(vec![19_000, 19_010]))
-            .expect("date32 pack");
+        let arr =
+            pack_array(DataType::Date32, Scalars::I32(vec![19_000, 19_010])).expect("date32 pack");
         let d = arr
             .as_any()
             .downcast_ref::<arrow_array::Date32Array>()
@@ -4931,8 +4948,7 @@ mod tests {
             Some(30),
         ]));
         let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
-        let out = collect_filtered_timestamp(arr.as_ref(), "ts", None, Some(&vv))
-            .expect("extract");
+        let out = collect_filtered_timestamp(arr.as_ref(), "ts", None, Some(&vv)).expect("extract");
         assert_eq!(out, vec![10, 30]);
     }
 
@@ -5036,7 +5052,14 @@ mod tests {
         let key_col_gpu = GpuVec::<i64>::from_slice_async(keys, stream.raw())?;
         let overflow_counter = GpuVec::<u32>::zeros_async(1, stream.raw())?;
         let overflow_ptr: CUdeviceptr = overflow_counter.device_ptr();
-        launch_keys_kernel(&key_col_gpu, &mut keys_table, n_rows, k_u32, &stream, overflow_ptr)?;
+        launch_keys_kernel(
+            &key_col_gpu,
+            &mut keys_table,
+            n_rows,
+            k_u32,
+            &stream,
+            overflow_ptr,
+        )?;
 
         let input_gpu = GpuVec::<i128>::from_slice_async(vals, stream.raw())?;
         let init: Vec<i128> = vec![identity; k];
@@ -5097,13 +5120,11 @@ mod tests {
         let keys = [1i64, 1, 1, 2, 2];
         let vals = [-300i128, 50, -1000, 7, -7];
 
-        let (mn, _) =
-            gpu_grouped_decimal(GroupedDecimalOp::Min, &keys, &vals, i128::MAX).unwrap();
+        let (mn, _) = gpu_grouped_decimal(GroupedDecimalOp::Min, &keys, &vals, i128::MAX).unwrap();
         assert_eq!(mn[&1], -1000);
         assert_eq!(mn[&2], -7);
 
-        let (mx, _) =
-            gpu_grouped_decimal(GroupedDecimalOp::Max, &keys, &vals, i128::MIN).unwrap();
+        let (mx, _) = gpu_grouped_decimal(GroupedDecimalOp::Max, &keys, &vals, i128::MIN).unwrap();
         assert_eq!(mx[&1], 50);
         assert_eq!(mx[&2], 7);
     }
@@ -5131,6 +5152,9 @@ mod tests {
         let keys = [9i64, 9];
         let vals = [i128::MAX, 1];
         let (_m, of) = gpu_grouped_decimal(GroupedDecimalOp::Sum, &keys, &vals, 0).unwrap();
-        assert!(of, "i128 overflow must raise the device overflow flag, not wrap");
+        assert!(
+            of,
+            "i128 overflow must raise the device overflow flag, not wrap"
+        );
     }
 }

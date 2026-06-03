@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tier-2 hash-partitioned GROUP BY executor (top-level shim).
 //!
@@ -27,10 +27,7 @@ use crate::plan::physical_plan::PhysicalPlan;
 
 /// Try the Tier-2 fast path. Returns `None` on any precondition miss so
 /// the caller falls through to the next strategy.
-pub fn try_execute(
-    plan: &PhysicalPlan,
-    batch: &RecordBatch,
-) -> Option<BoltResult<RecordBatch>> {
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
         _ => return None,
@@ -204,7 +201,11 @@ mod stage4_tests {
 
         // Output rows are (k, sum_v). Verify by index lookup.
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let vs = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let vs = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i);
             let v = vs.value(i);

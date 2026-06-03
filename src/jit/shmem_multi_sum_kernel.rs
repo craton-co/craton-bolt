@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-block shared-memory GROUP BY kernel with **multiple SUM aggregates**
 //! computed in a single pass (Tier-1 extension).
@@ -245,11 +245,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
     // %rd20      = keys  pointer
     // %rd30+j    = vals_j pointer
     // %rd40+j    = out_j  pointer
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd20, [{entry}_param_0];"
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tld.param.u64 %rd20, [{entry}_param_0];").map_err(write_err)?;
     writeln!(ptx, "\tcvta.to.global.u64 %rd20, %rd20;").map_err(write_err)?;
     for j in 0..n_vals {
         let pidx = 1 + j;
@@ -260,12 +256,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
             p = pidx
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tcvta.to.global.u64 %rd{rd}, %rd{rd};",
-            rd = 30 + j
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd{rd}, %rd{rd};", rd = 30 + j).map_err(write_err)?;
     }
     for j in 0..n_vals {
         let pidx = 1 + n_vals + j;
@@ -276,12 +267,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
             p = pidx
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tcvta.to.global.u64 %rd{rd}, %rd{rd};",
-            rd = 40 + j
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tcvta.to.global.u64 %rd{rd}, %rd{rd};", rd = 40 + j).map_err(write_err)?;
     }
     writeln!(ptx).map_err(write_err)?;
 
@@ -291,12 +277,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
     // %r10 = zero-loop index (start at threadIdx.x, stride BLOCK_THREADS).
     writeln!(ptx, "\tmov.u32 %r10, %r2;").map_err(write_err)?;
     writeln!(ptx, "ZERO_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p0, %r10, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p0, %r10, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p0 bra ZERO_DONE;").map_err(write_err)?;
     // 8-byte slot offset once, reused for every accumulator.
     writeln!(ptx, "\tmul.wide.u32 %rd50, %r10, 8;").map_err(write_err)?;
@@ -309,23 +290,13 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
             base = 10 + j
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\tst.shared.u64 [%rd{rd}], 0;",
-            rd = 51 + j
-        )
-        .map_err(write_err)?;
+        writeln!(ptx, "\tst.shared.u64 [%rd{rd}], 0;", rd = 51 + j).map_err(write_err)?;
     }
     // block_set[%r10] = 0
     writeln!(ptx, "\tcvt.u64.u32 %rd60, %r10;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd61, %rd9, %rd60;").map_err(write_err)?;
     writeln!(ptx, "\tst.shared.u8 [%rd61], 0;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r10, %r10, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r10, %r10, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra ZERO_TOP;").map_err(write_err)?;
     writeln!(ptx, "ZERO_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
@@ -363,12 +334,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
     }
 
     // Overflow check on key (unsigned comparison — see single-SUM notes).
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p2, %r12, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
     // Shared-mem accumulate: 8-byte offset reused across every accumulator.
@@ -431,12 +397,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
     // ---------------------------------------------------------------------
     writeln!(ptx, "\tmov.u32 %r20, %r2;").map_err(write_err)?;
     writeln!(ptx, "MERGE_TOP:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tsetp.ge.u32 %p3, %r20, {bg};",
-        bg = block_groups
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.u32 %p3, %r20, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p3 bra MERGE_DONE;").map_err(write_err)?;
 
     // Load block_set[%r20].
@@ -483,12 +444,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
     }
 
     writeln!(ptx, "MERGE_NEXT:").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tadd.u32 %r20, %r20, {bt};",
-        bt = block_threads
-    )
-    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
     writeln!(ptx, "\tbra MERGE_TOP;").map_err(write_err)?;
     writeln!(ptx, "MERGE_DONE:").map_err(write_err)?;
 
@@ -610,8 +566,14 @@ mod tests {
     #[test]
     fn ptx_header_matches_project_conventions() {
         for (n, ptx) in compile_all() {
-            assert!(ptx.contains(".version 7.5"), "n_vals={n}: missing .version 7.5");
-            assert!(ptx.contains(".target sm_70"), "n_vals={n}: missing .target sm_70");
+            assert!(
+                ptx.contains(".version 7.5"),
+                "n_vals={n}: missing .version 7.5"
+            );
+            assert!(
+                ptx.contains(".target sm_70"),
+                "n_vals={n}: missing .target sm_70"
+            );
             assert!(
                 ptx.contains(".address_size 64"),
                 "n_vals={n}: missing .address_size 64"

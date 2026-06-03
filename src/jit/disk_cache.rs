@@ -314,8 +314,14 @@ fn arch_salt_token() -> String {
     use crate::jit::ptx_gen::{PTX_TARGET, PTX_VERSION};
     // `.target sm_70` -> "sm_70"; `.version 7.5` -> "7.5". Fall back to the
     // whole trimmed string if there's no whitespace.
-    let arch = PTX_TARGET.rsplit(char::is_whitespace).next().unwrap_or(PTX_TARGET);
-    let isa = PTX_VERSION.rsplit(char::is_whitespace).next().unwrap_or(PTX_VERSION);
+    let arch = PTX_TARGET
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or(PTX_TARGET);
+    let isa = PTX_VERSION
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or(PTX_VERSION);
     let mut s = format!("arch_{arch}_isa_{isa}");
     // Sanitise to the `valid_key` charset so the salt can never introduce a
     // path separator / unsafe byte into the final cache key.
@@ -1382,7 +1388,9 @@ mod tests {
     fn hash_to_key_is_fixed_width_lowercase_hex() {
         let k = hash_to_key(0, 0);
         assert_eq!(k.len(), 32);
-        assert!(k.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(k
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
         let k2 = hash_to_key(u64::MAX, u64::MAX);
         assert_eq!(k2, "ffffffffffffffffffffffffffffffff");
     }
@@ -1540,7 +1548,12 @@ mod tests {
         // arch token (`arch_sm_70_isa_7.5` today) is folded in between the
         // crate version and the optional fingerprint.
         let arch = arch_salt_token();
-        let base = format!("cg{}-v{}-{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"), arch);
+        let base = format!(
+            "cg{}-v{}-{}",
+            CODEGEN_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            arch
+        );
         let with_fp_a = format!("{base}-fp{}", "aaaa1111");
         let with_fp_b = format!("{base}-fp{}", "bbbb2222");
         // A fingerprint changes the salt vs. no fingerprint...
@@ -1552,7 +1565,10 @@ mod tests {
         // salt must be consistent with codegen_salt()'s documented shape.
         let live = codegen_salt();
         let cg_v = format!("cg{}-v{}", CODEGEN_VERSION, env!("CARGO_PKG_VERSION"));
-        assert!(live.starts_with(&cg_v), "live salt must start with cgN-vX.Y.Z");
+        assert!(
+            live.starts_with(&cg_v),
+            "live salt must start with cgN-vX.Y.Z"
+        );
         assert!(
             live.contains(&arch),
             "live salt must fold in the PTX target arch token"
@@ -1933,10 +1949,10 @@ mod tests {
             "a\\b",
             "/etc/passwd",
             "C:\\windows\\system32",
-            "a:b",            // Windows ADS / drive separator
-            "a\0b",           // embedded NUL
-            "foo bar",        // space
-            "scalar_agg::x",  // the old `::` separator must NOT pass
+            "a:b",           // Windows ADS / drive separator
+            "a\0b",          // embedded NUL
+            "foo bar",       // space
+            "scalar_agg::x", // the old `::` separator must NOT pass
         ] {
             assert!(!valid_key(bad), "key must be rejected: {bad:?}");
         }
@@ -2013,10 +2029,7 @@ mod tests {
             ("scalar_agg::x", "old `::` separator"),
         ];
         for (bad, why) in rejected {
-            assert!(
-                !valid_key(bad),
-                "key {bad:?} must be rejected ({why})"
-            );
+            assert!(!valid_key(bad), "key {bad:?} must be rejected ({why})");
             // The gate must also deny it a filesystem path everywhere it is
             // consulted: a fresh cache yields no entry_path / lookup / store.
             let dir = fresh_tempdir("vk_table");
@@ -2061,7 +2074,11 @@ mod tests {
         // Hex content keys and full composed disk keys always pass the gate.
         assert!(valid_key(hash_to_key(0, 0).as_str()));
         assert!(valid_key(hash_to_key(u64::MAX, u64::MAX).as_str()));
-        assert!(valid_key(&disk_key("bolt_reduce", 0xdead_beef, 0xcafe_babe)));
+        assert!(valid_key(&disk_key(
+            "bolt_reduce",
+            0xdead_beef,
+            0xcafe_babe
+        )));
     }
 
     /// `valid_key` accepts a long-but-legitimate key (a real composed disk
@@ -2081,7 +2098,10 @@ mod tests {
         // A long key that is ALL dots is still rejected (traversal guard wins
         // regardless of length).
         let long_dots: String = std::iter::repeat('.').take(64).collect();
-        assert!(!valid_key(&long_dots), "an all-dots run must be rejected at any length");
+        assert!(
+            !valid_key(&long_dots),
+            "an all-dots run must be rejected at any length"
+        );
     }
 
     /// A traversal key must produce no on-disk path: `lookup` misses and
@@ -2096,7 +2116,10 @@ mod tests {
             // Lookup must be a miss, never an out-of-root read.
             assert!(cache.lookup(bad).is_none(), "lookup must miss for {bad:?}");
             // Store must be a silent no-op (Ok, but nothing written).
-            assert!(cache.store(bad, "payload").is_ok(), "store must be Ok no-op for {bad:?}");
+            assert!(
+                cache.store(bad, "payload").is_ok(),
+                "store must be Ok no-op for {bad:?}"
+            );
         }
         // Nothing — no .ptx, no .tmp — landed in the cache root.
         let mut any = false;
@@ -2104,7 +2127,10 @@ mod tests {
             let _ = entry.expect("dirent");
             any = true;
         }
-        assert!(!any, "traversal store must not create any file in the cache root");
+        assert!(
+            !any,
+            "traversal store must not create any file in the cache root"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2173,7 +2199,11 @@ mod tests {
         let cache = DiskPtxCache::open(dir.clone()).expect("open");
         let key = hash_to_key(3, 3);
         // No header, no newline at all -> split_header returns None -> miss.
-        fs::write(dir.join(format!("{key}.ptx")), "raw legacy ptx with no header").expect("write");
+        fs::write(
+            dir.join(format!("{key}.ptx")),
+            "raw legacy ptx with no header",
+        )
+        .expect("write");
         assert!(cache.lookup(&key).is_none(), "headerless entry must miss");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2231,7 +2261,9 @@ mod tests {
         assert!(!cache.is_disk_enabled());
         let key = hash_to_key(9, 9);
         // store is a silent Ok no-op...
-        cache.store(&key, "payload").expect("store must be Ok no-op");
+        cache
+            .store(&key, "payload")
+            .expect("store must be Ok no-op");
         // ...nothing landed on disk...
         assert!(
             !dir.join(format!("{key}.ptx")).exists(),
@@ -2261,7 +2293,10 @@ mod tests {
             cache.is_disk_enabled(),
             "an owner-only 0o700 dir we own must pass the V-7 trust check"
         );
-        assert!(dir_is_trusted_unix(&dir), "trust check must accept 0o700 owner dir");
+        assert!(
+            dir_is_trusted_unix(&dir),
+            "trust check must accept 0o700 owner dir"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2302,7 +2337,11 @@ mod tests {
         let key = hash_to_key(0xfeed_face_dead_beef, 0x0bad_cafe_f00d_d00d);
         let ptx = "// win ptx\n.version 7.0\n.target sm_70\n";
         cache.store(&key, ptx).expect("store");
-        assert_eq!(cache.lookup(&key).as_deref(), Some(ptx), "round-trip after hardening");
+        assert_eq!(
+            cache.lookup(&key).as_deref(),
+            Some(ptx),
+            "round-trip after hardening"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

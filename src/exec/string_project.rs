@@ -242,12 +242,14 @@ fn decode_row<'a>(
                     "StringProject: negative dictionary key {key}"
                 )))
             } else {
-                dict.get((key - 1) as usize).map(String::as_str).ok_or_else(|| {
-                    BoltError::Other(format!(
-                        "StringProject: key {key} out of range (dict size {})",
-                        dict.len()
-                    ))
-                })
+                dict.get((key - 1) as usize)
+                    .map(String::as_str)
+                    .ok_or_else(|| {
+                        BoltError::Other(format!(
+                            "StringProject: key {key} out of range (dict size {})",
+                            dict.len()
+                        ))
+                    })
             }
         }
         KeyLayout::ZeroBased => {
@@ -294,7 +296,9 @@ pub fn build_row_aligned_input(
     let mut bytes: Vec<u8> = Vec::new();
     offsets.push(0);
     for (row, &key) in keys.iter().enumerate() {
-        let is_valid = validity.map(|v| v.get(row).copied().unwrap_or(false)).unwrap_or(true);
+        let is_valid = validity
+            .map(|v| v.get(row).copied().unwrap_or(false))
+            .unwrap_or(true);
         let s = decode_row(dict, key, layout, is_valid)?;
         bytes.extend_from_slice(s.as_bytes());
         if bytes.len() > i32::MAX as usize {
@@ -327,9 +331,9 @@ pub fn exclusive_scan_lens(row_lens: &[u32]) -> BoltResult<(Vec<i32>, usize)> {
     let mut acc: usize = 0;
     offsets.push(0);
     for &len in row_lens {
-        acc = acc.checked_add(len as usize).ok_or_else(|| {
-            BoltError::Other("StringProject: output offset overflow".into())
-        })?;
+        acc = acc
+            .checked_add(len as usize)
+            .ok_or_else(|| BoltError::Other("StringProject: output offset overflow".into()))?;
         if acc > i32::MAX as usize {
             return Err(BoltError::Other(format!(
                 "StringProject: total output bytes {acc} exceeds i32::MAX (Utf8)"
@@ -364,7 +368,9 @@ pub fn string_array_from_offsets(
     let n_rows = offsets.len() - 1;
     let mut out: Vec<Option<String>> = Vec::with_capacity(n_rows);
     for row in 0..n_rows {
-        let is_valid = validity.map(|v| v.get(row).copied().unwrap_or(false)).unwrap_or(true);
+        let is_valid = validity
+            .map(|v| v.get(row).copied().unwrap_or(false))
+            .unwrap_or(true);
         if !is_valid {
             out.push(None);
             continue;
@@ -406,7 +412,9 @@ pub fn gpu_path_transform_pure(
 ) -> BoltResult<StringArray> {
     let mut out: Vec<Option<String>> = Vec::with_capacity(keys.len());
     for (row, &key) in keys.iter().enumerate() {
-        let is_valid = validity.map(|v| v.get(row).copied().unwrap_or(false)).unwrap_or(true);
+        let is_valid = validity
+            .map(|v| v.get(row).copied().unwrap_or(false))
+            .unwrap_or(true);
         // Honor the slot-0 NULL sentinel even without an explicit validity slice,
         // mirroring `host_transform_strings` so the two stay byte-for-byte equal.
         let is_null_sentinel = matches!(layout, KeyLayout::OneBasedNullSlot0) && key == 0;
@@ -419,7 +427,9 @@ pub fn gpu_path_transform_pure(
         // ASCII byte folding keeps the string valid UTF-8 (folds only touch
         // a-z / A-Z, which are single-byte).
         let folded = String::from_utf8(folded).map_err(|e| {
-            BoltError::Other(format!("StringProject: ASCII fold produced invalid UTF-8: {e}"))
+            BoltError::Other(format!(
+                "StringProject: ASCII fold produced invalid UTF-8: {e}"
+            ))
         })?;
         out.push(Some(folded));
     }
@@ -441,7 +451,9 @@ pub fn host_transform_strings(
 ) -> BoltResult<StringArray> {
     let mut out: Vec<Option<String>> = Vec::with_capacity(keys.len());
     for (row, &key) in keys.iter().enumerate() {
-        let is_valid = validity.map(|v| v.get(row).copied().unwrap_or(false)).unwrap_or(true);
+        let is_valid = validity
+            .map(|v| v.get(row).copied().unwrap_or(false))
+            .unwrap_or(true);
         // A row is SQL NULL if the explicit validity bit says so, OR (for the
         // engine-managed Utf8 layout) the key is the slot-0 NULL sentinel. The
         // latter makes NULL surface as Arrow NULL even when no separate validity
@@ -502,7 +514,9 @@ pub struct ConcatInput {
 /// should never emit those, but we surface rather than panic.
 pub fn concat_row_lens(inputs: &[ConcatInput]) -> BoltResult<Vec<u32>> {
     if inputs.is_empty() {
-        return Err(BoltError::Other("CONCAT: at least one input is required".into()));
+        return Err(BoltError::Other(
+            "CONCAT: at least one input is required".into(),
+        ));
     }
     let n_rows = inputs[0].offsets.len().saturating_sub(1);
     for (k, inp) in inputs.iter().enumerate() {
@@ -519,9 +533,9 @@ pub fn concat_row_lens(inputs: &[ConcatInput]) -> BoltResult<Vec<u32>> {
     for inp in inputs {
         for (r, slot) in row_lens.iter_mut().enumerate() {
             let len = (inp.offsets[r + 1] - inp.offsets[r]) as u32;
-            *slot = slot.checked_add(len).ok_or_else(|| {
-                BoltError::Other("CONCAT: per-row length overflow".into())
-            })?;
+            *slot = slot
+                .checked_add(len)
+                .ok_or_else(|| BoltError::Other("CONCAT: per-row length overflow".into()))?;
         }
     }
     Ok(row_lens)
@@ -536,7 +550,11 @@ pub fn concat_output_validity(inputs: &[ConcatInput]) -> Vec<bool> {
     }
     let n_rows = inputs[0].offsets.len().saturating_sub(1);
     (0..n_rows)
-        .map(|r| inputs.iter().all(|inp| inp.validity.get(r).copied().unwrap_or(false)))
+        .map(|r| {
+            inputs
+                .iter()
+                .all(|inp| inp.validity.get(r).copied().unwrap_or(false))
+        })
         .collect()
 }
 
@@ -588,7 +606,9 @@ pub fn gpu_path_concat_pure(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
 /// the executor can call it without first materialising scan/offset buffers.
 pub fn host_concat_strings(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
     if inputs.is_empty() {
-        return Err(BoltError::Other("CONCAT: at least one input is required".into()));
+        return Err(BoltError::Other(
+            "CONCAT: at least one input is required".into(),
+        ));
     }
     let n_rows = inputs[0].offsets.len().saturating_sub(1);
     let validity = concat_output_validity(inputs);
@@ -648,7 +668,11 @@ pub fn build_concat_input(
             }
         })
         .collect();
-    Ok(ConcatInput { offsets, bytes, validity: row_validity })
+    Ok(ConcatInput {
+        offsets,
+        bytes,
+        validity: row_validity,
+    })
 }
 
 /// Whether the GPU ASCII case-fold path is correct for `dict`.
@@ -873,12 +897,10 @@ mod tests {
         let dict = owned(&["Hello", "WORLD", "MixedCase"]);
         let keys = vec![1i32, 2, 3, 0]; // last row NULL
         for t in [StringTransform::Upper, StringTransform::Lower] {
-            let gpu =
-                gpu_path_transform_pure(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
-                    .unwrap();
-            let host =
-                host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
-                    .unwrap();
+            let gpu = gpu_path_transform_pure(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
+                .unwrap();
+            let host = host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
+                .unwrap();
             assert_eq!(collect(&gpu), collect(&host), "transform {t:?}");
         }
     }
@@ -888,9 +910,14 @@ mod tests {
         // ZeroBased: key k → dict[k]. keys [0,1] → "abc","Z9z".
         let dict = owned(&["abc", "Z9z"]);
         let keys = vec![0i32, 1];
-        let arr =
-            gpu_path_transform_pure(&dict, &keys, KeyLayout::ZeroBased, None, StringTransform::Upper)
-                .unwrap();
+        let arr = gpu_path_transform_pure(
+            &dict,
+            &keys,
+            KeyLayout::ZeroBased,
+            None,
+            StringTransform::Upper,
+        )
+        .unwrap();
         // "abc"→"ABC" (folds a-z), "Z9z"→"Z9Z" (only the trailing 'z' folds).
         assert_eq!(
             collect(&arr),
@@ -924,7 +951,11 @@ mod tests {
             }
             offsets.push(bytes.len() as i32);
         }
-        ConcatInput { offsets, bytes, validity }
+        ConcatInput {
+            offsets,
+            bytes,
+            validity,
+        }
     }
 
     #[test]
@@ -1016,7 +1047,10 @@ mod tests {
         let a = concat_input(&[Some(""), Some("")]);
         let b = concat_input(&[Some(""), Some("")]);
         let arr = gpu_path_concat_pure(&[a, b]).unwrap();
-        assert_eq!(collect(&arr), vec![Some("".to_string()), Some("".to_string())]);
+        assert_eq!(
+            collect(&arr),
+            vec![Some("".to_string()), Some("".to_string())]
+        );
 
         // Zero rows.
         let a0 = concat_input(&[]);
@@ -1072,7 +1106,10 @@ mod tests {
         // SUBSTRING(s, 2, 3): "hello"->"ell", "world"->"orl", NULL->NULL.
         let dict = owned(&["hello", "world"]);
         let keys = vec![1i32, 2, 0];
-        let t = StringTransform::Substring { start: 2, length: Some(3) };
+        let t = StringTransform::Substring {
+            start: 2,
+            length: Some(3),
+        };
         let arr =
             host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
         assert_eq!(
@@ -1086,7 +1123,10 @@ mod tests {
         // SUBSTRING(s FROM 3) (length = None) takes to the end of the string.
         let dict = owned(&["hello"]);
         let keys = vec![1i32];
-        let t = StringTransform::Substring { start: 3, length: None };
+        let t = StringTransform::Substring {
+            start: 3,
+            length: None,
+        };
         let arr =
             host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
         assert_eq!(collect(&arr), vec![Some("llo".to_string())]);
@@ -1097,7 +1137,10 @@ mod tests {
         // "héllo" is 5 CHARACTERS; SUBSTRING(2,1) is the single char 'é'.
         let dict = owned(&["héllo"]);
         let keys = vec![1i32];
-        let t = StringTransform::Substring { start: 2, length: Some(1) };
+        let t = StringTransform::Substring {
+            start: 2,
+            length: Some(1),
+        };
         let arr =
             host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
         assert_eq!(collect(&arr), vec![Some("é".to_string())]);
@@ -1114,12 +1157,15 @@ mod tests {
             (TrimMode::Trailing, "  hi"),
         ] {
             let t = StringTransform::Trim { mode };
-            let arr =
-                host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
-                    .unwrap();
+            let arr = host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t)
+                .unwrap();
             assert_eq!(
                 collect(&arr),
-                vec![Some(expected_first.to_string()), Some("x".to_string()), None],
+                vec![
+                    Some(expected_first.to_string()),
+                    Some("x".to_string()),
+                    None
+                ],
                 "trim mode {mode:?}"
             );
         }
@@ -1133,7 +1179,9 @@ mod tests {
         let nbsp = "\u{2009}go\u{2009}"; // U+2009 THIN SPACE on both ends
         let dict = owned(&[nbsp]);
         let keys = vec![1i32];
-        let t = StringTransform::Trim { mode: TrimMode::Both };
+        let t = StringTransform::Trim {
+            mode: TrimMode::Both,
+        };
         let arr =
             host_transform_strings(&dict, &keys, KeyLayout::OneBasedNullSlot0, None, t).unwrap();
         assert_eq!(collect(&arr), vec![Some("go".to_string())]);
@@ -1143,23 +1191,43 @@ mod tests {
     fn substring_trim_scalar_fn_kind_mapping() {
         use crate::plan::logical_plan::ScalarFnKind;
         assert_eq!(
-            StringTransform::Substring { start: 1, length: Some(2) }.scalar_fn_kind(),
+            StringTransform::Substring {
+                start: 1,
+                length: Some(2)
+            }
+            .scalar_fn_kind(),
             ScalarFnKind::Substring
         );
         assert_eq!(
-            StringTransform::Trim { mode: TrimMode::Both }.scalar_fn_kind(),
+            StringTransform::Trim {
+                mode: TrimMode::Both
+            }
+            .scalar_fn_kind(),
             ScalarFnKind::TrimBoth
         );
         assert_eq!(
-            StringTransform::Trim { mode: TrimMode::Leading }.scalar_fn_kind(),
+            StringTransform::Trim {
+                mode: TrimMode::Leading
+            }
+            .scalar_fn_kind(),
             ScalarFnKind::TrimLeading
         );
         assert_eq!(
-            StringTransform::Trim { mode: TrimMode::Trailing }.scalar_fn_kind(),
+            StringTransform::Trim {
+                mode: TrimMode::Trailing
+            }
+            .scalar_fn_kind(),
             ScalarFnKind::TrimTrailing
         );
-        assert!(StringTransform::Substring { start: 1, length: None }.is_host_realized());
-        assert!(StringTransform::Trim { mode: TrimMode::Both }.is_host_realized());
+        assert!(StringTransform::Substring {
+            start: 1,
+            length: None
+        }
+        .is_host_realized());
+        assert!(StringTransform::Trim {
+            mode: TrimMode::Both
+        }
+        .is_host_realized());
         assert!(!StringTransform::Upper.is_host_realized());
     }
 
@@ -1174,11 +1242,23 @@ mod tests {
             write_pass_entry,
         };
         for t in [
-            StringTransform::Substring { start: 1, length: Some(2) },
-            StringTransform::Substring { start: 2, length: None },
-            StringTransform::Trim { mode: TrimMode::Both },
-            StringTransform::Trim { mode: TrimMode::Leading },
-            StringTransform::Trim { mode: TrimMode::Trailing },
+            StringTransform::Substring {
+                start: 1,
+                length: Some(2),
+            },
+            StringTransform::Substring {
+                start: 2,
+                length: None,
+            },
+            StringTransform::Trim {
+                mode: TrimMode::Both,
+            },
+            StringTransform::Trim {
+                mode: TrimMode::Leading,
+            },
+            StringTransform::Trim {
+                mode: TrimMode::Trailing,
+            },
         ] {
             let kind = t.scalar_fn_kind();
             let len_ptx = compile_varwidth_len_pass(kind).expect("len pass compiles");
@@ -1190,9 +1270,7 @@ mod tests {
 
     // ---- CASE over Utf8 host evaluation (F11) ----------------------------
 
-    fn env_of<'a>(
-        cols: &'a [(&str, &'a HostColumn)],
-    ) -> crate::exec::expr_agg::ColumnEnv<'a> {
+    fn env_of<'a>(cols: &'a [(&str, &'a HostColumn)]) -> crate::exec::expr_agg::ColumnEnv<'a> {
         cols.iter().map(|(n, c)| (n.to_string(), *c)).collect()
     }
 
@@ -1216,7 +1294,11 @@ mod tests {
         // UNKNOWN → falls through to ELSE → 'B' (the ELSE value is not NULL).
         assert_eq!(
             collect(&arr),
-            vec![Some("A".to_string()), Some("B".to_string()), Some("B".to_string())]
+            vec![
+                Some("A".to_string()),
+                Some("B".to_string()),
+                Some("B".to_string())
+            ]
         );
     }
 

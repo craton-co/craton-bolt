@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! GROUP BY execution using the sentinel-free (slot-valid-flag) protocol.
 //!
@@ -89,9 +89,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
-use arrow_schema::{
-    DataType as ArrowDataType, Schema as ArrowSchema,
-};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
@@ -102,9 +100,8 @@ use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
 use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::valid_flag_kernels::{
-    compile_agg_valid_kernel, compile_agg_valid_kernel_with_validity,
-    compile_keys_valid_kernel, pack_validity_bits, valid_block_size,
-    VALID_AGG_KERNEL_ENTRY, VALID_KEYS_KERNEL_ENTRY,
+    compile_agg_valid_kernel, compile_agg_valid_kernel_with_validity, compile_keys_valid_kernel,
+    pack_validity_bits, valid_block_size, VALID_AGG_KERNEL_ENTRY, VALID_KEYS_KERNEL_ENTRY,
 };
 // PV-stage-f: the sentinel-free validity-aware emitters are now wired in
 // at the launcher boundary. `compile_agg_valid_kernel_with_validity`
@@ -211,8 +208,8 @@ fn column_should_use_native_validity(
 // local `KeyComponent` had no `name` field; the canonical (superset) one does,
 // which is inert here (the production path never reads it).
 use crate::exec::groupby_common::{
-    decode_key, download_pinned_f32, download_pinned_f64, download_pinned_i32,
-    download_pinned_i64, next_pow2, pack_keys, unique_count, KeyComponent, KeyValue,
+    decode_key, download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64,
+    next_pow2, pack_keys, unique_count, KeyComponent, KeyValue,
 };
 
 /// Execute a GROUP BY plan using the sentinel-free (slot-valid-flag)
@@ -242,7 +239,8 @@ pub fn execute_groupby_valid(
 
     if aggregate.group_by.is_empty() {
         return Err(BoltError::Other(
-            "execute_groupby_valid: aggregate has no GROUP BY columns; use execute_aggregate".into(),
+            "execute_groupby_valid: aggregate has no GROUP BY columns; use execute_aggregate"
+                .into(),
         ));
     }
     if pre.is_some() {
@@ -281,10 +279,7 @@ pub fn execute_groupby_valid(
     let n_unique = unique_count(&host_keys);
     let k = next_pow2((n_unique.saturating_mul(2)).saturating_add(16)).max(64);
     let k_u32 = u32::try_from(k).map_err(|_| {
-        BoltError::Other(format!(
-            "GROUP BY hash table size {} exceeds u32::MAX",
-            k
-        ))
+        BoltError::Other(format!("GROUP BY hash table size {} exceeds u32::MAX", k))
     })?;
 
     // Stage-3: per-call stream up front so all subsequent H2D / kernels /
@@ -309,8 +304,7 @@ pub fn execute_groupby_valid(
     // Spill init uses async H2D for the keys buffer and a `zeros_async`
     // for the single-element counter (cheap and dependency-ordered).
     let spill_init: Vec<i64> = vec![SPILL_EMPTY_KEY; SPILL_CAPACITY];
-    let mut keys_spill_keys =
-        GpuVec::<i64>::from_slice_async(&spill_init, stream.raw())?;
+    let mut keys_spill_keys = GpuVec::<i64>::from_slice_async(&spill_init, stream.raw())?;
     let mut keys_spill_counter = GpuVec::<u32>::zeros_async(1, stream.raw())?;
     let max_spill_u32 = u32::try_from(SPILL_CAPACITY).map_err(|_| {
         BoltError::Other(format!(
@@ -341,8 +335,7 @@ pub fn execute_groupby_valid(
     // below uses this together with the runtime per-column null check
     // (`column_should_use_native_validity`) to decide between the native
     // `_with_validity` kernel and the legacy host-strip path.
-    let any_input_has_validity: bool =
-        aggregate.input_has_validity.iter().any(|&v| v);
+    let any_input_has_validity: bool = aggregate.input_has_validity.iter().any(|&v| v);
     let mut acc_results: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
     for agg in &aggregate.aggregates {
         let acc = run_one_aggregate(
@@ -425,9 +418,7 @@ pub fn execute_groupby_valid(
             // The keys kernel guarantees each committed key appears in
             // exactly one slot, but defensively dedupe — a hypothetical
             // future race could otherwise produce a doubled group.
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                key_to_group.entry(key)
-            {
+            if let std::collections::hash_map::Entry::Vacant(e) = key_to_group.entry(key) {
                 e.insert(groups.len());
                 groups.push(GroupEntry {
                     key,
@@ -437,9 +428,7 @@ pub fn execute_groupby_valid(
         }
     }
     for &spilled_key in &host_keys_spill {
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            key_to_group.entry(spilled_key)
-        {
+        if let std::collections::hash_map::Entry::Vacant(e) = key_to_group.entry(spilled_key) {
             e.insert(groups.len());
             groups.push(GroupEntry {
                 key: spilled_key,
@@ -462,8 +451,7 @@ pub fn execute_groupby_valid(
     // per-agg spill buffers in. The result is a flat Vec<T> of length
     // n_groups, indexed by group position.
     let n_groups = groups.len();
-    let mut per_group_accs: Vec<AccDownload> =
-        Vec::with_capacity(aggregate.aggregates.len());
+    let mut per_group_accs: Vec<AccDownload> = Vec::with_capacity(aggregate.aggregates.len());
     for (acc, agg) in acc_results.into_iter().zip(aggregate.aggregates.iter()) {
         let op = aggregate_to_op(agg);
         let folded = fold_acc_with_spill(acc, op, &groups, &key_to_group)?;
@@ -472,8 +460,7 @@ pub fn execute_groupby_valid(
 
     // Assemble the output RecordBatch.
     let m_keys = key_components.len();
-    let mut arrays: Vec<ArrayRef> =
-        Vec::with_capacity(m_keys + aggregate.aggregates.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(m_keys + aggregate.aggregates.len());
 
     let key_arrays = build_key_arrays_from_entries(&groups, &key_components)?;
     for arr in key_arrays {
@@ -481,15 +468,17 @@ pub fn execute_groupby_valid(
     }
 
     for (i, agg) in aggregate.aggregates.iter().enumerate() {
-        let out_field =
-            aggregate.output_schema.fields.get(m_keys + i).ok_or_else(|| {
+        let out_field = aggregate
+            .output_schema
+            .fields
+            .get(m_keys + i)
+            .ok_or_else(|| {
                 BoltError::Other(format!(
                     "execute_groupby_valid: output_schema missing field for aggregate index {}",
                     i
                 ))
             })?;
-        let arr =
-            build_agg_array_from_per_group(agg, out_field, &per_group_accs[i], n_groups)?;
+        let arr = build_agg_array_from_per_group(agg, out_field, &per_group_accs[i], n_groups)?;
         arrays.push(arr);
     }
 
@@ -560,12 +549,10 @@ fn launch_keys_kernel(
         return Ok(());
     }
 
-    let module = module_cache::get_or_build_module(
-        module_path!(),
-        "keys_valid".to_string(),
-        None,
-        || compile_keys_valid_kernel(),
-    )?;
+    let module =
+        module_cache::get_or_build_module(module_path!(), "keys_valid".to_string(), None, || {
+            compile_keys_valid_kernel()
+        })?;
     let function = module.function(VALID_KEYS_KERNEL_ENTRY)?;
 
     let mut group_ptr: CUdeviceptr = group_col.device_ptr();
@@ -607,7 +594,13 @@ fn launch_keys_kernel(
         ))?;
     }
     stream.synchronize()?;
-    let _ = (group_ptr, keys_ptr, valid_ptr, spill_keys_ptr, spill_counter_ptr);
+    let _ = (
+        group_ptr,
+        keys_ptr,
+        valid_ptr,
+        spill_keys_ptr,
+        spill_counter_ptr,
+    );
     Ok(())
 }
 
@@ -825,7 +818,12 @@ fn launch_agg_kernel<T: Pod>(
         // Touch the spill-related host pointers post-launch so the borrow
         // checker doesn't complain about unused `mut` for variables the
         // float path intentionally drops.
-        let _ = (spill_keys_ptr, spill_values_ptr, spill_counter_ptr, max_spill_param);
+        let _ = (
+            spill_keys_ptr,
+            spill_values_ptr,
+            spill_counter_ptr,
+            max_spill_param,
+        );
     } else {
         let mut params: [*mut c_void; 11] = [
             &mut group_ptr as *mut CUdeviceptr as *mut c_void,
@@ -1010,15 +1008,24 @@ fn run_one_aggregate(
     any_input_has_validity: bool,
 ) -> BoltResult<AccDownload> {
     match agg {
-        AggregateExpr::Sum(expr)
-        | AggregateExpr::Min(expr)
-        | AggregateExpr::Max(expr) => {
+        AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
             let op = ReduceOp::from_agg(agg)?;
             let col_name = bare_column_name(expr)?;
             let col_io = resolve_input(inputs, col_name)?;
             run_typed_agg(
-                op, col_io, group_col, keys_table, slot_valid, batch, n_rows, k,
-                k_u32, max_spill, stream, key_valid, any_input_has_validity,
+                op,
+                col_io,
+                group_col,
+                keys_table,
+                slot_valid,
+                batch,
+                n_rows,
+                k,
+                k_u32,
+                max_spill,
+                stream,
+                key_valid,
+                any_input_has_validity,
             )
         }
 
@@ -1036,8 +1043,13 @@ fn run_one_aggregate(
                 None => None,
             };
 
-            let filtered =
-                prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
+            let filtered = prepare_filtered_keys(
+                group_col,
+                n_rows,
+                key_valid,
+                value_valid.as_deref(),
+                stream,
+            )?;
             let count_n_rows = filtered.n_rows();
 
             let ones: Vec<i64> = vec![1i64; count_n_rows];
@@ -1064,12 +1076,8 @@ fn run_one_aggregate(
                 None,
             )?;
             let gpu_acc = download_pinned_i64(&acc_table, stream)?;
-            let spill = download_agg_spill(
-                spill_keys,
-                spill_values,
-                spill_counter,
-                "COUNT agg kernel",
-            )?;
+            let spill =
+                download_agg_spill(spill_keys, spill_values, spill_counter, "COUNT agg kernel")?;
             Ok(AccDownload::I64 { gpu_acc, spill })
         }
 
@@ -1113,8 +1121,13 @@ fn run_one_aggregate(
             let col_io = resolve_input(inputs, col_name)?;
 
             let value_valid = column_null_mask(col_io, batch)?;
-            let filtered =
-                prepare_filtered_keys(group_col, n_rows, key_valid, value_valid.as_deref(), stream)?;
+            let filtered = prepare_filtered_keys(
+                group_col,
+                n_rows,
+                key_valid,
+                value_valid.as_deref(),
+                stream,
+            )?;
             let avg_n_rows = filtered.n_rows();
 
             // --- SUM(expr) cast to f64. Upcast host-side, drop NULL positions
@@ -1232,12 +1245,8 @@ fn run_welford_aggregate_valid(
     stream.synchronize()?;
 
     let value_valid = column_null_mask(col_io, batch)?;
-    let values_f64 = load_input_column_as_f64_filtered(
-        col_io,
-        batch,
-        key_valid,
-        value_valid.as_deref(),
-    )?;
+    let values_f64 =
+        load_input_column_as_f64_filtered(col_io, batch, key_valid, value_valid.as_deref())?;
 
     // Re-project the value-valid mask through key_valid so its index
     // axis aligns with host_keys (same shape as
@@ -1254,10 +1263,8 @@ fn run_welford_aggregate_valid(
         }),
     };
 
-    let mut states_by_key: std::collections::HashMap<
-        i64,
-        crate::exec::welford::WelfordState,
-    > = std::collections::HashMap::new();
+    let mut states_by_key: std::collections::HashMap<i64, crate::exec::welford::WelfordState> =
+        std::collections::HashMap::new();
 
     let mut idx_vals: usize = 0;
     match value_valid_filtered {
@@ -1290,10 +1297,7 @@ fn run_welford_aggregate_valid(
 
 /// Return the per-row validity mask for `col_io` in `batch`, or `None` if
 /// the column has no nulls (saves the per-row allocation in the hot path).
-fn column_null_mask(
-    col_io: &ColumnIO,
-    batch: &RecordBatch,
-) -> BoltResult<Option<Vec<bool>>> {
+fn column_null_mask(col_io: &ColumnIO, batch: &RecordBatch) -> BoltResult<Option<Vec<bool>>> {
     let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
         BoltError::Plan(format!(
             "aggregate input '{}' not present in table batch: {}",
@@ -1316,10 +1320,16 @@ fn column_null_mask(
 /// whose lifetime might come from local storage.
 enum FilteredKeys<'a> {
     /// Reuse the shared post-key-filter key column.
-    Borrowed { group_col: &'a GpuVec<i64>, n_rows: usize },
+    Borrowed {
+        group_col: &'a GpuVec<i64>,
+        n_rows: usize,
+    },
     /// Freshly-uploaded smaller column applying a value-NULL filter on top
     /// of `key_valid`. The owned vec must live across the kernel launch.
-    Owned { group_col: GpuVec<i64>, n_rows: usize },
+    Owned {
+        group_col: GpuVec<i64>,
+        n_rows: usize,
+    },
 }
 
 impl<'a> FilteredKeys<'a> {
@@ -1331,8 +1341,7 @@ impl<'a> FilteredKeys<'a> {
     }
     fn n_rows(&self) -> usize {
         match self {
-            FilteredKeys::Borrowed { n_rows, .. }
-            | FilteredKeys::Owned { n_rows, .. } => *n_rows,
+            FilteredKeys::Borrowed { n_rows, .. } | FilteredKeys::Owned { n_rows, .. } => *n_rows,
         }
     }
 }
@@ -1437,12 +1446,22 @@ fn run_typed_agg(
         && key_valid.is_none()
         && column_should_use_native_validity(arr.as_ref(), op, col_io.dtype)
     {
-        let vv = value_valid.as_deref().expect(
-            "column_should_use_native_validity guarantees arr.null_count() > 0",
-        );
+        let vv = value_valid
+            .as_deref()
+            .expect("column_should_use_native_validity guarantees arr.null_count() > 0");
         return run_typed_agg_native_validity(
-            op, col_io, arr.as_ref(), vv, group_col, keys_table, slot_valid,
-            n_rows, k, k_u32, max_spill, stream,
+            op,
+            col_io,
+            arr.as_ref(),
+            vv,
+            group_col,
+            keys_table,
+            slot_valid,
+            n_rows,
+            k,
+            k_u32,
+            max_spill,
+            stream,
         );
     }
 
@@ -1467,14 +1486,11 @@ fn run_typed_agg(
             // `AccDownload::I64`) all agree at i64. MIN/MAX preserve the
             // input dtype and keep the narrow i32 path.
             if matches!(op, ReduceOp::Sum) {
-                let host: Vec<i64> = collect_filtered_primitive(
-                    pa,
-                    key_valid,
-                    value_valid.as_deref(),
-                )
-                .into_iter()
-                .map(|v| v as i64)
-                .collect();
+                let host: Vec<i64> =
+                    collect_filtered_primitive(pa, key_valid, value_valid.as_deref())
+                        .into_iter()
+                        .map(|v| v as i64)
+                        .collect();
                 debug_assert_eq!(host.len(), n);
                 let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
                 let init: Vec<i64> = vec![identity_i64(op); k];
@@ -1507,11 +1523,8 @@ fn run_typed_agg(
                 )?;
                 Ok(AccDownload::I64 { gpu_acc, spill })
             } else {
-                let host: Vec<i32> = collect_filtered_primitive(
-                    pa,
-                    key_valid,
-                    value_valid.as_deref(),
-                );
+                let host: Vec<i32> =
+                    collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
                 debug_assert_eq!(host.len(), n);
                 let input_gpu = GpuVec::<i32>::from_slice_async(&host, stream.raw())?;
                 let init: Vec<i32> = vec![identity_i32(op); k];
@@ -1536,12 +1549,8 @@ fn run_typed_agg(
                     None,
                 )?;
                 let gpu_acc = download_pinned_i32(&acc, stream)?;
-                let spill = download_agg_spill(
-                    spill_keys,
-                    spill_values,
-                    spill_counter,
-                    "i32 agg kernel",
-                )?;
+                let spill =
+                    download_agg_spill(spill_keys, spill_values, spill_counter, "i32 agg kernel")?;
                 Ok(AccDownload::I32 { gpu_acc, spill })
             }
         }
@@ -1550,8 +1559,7 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            let host: Vec<i64> =
-                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            let host: Vec<i64> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
@@ -1576,12 +1584,8 @@ fn run_typed_agg(
                 None,
             )?;
             let gpu_acc = download_pinned_i64(&acc, stream)?;
-            let spill = download_agg_spill(
-                spill_keys,
-                spill_values,
-                spill_counter,
-                "i64 agg kernel",
-            )?;
+            let spill =
+                download_agg_spill(spill_keys, spill_values, spill_counter, "i64 agg kernel")?;
             Ok(AccDownload::I64 { gpu_acc, spill })
         }
         DataType::Float32 => {
@@ -1589,8 +1593,7 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            let host: Vec<f32> =
-                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            let host: Vec<f32> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
@@ -1615,12 +1618,8 @@ fn run_typed_agg(
                 None,
             )?;
             let gpu_acc = download_pinned_f32(&acc, stream)?;
-            let spill = download_agg_spill(
-                spill_keys,
-                spill_values,
-                spill_counter,
-                "f32 agg kernel",
-            )?;
+            let spill =
+                download_agg_spill(spill_keys, spill_values, spill_counter, "f32 agg kernel")?;
             Ok(AccDownload::F32 { gpu_acc, spill })
         }
         DataType::Float64 => {
@@ -1628,8 +1627,7 @@ fn run_typed_agg(
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            let host: Vec<f64> =
-                collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
+            let host: Vec<f64> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
             let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f64> = vec![identity_f64(op); k];
@@ -1654,15 +1652,15 @@ fn run_typed_agg(
                 None,
             )?;
             let gpu_acc = download_pinned_f64(&acc, stream)?;
-            let spill = download_agg_spill(
-                spill_keys,
-                spill_values,
-                spill_counter,
-                "f64 agg kernel",
-            )?;
+            let spill =
+                download_agg_spill(spill_keys, spill_values, spill_counter, "f64 agg kernel")?;
             Ok(AccDownload::F64 { gpu_acc, spill })
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -1758,7 +1756,12 @@ fn run_typed_agg_native_validity(
                 )?;
                 let _ = validity_gpu;
                 let gpu_acc = download_pinned_i64(&acc, stream)?;
-                let spill = download_agg_spill(sk, sv, sc, "i64 agg kernel (widened SUM(Int32), validity)")?;
+                let spill = download_agg_spill(
+                    sk,
+                    sv,
+                    sc,
+                    "i64 agg kernel (widened SUM(Int32), validity)",
+                )?;
                 return Ok(AccDownload::I64 { gpu_acc, spill });
             }
             let host: Vec<i32> = pa.values().to_vec();
@@ -1884,7 +1887,11 @@ fn run_typed_agg_native_validity(
             let spill = download_agg_spill(sk, sv, sc, "f64 agg kernel (validity)")?;
             Ok(AccDownload::F64 { gpu_acc, spill })
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "native-validity dispatch reached unsupported dtype {:?} (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -1964,7 +1971,11 @@ fn load_input_column_as_f64_filtered(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
         }
-        DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Decimal128(_, _)
+        | DataType::Date32
+        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
             "AVG input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2026,7 +2037,11 @@ fn build_key_arrays_from_entries(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool | DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype
@@ -2080,14 +2095,7 @@ fn build_agg_array_from_per_group(
             debug_assert_eq!(gpu_acc.len(), n_groups);
             pack_array(out_field.dtype, Scalars::I64(gpu_acc.clone()))
         }
-        (
-            AggregateExpr::Avg(_),
-            AccDownload::Avg {
-                sum,
-                count,
-                ..
-            },
-        ) => {
+        (AggregateExpr::Avg(_), AccDownload::Avg { sum, count, .. }) => {
             debug_assert_eq!(sum.len(), n_groups);
             debug_assert_eq!(count.len(), n_groups);
             // SQL spec (see docs/SQL_REFERENCE.md): aggregate functions over
@@ -2180,8 +2188,7 @@ fn build_agg_array_from_per_group(
                 AccDownload::F64 { gpu_acc, .. } => Scalars::F64(gpu_acc.clone()),
                 AccDownload::Avg { .. } => {
                     return Err(BoltError::Other(
-                        "internal: AVG accumulator passed to non-AVG aggregate"
-                            .into(),
+                        "internal: AVG accumulator passed to non-AVG aggregate".into(),
                     ))
                 }
                 AccDownload::Welford(_) => {
@@ -2328,12 +2335,8 @@ fn fold_acc_with_spill(
             let per_group_count = reindex_i64(&count, groups, ReduceOp::Sum);
             let folded_sum =
                 apply_spill_f64(per_group_sum, &sum_spill, ReduceOp::Sum, key_to_group)?;
-            let folded_count = apply_spill_i64(
-                per_group_count,
-                &count_spill,
-                ReduceOp::Sum,
-                key_to_group,
-            )?;
+            let folded_count =
+                apply_spill_i64(per_group_count, &count_spill, ReduceOp::Sum, key_to_group)?;
             Ok(AccDownload::Avg {
                 sum: folded_sum,
                 count: folded_count,
@@ -2428,7 +2431,10 @@ fn apply_spill_i32(
     key_to_group: &HashMap<i64, usize>,
 ) -> BoltResult<Vec<i32>> {
     for &(key, val) in spill {
-        let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
+        let idx = key_to_group
+            .get(&key)
+            .copied()
+            .ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_i32(op, acc[idx], val);
     }
     Ok(acc)
@@ -2440,7 +2446,10 @@ fn apply_spill_i64(
     key_to_group: &HashMap<i64, usize>,
 ) -> BoltResult<Vec<i64>> {
     for &(key, val) in spill {
-        let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
+        let idx = key_to_group
+            .get(&key)
+            .copied()
+            .ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_i64(op, acc[idx], val);
     }
     Ok(acc)
@@ -2452,7 +2461,10 @@ fn apply_spill_f32(
     key_to_group: &HashMap<i64, usize>,
 ) -> BoltResult<Vec<f32>> {
     for &(key, val) in spill {
-        let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
+        let idx = key_to_group
+            .get(&key)
+            .copied()
+            .ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_f32(op, acc[idx], val);
     }
     Ok(acc)
@@ -2464,7 +2476,10 @@ fn apply_spill_f64(
     key_to_group: &HashMap<i64, usize>,
 ) -> BoltResult<Vec<f64>> {
     for &(key, val) in spill {
-        let idx = key_to_group.get(&key).copied().ok_or_else(|| spill_lookup_err(key))?;
+        let idx = key_to_group
+            .get(&key)
+            .copied()
+            .ok_or_else(|| spill_lookup_err(key))?;
         acc[idx] = combine_f64(op, acc[idx], val);
     }
     Ok(acc)
@@ -2555,12 +2570,8 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
     match (scalars, out_dtype) {
         (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
         (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
-        (Scalars::F32(v), DataType::Float32) => {
-            Ok(Arc::new(Float32Array::from(v)) as ArrayRef)
-        }
-        (Scalars::F64(v), DataType::Float64) => {
-            Ok(Arc::new(Float64Array::from(v)) as ArrayRef)
-        }
+        (Scalars::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
+        (Scalars::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
 
         (Scalars::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
             v.into_iter().map(|x| x as i64).collect::<Vec<_>>(),
@@ -2661,7 +2672,10 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(s, "this aggregate output path")
+    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
+        s,
+        "this aggregate output path",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2689,7 +2703,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
-use arrow_schema::{Field as ArrowField};
+use arrow_schema::Field as ArrowField;
 
 #[cfg(test)]
 mod tests {
@@ -2708,9 +2722,7 @@ mod tests {
     /// validity bitmaps.
     fn one_col_batch(name: &str, arr: ArrayRef) -> RecordBatch {
         let dt = arr.data_type().clone();
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            name, dt, true,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(name, dt, true)]));
         RecordBatch::try_new(schema, vec![arr]).expect("one-col batch")
     }
 
@@ -2733,8 +2745,7 @@ mod tests {
         };
         assert!(column_null_mask(&io, &batch).unwrap().is_none());
 
-        let arr2: ArrayRef =
-            Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
+        let arr2: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(3)]));
         let batch2 = one_col_batch("v", arr2);
         let mask = column_null_mask(&io, &batch2).unwrap().expect("mask");
         assert_eq!(mask, vec![true, false, true]);
@@ -2760,8 +2771,7 @@ mod tests {
             Some(4),
             None,
         ]);
-        let value_valid: Vec<bool> =
-            (0..arr.len()).map(|i| !arr.is_null(i)).collect();
+        let value_valid: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
 
         let bitmap = build_native_validity_bitmap(&value_valid);
         assert_eq!(bitmap, vec![0x55u8]);
@@ -2786,11 +2796,8 @@ mod tests {
     fn collect_filtered_primitive_drops_value_null_rows() {
         let arr = Int32Array::from(vec![Some(1i32), None, Some(3), Some(4)]);
         let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
-        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
-            &arr,
-            None,
-            Some(&vv),
-        );
+        let out =
+            collect_filtered_primitive::<arrow_array::types::Int32Type>(&arr, None, Some(&vv));
         assert_eq!(out, vec![1, 3, 4]);
     }
 
@@ -2802,11 +2809,8 @@ mod tests {
         // Simulate "row 0 and row 2 had a NULL key" — all values are
         // present in the value column, but key-NULLs disqualify those rows.
         let kv = vec![false, true, false, true];
-        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
-            &arr,
-            Some(&kv),
-            None,
-        );
+        let out =
+            collect_filtered_primitive::<arrow_array::types::Int32Type>(&arr, Some(&kv), None);
         assert_eq!(out, vec![20, 40]);
     }
 
@@ -2820,11 +2824,8 @@ mod tests {
         let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
         // key_valid: drop row 0 too.
         let kv = vec![false, true, true, true];
-        let out = collect_filtered_primitive::<arrow_array::types::Int32Type>(
-            &arr,
-            Some(&kv),
-            Some(&vv),
-        );
+        let out =
+            collect_filtered_primitive::<arrow_array::types::Int32Type>(&arr, Some(&kv), Some(&vv));
         // Survivors: row 2 (kv=T, vv=T) and row 3 (kv=T, vv=T).
         // Row 0: kv=F. Row 1: vv=F. Both dropped.
         assert_eq!(out, vec![3, 4]);
@@ -2838,12 +2839,10 @@ mod tests {
     fn filter_iter_to_f64_drops_and_casts() {
         let arr = Int32Array::from(vec![Some(2i32), None, Some(4), Some(6)]);
         let vv: Vec<bool> = (0..arr.len()).map(|i| !arr.is_null(i)).collect();
-        let out = filter_iter_to_f64::<arrow_array::types::Int32Type, _>(
-            &arr,
-            None,
-            Some(&vv),
-            |v| v as f64,
-        );
+        let out =
+            filter_iter_to_f64::<arrow_array::types::Int32Type, _>(&arr, None, Some(&vv), |v| {
+                v as f64
+            });
         assert_eq!(out, vec![2.0f64, 4.0, 6.0]);
 
         // Joint mask: also drop row 2 via key_valid. Survivors: rows 0
@@ -2952,17 +2951,26 @@ mod tests {
         // mask path goes through `prepare_filtered_keys`, exercising
         // the migrated D2H + H2D pair.
         let keys: ArrayRef = Arc::new(Int32Array::from(vec![
-            Some(0), Some(1), None, Some(0), Some(1), Some(2),
+            Some(0),
+            Some(1),
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
         ]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![
-            Some(10i64), Some(20), Some(30), None, Some(40), Some(50),
+            Some(10i64),
+            Some(20),
+            Some(30),
+            None,
+            Some(40),
+            Some(50),
         ]));
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("k", ArrowDataType::Int32, true),
             ArrowField::new("v", ArrowDataType::Int64, true),
         ]));
-        let batch =
-            RecordBatch::try_new(schema, vec![keys, vals]).expect("batch");
+        let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("batch");
         engine.register_table("t", batch).unwrap();
         let h = match engine.sql("SELECT k, SUM(v) FROM t GROUP BY k") {
             Ok(h) => h,
@@ -2973,21 +2981,12 @@ mod tests {
         let out = h.record_batch();
         // (k=0, v=10), (k=1, v=20+40=60), (k=2, v=50). NULL key + NULL
         // value rows drop.
-        let mut expected: std::collections::HashMap<i32, i64> =
-            std::collections::HashMap::new();
+        let mut expected: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
         expected.insert(0, 10);
         expected.insert(1, 60);
         expected.insert(2, 50);
-        let ks = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let ss = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ss = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..out.num_rows() {
             let k = ks.value(i);
             let s = ss.value(i);

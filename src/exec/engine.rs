@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Top-level engine: dispatches per-shape executors (scalar agg, GROUP BY, etc.);
 //! performs GPU prefix-scan + gather compaction for filter outputs, or a host-side
@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
-use arrow_schema::DataType as ArrowDataType;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::{CudaContext, GpuVec};
@@ -36,8 +35,8 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::{
-    parse_sql, DataType, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan,
-    PlanRewrite, Schema,
+    parse_sql, DataType, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan, PlanRewrite,
+    Schema,
 };
 
 // Items lifted out of this file into sibling modules (pure-reorg split).
@@ -46,14 +45,13 @@ use crate::plan::{
 use crate::exec::engine_cache_key::{
     ClonedHostRevision, HostRevisionSnapshot, HostTableRevision, ModuleCacheKey,
 };
-use crate::exec::engine_device_col::{check_len, DeviceCol};
+use crate::exec::engine_device_col::DeviceCol;
 use crate::exec::engine_provider::{EngineProvider, EngineTableStats};
 use crate::exec::engine_support::{
-    arrow_schema_to_plan_schema, build_count_rows_batch, column_storage_rows,
-    concat_table_batches, debug_sync_check, host_column_to_arrow_array,
-    install_persistent_cache_override, passthrough_output_sources,
-    plan_schema_to_arrow_schema, propagate_column_nullability, should_emit_pool_stats,
-    try_extend_column,
+    arrow_schema_to_plan_schema, build_count_rows_batch, column_storage_rows, concat_table_batches,
+    debug_sync_check, host_column_to_arrow_array, install_persistent_cache_override,
+    passthrough_output_sources, plan_schema_to_arrow_schema, propagate_column_nullability,
+    should_emit_pool_stats, try_extend_column,
 };
 // Re-exported (not just `use`d) so `crate::exec::engine::pool_stats_interval_from_env`
 // — the path `lib.rs`'s `__test_only_env_vars` module re-exports — keeps resolving
@@ -152,9 +150,7 @@ fn concat_two_batches(a: &RecordBatch, b: &RecordBatch) -> BoltResult<RecordBatc
 pub(crate) fn materialize_values_relation(
     relation: &crate::plan::sql_frontend::ValuesRelation,
 ) -> BoltResult<RecordBatch> {
-    use arrow_array::{
-        BooleanArray, Float32Array, Float64Array, Int32Array, StringArray,
-    };
+    use arrow_array::{BooleanArray, Float32Array, Float64Array, Int32Array, StringArray};
 
     use crate::plan::logical_plan::Literal;
 
@@ -229,9 +225,7 @@ pub(crate) fn materialize_values_relation(
                     .map(|r| match &r[ci] {
                         Literal::Null => Ok(None),
                         Literal::Bool(v) => Ok(Some(*v)),
-                        other => Err(BoltError::Plan(format!(
-                            "VALUES Bool column got {other:?}"
-                        ))),
+                        other => Err(BoltError::Plan(format!("VALUES Bool column got {other:?}"))),
                     })
                     .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(BooleanArray::from(vals))
@@ -243,9 +237,7 @@ pub(crate) fn materialize_values_relation(
                     .map(|r| match &r[ci] {
                         Literal::Null => Ok(None),
                         Literal::Utf8(v) => Ok(Some(v.clone())),
-                        other => Err(BoltError::Plan(format!(
-                            "VALUES Utf8 column got {other:?}"
-                        ))),
+                        other => Err(BoltError::Plan(format!("VALUES Utf8 column got {other:?}"))),
                     })
                     .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(StringArray::from(vals))
@@ -524,11 +516,23 @@ pub(crate) fn host_multi_agg_groupby(
                         });
                         acc.min = Some(match acc.min {
                             None => num,
-                            Some(m) => if agg_lt(num, m) { num } else { m },
+                            Some(m) => {
+                                if agg_lt(num, m) {
+                                    num
+                                } else {
+                                    m
+                                }
+                            }
                         });
                         acc.max = Some(match acc.max {
                             None => num,
-                            Some(m) => if agg_lt(m, num) { num } else { m },
+                            Some(m) => {
+                                if agg_lt(m, num) {
+                                    num
+                                } else {
+                                    m
+                                }
+                            }
                         });
                     }
                 }
@@ -593,25 +597,13 @@ pub(crate) fn host_multi_agg_groupby(
                         Arc::new(v) as ArrayRef
                     }
                     CdAgg::Sum { .. } => {
-                        finalize_numeric(
-                            order.iter().map(|g| g.plain[*a].sum),
-                            field.dtype,
-                            "SUM",
-                        )?
+                        finalize_numeric(order.iter().map(|g| g.plain[*a].sum), field.dtype, "SUM")?
                     }
                     CdAgg::Min { .. } => {
-                        finalize_numeric(
-                            order.iter().map(|g| g.plain[*a].min),
-                            field.dtype,
-                            "MIN",
-                        )?
+                        finalize_numeric(order.iter().map(|g| g.plain[*a].min), field.dtype, "MIN")?
                     }
                     CdAgg::Max { .. } => {
-                        finalize_numeric(
-                            order.iter().map(|g| g.plain[*a].max),
-                            field.dtype,
-                            "MAX",
-                        )?
+                        finalize_numeric(order.iter().map(|g| g.plain[*a].max), field.dtype, "MAX")?
                     }
                 };
                 out_cols.push(col);
@@ -685,9 +677,9 @@ fn finalize_numeric(
                 .iter()
                 .map(|v| match v {
                     None => Ok(None),
-                    Some(AggNum::Int(i)) => i32::try_from(*i).map(Some).map_err(|_| {
-                        BoltError::Type(format!("{op} result {i} overflows Int32"))
-                    }),
+                    Some(AggNum::Int(i)) => i32::try_from(*i)
+                        .map(Some)
+                        .map_err(|_| BoltError::Type(format!("{op} result {i} overflows Int32"))),
                     Some(AggNum::Float(_)) => Err(BoltError::Type(format!(
                         "{op}: float value for an Int32 column"
                     ))),
@@ -700,9 +692,9 @@ fn finalize_numeric(
                 .iter()
                 .map(|v| match v {
                     None => Ok(None),
-                    Some(AggNum::Int(i)) => i64::try_from(*i).map(Some).map_err(|_| {
-                        BoltError::Type(format!("{op} result {i} overflows Int64"))
-                    }),
+                    Some(AggNum::Int(i)) => i64::try_from(*i)
+                        .map(Some)
+                        .map_err(|_| BoltError::Type(format!("{op} result {i} overflows Int64"))),
                     Some(AggNum::Float(_)) => Err(BoltError::Type(format!(
                         "{op}: float value for an Int64 column"
                     ))),
@@ -969,8 +961,7 @@ pub struct Engine {
     /// `pub(crate)` (was module-private): the streaming / agg method clusters
     /// were split into sibling modules and overlay-swap through this field.
     /// Pure visibility widening — no behaviour change.
-    pub(crate) streaming_sources:
-        RefCell<HashMap<String, crate::exec::streaming::TableSource>>,
+    pub(crate) streaming_sources: RefCell<HashMap<String, crate::exec::streaming::TableSource>>,
     /// Name → Schema provider, kept in sync with `tables`. The schema is
     /// EXTENDED with `__idx_<col>` Int32 columns for every registered Utf8
     /// column so the SQL frontend resolves rewriter-produced column refs.
@@ -1005,8 +996,7 @@ pub struct Engine {
     /// `pub(crate)` (was module-private): the agg method cluster (split into
     /// `engine_agg_impl`) clears overlay GPU-table slots through this field.
     /// Pure visibility widening — no behaviour change.
-    pub(crate) gpu_tables:
-        RefCell<HashMap<String, Option<crate::exec::gpu_table::GpuTable>>>,
+    pub(crate) gpu_tables: RefCell<HashMap<String, Option<crate::exec::gpu_table::GpuTable>>>,
     /// Per-table host-side revision counters for the incremental GpuTable
     /// cache (batch 5).
     ///
@@ -1509,10 +1499,8 @@ impl Engine {
         // a global hit we also seed the per-engine cache so subsequent
         // calls on this engine take the per-engine fast path above and
         // skip the global mutex altogether.
-        let module = crate::exec::module_cache::get_or_build_module_for_spec(
-            spec,
-            entry,
-            |spec| {
+        let module =
+            crate::exec::module_cache::get_or_build_module_for_spec(spec, entry, |spec| {
                 // Global miss path: this closure runs at most once per
                 // (spec, entry) per process. Inside it we still want
                 // the disk cache + codegen layers, so we open-code
@@ -1530,11 +1518,7 @@ impl Engine {
                     // key shape; the in-process KernelSpecCache key is
                     // intentionally left unsalted (it re-validates PTX
                     // content on every hit).
-                    crate::jit::disk_cache::disk_key(
-                        entry,
-                        spec_hash_hi,
-                        spec_hash_lo,
-                    )
+                    crate::jit::disk_cache::disk_key(entry, spec_hash_hi, spec_hash_lo)
                 });
                 let ptx = match (&disk, &disk_key) {
                     (Some(cache), Some(k)) => match cache.lookup(k) {
@@ -1555,8 +1539,7 @@ impl Engine {
                     _ => compile(spec)?,
                 };
                 Ok(ptx)
-            },
-        )?;
+            })?;
         // Bump the per-engine miss counter. We treat any path that
         // missed the per-engine cache as a "miss" for this counter —
         // even if the global cache served us — because the counter's
@@ -1590,8 +1573,7 @@ impl Engine {
         let next_table_rev = prev.as_ref().map(|p| p.table_revision).unwrap_or(0) + 1;
         let mut column_revisions: HashMap<String, u64> =
             HashMap::with_capacity(batch.num_columns());
-        let mut column_n_rows: HashMap<String, usize> =
-            HashMap::with_capacity(batch.num_columns());
+        let mut column_n_rows: HashMap<String, usize> = HashMap::with_capacity(batch.num_columns());
         let n_rows = batch.num_rows();
         for field in batch.schema().fields() {
             column_revisions.insert(field.name().clone(), next_table_rev);
@@ -1622,9 +1604,7 @@ impl Engine {
         batch: RecordBatch,
     ) -> BoltResult<()> {
         let name = name.into();
-        if self.tables.contains_key(&name)
-            || self.streaming_sources.borrow().contains_key(&name)
-        {
+        if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — use register_batch to append \
                  additional batches to an existing table"
@@ -1724,9 +1704,7 @@ impl Engine {
         I: IntoIterator<Item = BoltResult<RecordBatch>>,
     {
         let name = name.into();
-        if self.tables.contains_key(&name)
-            || self.streaming_sources.borrow().contains_key(&name)
-        {
+        if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — register_table_stream \
                  cannot append to an existing table; use register_batch instead"
@@ -1860,9 +1838,7 @@ impl Engine {
         producer: crate::exec::streaming::BatchProducer,
     ) -> BoltResult<()> {
         let name = name.into();
-        if self.tables.contains_key(&name)
-            || self.streaming_sources.borrow().contains_key(&name)
-        {
+        if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — register_table_stream_lazy \
                  cannot append to an existing table"
@@ -1991,11 +1967,7 @@ impl Engine {
     /// list, AND the GPU-resident `GpuTable` are all rebuilt from `batch`.
     /// The previous `GpuTable`'s device allocations are returned to the
     /// memory pool, where the new upload can recycle them.
-    pub fn replace_table(
-        &mut self,
-        name: impl Into<String>,
-        batch: RecordBatch,
-    ) -> BoltResult<()> {
+    pub fn replace_table(&mut self, name: impl Into<String>, batch: RecordBatch) -> BoltResult<()> {
         let name = name.into();
         // Drop any lazy streaming overlay entry under this name — a replace
         // installs an eager `tables` entry, and `materialize_table` prefers
@@ -2089,11 +2061,7 @@ impl Engine {
     /// appends paid `1+2+…+N = N(N+1)/2` batches' worth of HtoD traffic.
     /// With the incremental cache, the same workload pays N batches'
     /// worth — one HtoD copy of the new tail per append.
-    pub fn register_batch(
-        &mut self,
-        name: &str,
-        batch: RecordBatch,
-    ) -> BoltResult<()> {
+    pub fn register_batch(&mut self, name: &str, batch: RecordBatch) -> BoltResult<()> {
         // Stage 6: dict-encoded columns are ingested natively now, so no
         // flatten-to-StringArray is needed for the schema check below to
         // line up — batch 0 and any appended batch both carry the Arrow
@@ -2128,8 +2096,7 @@ impl Engine {
             self.dict_registry.unregister_table(name);
             self.dict_registry
                 .register_table(name.to_string(), &concatenated)?;
-            let base_schema =
-                arrow_schema_to_plan_schema(concatenated.schema().as_ref())?;
+            let base_schema = arrow_schema_to_plan_schema(concatenated.schema().as_ref())?;
             let extended = self.dict_registry.extended_schema(name, &base_schema);
             self.provider.register(name.to_string(), extended);
             propagate_column_nullability(&mut self.provider, name, &concatenated);
@@ -2147,17 +2114,12 @@ impl Engine {
             // holds — so the prefix-preserving copy is correct for
             // Utf8 columns too.
             let n_rows_total = concatenated.num_rows();
-            let entry = self
-                .host_revisions
-                .entry(name.to_string())
-                .or_default();
+            let entry = self.host_revisions.entry(name.to_string()).or_default();
             entry.table_revision += 1;
             entry.n_rows = n_rows_total;
             let new_rev = entry.table_revision;
             for field in concatenated.schema().fields() {
-                entry
-                    .column_revisions
-                    .insert(field.name().clone(), new_rev);
+                entry.column_revisions.insert(field.name().clone(), new_rev);
                 entry
                     .column_n_rows
                     .insert(field.name().clone(), n_rows_total);
@@ -2209,10 +2171,8 @@ impl Engine {
         // though they're separate fields, taking owned data sidesteps any
         // borrow-graph subtlety with the `&self` we pass to
         // `incremental_rebuild`.
-        let host: Option<ClonedHostRevision> = self
-            .host_revisions
-            .get(name)
-            .cloned_revision_owned();
+        let host: Option<ClonedHostRevision> =
+            self.host_revisions.get(name).cloned_revision_owned();
         // Fast path: cache hit AND every column is at the current
         // revision. Inspect under the same borrow we'd return.
         {
@@ -2241,9 +2201,7 @@ impl Engine {
             Some(existing) => self.incremental_rebuild(existing, &concatenated, host.as_ref())?,
             None => {
                 // Slot absent or dirty (None): full upload.
-                let mut full = crate::exec::gpu_table::GpuTable::from_record_batch(
-                    &concatenated,
-                )?;
+                let mut full = crate::exec::gpu_table::GpuTable::from_record_batch(&concatenated)?;
                 if let Some(h) = host.as_ref() {
                     full.last_uploaded_revision = h.table_revision;
                     for col in full.columns.iter_mut() {
@@ -2256,10 +2214,8 @@ impl Engine {
                     }
                 }
                 #[cfg(test)]
-                self.gpu_table_load_count.fetch_add(
-                    full.columns.len(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
+                self.gpu_table_load_count
+                    .fetch_add(full.columns.len(), std::sync::atomic::Ordering::SeqCst);
                 full
             }
         };
@@ -2294,8 +2250,7 @@ impl Engine {
         let host = match host {
             Some(h) => h,
             None => {
-                let table =
-                    crate::exec::gpu_table::GpuTable::from_record_batch(concatenated)?;
+                let table = crate::exec::gpu_table::GpuTable::from_record_batch(concatenated)?;
                 #[cfg(test)]
                 self.gpu_table_load_count
                     .fetch_add(table.columns.len(), std::sync::atomic::Ordering::SeqCst);
@@ -2366,12 +2321,11 @@ impl Engine {
                         // Either previous column was empty / replaced (not
                         // an append) — full re-upload.
                         drop(prev);
-                        let mut fresh =
-                            crate::exec::gpu_table::GpuTable::upload_column_from_batch(
-                                concatenated,
-                                field,
-                                idx,
-                            )?;
+                        let mut fresh = crate::exec::gpu_table::GpuTable::upload_column_from_batch(
+                            concatenated,
+                            field,
+                            idx,
+                        )?;
                         fresh.host_revision = host_col_rev;
                         #[cfg(test)]
                         self.gpu_table_load_count
@@ -2381,12 +2335,11 @@ impl Engine {
                 }
                 None => {
                     // Column not in the previous cache — full upload.
-                    let mut fresh =
-                        crate::exec::gpu_table::GpuTable::upload_column_from_batch(
-                            concatenated,
-                            field,
-                            idx,
-                        )?;
+                    let mut fresh = crate::exec::gpu_table::GpuTable::upload_column_from_batch(
+                        concatenated,
+                        field,
+                        idx,
+                    )?;
                     fresh.host_revision = host_col_rev;
                     #[cfg(test)]
                     self.gpu_table_load_count
@@ -2526,7 +2479,9 @@ impl Engine {
                 row_counts.entry(name.clone()).or_insert(rows);
             }
         }
-        Arc::new(crate::plan::StatsEstimator::new(EngineTableStats { row_counts }))
+        Arc::new(crate::plan::StatsEstimator::new(EngineTableStats {
+            row_counts,
+        }))
     }
 
     pub fn sql(&self, query: &str) -> BoltResult<QueryHandle> {
@@ -2735,8 +2690,8 @@ impl Engine {
         // Time the whole logical-planning stage (rewrites + optimizer +
         // subquery resolution) into the `Plan` histogram.
         let plan_start = Instant::now();
-        let plan = tracing::info_span!("plan")
-            .in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
+        let plan =
+            tracing::info_span!("plan").in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
         let plan = self.dict_registry.rewrite_plan(&plan)?;
         // Built-in logical optimizer: run the default pass pipeline
         // (constant folding, predicate pushdown, filter-into-join, join
@@ -2766,10 +2721,7 @@ impl Engine {
         // with `__idx_<col>` refs already in place) and BEFORE
         // `lower_physical` (so users can still target logical-plan
         // structure). See `crate::plan::rewrite` for the contract.
-        let plan = self
-            .rewrites
-            .iter()
-            .try_fold(plan, |p, r| r.rewrite(p))?;
+        let plan = self.rewrites.iter().try_fold(plan, |p, r| r.rewrite(p))?;
         // Resolve uncorrelated scalar / IN subqueries to constants BEFORE
         // lowering. Each subplan is uncorrelated (the frontend rejects
         // correlation) and so independently executable; we run it here and
@@ -2843,9 +2795,7 @@ impl Engine {
     pub fn explain_sql(&self, query: &str) -> BoltResult<String> {
         // F1: a `WITH RECURSIVE` query has no single LogicalPlan; render its
         // three subplans via the dedicated formatter instead.
-        if let Some(rec) =
-            crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider)?
-        {
+        if let Some(rec) = crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider)? {
             use crate::plan::sql_frontend::RecursiveQueryPlan;
             return Ok(match rec {
                 RecursiveQueryPlan::Single(rec) => format!(
@@ -2908,8 +2858,7 @@ impl Engine {
         }
         // F3-finish (generalized): render the multi/mixed COUNT(DISTINCT) +
         // GROUP BY descriptor.
-        if let Some(cd) =
-            crate::plan::sql_frontend::plan_multi_agg_groupby(query, &self.provider)?
+        if let Some(cd) = crate::plan::sql_frontend::plan_multi_agg_groupby(query, &self.provider)?
         {
             return Ok(format!(
                 "multi-agg GROUP BY plan:\n{}",
@@ -3022,9 +2971,8 @@ impl Engine {
     /// by executing a subplan is the interior-mutable GpuTable cache and the
     /// pool-stats throttle, neither of which needs `&mut`.
     fn resolve_subqueries(&self, plan: LogicalPlan) -> BoltResult<LogicalPlan> {
-        let mut exec = |subplan: LogicalPlan| -> BoltResult<RecordBatch> {
-            self.run_subplan(subplan)
-        };
+        let mut exec =
+            |subplan: LogicalPlan| -> BoltResult<RecordBatch> { self.run_subplan(subplan) };
         crate::exec::subquery_resolve::resolve_plan(plan, &mut exec)
     }
 
@@ -3245,8 +3193,8 @@ impl Engine {
                 // that does not depend on row ordering.
                 let prev_rows = result.num_rows();
                 let combined = concat_two_batches(&result, &rec_out)?;
-                let deduped = execute_distinct(QueryHandle::from_record_batch(combined))?
-                    .into_record_batch();
+                let deduped =
+                    execute_distinct(QueryHandle::from_record_batch(combined))?.into_record_batch();
                 if deduped.num_rows() == prev_rows {
                     break; // Fixpoint: no rows the result didn't already hold.
                 }
@@ -3300,8 +3248,7 @@ impl Engine {
 
         // Refuse to shadow real tables under either reserved ephemeral name.
         for name in [LATERAL_OUTER_TABLE, LATERAL_APPLY_RESULT_TABLE] {
-            if self.tables.contains_key(name)
-                || self.streaming_sources.borrow().contains_key(name)
+            if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name)
             {
                 return Err(BoltError::Plan(format!(
                     "LATERAL apply: reserved ephemeral table name '{name}' collides \
@@ -3431,7 +3378,9 @@ impl Engine {
         };
 
         // --- 4. Bind the applied relation and run the OUTER template. ---
-        self.gpu_tables.borrow_mut().remove(LATERAL_APPLY_RESULT_TABLE);
+        self.gpu_tables
+            .borrow_mut()
+            .remove(LATERAL_APPLY_RESULT_TABLE);
         self.streaming_sources.borrow_mut().insert(
             LATERAL_APPLY_RESULT_TABLE.to_string(),
             TableSource::Materialized(vec![applied]),
@@ -3483,12 +3432,13 @@ impl Engine {
         use arrow_array::{Array, BooleanArray, UInt32Array};
 
         use crate::exec::streaming::TableSource;
-        use crate::plan::sql_frontend::{CorrWhereKind, CORR_WHERE_RESULT_TABLE, LATERAL_OUTER_TABLE};
+        use crate::plan::sql_frontend::{
+            CorrWhereKind, CORR_WHERE_RESULT_TABLE, LATERAL_OUTER_TABLE,
+        };
 
         // Refuse to shadow real tables under either reserved ephemeral name.
         for name in [LATERAL_OUTER_TABLE, CORR_WHERE_RESULT_TABLE] {
-            if self.tables.contains_key(name)
-                || self.streaming_sources.borrow().contains_key(name)
+            if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name)
             {
                 return Err(BoltError::Plan(format!(
                     "correlated WHERE: reserved ephemeral table name '{name}' \
@@ -3609,9 +3559,7 @@ impl Engine {
         self.streaming_sources
             .borrow_mut()
             .remove(CORR_WHERE_RESULT_TABLE);
-        self.gpu_tables
-            .borrow_mut()
-            .remove(CORR_WHERE_RESULT_TABLE);
+        self.gpu_tables.borrow_mut().remove(CORR_WHERE_RESULT_TABLE);
         Ok(QueryHandle::from_record_batch(out?))
     }
 
@@ -3689,21 +3637,22 @@ impl Engine {
         // Bind ALL current accumulations under their CTE names, run `plan`, then
         // clear every overlay entry (and evict any GPU-resident copy so the next
         // bind re-uploads the current rows). Returns the produced batch.
-        let run_with_all = |accums: &[RecordBatch], plan: &LogicalPlan| -> BoltResult<RecordBatch> {
-            for (i, term) in rec.ctes.iter().enumerate() {
-                self.gpu_tables.borrow_mut().remove(&term.name);
-                self.streaming_sources.borrow_mut().insert(
-                    term.name.clone(),
-                    TableSource::Materialized(vec![accums[i].clone()]),
-                );
-            }
-            let out = self.run_subplan(plan.clone());
-            for term in &rec.ctes {
-                self.streaming_sources.borrow_mut().remove(&term.name);
-                self.gpu_tables.borrow_mut().remove(&term.name);
-            }
-            out
-        };
+        let run_with_all =
+            |accums: &[RecordBatch], plan: &LogicalPlan| -> BoltResult<RecordBatch> {
+                for (i, term) in rec.ctes.iter().enumerate() {
+                    self.gpu_tables.borrow_mut().remove(&term.name);
+                    self.streaming_sources.borrow_mut().insert(
+                        term.name.clone(),
+                        TableSource::Materialized(vec![accums[i].clone()]),
+                    );
+                }
+                let out = self.run_subplan(plan.clone());
+                for term in &rec.ctes {
+                    self.streaming_sources.borrow_mut().remove(&term.name);
+                    self.gpu_tables.borrow_mut().remove(&term.name);
+                }
+                out
+            };
 
         // --- 1. Seed: materialise every anchor. ---
         let mut accums: Vec<RecordBatch> = Vec::with_capacity(rec.ctes.len());
@@ -3711,8 +3660,7 @@ impl Engine {
             let anchor_out = relabel(i, self.run_subplan(term.anchor.clone())?)?;
             // De-duplicate the seed for a UNION member (matches the single path).
             let seeded = if term.recursive.is_some() && !term.all {
-                execute_distinct(QueryHandle::from_record_batch(anchor_out))?
-                    .into_record_batch()
+                execute_distinct(QueryHandle::from_record_batch(anchor_out))?.into_record_batch()
             } else {
                 anchor_out
             };
@@ -3849,9 +3797,7 @@ impl Engine {
                 let is_overlay_only = !self.tables.contains_key(table)
                     && self.streaming_sources.borrow().contains_key(table);
                 if is_overlay_only {
-                    if let Some(morsel_rows) =
-                        self.morsel_plan_for_table(table)?.morsel_rows()
-                    {
+                    if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
                         let output_schema = phys.output_schema().clone();
                         return self.execute_streaming_leaf(
                             table,
@@ -3871,9 +3817,7 @@ impl Engine {
                 let is_overlay_only = !self.tables.contains_key(table)
                     && self.streaming_sources.borrow().contains_key(table);
                 if is_overlay_only {
-                    if let Some(morsel_rows) =
-                        self.morsel_plan_for_table(table)?.morsel_rows()
-                    {
+                    if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
                         if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
                             return self.execute_streaming_scalar_aggregate(
                                 table,
@@ -3895,9 +3839,7 @@ impl Engine {
                 let is_overlay_only = !self.tables.contains_key(table)
                     && self.streaming_sources.borrow().contains_key(table);
                 if is_overlay_only {
-                    if let Some(morsel_rows) =
-                        self.morsel_plan_for_table(table)?.morsel_rows()
-                    {
+                    if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
                         if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
                             return self.execute_streaming_grouped_aggregate(
                                 table,
@@ -3938,8 +3880,7 @@ impl Engine {
                 // failing the query. Any *other* error still propagates.
                 match self.execute_projection(table, kernel, output_schema) {
                     Err(BoltError::GpuCapacity(reason)) => {
-                        crate::metrics::metrics()
-                            .inc(crate::metrics::Counter::HostFallbacksTotal);
+                        crate::metrics::metrics().inc(crate::metrics::Counter::HostFallbacksTotal);
                         log::debug!(
                             "execute_projection: GPU declined ({reason}); \
                              re-running projection on host"
@@ -4022,9 +3963,7 @@ impl Engine {
                             Some(b) => b,
                             None => {
                                 let batch = self.materialize_table(table)?;
-                                crate::exec::agg_with_pre::execute_aggregate_with_pre(
-                                    phys, &batch,
-                                )?
+                                crate::exec::agg_with_pre::execute_aggregate_with_pre(phys, &batch)?
                             }
                         }
                     }
@@ -4114,10 +4053,9 @@ impl Engine {
                     handles.push(self.execute(inp)?);
                 }
                 let schema = handles[0].batch.schema();
-                let batches: Vec<RecordBatch> =
-                    handles.into_iter().map(|h| h.batch).collect();
-                let merged = arrow::compute::concat_batches(&schema, batches.iter())
-                    .map_err(|e| {
+                let batches: Vec<RecordBatch> = handles.into_iter().map(|h| h.batch).collect();
+                let merged =
+                    arrow::compute::concat_batches(&schema, batches.iter()).map_err(|e| {
                         BoltError::Other(format!(
                             "failed to concatenate {} UNION ALL inputs: {e}",
                             batches.len()
@@ -4162,9 +4100,7 @@ impl Engine {
                 literal,
                 mode,
                 negated,
-            } => self.execute_string_like_filter(
-                input, table, column, literal, *mode, *negated,
-            ),
+            } => self.execute_string_like_filter(input, table, column, literal, *mode, *negated),
             PhysicalPlan::Filter { input, predicate } => {
                 // Host-side post-aggregate (or other non-scan-chain) filter.
                 // The lowerer emits this for `HAVING` and any `Filter`
@@ -4242,17 +4178,11 @@ impl Engine {
                         owned_env = Some(v);
                     }
                     let env_ref = owned_env.as_ref().expect("just built");
-                    let env: crate::exec::expr_agg::ColumnEnv<'_> = env_ref
-                        .iter()
-                        .map(|(n, c)| (n.clone(), c))
-                        .collect();
+                    let env: crate::exec::expr_agg::ColumnEnv<'_> =
+                        env_ref.iter().map(|(n, c)| (n.clone(), c)).collect();
                     let out_field = &output_schema.fields[out_idx];
-                    let computed = crate::exec::expr_agg::eval_expr(
-                        inner,
-                        &env,
-                        out_field.dtype,
-                        n_rows,
-                    )?;
+                    let computed =
+                        crate::exec::expr_agg::eval_expr(inner, &env, out_field.dtype, n_rows)?;
                     // Temporal-typed outputs (e.g. CAST(<str> AS DATE/TIMESTAMP
                     // FORMAT ...)) carry their value as the underlying i32/i64
                     // HostColumn; rebuild the declared temporal Arrow type so the
@@ -4359,12 +4289,15 @@ impl Engine {
                 // rank table maps each index to its rank. NULL rows carry index
                 // 0, which the rank table maps to the `-1` sentinel — the
                 // rewriter's `(__rank_ >= 0)` guard then drops them (SQL 3VL).
-                let dict = self.dict_registry.dictionary(table, original).ok_or_else(|| {
-                    BoltError::Plan(format!(
+                let dict = self
+                    .dict_registry
+                    .dictionary(table, original)
+                    .ok_or_else(|| {
+                        BoltError::Plan(format!(
                         "rank column '{}' references column '{}' with no dictionary in registry",
                         io.name, original
                     ))
-                })?;
+                    })?;
                 // Gather host-side: download the index column once, map each
                 // index through the rank table, upload the i64 rank column. This
                 // is per-query setup cost (one D2H + one H2D of the index/rank
@@ -4419,7 +4352,9 @@ impl Engine {
                 if host_ranks.len() != n_rows {
                     return Err(BoltError::Other(format!(
                         "rank materialise: column '{}' produced {} rows, table has {}",
-                        io.name, host_ranks.len(), n_rows
+                        io.name,
+                        host_ranks.len(),
+                        n_rows
                     )));
                 }
                 let dev = GpuVec::<i64>::from_slice(&host_ranks)?;
@@ -4428,12 +4363,15 @@ impl Engine {
                 continue;
             }
             if let Some(original) = io.name.strip_prefix("__idx_") {
-                let dict = self.dict_registry.dictionary(table, original).ok_or_else(|| {
-                    BoltError::Plan(format!(
-                        "rewriter-emitted column '{}' has no dictionary in registry",
-                        io.name
-                    ))
-                })?;
+                let dict = self
+                    .dict_registry
+                    .dictionary(table, original)
+                    .ok_or_else(|| {
+                        BoltError::Plan(format!(
+                            "rewriter-emitted column '{}' has no dictionary in registry",
+                            io.name
+                        ))
+                    })?;
                 // Fail fast on plan/dict dtype mismatch BEFORE doing any I/O —
                 // this catches a stale plan that names __idx_X with the wrong
                 // width without paying the cost of touching the device.
@@ -4543,9 +4481,8 @@ impl Engine {
         // The underlying `jit::jit_compiler` PTX-text-hash cache continues
         // to short-circuit `cuModuleLoadDataEx` for unique-spec / shared-
         // PTX cases (e.g. across distinct engines in the same process).
-        let module = self.get_or_build_module(kernel, KERNEL_ENTRY, |k| {
-            compile_ptx(k, KERNEL_ENTRY)
-        })?;
+        let module =
+            self.get_or_build_module(kernel, KERNEL_ENTRY, |k| compile_ptx(k, KERNEL_ENTRY))?;
         let function = module.function(KERNEL_ENTRY)?;
 
         // 4. Build the kernel-parameter list.
@@ -4810,11 +4747,12 @@ impl Engine {
         // 9. Build the result RecordBatch (Materialize phase).
         let materialize_start = Instant::now();
         let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
-        let batch_out = RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
-            BoltError::Other(format!("failed to build output RecordBatch: {e}"))
-        })?;
-        crate::metrics::metrics()
-            .observe_duration(crate::metrics::Phase::Materialize, materialize_start.elapsed());
+        let batch_out = RecordBatch::try_new(arrow_schema, arrays)
+            .map_err(|e| BoltError::Other(format!("failed to build output RecordBatch: {e}")))?;
+        crate::metrics::metrics().observe_duration(
+            crate::metrics::Phase::Materialize,
+            materialize_start.elapsed(),
+        );
         Ok(QueryHandle { batch: batch_out })
     }
 
@@ -5021,7 +4959,10 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("Int64 col");
         assert_eq!(c0.value(0), 1);
-        assert!(arrow_array::Array::is_null(c0, 1), "NULL cell must materialise as a null");
+        assert!(
+            arrow_array::Array::is_null(c0, 1),
+            "NULL cell must materialise as a null"
+        );
         let c1 = batch
             .column(1)
             .as_any()
@@ -5082,11 +5023,23 @@ mod tests {
     /// Read the `(key, count)` result rows out of a count-result batch.
     fn cd_read(batch: &RecordBatch) -> Vec<(Option<i32>, i64)> {
         use arrow_array::Array;
-        let keys = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let cnts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let cnts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         (0..batch.num_rows())
             .map(|i| {
-                let k = if keys.is_null(i) { None } else { Some(keys.value(i)) };
+                let k = if keys.is_null(i) {
+                    None
+                } else {
+                    Some(keys.value(i))
+                };
                 (k, cnts.value(i))
             })
             .collect()
@@ -5128,11 +5081,7 @@ mod tests {
     /// A NULL group key forms its own distinct group (per SQL GROUP BY).
     #[test]
     fn host_cd_null_group_key_is_its_own_group() {
-        let base = cd_base(&[
-            (None, Some(1)),
-            (None, Some(2)),
-            (Some(5), Some(9)),
-        ]);
+        let base = cd_base(&[(None, Some(1)), (None, Some(2)), (Some(5), Some(9))]);
         let out = host_count_distinct_groupby(&base, 1, &cd_result_schema()).unwrap();
         let rows = cd_read(&out);
         // First-occurrence order: NULL group first (count 2), then key 5 (count 1).
@@ -5146,7 +5095,9 @@ mod tests {
         // base = [k1 Int32, k2 Int64, v Int64]; n_keys = 2.
         let k1: Int32Array = [Some(1), Some(1), Some(1), Some(2)].into_iter().collect();
         let k2: Int64Array = [Some(7), Some(7), Some(8), Some(7)].into_iter().collect();
-        let v: Int64Array = [Some(100), Some(200), Some(100), Some(100)].into_iter().collect();
+        let v: Int64Array = [Some(100), Some(200), Some(100), Some(100)]
+            .into_iter()
+            .collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("k1", ArrowDataType::Int32, true),
             ArrowField::new("k2", ArrowDataType::Int64, true),
@@ -5190,12 +5141,21 @@ mod tests {
         //          x = 1+2+3 = 6; count(*) = 3.
         // group 2: a in {30,30} -> distinct 1; b in {7,7} -> distinct 1;
         //          x = 4 (one NULL ignored by SUM but counted by COUNT(*)=2).
-        let g: Int32Array = [Some(1), Some(1), Some(1), Some(2), Some(2)].into_iter().collect();
-        let a: Int64Array =
-            [Some(10), Some(10), Some(20), Some(30), Some(30)].into_iter().collect();
-        let b: Int64Array = [None, Some(5), Some(5), Some(7), Some(7)].into_iter().collect();
-        let x: Int64Array = [Some(1), Some(2), Some(3), Some(4), None].into_iter().collect();
-        let star: Int64Array = [Some(1), Some(1), Some(1), Some(1), Some(1)].into_iter().collect();
+        let g: Int32Array = [Some(1), Some(1), Some(1), Some(2), Some(2)]
+            .into_iter()
+            .collect();
+        let a: Int64Array = [Some(10), Some(10), Some(20), Some(30), Some(30)]
+            .into_iter()
+            .collect();
+        let b: Int64Array = [None, Some(5), Some(5), Some(7), Some(7)]
+            .into_iter()
+            .collect();
+        let x: Int64Array = [Some(1), Some(2), Some(3), Some(4), None]
+            .into_iter()
+            .collect();
+        let star: Int64Array = [Some(1), Some(1), Some(1), Some(1), Some(1)]
+            .into_iter()
+            .collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("g", ArrowDataType::Int32, true),
             ArrowField::new("a", ArrowDataType::Int64, true),
@@ -5205,7 +5165,13 @@ mod tests {
         ]));
         let base = RecordBatch::try_new(
             schema,
-            vec![Arc::new(g), Arc::new(a), Arc::new(b), Arc::new(x), Arc::new(star)],
+            vec![
+                Arc::new(g),
+                Arc::new(a),
+                Arc::new(b),
+                Arc::new(x),
+                Arc::new(star),
+            ],
         )
         .unwrap();
         let aggs = vec![
@@ -5228,8 +5194,7 @@ mod tests {
             Field::new("sum_x", DataType::Int64, true),
             Field::new("cnt", DataType::Int64, false),
         ]);
-        let out =
-            host_multi_agg_groupby(&base, 1, &aggs, &output_layout, &result_schema).unwrap();
+        let out = host_multi_agg_groupby(&base, 1, &aggs, &output_layout, &result_schema).unwrap();
         assert_eq!(out.num_rows(), 2);
         let g = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let cda = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -5238,9 +5203,15 @@ mod tests {
         let cnt = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
         // First-occurrence order: group 1 then group 2.
         assert_eq!(g.value(0), 1);
-        assert_eq!((cda.value(0), cdb.value(0), sumx.value(0), cnt.value(0)), (2, 1, 6, 3));
+        assert_eq!(
+            (cda.value(0), cdb.value(0), sumx.value(0), cnt.value(0)),
+            (2, 1, 6, 3)
+        );
         assert_eq!(g.value(1), 2);
-        assert_eq!((cda.value(1), cdb.value(1), sumx.value(1), cnt.value(1)), (1, 1, 4, 2));
+        assert_eq!(
+            (cda.value(1), cdb.value(1), sumx.value(1), cnt.value(1)),
+            (1, 1, 4, 2)
+        );
         // SUM(x) for group 2 ignored the NULL row but COUNT(*) counted it.
         assert!(!sumx.is_null(1));
     }
@@ -5252,8 +5223,12 @@ mod tests {
         use crate::plan::sql_frontend::{CdAgg, CdOutputCol};
         use arrow_array::{Array, Float64Array};
         // group 1: x = {2,4,6}; group 2: x = {NULL,NULL}.
-        let g: Int32Array = [Some(1), Some(1), Some(1), Some(2), Some(2)].into_iter().collect();
-        let x: Int64Array = [Some(2), Some(4), Some(6), None, None].into_iter().collect();
+        let g: Int32Array = [Some(1), Some(1), Some(1), Some(2), Some(2)]
+            .into_iter()
+            .collect();
+        let x: Int64Array = [Some(2), Some(4), Some(6), None, None]
+            .into_iter()
+            .collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("g", ArrowDataType::Int32, true),
             ArrowField::new("xmin", ArrowDataType::Int64, true),
@@ -5292,11 +5267,14 @@ mod tests {
             Field::new("av", DataType::Float64, true),
             Field::new("c", DataType::Int64, false),
         ]);
-        let out =
-            host_multi_agg_groupby(&base, 1, &aggs, &output_layout, &result_schema).unwrap();
+        let out = host_multi_agg_groupby(&base, 1, &aggs, &output_layout, &result_schema).unwrap();
         let mn = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let mx = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-        let av = out.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
+        let av = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let c = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
         // group 1: min 2, max 6, avg 4.0, count 3.
         assert_eq!((mn.value(0), mx.value(0)), (2, 6));
@@ -5313,8 +5291,15 @@ mod tests {
     fn host_multi_agg_rejects_wrong_column_count() {
         use crate::plan::sql_frontend::{CdAgg, CdOutputCol};
         let base = cd_base(&[(Some(1), Some(1))]); // 2 columns
-        let aggs = vec![CdAgg::CountDistinct { base_col: 1 }, CdAgg::Sum { base_col: 2 }];
-        let layout = vec![CdOutputCol::GroupKey(0), CdOutputCol::Agg(0), CdOutputCol::Agg(1)];
+        let aggs = vec![
+            CdAgg::CountDistinct { base_col: 1 },
+            CdAgg::Sum { base_col: 2 },
+        ];
+        let layout = vec![
+            CdOutputCol::GroupKey(0),
+            CdOutputCol::Agg(0),
+            CdOutputCol::Agg(1),
+        ];
         let rs = Schema::new(vec![
             Field::new("k", DataType::Int32, true),
             Field::new("cd", DataType::Int64, false),
@@ -5373,11 +5358,17 @@ mod tests {
         let spec = spec_with(
             vec![
                 col_io("d", DataType::Date32),
-                col_io("ts", DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None)),
+                col_io(
+                    "ts",
+                    DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None),
+                ),
             ],
             vec![
                 col_io("d", DataType::Date32),
-                col_io("ts", DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None)),
+                col_io(
+                    "ts",
+                    DataType::Timestamp(crate::plan::TimeUnit::Microsecond, None),
+                ),
             ],
             vec![
                 Op::LoadColumn {
@@ -5563,7 +5554,10 @@ mod tests {
         let rows_per_batch = 100usize;
         for i in 0..n_batches {
             engine
-                .register_batch("t", int64_batch((i * rows_per_batch) as i64, rows_per_batch))
+                .register_batch(
+                    "t",
+                    int64_batch((i * rows_per_batch) as i64, rows_per_batch),
+                )
                 .unwrap_or_else(|e| panic!("register_batch {i}: {e}"));
         }
         let total_rows = n_batches * rows_per_batch;
@@ -5597,11 +5591,7 @@ mod tests {
             ArrowField::new("b", ArrowDataType::Int64, false),
             ArrowField::new("c", ArrowDataType::Float64, false),
         ]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(a), Arc::new(b), Arc::new(c)],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b), Arc::new(c)]).unwrap()
     }
 
     /// Batch 5 — incremental rebuild after `register_batch`. Register a
@@ -5776,9 +5766,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
         engine.register_table("t", batch).expect("register");
 
-        let handle = engine
-            .sql("SELECT x FROM t WHERE x > 2")
-            .expect("query");
+        let handle = engine.sql("SELECT x FROM t WHERE x > 2").expect("query");
         let out = handle.record_batch();
 
         let col = out
@@ -5911,8 +5899,7 @@ mod tests {
             ArrowDataType::Int32,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
         engine.register_table("t", batch).expect("register");
 
         let provider = EngineProvider {
@@ -6012,8 +5999,7 @@ mod tests {
             ArrowDataType::Int32,
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
         engine.register_table("t", batch).expect("register");
 
         let provider = EngineProvider {
@@ -6951,8 +6937,7 @@ mod tests {
         assert_eq!(Engine::streamable_scalar_aggregate(&avg), None);
 
         // A GROUP BY (non-empty group_by) is out of scope for scalar streaming.
-        let mut grouped =
-            scalar_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
+        let mut grouped = scalar_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
         if let PhysicalPlan::Aggregate { aggregate, .. } = &mut grouped {
             aggregate.group_by = vec![0];
         }
@@ -6973,10 +6958,7 @@ mod tests {
             table: table.to_string(),
             pre: None,
             aggregate: AggregateSpec {
-                inputs: vec![
-                    col_io("g", DataType::Int64),
-                    col_io("x", DataType::Int64),
-                ],
+                inputs: vec![col_io("g", DataType::Int64), col_io("x", DataType::Int64)],
                 group_by: vec![0],
                 aggregates: aggs,
                 output_schema: Schema::new(fields),
@@ -7019,8 +7001,7 @@ mod tests {
         assert_eq!(Engine::streamable_grouped_aggregate(&avg), None);
 
         // A scalar aggregate (empty group_by) is NOT the grouped path.
-        let scalar =
-            scalar_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
+        let scalar = scalar_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
         assert_eq!(Engine::streamable_grouped_aggregate(&scalar), None);
     }
 
@@ -7142,8 +7123,12 @@ mod tests {
 
         // Baseline: whole table materialised, no budget.
         let mut whole = Engine::new().expect("ctx");
-        whole.register_table("t", int64_batch(0, total)).expect("register whole");
-        let h_whole = whole.sql("SELECT x FROM t WHERE x >= 100").expect("whole query");
+        whole
+            .register_table("t", int64_batch(0, total))
+            .expect("register whole");
+        let h_whole = whole
+            .sql("SELECT x FROM t WHERE x >= 100")
+            .expect("whole query");
         let want = h_whole.record_batch().clone();
 
         // Streaming source + a budget far below the table footprint, so
@@ -7156,15 +7141,24 @@ mod tests {
         streamed
             .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
             .expect("register stream");
-        let h_stream = streamed.sql("SELECT x FROM t WHERE x >= 100").expect("stream query");
+        let h_stream = streamed
+            .sql("SELECT x FROM t WHERE x >= 100")
+            .expect("stream query");
         let got = h_stream.record_batch().clone();
 
         assert_eq!(got.num_rows(), want.num_rows(), "row counts must match");
-        let want_col = want.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let want_col = want
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let got_col = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let want_v: Vec<i64> = (0..want_col.len()).map(|i| want_col.value(i)).collect();
         let got_v: Vec<i64> = (0..got_col.len()).map(|i| got_col.value(i)).collect();
-        assert_eq!(got_v, want_v, "morsel-streamed values must equal whole-table values");
+        assert_eq!(
+            got_v, want_v,
+            "morsel-streamed values must equal whole-table values"
+        );
     }
 
     /// End-to-end equivalence for the **streaming scalar-aggregate** path: a
@@ -7193,7 +7187,11 @@ mod tests {
         assert_eq!(out.num_rows(), 1, "scalar aggregate yields one row");
         let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let expected: i64 = (0..total as i64).sum();
-        assert_eq!(col.value(0), expected, "streamed SUM equals whole-table SUM");
+        assert_eq!(
+            col.value(0),
+            expected,
+            "streamed SUM equals whole-table SUM"
+        );
     }
 
     /// Streaming a scalar aggregate WITH a `WHERE` filter: the per-morsel
@@ -7251,7 +7249,11 @@ mod tests {
         let h = engine.sql("SELECT AVG(x) FROM t").expect("aggregate query");
         let out = h.record_batch();
         assert_eq!(out.num_rows(), 1, "scalar aggregate yields one row");
-        let col = out.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let expected = (0..total as i64).sum::<i64>() as f64 / total as f64;
         assert!(
             (col.value(0) - expected).abs() < 1e-6,
@@ -7277,13 +7279,28 @@ mod tests {
             .register_table_stream_lazy("t", x_schema(), int64_producer(0, total))
             .expect("register stream");
         // First query streams morsel-by-morsel.
-        let h1 = engine.sql("SELECT x FROM t").expect("first (streamed) query");
-        assert_eq!(h1.record_batch().num_rows(), total, "first query sees all rows");
+        let h1 = engine
+            .sql("SELECT x FROM t")
+            .expect("first (streamed) query");
+        assert_eq!(
+            h1.record_batch().num_rows(),
+            total,
+            "first query sees all rows"
+        );
         // Second query (drain-fallback aggregate) must still see the full
         // table — the overlay was restored to the whole-table view.
         let h2 = engine.sql("SELECT COUNT(x) FROM t").expect("second query");
-        let c = h2.record_batch().column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(c.value(0), total as i64, "overlay restored: full table visible");
+        let c = h2
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            c.value(0),
+            total as i64,
+            "overlay restored: full table visible"
+        );
     }
 
     /// Schema for the grouped streaming fixture: an Int64 group key `g` and an
@@ -7375,7 +7392,10 @@ mod tests {
         let want_map = to_map(&want);
         let got_map = to_map(&got);
         assert_eq!(got.num_rows() as i64, n_groups, "all groups present");
-        assert_eq!(got_map, want_map, "streamed grouped aggregates equal whole-table");
+        assert_eq!(
+            got_map, want_map,
+            "streamed grouped aggregates equal whole-table"
+        );
     }
 
     /// The grouped drain-fallback: a non-distributive grouped `AVG` is NOT
@@ -7404,7 +7424,11 @@ mod tests {
         assert_eq!(got.num_rows() as i64, n_groups);
         // Spot-check group 0's average: x in {0, n_groups, 2*n_groups, ...}.
         let g = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let a = got.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let a = got
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for r in 0..got.num_rows() {
             let key = g.value(r);
             let members: Vec<i64> = (0..total as i64).filter(|i| i % n_groups == key).collect();
@@ -7450,7 +7474,9 @@ mod tests {
             ArrowField::new("dst", ArrowDataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![src, dst]).expect("edges batch");
-        engine.register_table("edges", batch).expect("register edges");
+        engine
+            .register_table("edges", batch)
+            .expect("register edges");
     }
 
     /// End-to-end: an integer sequence `1..=5` via UNION ALL accumulates
@@ -7461,9 +7487,9 @@ mod tests {
     fn recursive_integer_sequence_accumulates_rows() {
         let mut engine = Engine::new().expect("ctx");
         register_edges(&mut engine); // base table so the provider is non-empty
-        // Seed from a base table (the frontend requires a FROM clause, so a
-        // bare `SELECT 1` anchor is not available): `src = 1` selects the
-        // single row valued 1 from `edges`.
+                                     // Seed from a base table (the frontend requires a FROM clause, so a
+                                     // bare `SELECT 1` anchor is not available): `src = 1` selects the
+                                     // single row valued 1 from `edges`.
         let h = engine
             .sql(
                 "WITH RECURSIVE seq(n) AS (\
@@ -7550,11 +7576,14 @@ mod tests {
             )
             .expect("non-linear transitive closure must execute");
         let b = h.record_batch();
-        assert_eq!(b.num_rows(), 6, "transitive closure of a 4-node path is 6 pairs");
+        assert_eq!(
+            b.num_rows(),
+            6,
+            "transitive closure of a 4-node path is 6 pairs"
+        );
         let xs = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let ys = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let got: Vec<(i64, i64)> =
-            (0..xs.len()).map(|i| (xs.value(i), ys.value(i))).collect();
+        let got: Vec<(i64, i64)> = (0..xs.len()).map(|i| (xs.value(i), ys.value(i))).collect();
         assert_eq!(
             got,
             vec![(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)],
@@ -7627,7 +7656,11 @@ mod tests {
         let b = h.record_batch();
         let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let got: Vec<i64> = (0..col.len()).map(|i| col.value(i)).collect();
-        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 6], "0..=6 from the lockstep fixpoint");
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3, 4, 5, 6],
+            "0..=6 from the lockstep fixpoint"
+        );
     }
 
     /// A mutually-recursive system with no bound grows forever and must hit the
@@ -7701,8 +7734,9 @@ mod tests {
         assert_eq!(out.num_rows(), 2, "only k=1 pairs survive the filter");
         let av = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let bv = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-        let mut got: Vec<(i32, i32)> =
-            (0..out.num_rows()).map(|i| (av.value(i), bv.value(i))).collect();
+        let mut got: Vec<(i32, i32)> = (0..out.num_rows())
+            .map(|i| (av.value(i), bv.value(i)))
+            .collect();
         got.sort_unstable();
         assert_eq!(got, vec![(10, 100), (10, 101)]);
     }
@@ -7746,8 +7780,14 @@ mod tests {
         let cda = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let sumx = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let cnt = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!((g.value(0), cda.value(0), sumx.value(0), cnt.value(0)), (1, 2, 6, 3));
-        assert_eq!((g.value(1), cda.value(1), sumx.value(1), cnt.value(1)), (2, 1, 4, 1));
+        assert_eq!(
+            (g.value(0), cda.value(0), sumx.value(0), cnt.value(0)),
+            (1, 2, 6, 3)
+        );
+        assert_eq!(
+            (g.value(1), cda.value(1), sumx.value(1), cnt.value(1)),
+            (2, 1, 4, 1)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7838,7 +7878,10 @@ mod tests {
         )
         .expect_err("a residual JOIN LATERAL predicate must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("ON true"), "expected ON-true rejection, got: {msg}");
+        assert!(
+            msg.contains("ON true"),
+            "expected ON-true rejection, got: {msg}"
+        );
     }
 
     /// End-to-end correctness: a correlated LATERAL join. `k=1` yields two rows
@@ -7859,7 +7902,9 @@ mod tests {
         assert_eq!(b.num_rows(), 3, "k=1 (2 rows) + k=2 (1 row); k=3 dropped");
         let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let n = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let got: Vec<(i64, i64)> = (0..b.num_rows()).map(|i| (k.value(i), n.value(i))).collect();
+        let got: Vec<(i64, i64)> = (0..b.num_rows())
+            .map(|i| (k.value(i), n.value(i)))
+            .collect();
         assert_eq!(got, vec![(1, 10), (1, 11), (2, 20)]);
     }
 
@@ -7881,7 +7926,10 @@ mod tests {
         assert_eq!(b.num_rows(), 4, "unmatched left row kept once with NULL");
         let n = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert!(
-            (0..b.num_rows()).filter(|&i| arrow_array::Array::is_null(n, i)).count() == 1,
+            (0..b.num_rows())
+                .filter(|&i| arrow_array::Array::is_null(n, i))
+                .count()
+                == 1,
             "exactly one NULL subquery value (the k=3 left row)"
         );
     }
@@ -7896,9 +7944,7 @@ mod tests {
         register_lateral_fixtures(&mut engine); // lft has 3 rows
         std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "2");
         let err = engine
-            .sql(
-                "SELECT lft.k, d.n FROM lft, LATERAL (SELECT n FROM vals WHERE vk = lft.k) AS d",
-            )
+            .sql("SELECT lft.k, d.n FROM lft, LATERAL (SELECT n FROM vals WHERE vk = lft.k) AS d")
             .expect_err("3 left rows must exceed the 2-row cap");
         std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
         let msg = format!("{err}");
@@ -7917,9 +7963,17 @@ mod tests {
         std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "5");
         assert_eq!(max_apply_left_rows(), 5);
         std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "0");
-        assert_eq!(max_apply_left_rows(), MAX_APPLY_LEFT_ROWS, "zero falls back");
+        assert_eq!(
+            max_apply_left_rows(),
+            MAX_APPLY_LEFT_ROWS,
+            "zero falls back"
+        );
         std::env::set_var(MAX_APPLY_LEFT_ROWS_ENV, "nope");
-        assert_eq!(max_apply_left_rows(), MAX_APPLY_LEFT_ROWS, "non-int falls back");
+        assert_eq!(
+            max_apply_left_rows(),
+            MAX_APPLY_LEFT_ROWS,
+            "non-int falls back"
+        );
         std::env::remove_var(MAX_APPLY_LEFT_ROWS_ENV);
     }
 
@@ -7996,16 +8050,21 @@ mod tests {
             &provider,
         )
         .expect("detector");
-        assert!(got.is_none(), "an uncorrelated scalar subquery is not our shape");
+        assert!(
+            got.is_none(),
+            "an uncorrelated scalar subquery is not our shape"
+        );
     }
 
     /// The detector declines a query with no WHERE / no subquery. Host-only.
     #[test]
     fn corr_where_declines_plain_query() {
         let provider = lateral_provider();
-        assert!(crate::plan::sql_frontend::plan_correlated_where("SELECT k FROM lft", &provider)
-            .expect("detector")
-            .is_none());
+        assert!(
+            crate::plan::sql_frontend::plan_correlated_where("SELECT k FROM lft", &provider)
+                .expect("detector")
+                .is_none()
+        );
     }
 
     /// Out-of-scope shape: two correlated subqueries in the WHERE are rejected

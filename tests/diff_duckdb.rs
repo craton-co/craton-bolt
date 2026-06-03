@@ -289,10 +289,7 @@ fn assert_results_equal(label: &str, duck: &ResultSet, bolt: &ResultSet) {
         }
         for c in 0..dr.len() {
             if !dr[c].approx_eq(&br[c]) {
-                errs.push(format!(
-                    "row {i}, col {c}: DuckDB={} Bolt={}",
-                    dr[c], br[c]
-                ));
+                errs.push(format!("row {i}, col {c}: DuckDB={} Bolt={}", dr[c], br[c]));
             }
         }
     }
@@ -341,10 +338,7 @@ struct TableSpec<'a> {
 /// the live pair so the caller can run SQL through each. Panics on CUDA
 /// init failure — every test is `#[ignore]`'d, so the panic only fires
 /// on the GPU host we explicitly opted in to.
-fn setup(
-    label: &str,
-    tables: &[TableSpec<'_>],
-) -> (duckdb::Connection, craton_bolt::Engine) {
+fn setup(label: &str, tables: &[TableSpec<'_>]) -> (duckdb::Connection, craton_bolt::Engine) {
     let mut engine = craton_bolt::Engine::new().unwrap_or_else(|e| {
         panic!("[{label}] CUDA init failed (need a GPU to run --ignored tests): {e}")
     });
@@ -470,7 +464,13 @@ fn t_with_nulls(n: usize) -> RecordBatch {
     // Every 3rd row is NULL; the remaining values span a wide range so
     // MIN/MAX/AVG diverge from "treat null as 0" by a large margin.
     let v: Float64Array = (0..n)
-        .map(|i| if i % 3 == 0 { None } else { Some((i as f64) - 50.0) })
+        .map(|i| {
+            if i % 3 == 0 {
+                None
+            } else {
+                Some((i as f64) - 50.0)
+            }
+        })
         .collect();
     RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("t_with_nulls batch")
 }
@@ -509,8 +509,7 @@ fn t_strings(n: usize) -> RecordBatch {
     let s_vals: Vec<&str> = (0..n).map(|i| vocab[i % vocab.len()]).collect();
     let s = StringArray::from(s_vals);
     let v: Int64Array = (0..n as i64).map(|i| (i * 3) % 31).collect();
-    RecordBatch::try_new(schema, vec![Arc::new(s), Arc::new(v)])
-        .expect("t_strings batch")
+    RecordBatch::try_new(schema, vec![Arc::new(s), Arc::new(v)]).expect("t_strings batch")
 }
 
 /// Two-table Utf8 join fixture: `t1(s)` and `t2(s)` with overlapping
@@ -580,8 +579,7 @@ fn diff_filter_basic() {
         "SELECT k, x, v FROM t WHERE x > 5",
         &[TableSpec {
             name: "t",
-            ddl_cols:
-                "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
+            ddl_cols: "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
                  a DOUBLE NOT NULL, b DOUBLE NOT NULL, c DOUBLE NOT NULL",
             batch,
         }],
@@ -599,8 +597,7 @@ fn diff_groupby_basic_sum() {
         "SELECT k, SUM(v) FROM t GROUP BY k",
         &[TableSpec {
             name: "t",
-            ddl_cols:
-                "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
+            ddl_cols: "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
                  a DOUBLE NOT NULL, b DOUBLE NOT NULL, c DOUBLE NOT NULL",
             batch,
         }],
@@ -624,8 +621,7 @@ fn diff_groupby_having_sum() {
     ]));
     let k: Int32Array = (0..n as i32).map(|i| i % 8).collect();
     let v: Float64Array = (0..n).map(|i| (i % 7) as f64 + 1.0).collect();
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("having batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("having batch");
     diff_query(
         "diff_groupby_having_sum",
         "SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(v) > 100",
@@ -698,8 +694,7 @@ fn diff_groupby_order_limit() {
         "SELECT k, SUM(v) FROM t GROUP BY k ORDER BY k LIMIT 10",
         &[TableSpec {
             name: "t",
-            ddl_cols:
-                "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
+            ddl_cols: "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
                  a DOUBLE NOT NULL, b DOUBLE NOT NULL, c DOUBLE NOT NULL",
             batch,
         }],
@@ -745,8 +740,7 @@ fn diff_groupby_multi_sum() {
         "SELECT k, SUM(a), SUM(b), SUM(c) FROM t GROUP BY k",
         &[TableSpec {
             name: "t",
-            ddl_cols:
-                "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
+            ddl_cols: "k INTEGER NOT NULL, x INTEGER NOT NULL, v DOUBLE NOT NULL, \
                  a DOUBLE NOT NULL, b DOUBLE NOT NULL, c DOUBLE NOT NULL",
             batch,
         }],

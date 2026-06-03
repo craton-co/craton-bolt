@@ -190,10 +190,7 @@ pub fn dispatch_v2(inputs: DispatchInputsV2) -> GroupByStrategyV2 {
 
     // Tier-2: cardinality fits in (TIER1_MAX_GROUPS, TIER2_MAX_GROUPS]
     // AND the input is large enough to amortise the partition pass.
-    if n_groups > TIER1_MAX_GROUPS
-        && n_groups <= TIER2_MAX_GROUPS
-        && n_rows >= TIER2_MIN_ROWS
-    {
+    if n_groups > TIER1_MAX_GROUPS && n_groups <= TIER2_MAX_GROUPS && n_rows >= TIER2_MIN_ROWS {
         return GroupByStrategyV2::Tier2Partitioned;
     }
 
