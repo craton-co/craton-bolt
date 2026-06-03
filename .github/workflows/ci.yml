@@ -87,6 +87,50 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
 
+  # Compile-check the optional EXPERIMENTAL subsystems (Arrow Flight SQL and
+  # Substrait ingestion) so they don't bit-rot. They are off by default and not
+  # exercised by the main `build` lane, so without this job an unrelated change
+  # to Engine / LogicalPlan could silently break them. We `cargo check --lib
+  # --tests` (compile, no link/run) which is enough to catch API drift in both
+  # the module code and its unit tests.
+  #
+  # RUSTFLAGS is cleared because these skeletons carry intentional dead-code
+  # (unused Flight SQL command variants, substrait helpers reachable only from
+  # tests) that we don't want to gate the lane on under `-D warnings`.
+  feature-build:
+    name: feature build (flight + substrait)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-features-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-features-
+
+      # The `substrait` crate's build script regenerates its prost types and
+      # needs the Protocol Buffers compiler on PATH.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: cargo check --features flight
+        run: cargo check --lib --tests --no-default-features --features cuda-stub,flight
+
+      - name: cargo check --features substrait
+        run: cargo check --lib --tests --no-default-features --features cuda-stub,substrait
+
   # Documentation build under the HOST config. This mirrors what docs.rs
   # builds (docs.rs cannot link CUDA), so a green run here gives us
   # docs.rs-parity confidence: if `cargo doc` fails here it will fail on
