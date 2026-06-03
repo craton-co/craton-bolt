@@ -70,15 +70,17 @@ version = 2
 # vulnerability advisories: deny (cargo-deny v2 default).
 # (cargo-deny v2 reads RUSTSEC database from the cargo-deny database mirror.)
 #
-# V-11: explicitly set unmaintained/unsound policy rather than relying on
-# defaults. The default host graph (all-features=false) is clean, so we make
-# these strict. NOTE: the rust-cuda / NVVM build-dependency tree (curl/tar/
-# xz 0.1.0/nvvm/rustc_codegen_nvvm) pulls in the known-unmaintained `xz 0.1.0`
-# crate; that tree is only scanned by the informational all-features
-# cargo-deny job in CI (see .github/workflows/ci.yml), which is
-# continue-on-error so this "deny" does not block CI for the rust-cuda graph.
-unmaintained = "deny"
-unsound = "deny"
+# V-11: explicitly set the unmaintained-advisory scan SCOPE rather than relying
+# on defaults. In current cargo-deny the `[advisories]` schema dropped the old
+# per-severity `unmaintained`/`unsound = "deny"` toggles (vulnerability/unsound
+# advisories are now ALWAYS denied via the RUSTSEC DB); `unmaintained` instead
+# selects WHICH part of the graph is scanned for unmaintained crates. We use
+# "all" (strictest — scan every dependency). The default host graph
+# (all-features=false) is clean under it. NOTE: the rust-cuda / NVVM
+# build-dependency tree (curl/tar/xz 0.1.0/nvvm/rustc_codegen_nvvm) pulls in the
+# known-unmaintained `xz 0.1.0`, but that tree is only scanned by the
+# informational, continue-on-error all-features cargo-deny job in CI.
+unmaintained = "all"
 yanked = "warn"
 ignore = [
     # Add RUSTSEC-XXXX-YYYY ids here only with justification + tracking
