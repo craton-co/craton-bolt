@@ -116,8 +116,11 @@ impl DictionaryColumnI64 {
     ///
     /// Nulls in `arr` map to index `0`. Distinct non-null strings are
     /// deduplicated and assigned sequential indices starting at `1`, in
-    /// first-occurrence order. Returns `BoltError::Other` if the unique
-    /// count would overflow `i64::MAX` (defensive — unreachable in practice).
+    /// **byte-lexicographic order** of the string values (R1, mirroring the
+    /// i32 sibling): code `k` names the `k`-th smallest distinct string under
+    /// `str`'s `Ord`, so the integer code order matches lexicographic string
+    /// order. Returns `BoltError::Other` if the unique count would overflow
+    /// `i64::MAX` (defensive — unreachable in practice).
     pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
@@ -168,6 +171,10 @@ impl DictionaryColumnI64 {
                 indices.push(idx);
             }
         }
+
+        // R1: re-order codes into byte-lexicographic rank and remap the row
+        // indices so the integer codes match string order before upload.
+        crate::cuda::dictionary::lex_sort_dictionary(&mut dictionary, &mut indices);
 
         let device_indices = GpuVec::<i64>::from_slice(&indices)?;
         Ok(Self {
@@ -414,6 +421,8 @@ impl DictionaryColumnI64 {
                 indices.push(idx);
             }
         }
+        // R1 parity with `from_string_array`: lex-sort and remap.
+        crate::cuda::dictionary::lex_sort_dictionary(&mut dictionary, &mut indices);
         Ok((dictionary, indices))
     }
 }
@@ -552,6 +561,10 @@ mod tests {
         // Same memory-fix regression as the i32 sibling: 1M rows over 100
         // distinct strings, asserting the digest dedupe collapses to the
         // expected cardinality with the right per-row indices.
+        //
+        // R1: codes are now byte-lexicographic, so the dictionary comes out
+        // sorted (NOT first-seen). Verify against the sorted pool and that
+        // every row index decodes back to its original string.
         const ROWS: usize = 1_000_000;
         const DISTINCT: usize = 100;
 
@@ -562,19 +575,29 @@ mod tests {
             DictionaryColumnI64::dedupe_for_test(rows).expect("dedupe");
 
         assert_eq!(dictionary.len(), DISTINCT);
-        for i in 0..DISTINCT {
-            assert_eq!(dictionary[i], pool[i]);
+        let mut sorted_pool = pool.clone();
+        sorted_pool.sort();
+        assert_eq!(dictionary, sorted_pool, "dictionary must be byte-lex sorted");
+        for w in dictionary.windows(2) {
+            assert!(w[0] < w[1], "dictionary must be strictly lex-increasing");
         }
         assert_eq!(indices.len(), ROWS);
-        for (r, &idx) in indices.iter().enumerate() {
-            let expected = ((r % DISTINCT) as i64) + 1;
-            assert_eq!(idx, expected);
-        }
 
         let col = DictionaryColumnI64::new_host_only(dictionary, ROWS)
             .expect("host-only constructor");
-        for (i, s) in pool.iter().enumerate() {
-            assert_eq!(col.index_of(s), Some((i as i64) + 1));
+        // Each row index decodes back to its original string (remap consistency).
+        for (r, &idx) in indices.iter().enumerate() {
+            assert!(idx >= 1, "row {r} must have a non-NULL index, got {idx}");
+            let pos = (idx as usize) - 1;
+            assert_eq!(
+                col.dictionary[pos].as_str(),
+                pool[r % DISTINCT].as_str(),
+                "row {r} index {idx} must decode to its original string"
+            );
+        }
+        // `index_of` must equal each value's lex rank (+1 for the NULL slot).
+        for (lex_rank, s) in sorted_pool.iter().enumerate() {
+            assert_eq!(col.index_of(s), Some((lex_rank as i64) + 1));
         }
         assert_eq!(col.index_of("missing-literal"), None);
     }

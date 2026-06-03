@@ -536,6 +536,394 @@ pub fn classify_operator(kind: OperatorKind) -> StreamCapability {
 }
 
 // ===========================================================================
+// Grouped-aggregate partial merge (host fold across morsels)
+// ===========================================================================
+
+/// How one aggregate output column folds when partials are combined across
+/// morsels.
+///
+/// A streaming GROUP BY runs the *same* per-batch grouped-aggregate executor on
+/// each morsel, producing a partial grouped batch (group-key columns followed by
+/// per-aggregate result columns). The per-key partials are then combined by
+/// re-applying a distributive fold per aggregate column:
+///
+/// * `COUNT(e)` / `SUM(e)` → **add** the per-morsel partials (a `COUNT` partial
+///   is that morsel's per-group non-NULL count; summing the counts is the
+///   whole-table count. A `SUM` partial is that morsel's per-group sum; summing
+///   is the total).
+/// * `MIN(e)` / `MAX(e)` → **min** / **max** across partials.
+///
+/// This mirrors the scalar combiner ([`crate::exec::engine`]'s
+/// `combine_scalar_aggregate_partials`), lifted to a keyed fold. Only the
+/// distributive set is representable here — `AVG`/variance/stddev are not
+/// (folding finalised per-morsel averages is wrong), so the engine's streaming
+/// gate must reject them and drain instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedFold {
+    /// Sum the per-morsel partials (COUNT, SUM).
+    Add,
+    /// Take the minimum across per-morsel partials (MIN).
+    Min,
+    /// Take the maximum across per-morsel partials (MAX).
+    Max,
+}
+
+/// A numeric accumulator value for the grouped fold. Integers are widened to
+/// `i128` so SUM accumulation across morsels cannot overflow before the
+/// downstream range-check at finalisation; floats carry `f64`. NULLs are not
+/// represented — callers skip NULL cells before folding (SQL aggregates ignore
+/// NULLs), and a group whose every partial cell was NULL stays `None`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeNum {
+    /// A widened integer partial (Int32 / Int64 column).
+    Int(i128),
+    /// A float partial (Float32 / Float64 column).
+    Float(f64),
+}
+
+impl MergeNum {
+    fn add(self, other: MergeNum) -> MergeNum {
+        match (self, other) {
+            (MergeNum::Int(a), MergeNum::Int(b)) => MergeNum::Int(a.saturating_add(b)),
+            (MergeNum::Float(a), MergeNum::Float(b)) => MergeNum::Float(a + b),
+            // Mixed never happens (one column → one variant); fall back to float.
+            (MergeNum::Int(a), MergeNum::Float(b)) | (MergeNum::Float(b), MergeNum::Int(a)) => {
+                MergeNum::Float(a as f64 + b)
+            }
+        }
+    }
+
+    /// `self < other`. NaN floats sort as greater so a real value wins a MIN,
+    /// matching the host scalar/group-by convention.
+    fn lt(self, other: MergeNum) -> bool {
+        match (self, other) {
+            (MergeNum::Int(a), MergeNum::Int(b)) => a < b,
+            (MergeNum::Float(a), MergeNum::Float(b)) => a < b,
+            (MergeNum::Int(a), MergeNum::Float(b)) | (MergeNum::Float(b), MergeNum::Int(a)) => {
+                (a as f64) < b
+            }
+        }
+    }
+
+    fn fold(acc: Option<MergeNum>, v: MergeNum, op: GroupedFold) -> MergeNum {
+        match acc {
+            None => v,
+            Some(a) => match op {
+                GroupedFold::Add => a.add(v),
+                GroupedFold::Min => {
+                    if v.lt(a) {
+                        v
+                    } else {
+                        a
+                    }
+                }
+                GroupedFold::Max => {
+                    if a.lt(v) {
+                        v
+                    } else {
+                        a
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Read the numeric value of one aggregate output column at `row`, as a
+/// [`MergeNum`], or `None` for a NULL cell. Errors for a non-numeric column —
+/// the grouped streaming gate only admits primitive numeric aggregate outputs.
+fn merge_num_at(array: &dyn Array, row: usize) -> BoltResult<Option<MergeNum>> {
+    use arrow_array::{Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow_schema::DataType as D;
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    Ok(Some(match array.data_type() {
+        D::Int32 => {
+            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            MergeNum::Int(a.value(row) as i128)
+        }
+        D::Int64 => {
+            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            MergeNum::Int(a.value(row) as i128)
+        }
+        D::Float32 => {
+            let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            MergeNum::Float(a.value(row) as f64)
+        }
+        D::Float64 => {
+            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            MergeNum::Float(a.value(row))
+        }
+        other => {
+            return Err(BoltError::Type(format!(
+                "streaming GROUP BY merge: aggregate output column has unsupported \
+                 dtype {other:?} (expected Int32/Int64/Float32/Float64)"
+            )))
+        }
+    }))
+}
+
+/// Build one finalised aggregate output column of `target` dtype from the
+/// per-group folded values, in `order`. A `None` group value becomes a NULL
+/// cell; an integer fold that overflows the target integer range errors rather
+/// than wraps (matching the host group-by finaliser).
+fn build_agg_column(
+    values: &[Option<MergeNum>],
+    target: &arrow_schema::DataType,
+) -> BoltResult<arrow_array::ArrayRef> {
+    use arrow_array::{Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow_schema::DataType as D;
+    use std::sync::Arc;
+    Ok(match target {
+        D::Int32 => {
+            let out: Vec<Option<i32>> = values
+                .iter()
+                .map(|v| match v {
+                    None => Ok(None),
+                    Some(MergeNum::Int(i)) => i32::try_from(*i).map(Some).map_err(|_| {
+                        BoltError::Type(format!("streaming GROUP BY result {i} overflows Int32"))
+                    }),
+                    Some(MergeNum::Float(_)) => Err(BoltError::Type(
+                        "streaming GROUP BY: float value for an Int32 column".into(),
+                    )),
+                })
+                .collect::<BoltResult<_>>()?;
+            Arc::new(Int32Array::from(out)) as arrow_array::ArrayRef
+        }
+        D::Int64 => {
+            let out: Vec<Option<i64>> = values
+                .iter()
+                .map(|v| match v {
+                    None => Ok(None),
+                    Some(MergeNum::Int(i)) => i64::try_from(*i).map(Some).map_err(|_| {
+                        BoltError::Type(format!("streaming GROUP BY result {i} overflows Int64"))
+                    }),
+                    Some(MergeNum::Float(_)) => Err(BoltError::Type(
+                        "streaming GROUP BY: float value for an Int64 column".into(),
+                    )),
+                })
+                .collect::<BoltResult<_>>()?;
+            Arc::new(Int64Array::from(out)) as arrow_array::ArrayRef
+        }
+        D::Float32 => {
+            let out: Vec<Option<f32>> = values
+                .iter()
+                .map(|v| match v {
+                    None => None,
+                    Some(MergeNum::Float(f)) => Some(*f as f32),
+                    Some(MergeNum::Int(i)) => Some(*i as f32),
+                })
+                .collect();
+            Arc::new(Float32Array::from(out)) as arrow_array::ArrayRef
+        }
+        D::Float64 => {
+            let out: Vec<Option<f64>> = values
+                .iter()
+                .map(|v| match v {
+                    None => None,
+                    Some(MergeNum::Float(f)) => Some(*f),
+                    Some(MergeNum::Int(i)) => Some(*i as f64),
+                })
+                .collect();
+            Arc::new(Float64Array::from(out)) as arrow_array::ArrayRef
+        }
+        other => {
+            return Err(BoltError::Type(format!(
+                "streaming GROUP BY merge: unsupported aggregate output dtype {other:?}"
+            )))
+        }
+    })
+}
+
+/// Merge per-morsel **grouped** aggregate partials into one finalised grouped
+/// result batch.
+///
+/// Each element of `partials` is the output of running the *same* per-batch
+/// grouped-aggregate executor over one morsel: a `RecordBatch` whose first
+/// `n_group_cols` columns are the group-key columns and whose remaining columns
+/// are the per-aggregate partial result columns, in `agg_folds` order. Every
+/// partial must share the same schema (the executor is deterministic in schema
+/// given a fixed plan), which becomes the merged result's schema.
+///
+/// The merge folds per group key:
+/// * group keys are hashed via the canonical [`crate::exec::distinct`]
+///   row-key relation (NULL keys group together — `GROUP BY` treats two NULLs as
+///   one group, matching the engine-wide convention),
+/// * each aggregate column is combined with its [`GroupedFold`] op, skipping
+///   NULL partial cells (a group whose every partial cell for a SUM/MIN/MAX was
+///   NULL finalises to NULL).
+///
+/// Group output order is **first-seen**: the order in which distinct keys first
+/// appear while scanning partials in order, rows in order. (A GROUP BY without
+/// ORDER BY has no guaranteed row order, so any deterministic order is correct;
+/// first-seen is stable and cheap.)
+///
+/// An empty `partials` slice is rejected — the caller must pass the morsels'
+/// partials (zero morsels means a zero-row table, which the caller handles by
+/// emitting an empty batch from the output schema, since there is no partial to
+/// borrow a schema from here).
+///
+/// # Errors
+/// * `agg_folds.len()` must equal `n_cols - n_group_cols` for the partials'
+///   schema, else a `Plan` error.
+/// * A non-numeric aggregate output column, or an integer overflow at
+///   finalisation, surfaces as a `Type` error.
+///
+/// # Memory bound (and the spill follow-up)
+///
+/// This keeps the running `HashMap<key, accumulators>` resident on the host —
+/// its size is bounded by the table's *group cardinality*, not its row count,
+/// so a low-cardinality GROUP BY over a larger-than-VRAM table merges in tiny
+/// host memory. The engine's streaming gate
+/// ([`crate::exec::engine::Engine::streamable_grouped_aggregate`]) admits this
+/// path for the distributive aggregates regardless of cardinality; a
+/// pathologically high-cardinality grouping (≈ one group per row) would grow
+/// this map to whole-table size.
+///
+/// TODO(R1-spill, larger-than-VRAM grouped aggregate): when the merge map's
+/// footprint itself exceeds the budget, spill cold partition slices of the
+/// accumulator map to disk/host-paged storage (radix-partition the key space,
+/// process one partition's morsels at a time, persist the others). That needs a
+/// spill-file seam this host-only fold does not yet have;
+/// [`register_table_stream`] is likewise still an eager-drain stub (the producer
+/// is collected up front rather than spilled), so the *source* side of spill is
+/// the prerequisite. Until both land, the bound is "group cardinality fits
+/// host memory", which covers the analytical GROUP BY norm.
+pub fn merge_grouped_partials(
+    partials: &[RecordBatch],
+    n_group_cols: usize,
+    agg_folds: &[GroupedFold],
+) -> BoltResult<RecordBatch> {
+    use crate::exec::distinct::{ColumnReader, RowKeyValue};
+    use std::collections::HashMap;
+
+    if partials.is_empty() {
+        return Err(BoltError::Plan(
+            "merge_grouped_partials: no partials (caller must emit an empty batch \
+             from the output schema for a zero-morsel table)"
+                .into(),
+        ));
+    }
+
+    let schema = partials[0].schema();
+    let n_cols = schema.fields().len();
+    if n_cols < n_group_cols {
+        return Err(BoltError::Plan(format!(
+            "merge_grouped_partials: partial has {n_cols} columns but {n_group_cols} \
+             group columns were declared"
+        )));
+    }
+    let n_aggs = n_cols - n_group_cols;
+    if agg_folds.len() != n_aggs {
+        return Err(BoltError::Plan(format!(
+            "merge_grouped_partials: {} fold ops for {n_aggs} aggregate columns",
+            agg_folds.len()
+        )));
+    }
+
+    // Per-group state: a running accumulator per aggregate column. The output
+    // group-key columns are reconstructed from the partials directly (via
+    // `interleave` below), so we do not store key cells here.
+    struct GroupState {
+        accums: Vec<Option<MergeNum>>,
+    }
+
+    let mut groups: HashMap<Vec<RowKeyValue>, GroupState> = HashMap::new();
+    // First-seen key order so the output is deterministic.
+    let mut order: Vec<Vec<RowKeyValue>> = Vec::new();
+
+    for (p, batch) in partials.iter().enumerate() {
+        if batch.num_columns() != n_cols {
+            return Err(BoltError::Plan(format!(
+                "merge_grouped_partials: partial {p} has {} columns, expected {n_cols}",
+                batch.num_columns()
+            )));
+        }
+        // Typed readers for the group-key columns (canonical row-key relation).
+        let key_readers: Vec<ColumnReader<'_>> = (0..n_group_cols)
+            .map(|c| ColumnReader::new(batch.column(c).as_ref()))
+            .collect::<BoltResult<_>>()?;
+
+        for row in 0..batch.num_rows() {
+            let key: Vec<RowKeyValue> =
+                key_readers.iter().map(|r| r.value_at(row)).collect();
+            // Track first-seen order before the (borrowing) entry lookup.
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
+            }
+            let state = groups.entry(key).or_insert_with(|| GroupState {
+                accums: vec![None; n_aggs],
+            });
+            for a in 0..n_aggs {
+                let col = batch.column(n_group_cols + a);
+                if let Some(v) = merge_num_at(col.as_ref(), row)? {
+                    state.accums[a] = Some(MergeNum::fold(state.accums[a], v, agg_folds[a]));
+                }
+            }
+        }
+    }
+
+    // Reconstruct group-key output columns from the partials' key columns via a
+    // first-occurrence index, preserving full Arrow fidelity for any key dtype.
+    // For each distinct key, find one (partial, row) that produced it.
+    let mut key_source: HashMap<&[RowKeyValue], (usize, usize)> = HashMap::new();
+    for (p, batch) in partials.iter().enumerate() {
+        let key_readers: Vec<ColumnReader<'_>> = (0..n_group_cols)
+            .map(|c| ColumnReader::new(batch.column(c).as_ref()))
+            .collect::<BoltResult<_>>()?;
+        for row in 0..batch.num_rows() {
+            let key: Vec<RowKeyValue> =
+                key_readers.iter().map(|r| r.value_at(row)).collect();
+            // Borrow the stored key slice (stable in `groups`) as the map key so
+            // we don't re-allocate; first occurrence wins.
+            if let Some((stored_key, _)) = groups.get_key_value(&key) {
+                key_source
+                    .entry(stored_key.as_slice())
+                    .or_insert((p, row));
+            }
+        }
+    }
+
+    let mut out_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(n_cols);
+
+    // Group-key columns via `arrow::compute::interleave`: gather the
+    // first-occurrence (partial, row) of each ordered key.
+    if n_group_cols > 0 {
+        for c in 0..n_group_cols {
+            let arrays: Vec<&dyn Array> =
+                partials.iter().map(|b| b.column(c).as_ref()).collect();
+            let indices: Vec<(usize, usize)> = order
+                .iter()
+                .map(|k| key_source[k.as_slice()])
+                .collect();
+            let col = arrow::compute::interleave(&arrays, &indices).map_err(|e| {
+                BoltError::Other(format!(
+                    "merge_grouped_partials: interleave of group-key column {c} failed: {e}"
+                ))
+            })?;
+            out_cols.push(col);
+        }
+    }
+
+    // Aggregate columns: finalise the folded accumulators in key order.
+    for a in 0..n_aggs {
+        let target = schema.field(n_group_cols + a).data_type();
+        let vals: Vec<Option<MergeNum>> = order
+            .iter()
+            .map(|k| groups[k].accums[a])
+            .collect();
+        out_cols.push(build_agg_column(&vals, target)?);
+    }
+
+    RecordBatch::try_new(schema, out_cols).map_err(|e| {
+        BoltError::Other(format!(
+            "merge_grouped_partials: result build failed: {e}"
+        ))
+    })
+}
+
+// ===========================================================================
 // Device morsel upload (bounded, pinned, double-buffered)
 // ===========================================================================
 
@@ -897,7 +1285,7 @@ impl MorselDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Int32Array;
+    use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
@@ -1443,5 +1831,207 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    // ---- grouped-aggregate partial merge (host-only) ------------------
+
+    use arrow_array::{Float64Array, Int64Array};
+
+    /// Build a grouped partial batch: one Int64 key column `g`, then `n_aggs`
+    /// Int64 aggregate columns. `rows` is `(key, [agg cells])` — a `None` key
+    /// cell models a NULL group key; a `None` agg cell models a NULL partial.
+    fn grouped_partial(
+        n_aggs: usize,
+        rows: &[(Option<i64>, Vec<Option<i64>>)],
+    ) -> RecordBatch {
+        let mut fields = vec![ArrowField::new("g", ArrowDataType::Int64, true)];
+        for i in 0..n_aggs {
+            fields.push(ArrowField::new(format!("a{i}"), ArrowDataType::Int64, true));
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let keys: Int64Array = rows.iter().map(|(k, _)| *k).collect::<Vec<_>>().into();
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(keys)];
+        for i in 0..n_aggs {
+            let col: Int64Array = rows
+                .iter()
+                .map(|(_, aggs)| aggs[i])
+                .collect::<Vec<_>>()
+                .into();
+            cols.push(Arc::new(col));
+        }
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    /// Pull (key, agg0) out of a single-agg merged batch into a sorted map for
+    /// order-independent comparison. NULL key -> i64::MIN sentinel.
+    fn collect_single_agg(batch: &RecordBatch) -> Vec<(i64, Option<i64>)> {
+        let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let agg = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut out: Vec<(i64, Option<i64>)> = (0..batch.num_rows())
+            .map(|r| {
+                let k = if keys.is_null(r) { i64::MIN } else { keys.value(r) };
+                let a = if agg.is_null(r) { None } else { Some(agg.value(r)) };
+                (k, a)
+            })
+            .collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    #[test]
+    fn merge_grouped_sum_adds_across_morsels() {
+        // SUM(x) GROUP BY g over two morsels.
+        // morsel0: g=1 -> 10, g=2 -> 5
+        // morsel1: g=1 -> 7,  g=3 -> 100
+        // => g1=17, g2=5, g3=100
+        let p0 = grouped_partial(1, &[(Some(1), vec![Some(10)]), (Some(2), vec![Some(5)])]);
+        let p1 = grouped_partial(1, &[(Some(1), vec![Some(7)]), (Some(3), vec![Some(100)])]);
+        let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(
+            collect_single_agg(&out),
+            vec![(1, Some(17)), (2, Some(5)), (3, Some(100))]
+        );
+    }
+
+    #[test]
+    fn merge_grouped_count_adds() {
+        // COUNT folds by Add, same as SUM.
+        let p0 = grouped_partial(1, &[(Some(1), vec![Some(3)]), (Some(2), vec![Some(1)])]);
+        let p1 = grouped_partial(1, &[(Some(1), vec![Some(2)])]);
+        let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
+        assert_eq!(
+            collect_single_agg(&out),
+            vec![(1, Some(5)), (2, Some(1))]
+        );
+    }
+
+    #[test]
+    fn merge_grouped_min_max_skip_null_partials() {
+        // A morsel can produce a NULL partial cell for a group (all-NULL inputs
+        // in that morsel for that group); it must be skipped, not folded.
+        // MIN: g1 partials 7, NULL, 3 -> 3.  MAX would be 7.
+        let p0 = grouped_partial(1, &[(Some(1), vec![Some(7)])]);
+        let p1 = grouped_partial(1, &[(Some(1), vec![None])]);
+        let p2 = grouped_partial(1, &[(Some(1), vec![Some(3)])]);
+        let min = merge_grouped_partials(
+            &[p0.clone(), p1.clone(), p2.clone()],
+            1,
+            &[GroupedFold::Min],
+        )
+        .unwrap();
+        assert_eq!(collect_single_agg(&min), vec![(1, Some(3))]);
+        let max =
+            merge_grouped_partials(&[p0, p1, p2], 1, &[GroupedFold::Max]).unwrap();
+        assert_eq!(collect_single_agg(&max), vec![(1, Some(7))]);
+    }
+
+    #[test]
+    fn merge_grouped_all_null_group_finalises_null() {
+        // A group present in the keys but whose every agg partial is NULL must
+        // finalise to a NULL cell (SUM/MIN/MAX over all-NULL == NULL).
+        let p0 = grouped_partial(1, &[(Some(5), vec![None])]);
+        let p1 = grouped_partial(1, &[(Some(5), vec![None])]);
+        let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
+        assert_eq!(collect_single_agg(&out), vec![(5, None)]);
+    }
+
+    #[test]
+    fn merge_grouped_null_key_groups_together() {
+        // Two morsels each contribute a NULL-keyed group; they must merge into
+        // ONE group (GROUP BY treats two NULLs as one group).
+        let p0 = grouped_partial(1, &[(None, vec![Some(4)]), (Some(1), vec![Some(1)])]);
+        let p1 = grouped_partial(1, &[(None, vec![Some(6)])]);
+        let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        // NULL key collected as i64::MIN sentinel -> sum 10; key 1 -> 1.
+        assert_eq!(
+            collect_single_agg(&out),
+            vec![(i64::MIN, Some(10)), (1, Some(1))]
+        );
+        // The NULL key cell must actually be NULL in the output.
+        let keys = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!((0..out.num_rows()).any(|r| keys.is_null(r)), "a NULL group key");
+    }
+
+    #[test]
+    fn merge_grouped_multi_agg_independent_folds() {
+        // Two aggregates with different folds: COUNT (Add) + MAX.
+        // g1: counts 2+3=5, max(9, 4)=9
+        let p0 = grouped_partial(2, &[(Some(1), vec![Some(2), Some(9)])]);
+        let p1 = grouped_partial(2, &[(Some(1), vec![Some(3), Some(4)])]);
+        let out =
+            merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add, GroupedFold::Max])
+                .unwrap();
+        assert_eq!(out.num_rows(), 1);
+        let cnt = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let max = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(cnt.value(0), 5);
+        assert_eq!(max.value(0), 9);
+    }
+
+    #[test]
+    fn merge_grouped_float_sum() {
+        // Float64 aggregate column folds by Add over f64.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("g", ArrowDataType::Int64, true),
+            ArrowField::new("s", ArrowDataType::Float64, true),
+        ]));
+        let mk = |rows: &[(i64, f64)]| {
+            let keys: Int64Array = rows.iter().map(|(k, _)| *k).collect::<Vec<_>>().into();
+            let vals: Float64Array =
+                rows.iter().map(|(_, v)| *v).collect::<Vec<_>>().into();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(keys), Arc::new(vals)],
+            )
+            .unwrap()
+        };
+        let p0 = mk(&[(1, 1.5), (2, 2.0)]);
+        let p1 = mk(&[(1, 0.25)]);
+        let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
+        let agg = out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let keys = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut got: Vec<(i64, f64)> = (0..out.num_rows())
+            .map(|r| (keys.value(r), agg.value(r)))
+            .collect();
+        got.sort_by_key(|(k, _)| *k);
+        assert_eq!(got[0].0, 1);
+        assert!((got[0].1 - 1.75).abs() < 1e-9);
+        assert_eq!(got[1], (2, 2.0));
+    }
+
+    #[test]
+    fn merge_grouped_first_seen_order() {
+        // Output key order is first-seen across partials, rows in order.
+        let p0 = grouped_partial(1, &[(Some(3), vec![Some(1)]), (Some(1), vec![Some(1)])]);
+        let p1 = grouped_partial(1, &[(Some(2), vec![Some(1)]), (Some(3), vec![Some(1)])]);
+        let out = merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).unwrap();
+        let keys = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let order: Vec<i64> = (0..out.num_rows()).map(|r| keys.value(r)).collect();
+        assert_eq!(order, vec![3, 1, 2], "first-seen key order");
+    }
+
+    #[test]
+    fn merge_grouped_rejects_empty_partials() {
+        assert!(merge_grouped_partials(&[], 1, &[GroupedFold::Add]).is_err());
+    }
+
+    #[test]
+    fn merge_grouped_rejects_fold_count_mismatch() {
+        let p = grouped_partial(1, &[(Some(1), vec![Some(1)])]);
+        // 2 folds declared for 1 aggregate column.
+        assert!(
+            merge_grouped_partials(&[p], 1, &[GroupedFold::Add, GroupedFold::Max]).is_err()
+        );
+    }
+
+    #[test]
+    fn merge_grouped_overflow_errors() {
+        // Two i64::MAX partials added overflow Int64 -> error (not wrap), via the
+        // i128 accumulator + finalisation range check.
+        let p0 = grouped_partial(1, &[(Some(1), vec![Some(i64::MAX)])]);
+        let p1 = grouped_partial(1, &[(Some(1), vec![Some(i64::MAX)])]);
+        assert!(merge_grouped_partials(&[p0, p1], 1, &[GroupedFold::Add]).is_err());
     }
 }

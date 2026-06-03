@@ -44,9 +44,11 @@
 //!   * the radix scatter is now CROSS-BLOCK STABLE (per-block-per-digit
 //!     histogram + global block-offset scan; the old per-digit
 //!     `atom.global.add` race is gone). Non-null Int32/Int64 ASC/DESC and
-//!     two-key `ORDER BY` are GPU-validated correct. The gate stays ON pending
-//!     NULLS FIRST/LAST device-validity wiring (nullable primitives carry no
-//!     device validity bitmap yet) and float-radix dispatch.
+//!     two-key `ORDER BY` are GPU-validated correct. Float ORDER BY now routes
+//!     through the radix path too (R1 — host IEEE-monotonic key transform with
+//!     NaN / -0.0 canonicalization), pending on-hardware validation. The gate
+//!     stays ON pending NULLS FIRST/LAST device-validity wiring (nullable
+//!     primitives carry no device validity bitmap yet).
 //!   * the bitonic kernel is only verified for Int32 ASC at a power-of-two row
 //!     count — DESC, 64-bit, float, and padded inputs mis-sort.
 //! See the `gpu-validation-known-issues` notes. To re-enable GPU sort by
@@ -100,10 +102,12 @@ fn gpu_sort_override() -> Option<bool> {
 }
 
 /// True iff `dtype` is a sort key dtype the GPU path is selected for by
-/// default. The radix kernel handles `Int32`/`Int64`; the bitonic multi-key
-/// driver covers the same set (plus floats/bool/utf8, which we do **not**
-/// auto-select because they either need transforms not yet wired (float radix)
-/// or are cheaper host-side at typical cardinalities).
+/// default. The radix kernel handles `Int32`/`Int64`/`Float32`/`Float64`
+/// (R1 wired float radix via the host IEEE-monotonic key transform), but we
+/// deliberately keep the *default* heuristic to `Int32`/`Int64` only — floats
+/// stay opt-in via `BOLT_GPU_SORT=1` (which overrides this heuristic outright)
+/// until the float radix path is validated on hardware. Bool/Utf8 are cheaper
+/// host-side at typical cardinalities.
 fn dtype_is_gpu_sort_default(dtype: DataType) -> bool {
     matches!(dtype, DataType::Int32 | DataType::Int64)
 }
@@ -172,8 +176,10 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
         // ORDER BY are GPU-validated correct. Remaining gaps keeping the gate
         // ON: (a) NULLS FIRST/LAST needs device-validity wiring (nullable
         // primitives carry no device validity bitmap yet); (b) float radix is
-        // implemented but not yet routed through dispatch; (c) the bitonic
-        // kernel is only verified for Int32 ASC at a power-of-two row count.
+        // now routed through dispatch (R1 — IEEE-monotonic host key transform
+        // with NaN / -0.0 canonicalization) but awaits on-hardware validation;
+        // (c) the bitonic kernel is only verified for Int32 ASC at a
+        // power-of-two row count.
         // So run the GPU path ONLY under an explicit `BOLT_GPU_SORT=1` opt-in
         // (for benchmarking / kernel
         // validation). Every production ORDER BY falls through to the correct
@@ -476,7 +482,7 @@ fn arrow_err(e: arrow::error::ArrowError) -> BoltError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Float64Array, Int32Array};
+    use arrow_array::{Float32Array, Float64Array, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
     // The dispatch heuristic (`should_use_gpu_sort`) and `resolve_key_shape`
     // operate on the crate's own `logical_plan::DataType`, whereas the batch
@@ -880,10 +886,22 @@ mod tests {
             SortDirection::Desc,
             false,
         ));
-        // Float dtype rejected (radix_supports_dtype gate).
-        assert!(!radix_dispatch_predicate(
-            &arr,
+        // R1: Float dtype now ACCEPTED (radix_supports_dtype admits floats;
+        // the host IEEE-monotonic key transform runs during gather). A
+        // no-null Float32 column passes every gate.
+        let farr = Float32Array::from(vec![3.0f32, 1.0, 2.0, 5.0, 4.0]);
+        assert!(radix_dispatch_predicate(
+            &farr,
             PlanDataType::Float32,
+            SortDirection::Asc,
+            false,
+        ));
+        // Bool dtype still rejected (radix_supports_dtype gate — 2 distinct
+        // keys are cheaper to count-sort).
+        let barr = arrow_array::BooleanArray::from(vec![true, false, true, false, true]);
+        assert!(!radix_dispatch_predicate(
+            &barr,
+            PlanDataType::Bool,
             SortDirection::Asc,
             false,
         ));
@@ -941,11 +959,36 @@ mod tests {
         assert!(radix_dispatch_predicate_multi(&keys));
     }
 
-    /// #19: the multi-key predicate falls through when ANY key has an
-    /// unsupported dtype (one Int32, one Float64 — radix can't handle
-    /// the float, so the whole sort goes back to the bitonic / host path).
+    /// The multi-key predicate falls through when ANY key has an unsupported
+    /// dtype. R1 made Float32/Float64 supported, so we use Bool as the
+    /// unsupported key (one Int32, one Bool — radix can't handle the bool, so
+    /// the whole sort goes back to the bitonic / host path).
     #[test]
-    fn radix_predicate_multi_mixed_int_float_rejected() {
+    fn radix_predicate_multi_mixed_int_bool_rejected() {
+        let a = Int32Array::from(vec![1, 2, 3]);
+        let b = arrow_array::BooleanArray::from(vec![true, false, true]);
+        let keys = vec![
+            GpuSortKey {
+                column: &a,
+                dtype: PlanDataType::Int32,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+            GpuSortKey {
+                column: &b,
+                dtype: PlanDataType::Bool,
+                direction: SortDirection::Asc,
+                nulls_first: false,
+            },
+        ];
+        assert!(!radix_dispatch_predicate_multi(&keys));
+    }
+
+    /// R1: a multi-key Int32 + Float64 sort (both non-null) now ENGAGES the
+    /// radix path — the float key rides the host IEEE-monotonic transform, so
+    /// the predicate accepts the whole list.
+    #[test]
+    fn radix_predicate_multi_int_plus_float_accepted() {
         let a = Int32Array::from(vec![1, 2, 3]);
         let b = Float64Array::from(vec![1.0, 2.0, 3.0]);
         let keys = vec![
@@ -962,7 +1005,7 @@ mod tests {
                 nulls_first: false,
             },
         ];
-        assert!(!radix_dispatch_predicate_multi(&keys));
+        assert!(radix_dispatch_predicate_multi(&keys));
     }
 
     /// Empty key list falls through (no sort to do — and the radix path
@@ -1122,30 +1165,34 @@ mod tests {
 
     }
 
-    /// #19: a mixed (Int32, Float64) multi-key sort falls through to the
-    /// bitonic / host path — the predicate rejects the float key, so the
-    /// radix counter never bumps.
+    /// A mixed (Int32, Bool) multi-key sort falls through to the bitonic /
+    /// host path — the predicate rejects the Bool key (R1 made floats
+    /// supported, so Bool is now the canonical unsupported key), so the radix
+    /// counter never bumps and no GPU buffer is allocated. Pure host predicate
+    /// check, safe under `cuda-stub`.
     #[test]
-    fn radix_dispatch_skipped_on_int_plus_float() {
+    fn radix_dispatch_skipped_on_int_plus_bool() {
         let _gate = RadixGateGuard::new(true);
 
         let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
 
-        // Build a 2-column batch with one Int32 + one Float64. We only
-        // need >= GPU_SORT_MIN_ROWS rows; the predicate's dtype gate is
-        // the load-bearing assertion here.
+        // Build a 2-column batch with one Int32 + one Bool. We only need
+        // >= GPU_SORT_MIN_ROWS rows; the predicate's dtype gate is the
+        // load-bearing assertion here. Bool maps to a GPU-sortable internal
+        // dtype via `arrow_dtype_to_internal`, but `radix_supports_dtype`
+        // rejects it, so the multi-key predicate falls through.
         let n = GPU_SORT_MIN_ROWS;
         let a: Vec<i32> = (0..n as i32).collect();
-        let b: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let b: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Float64, false),
+            Field::new("b", DataType::Boolean, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(a)),
-                Arc::new(Float64Array::from(b)),
+                Arc::new(arrow_array::BooleanArray::from(b)),
             ],
         )
         .unwrap();
@@ -1154,12 +1201,43 @@ mod tests {
             &batch,
             &[col("a", false, false), col("b", false, false)],
         );
-        assert!(matches!(res, Ok(None)), "mixed int+float must fall through");
+        assert!(matches!(res, Ok(None)), "mixed int+bool must fall through");
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert_eq!(
             before, after,
-            "predicate must reject mixed int+float without bumping"
+            "predicate must reject mixed int+bool without bumping"
+        );
+    }
+
+    /// R1: a single-key Float64 ASC sort engages the radix path (the float
+    /// key rides the host IEEE-monotonic transform). GPU-gated because it
+    /// reaches the device driver after the predicate match.
+    #[test]
+    #[cfg_attr(not(feature = "cuda-stub"), ignore = "gpu:sort_radix")]
+    fn radix_dispatch_engages_on_float64_asc() {
+        let _gate = RadixGateGuard::new(true);
+
+        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+
+        let n = GPU_SORT_MIN_ROWS;
+        let b: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "b",
+            DataType::Float64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(b))]).unwrap();
+
+        let _ = try_gpu_sort_radix(&batch, &[col("b", false, false)]);
+
+        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after >= before + 1,
+            "float64 dispatch counter did not increment ({} -> {})",
+            before,
+            after,
         );
     }
 }

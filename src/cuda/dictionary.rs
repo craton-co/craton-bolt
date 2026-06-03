@@ -59,6 +59,79 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// Re-order a first-seen `(dictionary, indices)` pair so the dictionary is in
+/// byte-lexicographic order and every index points at its value's new
+/// (lex-ranked) slot (R1, lex-rank dictionaries at ingest).
+///
+/// On entry `dictionary[p]` is the string for first-seen GPU index `p + 1` and
+/// `indices[r]` is the 1-based GPU index of row `r` (or `0` for NULL). On exit
+/// the dictionary is sorted byte-lexicographically (`str`'s `Ord`, i.e. raw
+/// UTF-8 bytes — NOT locale-aware, consistent with [`collation_ranks_of`]) and
+/// each non-NULL index is rewritten to `lex_rank + 1`, so the integer code
+/// order matches lexicographic string order. NULL indices (`0`) are untouched.
+///
+/// This is the source-of-truth lex ordering: once codes equal lex rank, every
+/// downstream consumer that compares dict indices (ORDER BY, range predicates,
+/// dict sorts/joins/group-bys) gets the right order for free, and
+/// [`collation_ranks_of`] becomes the identity permutation.
+///
+/// Decode-correctness is preserved: the remap is a bijection on the non-NULL
+/// codes, so decoding `lex_rank + 1 -> dictionary[lex_rank]` yields the same
+/// string the row originally encoded.
+///
+/// Pure host function. Cost: `O(N log N)` to sort the distinct values plus
+/// `O(R)` to rewrite the row indices; intended for register-table time, not a
+/// per-row hot path. Generic over the index integer type so the i32 and i64
+/// builders share one implementation.
+pub(crate) fn lex_sort_dictionary<I>(dictionary: &mut Vec<String>, indices: &mut [I])
+where
+    I: Copy + TryFrom<usize> + TryInto<usize> + PartialEq + Default,
+{
+    let n = dictionary.len();
+    if n == 0 {
+        return;
+    }
+    // `order[new_slot]` is the OLD 0-based slot whose string sorts into
+    // `new_slot`. Sorting slot ids by their string value gives this directly.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| dictionary[a].cmp(&dictionary[b]));
+
+    // `remap[old_slot] = new GPU index (1-based)` for every old slot. Built by
+    // inverting `order`: the value at new slot `r` came from old slot
+    // `order[r]`, so old slot `order[r]` now lives at GPU index `r + 1`.
+    let mut remap: Vec<usize> = vec![0; n];
+    for (new_slot, &old_slot) in order.iter().enumerate() {
+        remap[old_slot] = new_slot + 1;
+    }
+
+    // Rewrite the dictionary into sorted order.
+    let mut sorted: Vec<String> = Vec::with_capacity(n);
+    for &old_slot in &order {
+        // Move each owned String into its sorted position via take + replace
+        // to avoid cloning. `std::mem::take` leaves an empty placeholder we
+        // never read again (the old vector is dropped below).
+        sorted.push(std::mem::take(&mut dictionary[old_slot]));
+    }
+    *dictionary = sorted;
+
+    // Rewrite every non-NULL row index to its value's new GPU index. NULL (0)
+    // stays 0. The `TryInto`/`TryFrom` round-trip is infallible here: every
+    // non-zero index was a valid 1-based slot (`1..=n`), and `remap[..]` values
+    // are also in `1..=n`, both of which fit the original index width.
+    let zero = I::default();
+    for slot in indices.iter_mut() {
+        if *slot == zero {
+            continue;
+        }
+        let old_idx: usize = (*slot)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("dictionary index must fit usize"));
+        let new_idx = remap[old_idx - 1];
+        *slot = I::try_from(new_idx)
+            .unwrap_or_else(|_| unreachable!("remapped index must fit original width"));
+    }
+}
+
 /// Compute the byte-lexicographic collation rank permutation of a dictionary
 /// slice (finding F10).
 ///
@@ -239,7 +312,12 @@ impl DictionaryColumn {
     ///
     /// Nulls in `arr` map to index `0`. Distinct non-null strings are
     /// deduplicated and assigned sequential indices starting at `1`, in
-    /// first-occurrence order.
+    /// **byte-lexicographic order** of the string values (R1): code `k`
+    /// (GPU index `k`) names the `k`-th smallest distinct string under `str`'s
+    /// `Ord` (raw UTF-8 bytes, NOT locale-aware). The integer code order
+    /// therefore matches lexicographic string order, so downstream dict-index
+    /// ORDER BY / range predicates / sorts / joins / group-bys are correct
+    /// without a decode. Decode still yields the original strings.
     pub fn from_string_array(arr: &StringArray) -> BoltResult<Self> {
         let n_rows = arr.len();
         let mut dictionary: Vec<String> = Vec::new();
@@ -304,6 +382,10 @@ impl DictionaryColumn {
                 indices.push(idx);
             }
         }
+
+        // R1: re-order codes into byte-lexicographic rank and remap the row
+        // indices so the integer codes match string order before upload.
+        lex_sort_dictionary(&mut dictionary, &mut indices);
 
         let device_indices = GpuVec::<i32>::from_slice(&indices)?;
         Ok(Self {
@@ -506,6 +588,8 @@ impl DictionaryColumn {
                 indices.push(idx);
             }
         }
+        // R1 parity with `from_string_array`: lex-sort and remap.
+        lex_sort_dictionary(&mut dictionary, &mut indices);
         Ok((dictionary, indices))
     }
 
@@ -855,6 +939,11 @@ mod tests {
         // allocated 100 redundant `String`s for the map keys, on top of the
         // 100 `String`s in the dictionary vec. The new digest map allocates
         // each distinct string exactly once.
+        //
+        // R1: codes are now byte-lexicographic, so the dictionary comes out
+        // *sorted* (NOT first-seen order). `format!("val_{i}")` sorts
+        // lexicographically as val_0, val_1, val_10, val_11, …, val_19, val_2,
+        // … — so we verify against the sorted pool, not the numeric pool.
         const ROWS: usize = 1_000_000;
         const DISTINCT: usize = 100;
 
@@ -866,26 +955,35 @@ mod tests {
         let (dictionary, indices) =
             DictionaryColumn::dedupe_for_test(rows).expect("dedupe");
 
-        // Distinct count must equal the input cardinality, in first-
-        // occurrence order.
+        // Distinct count must equal the input cardinality, now in byte-lex
+        // order.
         assert_eq!(dictionary.len(), DISTINCT);
-        for i in 0..DISTINCT {
-            assert_eq!(dictionary[i], pool[i]);
+        let mut sorted_pool = pool.clone();
+        sorted_pool.sort();
+        assert_eq!(dictionary, sorted_pool, "dictionary must be byte-lex sorted");
+        // The dictionary is strictly increasing (sorted + distinct).
+        for w in dictionary.windows(2) {
+            assert!(w[0] < w[1], "dictionary must be strictly lex-increasing");
         }
-        // Every row must have a positive index (slot 0 reserved for NULL).
+        // Every row must have a positive index (slot 0 reserved for NULL) that
+        // decodes back to the original string for that row — the load-bearing
+        // round-trip / remap-consistency check.
         assert_eq!(indices.len(), ROWS);
+        let col = DictionaryColumn::new_host_only(dictionary, ROWS);
         for (r, &idx) in indices.iter().enumerate() {
-            let expected = ((r % DISTINCT) as i32) + 1;
+            assert!(idx >= 1, "row {r} must have a non-NULL index, got {idx}");
+            let decoded =
+                DictionaryColumn::decode_index(&col.dictionary, idx).expect("decode");
             assert_eq!(
-                idx, expected,
-                "row {r} expected index {expected}, got {idx}"
+                decoded,
+                Some(pool[r % DISTINCT].as_str()),
+                "row {r} index {idx} must decode to its original string"
             );
         }
-        // `index_of` on the resulting dictionary must agree with the emitted
-        // indices for every distinct string.
-        let col = DictionaryColumn::new_host_only(dictionary, ROWS);
-        for (i, s) in pool.iter().enumerate() {
-            assert_eq!(col.index_of(s), Some((i as i32) + 1));
+        // `index_of` on the resulting dictionary must equal each value's lex
+        // rank (+1 for the NULL slot).
+        for (lex_rank, s) in sorted_pool.iter().enumerate() {
+            assert_eq!(col.index_of(s), Some((lex_rank as i32) + 1));
         }
         // Sanity: a string never seen during construction returns None.
         assert_eq!(col.index_of("missing-literal"), None);
@@ -912,6 +1010,77 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert_eq!(indices, vec![1, 0, 2, 0, 1, 3, 0]);
+    }
+
+    // ---- R1: lex-rank dictionaries at ingest -----------------------------
+
+    /// `lex_sort_dictionary` re-orders a first-seen dictionary into byte-lex
+    /// order and remaps the row indices so each value keeps pointing at its
+    /// string. Pure host — exercises the shared primitive directly.
+    #[test]
+    fn lex_sort_dictionary_reorders_and_remaps() {
+        // First-seen dictionary (slots 1,2,3) and a row index stream that uses
+        // every code plus a NULL.
+        //                          idx1     idx2     idx3
+        let mut dict = vec!["delta".to_string(), "apple".to_string(), "mango".to_string()];
+        //               delta apple NULL mango apple delta
+        let mut indices: Vec<i32> = vec![1, 2, 0, 3, 2, 1];
+
+        lex_sort_dictionary(&mut dict, &mut indices);
+
+        // Sorted: apple(1) < delta(2) < mango(3).
+        assert_eq!(dict, vec!["apple".to_string(), "delta".to_string(), "mango".to_string()]);
+        // Each non-NULL index now names its value's lex rank; NULL stays 0.
+        // delta→2, apple→1, NULL→0, mango→3, apple→1, delta→2.
+        assert_eq!(indices, vec![2, 1, 0, 3, 1, 2]);
+    }
+
+    /// `lex_sort_dictionary` on an empty dictionary is a no-op (no panic).
+    #[test]
+    fn lex_sort_dictionary_empty_is_noop() {
+        let mut dict: Vec<String> = Vec::new();
+        let mut indices: Vec<i32> = vec![0, 0];
+        lex_sort_dictionary(&mut dict, &mut indices);
+        assert!(dict.is_empty());
+        assert_eq!(indices, vec![0, 0]);
+    }
+
+    /// R1 (distinct → lex codes): after dedupe the dictionary is strictly
+    /// byte-lex increasing and `index_of` returns each value's 1-based lex rank,
+    /// regardless of the (deliberately unsorted, repeated, out-of-order) input.
+    #[test]
+    fn dedupe_assigns_codes_in_lex_order() {
+        // Repeated / out-of-order inserts: "mango" first, "Apple" (uppercase),
+        // "delta", repeats, plus a NULL.
+        let rows = vec![
+            Some("mango"),
+            Some("delta"),
+            Some("Apple"),
+            Some("mango"),
+            None,
+            Some("delta"),
+            Some("Apple"),
+        ];
+        let (dictionary, indices) =
+            DictionaryColumn::dedupe_for_test(rows.clone()).expect("dedupe");
+
+        // Byte collation: 'A' (0x41) sorts before lowercase letters.
+        assert_eq!(
+            dictionary,
+            vec!["Apple".to_string(), "delta".to_string(), "mango".to_string()]
+        );
+        let col = DictionaryColumn::new_host_only(dictionary, rows.len());
+        assert_eq!(col.index_of("Apple"), Some(1));
+        assert_eq!(col.index_of("delta"), Some(2));
+        assert_eq!(col.index_of("mango"), Some(3));
+
+        // R1 (encode → decode round-trips): every row index decodes to the
+        // exact original string it was built from (NULL preserved).
+        assert_eq!(indices.len(), rows.len());
+        for (r, &idx) in indices.iter().enumerate() {
+            let decoded = DictionaryColumn::decode_index(&col.dictionary, idx).expect("decode");
+            assert_eq!(decoded, rows[r], "row {r} must round-trip");
+        }
     }
 
     #[test]
@@ -1030,13 +1199,15 @@ mod tests {
     #[ignore = "gpu:string"]
     fn dict_index_of_lookup() {
         // After a real encode, `index_of` must report the same slots that
-        // the indices vec already uses for those strings.
+        // the indices vec already uses for those strings. R1: codes are in
+        // byte-lexicographic order, so blue < green < red ⇒ 1, 2, 3.
         let input = StringArray::from(vec!["red", "green", "blue", "green"]);
         let col = DictionaryColumn::from_string_array(&input).expect("encode");
 
-        assert_eq!(col.index_of("red"), Some(1));
+        assert_eq!(col.dictionary, vec!["blue".to_string(), "green".to_string(), "red".to_string()]);
+        assert_eq!(col.index_of("blue"), Some(1));
         assert_eq!(col.index_of("green"), Some(2));
-        assert_eq!(col.index_of("blue"), Some(3));
+        assert_eq!(col.index_of("red"), Some(3));
         // Literal never seen during construction => None, not 0.
         assert_eq!(col.index_of("yellow"), None);
     }

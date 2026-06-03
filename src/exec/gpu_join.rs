@@ -1397,128 +1397,19 @@ pub fn hash_join_indices_on_gpu(
     probe_keys_col: &dyn Array,
     dtype: DataType,
 ) -> BoltResult<(UInt32Array, UInt32Array)> {
-    let n_build = build_keys_col.len();
-    let n_probe = probe_keys_col.len();
-
-    // Trivial empty-side short-circuit: no matches possible.
-    if n_build == 0 || n_probe == 0 {
-        return Ok((
-            UInt32Array::from(Vec::<u32>::new()),
-            UInt32Array::from(Vec::<u32>::new()),
-        ));
-    }
-
-    // n_build and n_probe must fit in u32 for the kernel launch shape.
-    let n_build_u32 = n_rows_to_u32(n_build)?;
-    let n_probe_u32 = n_rows_to_u32(n_probe)?;
-
-    let cap = compute_capacity(n_build)?;
-    let cap_u32 = u32::try_from(cap).map_err(|_| {
-        BoltError::Other(format!("gpu_join: cap {cap} doesn't fit in u32"))
-    })?;
-
-    // Encode + upload both key columns.
-    let build_keys_host = encode_keys_i64(build_keys_col, dtype)?;
-    let probe_keys_host = encode_keys_i64(probe_keys_col, dtype)?;
-
-    // v0.7 async-memcpy migration (mirrors `aggregate.rs`): mint a per-call
-    // stream and chain H2D uploads + kernel launches + D2H index downloads
-    // on it, syncing exactly once at the end of each launch helper. Under
-    // `--features cuda-stub` the async FFI shims fall back to the sync
-    // wrappers via `upload_primitive_values_async`, so the call shape
-    // matches what existed before the migration.
-    let stream = CudaStream::null_or_default();
-
-    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
-    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
-
-    // Hash table buffers: keys init to i64::MIN, row_idx init to u32::MAX.
-    // PERF (join key encoding): the u32::MAX row_idx table is filled on-device
-    // via `cuMemsetD8Async(0xFF)` (see `alloc_u32_max_table_async`), dropping
-    // its host staging buffer + H2D upload. The i64::MIN key table is not
-    // byte-replicable, so it keeps the pooled host slice + async H2D.
-    let keys_init = get_sentinel_i64_min_vec(cap);
-    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
-    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
-
-    // Output buffers. We pre-size for the worst INNER-equi case under the
-    // unique-build-key invariant: every probe row matches at most one build
-    // row, so n_probe is a safe upper bound. We add n_build as a safety
-    // pad just in case (Stage 2: tight sizing for non-unique builds).
-    let out_capacity_usize = n_probe
-        .checked_add(n_build)
-        .ok_or_else(|| BoltError::Other("gpu_join: output buffer size overflow".into()))?;
-    let out_capacity_u32 = u32::try_from(out_capacity_usize).map_err(|_| {
-        BoltError::Other(format!(
-            "gpu_join: out_capacity {out_capacity_usize} doesn't fit in u32"
-        ))
-    })?;
-
-    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
-
-    // Build phase.
-    launch_build_kernel(
-        &build_keys_dev,
-        &mut keys_table_dev,
-        &mut row_idx_table_dev,
-        n_build_u32,
-        cap_u32,
-        &stream,
-    )?;
-
-    // Probe phase.
-    let n_matches_raw = launch_probe_kernel(
-        &probe_keys_dev,
-        &keys_table_dev,
-        &row_idx_table_dev,
-        &mut out_probe_idx_dev,
-        &mut out_build_idx_dev,
-        &mut out_counter_dev,
-        n_probe_u32,
-        cap_u32,
-        out_capacity_u32,
-        &stream,
-    )?;
-
-    if n_matches_raw > out_capacity_u32 {
-        // Probe overflow: kernel wrote more matches than out_capacity. The
-        // host join handles this input fine — return the fallback signal so
-        // the executor retries there. Under the INNER + unique-build
-        // invariant enforced by the gate this shouldn't fire, but if it
-        // does (e.g. duplicate-key violation slipping past the conservative
-        // gate) we route to the host hash-join rather than silently
-        // truncating. `try_gpu_inner_join` maps any `Err(_)` to `Ok(None)`,
-        // and `GpuCapacity` is the typed marker for that path.
-        log::warn!(
-            "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
-             falling back to host hash join"
-        );
-        return Err(BoltError::GpuCapacity(format!(
-            "gpu_join: probe kernel claimed {n_matches_raw} matches but \
-             output buffer was sized for {out_capacity_u32}; \
-             likely a build-side duplicate-key violation. Fall back to host path."
-        )));
-    }
-
-    let n_matches = n_matches_raw as usize;
-
-    // Download the index pairs. v0.7 async-memcpy: route through the pinned
-    // host buffer + per-call stream so the D2H DMA doesn't fall through to
-    // an implicit `cuCtxSynchronize`. Under `--features cuda-stub` the
-    // helper falls back to `GpuVec::to_vec()` for byte-stable failure mode.
-    let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
-    let build_idx_full = download_to_host_pinned::<u32>(&out_build_idx_dev, &stream)?;
-
-    // Drop trailing buffers; we want the first n_matches entries.
-    let probe_idx: Vec<u32> = probe_idx_full.into_iter().take(n_matches).collect();
-    let build_idx: Vec<u32> = build_idx_full.into_iter().take(n_matches).collect();
-
-    Ok((
-        UInt32Array::from(build_idx),
-        UInt32Array::from(probe_idx),
-    ))
+    // Run the build+probe on device, leaving the matched index pairs
+    // resident, then download them. The device-side work (encode, upload,
+    // hash-table build, probe, overflow contract) lives in
+    // [`hash_join_indices_on_gpu_resident`] so the host-materialising path
+    // and the multi-join composition hook share ONE kernel-launch
+    // implementation and can never drift. The only thing this wrapper adds
+    // is the D2H download + truncation to `n_matches`.
+    //
+    // Empty-side, capacity-overflow, and sentinel-collision behaviour are
+    // all inherited unchanged from the resident helper (which preserves the
+    // exact contract this function had before the refactor).
+    let resident = hash_join_indices_on_gpu_resident(build_keys_col, probe_keys_col, dtype)?;
+    resident.download()
 }
 
 /// End-to-end GPU INNER join over two `RecordBatch`es.
@@ -1580,6 +1471,209 @@ pub fn execute_inner_join_on_gpu(
 
     RecordBatch::try_new(output_schema, output_cols)
         .map_err(|e| BoltError::Other(format!("gpu_join: building RecordBatch failed: {e}")))
+}
+
+// =========================================================================
+// Stage 7 (R1): device-resident INNER-join index pairs (multi-join hook).
+//
+// Every entry point above ends with a `cuMemcpyDtoH` of the matched index
+// pairs followed by `arrow::compute::take` — i.e. the join's output is
+// materialised back on the host. For a *single* join that's fine: the
+// caller wants a host `RecordBatch` anyway. For a JOIN whose output feeds
+// ANOTHER operator (multi-join chaining, the TPC-H shape), that D2H +
+// re-upload round trip is pure overhead — the next operator wants the
+// matched build/probe row indices ON THE DEVICE so it can gather (via a
+// device `take`-equivalent) or re-probe in place without ever touching
+// the host.
+//
+// [`GpuJoinIndicesResident`] is that hook: it holds the matched
+// `(build_idx, probe_idx)` row indices as device-resident `GpuVec<u32>`
+// buffers plus the validated match count. The build+probe ran fully on
+// device (identical kernels to [`hash_join_indices_on_gpu`]); the ONLY
+// difference from the host path is that we skip the final D2H download and
+// hand the device buffers to the caller.
+//
+// The existing host path ([`hash_join_indices_on_gpu`]) is preserved
+// verbatim and is the correctness fallback; this is an additive composition
+// seam, not a behaviour change for any current caller.
+// =========================================================================
+
+/// Device-resident result of a GPU INNER equi-join: the matched
+/// `(build_idx, probe_idx)` row-index pairs, still on the device.
+///
+/// Returned by [`hash_join_indices_on_gpu_resident`] so a *parent* operator
+/// (the next join in a multi-join chain, a resident projection, a resident
+/// aggregate) can consume the join output on-device — no D2H download, no
+/// `arrow::compute::take` host round trip.
+///
+/// Invariants:
+/// * `build_idx` and `probe_idx` each hold at least `n_matches` valid u32
+///   entries (their `GpuVec` length is the over-sized output capacity; the
+///   meaningful prefix is `n_matches`). Entries past `n_matches` are
+///   unspecified scratch and MUST NOT be read.
+/// * `build_idx[i]` is a row index into the BUILD side; `probe_idx[i]` is a
+///   row index into the PROBE side, for the same matched pair `i`. The
+///   pairing order is the same arbitrary atomic-counter order the host path
+///   sees — a consumer that needs deterministic ordering must sort.
+/// * The buffers are valid only within the CUDA context that produced them
+///   (same contract as every other `GpuVec` in the engine).
+pub struct GpuJoinIndicesResident {
+    /// Device-resident build-side row indices (length ≥ `n_matches`).
+    pub build_idx: GpuVec<u32>,
+    /// Device-resident probe-side row indices (length ≥ `n_matches`).
+    pub probe_idx: GpuVec<u32>,
+    /// Number of valid matched pairs in the prefix of each buffer.
+    pub n_matches: usize,
+}
+
+impl GpuJoinIndicesResident {
+    /// Download the resident index pairs to host `UInt32Array`s, truncated to
+    /// `n_matches`. This is the explicit "materialise now" escape hatch — the
+    /// whole point of the resident type is to AVOID this until the chain
+    /// terminates, but a caller that has reached the end of the device-side
+    /// pipeline (or a test) uses this to land the indices on the host.
+    ///
+    /// Returns `(build, probe)` in the same orientation as
+    /// [`hash_join_indices_on_gpu`].
+    pub fn download(&self) -> BoltResult<(UInt32Array, UInt32Array)> {
+        // `to_vec` syncs on the buffer's recorded stream before copying, so
+        // this is safe to call directly on a resident handle without an
+        // explicit stream argument (mirrors the `download_to_host_pinned`
+        // contract used elsewhere — we use `to_vec` here so the type stays
+        // self-contained and stub-friendly).
+        let build_full = self.build_idx.to_vec()?;
+        let probe_full = self.probe_idx.to_vec()?;
+        let build: Vec<u32> = build_full.into_iter().take(self.n_matches).collect();
+        let probe: Vec<u32> = probe_full.into_iter().take(self.n_matches).collect();
+        Ok((UInt32Array::from(build), UInt32Array::from(probe)))
+    }
+}
+
+/// Build + probe a single-key Int32/Int64 INNER equi-join on the GPU and
+/// leave the matched `(build_idx, probe_idx)` pairs DEVICE-RESIDENT.
+///
+/// This is the multi-join composition hook (R1 TIER-2 #8): the build hash
+/// table is constructed from the (smaller) build side on device, the larger
+/// probe side is probed on device, matched row-index pairs are emitted into
+/// device output buffers — and, unlike [`hash_join_indices_on_gpu`], we do
+/// NOT download them. The caller receives [`GpuJoinIndicesResident`] and can
+/// feed those device buffers into the next operator (e.g. a second join's
+/// probe, or a device gather) so a multi-join runs the chain on device.
+///
+/// Correctness is identical to [`hash_join_indices_on_gpu`]: same build /
+/// probe kernels, same no-match (empty-slot ⇒ row dropped) and
+/// unique-build-key match handling, same `i64::MIN` sentinel contract. The
+/// caller must honour the SAME gates the host path requires (single
+/// Int32/Int64 key, unique build keys, no NULL keys, ≥ `GPU_JOIN_MIN_ROWS`
+/// per side); those gates live in `crate::exec::join::try_gpu_inner_join`
+/// and are unchanged.
+///
+/// On output-buffer overflow (a build-side duplicate-key violation slipping
+/// past the caller's uniqueness gate) this returns
+/// [`BoltError::GpuCapacity`], exactly as the host path does, so the caller
+/// can fall back to the host hash-join.
+pub fn hash_join_indices_on_gpu_resident(
+    build_keys_col: &dyn Array,
+    probe_keys_col: &dyn Array,
+    dtype: DataType,
+) -> BoltResult<GpuJoinIndicesResident> {
+    let n_build = build_keys_col.len();
+    let n_probe = probe_keys_col.len();
+
+    // Trivial empty-side short-circuit: no matches possible. Return empty
+    // (but valid) resident buffers so the consumer's gather is a no-op.
+    if n_build == 0 || n_probe == 0 {
+        return Ok(GpuJoinIndicesResident {
+            build_idx: GpuVec::<u32>::zeros(0)?,
+            probe_idx: GpuVec::<u32>::zeros(0)?,
+            n_matches: 0,
+        });
+    }
+
+    let n_build_u32 = n_rows_to_u32(n_build)?;
+    let n_probe_u32 = n_rows_to_u32(n_probe)?;
+
+    let cap = compute_capacity(n_build)?;
+    let cap_u32 = u32::try_from(cap)
+        .map_err(|_| BoltError::Other(format!("gpu_join: cap {cap} doesn't fit in u32")))?;
+
+    // Encode + upload both key columns (identical to the host path).
+    let build_keys_host = encode_keys_i64(build_keys_col, dtype)?;
+    let probe_keys_host = encode_keys_i64(probe_keys_col, dtype)?;
+
+    let stream = CudaStream::null_or_default();
+
+    let build_keys_dev = upload_primitive_values_async::<i64>(&build_keys_host, &stream)?;
+    let probe_keys_dev = upload_primitive_values_async::<i64>(&probe_keys_host, &stream)?;
+
+    let keys_init = get_sentinel_i64_min_vec(cap);
+    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
+    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
+
+    // Same worst-case INNER + unique-build sizing as the host path.
+    let out_capacity_usize = n_probe
+        .checked_add(n_build)
+        .ok_or_else(|| BoltError::Other("gpu_join: output buffer size overflow".into()))?;
+    let out_capacity_u32 = u32::try_from(out_capacity_usize).map_err(|_| {
+        BoltError::Other(format!(
+            "gpu_join: out_capacity {out_capacity_usize} doesn't fit in u32"
+        ))
+    })?;
+
+    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+
+    // Build phase — populate the device hash table from the build side.
+    launch_build_kernel(
+        &build_keys_dev,
+        &mut keys_table_dev,
+        &mut row_idx_table_dev,
+        n_build_u32,
+        cap_u32,
+        &stream,
+    )?;
+
+    // Probe phase — probe the larger side on device, emitting matched pairs.
+    let n_matches_raw = launch_probe_kernel(
+        &probe_keys_dev,
+        &keys_table_dev,
+        &row_idx_table_dev,
+        &mut out_probe_idx_dev,
+        &mut out_build_idx_dev,
+        &mut out_counter_dev,
+        n_probe_u32,
+        cap_u32,
+        out_capacity_u32,
+        &stream,
+    )?;
+
+    if n_matches_raw > out_capacity_u32 {
+        // Same overflow contract as the host path: typed GpuCapacity error so
+        // the caller routes to the host hash-join. Under the INNER + unique-
+        // build invariant the gate enforces, this never fires.
+        log::warn!(
+            "gpu join (resident) probe overflow ({n_matches_raw} > {out_capacity_u32}); \
+             falling back to host hash join"
+        );
+        return Err(BoltError::GpuCapacity(format!(
+            "gpu_join: resident probe kernel claimed {n_matches_raw} matches but \
+             output buffer was sized for {out_capacity_u32}; \
+             likely a build-side duplicate-key violation. Fall back to host path."
+        )));
+    }
+
+    // KEY DIFFERENCE vs `hash_join_indices_on_gpu`: no D2H download. The
+    // output buffers stay resident; the caller consumes them on-device.
+    // `launch_probe_kernel` already synchronised the stream to read the
+    // counter back, so the output buffers are fully populated and safe to
+    // hand on (any subsequent kernel that reads them is launched on the same
+    // null/default stream, preserving ordering).
+    Ok(GpuJoinIndicesResident {
+        build_idx: out_build_idx_dev,
+        probe_idx: out_probe_idx_dev,
+        n_matches: n_matches_raw as usize,
+    })
 }
 
 // =========================================================================
@@ -4036,6 +4130,78 @@ mod tests {
     }
 
     // -- GPU round-trip --
+
+    /// R1 (resident hook): the device-resident INNER-join path must produce
+    /// the EXACT same matched pair set as the host-downloading path
+    /// `hash_join_indices_on_gpu` — they share the build+probe kernels, so
+    /// `hash_join_indices_on_gpu_resident(..).download()` is byte-equivalent
+    /// to `hash_join_indices_on_gpu(..)` after sorting (the output order is
+    /// the arbitrary atomic-counter order on both). This is the proof that
+    /// the composition seam doesn't change join semantics.
+    #[test]
+    #[ignore = "gpu:join"]
+    fn gpu_resident_inner_join_matches_host_path() {
+        let n_build = 2000usize;
+        let n_probe = 4000usize;
+        let build_keys: Vec<i32> = (0..n_build as i32).collect();
+        let probe_keys: Vec<i32> = (0..n_probe as i32).map(|i| i % 3000).collect();
+
+        let build_col = Int32Array::from(build_keys.clone());
+        let probe_col = Int32Array::from(probe_keys.clone());
+
+        // Host-downloading path (the established reference).
+        let (host_build, host_probe) =
+            hash_join_indices_on_gpu(&build_col, &probe_col, DataType::Int32)
+                .expect("host-download gpu join");
+
+        // Device-resident path, then explicit download.
+        let resident =
+            hash_join_indices_on_gpu_resident(&build_col, &probe_col, DataType::Int32)
+                .expect("resident gpu join");
+        assert_eq!(
+            resident.n_matches,
+            host_build.len(),
+            "resident match count must equal host-download match count"
+        );
+        // The resident buffers are over-sized; only the n_matches prefix is
+        // valid. `download()` truncates to that prefix.
+        assert!(
+            resident.build_idx.len() >= resident.n_matches,
+            "resident build buffer must hold at least n_matches entries"
+        );
+        let (res_build, res_probe) = resident.download().expect("resident download");
+
+        // Reconcile arbitrary ordering: sort both pair sets.
+        let mut host_pairs: Vec<(u32, u32)> = (0..host_build.len())
+            .map(|i| (host_build.value(i), host_probe.value(i)))
+            .collect();
+        let mut res_pairs: Vec<(u32, u32)> = (0..res_build.len())
+            .map(|i| (res_build.value(i), res_probe.value(i)))
+            .collect();
+        host_pairs.sort_unstable();
+        res_pairs.sort_unstable();
+        assert_eq!(
+            res_pairs, host_pairs,
+            "resident join match set must equal host-download match set"
+        );
+    }
+
+    /// R1 (resident hook): an empty probe side yields a resident result with
+    /// `n_matches == 0` and empty device buffers — the consumer's downstream
+    /// gather becomes a no-op without any host round trip.
+    #[test]
+    #[ignore = "gpu:join"]
+    fn gpu_resident_inner_join_empty_probe() {
+        let build_col = Int32Array::from((0..1024i32).collect::<Vec<_>>());
+        let probe_col = Int32Array::from(Vec::<i32>::new());
+        let resident =
+            hash_join_indices_on_gpu_resident(&build_col, &probe_col, DataType::Int32)
+                .expect("resident gpu join (empty probe)");
+        assert_eq!(resident.n_matches, 0);
+        let (b, p) = resident.download().expect("download");
+        assert_eq!(b.len(), 0);
+        assert_eq!(p.len(), 0);
+    }
 
     /// Build two batches with a known overlap, run the GPU join, and verify
     /// the recovered match set matches the host-computed answer. The

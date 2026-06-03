@@ -54,6 +54,12 @@ fn binary_op_str(op: BinaryOp) -> &'static str {
         BinaryOp::And => "AND",
         BinaryOp::Or => "OR",
         BinaryOp::Concat => "||",
+        BinaryOp::Mod => "%",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::Shl => "<<",
+        BinaryOp::Shr => ">>",
     }
 }
 

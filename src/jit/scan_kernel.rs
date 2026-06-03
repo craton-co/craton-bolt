@@ -988,6 +988,17 @@ fn emit_binary(
                     .into(),
             ))
         }
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr => {
+            // Modulo / bitwise / shift are integer ops kept OFF the eager-safe
+            // allowlist, so a predicate using them routes to the host-side
+            // PhysicalPlan::Filter (evaluated by exec::expr_agg), not this
+            // WHERE-scan kernel. Projection codegen for these ops lives in
+            // ptx_gen.rs; the scan-predicate path is host-only for now.
+            Err(BoltError::Other(format!(
+                "scan_kernel: integer op {op:?} is not lowered to the GPU scan \
+                 (WHERE) kernel; the planner routes it through host-side execution"
+            )))
+        }
     }
 }
 

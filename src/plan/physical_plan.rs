@@ -2298,6 +2298,38 @@ impl<'a> Codegen<'a> {
                 let rv = self.emit_cast(r, unified);
                 (lv, rv, unified, unified)
             }
+        } else if op_is_integer(op) {
+            // R1-modulo-bitwise: MODULO (`%`) and the BITWISE / SHIFT family
+            // (`& | ^ << >>`) are integer-only (the logical type-checker has
+            // already rejected float / decimal operands; we re-validate here
+            // so a programmatically-built plan can't slip a bad dtype past
+            // codegen).
+            if !matches!(l.dtype, DataType::Int32 | DataType::Int64)
+                || !matches!(r.dtype, DataType::Int32 | DataType::Int64)
+            {
+                return Err(BoltError::Type(format!(
+                    "operator {op:?} requires integer (Int32/Int64) operands, \
+                     got {:?} and {:?}",
+                    l.dtype, r.dtype
+                )));
+            }
+            if op_is_shift(op) {
+                // Shifts: the result width follows the LEFT operand; the right
+                // operand is a shift count. ptx_gen consumes the shift amount
+                // as a 32-bit value, so normalise the count to Int32 here (a
+                // no-op when it already is). The operand_dtype handed to
+                // ptx_gen is the left/result integer width.
+                let left_dt = l.dtype;
+                let rv = self.emit_cast(r, DataType::Int32);
+                (l, rv, left_dt, left_dt)
+            } else {
+                // Modulo / AND / OR / XOR: unify both operands to a common
+                // integer width; the result keeps that width.
+                let unified = unify_numeric(l.dtype, r.dtype)?;
+                let lv = self.emit_cast(l, unified);
+                let rv = self.emit_cast(r, unified);
+                (lv, rv, unified, unified)
+            }
         } else if op_is_comparison(op) {
             if l.dtype == r.dtype {
                 (l, r, l.dtype, DataType::Bool)
@@ -3084,6 +3116,25 @@ fn op_is_comparison(op: BinaryOp) -> bool {
 /// True for `AND OR`.
 fn op_is_logical(op: BinaryOp) -> bool {
     matches!(op, BinaryOp::And | BinaryOp::Or)
+}
+
+/// True for the integer-only operators: modulo (`%`) and the bitwise / shift
+/// family (`& | ^ << >>`). R1-modulo-bitwise.
+fn op_is_integer(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+    )
+}
+
+/// True for the shift operators (`<<` / `>>`).
+fn op_is_shift(op: BinaryOp) -> bool {
+    matches!(op, BinaryOp::Shl | BinaryOp::Shr)
 }
 
 /// Result of folding a chain of Scan/Filter/Project nodes down to a single
@@ -5177,6 +5228,11 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
             // routed host-side earlier); leaving it off the allowlist keeps
             // the rule conservative. Any binary op not matched here is treated
             // as unsafe.
+            //
+            // R1-modulo-bitwise: the bitwise / shift family (`& | ^ << >>`)
+            // is pure, total and fault-free (no zero-divisor trap), so it is
+            // ALLOWLISTED here. `Mod` is deliberately EXCLUDED alongside `Div`
+            // — it is division-class and traps on a zero divisor.
             let op_is_safe = matches!(
                 op,
                 BinaryOp::Add
@@ -5190,6 +5246,11 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
                     | BinaryOp::GtEq
                     | BinaryOp::And
                     | BinaryOp::Or
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr
             );
             op_is_safe
                 && expr_eager_safe_under_shortcircuit(left)
@@ -8046,6 +8107,147 @@ mod tests {
             assert_eq!(
                 cg.ops.iter().filter(|o| matches!(o, Op::F64ToI128 { .. })).count(),
                 1
+            );
+        }
+    }
+
+    /// R1-modulo-bitwise: lowering coverage for MODULO (`%`) and the BITWISE /
+    /// SHIFT family (`& | ^ << >>`). Asserts the emitted `Op::Binary` carries
+    /// the new `BinaryOp` variant and the correct operand / result dtypes
+    /// (unified width for `% & | ^`; LEFT-operand width for the shifts, with
+    /// the shift count normalised to Int32).
+    mod integer_op_lowering {
+        use super::super::{op_is_integer, op_is_shift, Codegen, Op};
+        use crate::plan::logical_plan::{col, BinaryOp, DataType, Expr, Field, Schema};
+
+        fn schema() -> Schema {
+            Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int64, false),
+            ])
+        }
+
+        /// `a % b` (both Int32) lowers to a single `Op::Binary { op: Mod }`
+        /// with Int32 operand/result dtypes; the Value carries Int32.
+        #[test]
+        fn mod_int32_lowers_to_op_binary_mod() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let v = cg.emit_expr(&col("a").modulo(col("b"))).expect("emit a % b");
+            assert_eq!(v.dtype, DataType::Int32);
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Binary { op: BinaryOp::Mod, dtype: DataType::Int32, result_dtype: DataType::Int32, .. }
+            )), "expected Op::Binary Mod Int32, got {:?}", cg.ops);
+        }
+
+        /// Mixed-width `a % c` (Int32 % Int64) unifies to Int64: the operand
+        /// and result dtypes on the `Op::Binary` are both Int64.
+        #[test]
+        fn mod_mixed_width_widens_to_int64() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let v = cg.emit_expr(&col("a").modulo(col("c"))).expect("emit a % c");
+            assert_eq!(v.dtype, DataType::Int64);
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Binary { op: BinaryOp::Mod, dtype: DataType::Int64, result_dtype: DataType::Int64, .. }
+            )), "expected Op::Binary Mod Int64, got {:?}", cg.ops);
+        }
+
+        /// Each bitwise op lowers to its `Op::Binary` variant at the unified
+        /// width.
+        #[test]
+        fn bitwise_ops_lower_to_op_binary() {
+            let sch = schema();
+            for (build, want) in [
+                (col("a").bit_and(col("b")), BinaryOp::BitAnd),
+                (col("a").bit_or(col("b")), BinaryOp::BitOr),
+                (col("a").bit_xor(col("b")), BinaryOp::BitXor),
+            ] {
+                let mut cg = Codegen::new(&sch);
+                let v = cg.emit_expr(&build).expect("emit bitwise");
+                assert_eq!(v.dtype, DataType::Int32);
+                assert!(
+                    cg.ops.iter().any(|o| matches!(o, Op::Binary { op, .. } if *op == want)),
+                    "expected Op::Binary {want:?}, got {:?}",
+                    cg.ops
+                );
+            }
+        }
+
+        /// `c << a` (Int64 << Int32): the result follows the LEFT operand
+        /// (Int64) and the shift count is normalised to Int32 (no widening of
+        /// the count to Int64).
+        #[test]
+        fn shift_result_follows_left_operand() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let v = cg.emit_expr(&col("c").shl(col("a"))).expect("emit c << a");
+            assert_eq!(v.dtype, DataType::Int64);
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Binary { op: BinaryOp::Shl, dtype: DataType::Int64, result_dtype: DataType::Int64, .. }
+            )), "expected Op::Binary Shl Int64, got {:?}", cg.ops);
+        }
+
+        /// `a << c` (Int32 << Int64): result is Int32 and the Int64 count is
+        /// cast DOWN to Int32 before the shift (an `Op::Cast` to Int32 must
+        /// appear).
+        #[test]
+        fn shift_count_normalised_to_int32() {
+            let sch = schema();
+            let mut cg = Codegen::new(&sch);
+            let v = cg.emit_expr(&col("a").shr(col("c"))).expect("emit a >> c");
+            assert_eq!(v.dtype, DataType::Int32);
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Cast { to: DataType::Int32, .. }
+            )), "expected shift count cast to Int32, got {:?}", cg.ops);
+            assert!(cg.ops.iter().any(|o| matches!(
+                o,
+                Op::Binary { op: BinaryOp::Shr, dtype: DataType::Int32, result_dtype: DataType::Int32, .. }
+            )), "expected Op::Binary Shr Int32, got {:?}", cg.ops);
+        }
+
+        /// Classifier sanity: the integer ops are recognised, shifts are a
+        /// strict subset, and the prior op families are excluded.
+        #[test]
+        fn classifiers_partition_correctly() {
+            for op in [
+                BinaryOp::Mod,
+                BinaryOp::BitAnd,
+                BinaryOp::BitOr,
+                BinaryOp::BitXor,
+                BinaryOp::Shl,
+                BinaryOp::Shr,
+            ] {
+                assert!(op_is_integer(op), "{op:?} should be an integer op");
+            }
+            assert!(op_is_shift(BinaryOp::Shl) && op_is_shift(BinaryOp::Shr));
+            assert!(!op_is_shift(BinaryOp::Mod) && !op_is_shift(BinaryOp::BitAnd));
+            for op in [BinaryOp::Add, BinaryOp::Eq, BinaryOp::And, BinaryOp::Concat] {
+                assert!(!op_is_integer(op), "{op:?} must NOT be an integer op");
+            }
+        }
+
+        /// A float operand reaching the physical lowerer (e.g. a
+        /// programmatically built plan) is rejected with the integer-only
+        /// message.
+        #[test]
+        fn float_operand_rejected_at_lowering() {
+            let sch = Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("f", DataType::Float64, false),
+            ]);
+            let mut cg = Codegen::new(&sch);
+            let err = cg
+                .emit_expr(&col("a").bit_and(col("f")))
+                .expect_err("float operand must be rejected at lowering");
+            assert!(
+                format!("{err}").contains("integer"),
+                "expected integer-only rejection, got: {err}"
             );
         }
     }

@@ -298,6 +298,19 @@ pub fn execute_groupby(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
 ) -> BoltResult<RecordBatch> {
+    // R1-utf8-groupby: Utf8 (string) GROUP BY keys. The classic + tier
+    // integer kernels only key on i32/i64/float, so a string key column
+    // previously fell through to `groupby_wide`, which REJECTS Utf8. We now
+    // dictionary-encode each Utf8 key column into a LEX-RANKED i32 code
+    // column, run the ordinary integer GROUP BY on the codes, then
+    // reconstruct the Utf8 key column(s) from the dictionary on output. This
+    // keeps the integer kernels (and `dict_registry`) untouched. The detector
+    // returns `None` for plans with no Utf8 key, so the all-integer path is
+    // bit-for-bit unchanged. See `utf8_groupby` below.
+    if let Some(res) = utf8_groupby::try_execute_groupby_utf8(plan, table_batch) {
+        return res;
+    }
+
     // Layered fast-paths. Each `try_execute` returns `Some(_)` only if the
     // query's shape matches that path's preconditions; misses fall through
     // to the next. See docs/GROUPBY_PERF.md for the policy + cardinality
@@ -3140,6 +3153,1093 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 /// supported aggregate reductions.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     crate::exec::schema_convert::plan_schema_to_arrow_schema_minmax_temporal(s)
+}
+
+// ---------------------------------------------------------------------------
+// R1-utf8-groupby: Utf8 (string) GROUP BY keys via lex-ranked dictionary
+// codes.
+// ---------------------------------------------------------------------------
+//
+// The classic / tier integer kernels key on i32/i64/float only. A Utf8 key
+// column previously hit `pack_keys` → `key_bit_width(Utf8)` (a hard error)
+// and routed to `groupby_wide`, which itself REJECTS Utf8 keys — so a query
+// like `SELECT s, SUM(x) FROM t GROUP BY s` over a string column had no GPU
+// path at all.
+//
+// Strategy (single catalog of lex-ranked dictionary codes):
+//   1. Detect each GROUP BY key column whose Arrow array is Utf8
+//      (`StringArray`) or `Dictionary<Int32, Utf8>` (flattened to Utf8).
+//   2. Build a LEX-RANKED dictionary per such column: the distinct non-null
+//      strings sorted byte-lexicographically, code `i` = rank `i` (0-based).
+//      Encode the column into an `Int32` code array (NULLs preserved as Arrow
+//      nulls so the integer path's NULL-group synthesis handles them).
+//   3. Rewrite the `AggregateSpec` (key `ColumnIO` dtype Utf8 → Int32, the
+//      matching `output_schema` field Utf8 → Int32) and the input
+//      `RecordBatch` (Utf8 key column → Int32 code column), then RECURSE into
+//      `execute_groupby` — the ordinary integer GROUP BY runs on the codes.
+//   4. Reconstruct: map each output Int32 code column back to a `StringArray`
+//      through the dictionary (NULL code slot → NULL string), and rebuild the
+//      output batch with the ORIGINAL (Utf8) output schema.
+//
+// Because the codes are lex-ranked, an `ORDER BY s` over the grouped result
+// (or any range predicate on `s` folded elsewhere) is monotone in the code —
+// matching the sibling agent's lex-ranked ingest dictionaries. Group identity
+// only needs the codes to be DISTINCT per string, which any bijection gives;
+// the lex ranking is the property that makes downstream ordering sound.
+//
+// Huge cardinality: if the distinct-string count exceeds
+// [`utf8_groupby::MAX_DICT_CARDINALITY`] the i32 code space / hash-table sizing
+// is impractical, so we fall back to a correct host GROUP BY
+// ([`utf8_groupby::execute_groupby_utf8_host`]) rather than the GPU code path.
+pub(crate) mod utf8_groupby {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    };
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+    use crate::error::{BoltError, BoltResult};
+    use crate::plan::logical_plan::{
+        AggregateExpr, DataType, Expr, Field, Schema,
+    };
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO, PhysicalPlan};
+
+    /// Above this distinct-string count we abandon the i32-dict-code GPU path
+    /// (the open-addressing hash table sizes to `next_pow2(2*cardinality)`,
+    /// and an i32 code space is the hard ceiling) and fall back to the host
+    /// GROUP BY. ~16M distinct keys is already far past any sane GPU
+    /// group-by working set; the host path stays correct beyond it.
+    pub(crate) const MAX_DICT_CARDINALITY: usize = 1 << 24;
+
+    /// A lex-ranked dictionary for one Utf8 GROUP BY key column.
+    pub(crate) struct LexDict {
+        /// `code -> string`, indexed by the i32 code (0-based, lex order).
+        pub(crate) decode: Vec<String>,
+    }
+
+    impl LexDict {
+        /// Build a lex-ranked dictionary from the distinct non-null values of
+        /// `arr`, returning the dictionary plus the per-row i32 code column
+        /// (`None` at NULL rows). `arr` must be a Utf8 `StringArray`.
+        fn build(arr: &StringArray) -> (LexDict, Vec<Option<i32>>) {
+            // Collect distinct non-null strings.
+            let mut distinct: Vec<&str> = Vec::new();
+            {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    let s = arr.value(i);
+                    if seen.insert(s) {
+                        distinct.push(s);
+                    }
+                }
+            }
+            // Lex rank: byte-lexicographic sort over the distinct set. Arrow
+            // `StringArray` is UTF-8, and Rust `str` `Ord` is byte-lexicographic
+            // — the same total order the sibling lex-ranked ingest uses, so
+            // grouped output codes are monotone in the original string.
+            distinct.sort_unstable();
+            let mut code_of: HashMap<&str, i32> = HashMap::with_capacity(distinct.len());
+            for (rank, s) in distinct.iter().enumerate() {
+                code_of.insert(*s, rank as i32);
+            }
+            let codes: Vec<Option<i32>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(code_of[arr.value(i)])
+                    }
+                })
+                .collect();
+            let decode: Vec<String> = distinct.into_iter().map(|s| s.to_string()).collect();
+            (LexDict { decode }, codes)
+        }
+
+        /// Map an i32 code back to its string, or `None` if out of range.
+        fn string_of(&self, code: i32) -> Option<&str> {
+            usize::try_from(code)
+                .ok()
+                .and_then(|i| self.decode.get(i))
+                .map(|s| s.as_str())
+        }
+    }
+
+    /// Flatten an Arrow array that is either a Utf8 `StringArray` or a
+    /// `Dictionary<Int32, Utf8>` into an owned `StringArray`. Returns `None`
+    /// for any other Arrow type (i.e. this column is not a string key).
+    fn as_string_array(arr: &dyn Array) -> Option<StringArray> {
+        match arr.data_type() {
+            ArrowDataType::Utf8 => arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .cloned(),
+            ArrowDataType::Dictionary(_, val_t) if val_t.as_ref() == &ArrowDataType::Utf8 => {
+                // Materialise the dictionary into a flat StringArray.
+                let casted = arrow::compute::cast(arr, &ArrowDataType::Utf8).ok()?;
+                casted.as_any().downcast_ref::<StringArray>().cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Entry point invoked from [`super::execute_groupby`]. Returns `None`
+    /// when no GROUP BY key column is a Utf8 / dictionary string (the all-
+    /// integer/float path then runs unchanged), and `Some(result)` when at
+    /// least one key is a string and this module owns the query.
+    pub(crate) fn try_execute_groupby_utf8(
+        plan: &PhysicalPlan,
+        table_batch: &RecordBatch,
+    ) -> Option<BoltResult<RecordBatch>> {
+        let (pre, aggregate) = match plan {
+            PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+            _ => return None,
+        };
+        if aggregate.group_by.is_empty() {
+            return None;
+        }
+
+        // Locate every group-by key column whose batch array is a string.
+        // `string_keys[j] = Some(string_array)` for group_by position `j`.
+        let mut any_string = false;
+        let mut string_keys: Vec<Option<StringArray>> =
+            Vec::with_capacity(aggregate.group_by.len());
+        for &ord in &aggregate.group_by {
+            let io = match aggregate.inputs.get(ord) {
+                Some(io) => io,
+                None => return None, // malformed; let the main path raise it
+            };
+            let col_idx = match table_batch.schema().index_of(&io.name) {
+                Ok(i) => i,
+                Err(_) => return None,
+            };
+            let arr = table_batch.column(col_idx);
+            // Treat as a string key when the plan dtype is Utf8 OR the batch
+            // array is a string/dict-of-string (covers both the explicit Utf8
+            // ColumnIO and a dictionary-typed source column).
+            let is_string_plan = matches!(io.dtype, DataType::Utf8);
+            match as_string_array(arr.as_ref()) {
+                Some(sa) => {
+                    any_string = true;
+                    string_keys.push(Some(sa));
+                }
+                None => {
+                    if is_string_plan {
+                        // Plan says Utf8 but the array isn't a string — let the
+                        // main path surface the dtype-mismatch error.
+                        return None;
+                    }
+                    string_keys.push(None);
+                }
+            }
+        }
+        if !any_string {
+            return None;
+        }
+
+        Some(run(pre, aggregate, plan, table_batch, string_keys))
+    }
+
+    /// Core driver: build dictionaries, rewrite the plan + batch to integer
+    /// codes, recurse into the integer GROUP BY, and reconstruct the Utf8 key
+    /// columns on output.
+    fn run(
+        pre: &Option<crate::plan::physical_plan::KernelSpec>,
+        aggregate: &AggregateSpec,
+        orig_plan: &PhysicalPlan,
+        table_batch: &RecordBatch,
+        string_keys: Vec<Option<StringArray>>,
+    ) -> BoltResult<RecordBatch> {
+        // The pre-projection GROUP BY path (`groupby_with_pre`) rejects Utf8
+        // keys with a clear error and has no dictionary plumbing; a Utf8 key
+        // there is rare (it would require a string key threaded through a
+        // pre-kernel). Defer to the host fallback in that case.
+        if pre.is_some() {
+            return execute_groupby_utf8_host(aggregate, table_batch, &string_keys);
+        }
+
+        // Build a lex-ranked dictionary + i32 code column for each string key.
+        // `dicts[j]` is `Some(dict)` exactly when `string_keys[j].is_some()`.
+        let mut dicts: Vec<Option<LexDict>> = Vec::with_capacity(string_keys.len());
+        // `code_columns[j]` is the Int32 code ArrayRef for the rewritten batch.
+        let mut code_columns: Vec<Option<ArrayRef>> = Vec::with_capacity(string_keys.len());
+        for sk in &string_keys {
+            match sk {
+                Some(sa) => {
+                    let (dict, codes) = LexDict::build(sa);
+                    if dict.decode.len() > MAX_DICT_CARDINALITY {
+                        log::warn!(
+                            "execute_groupby (utf8): GROUP BY string key has {} \
+                             distinct values (> {}); falling back to host GROUP BY",
+                            dict.decode.len(),
+                            MAX_DICT_CARDINALITY
+                        );
+                        return execute_groupby_utf8_host(aggregate, table_batch, &string_keys);
+                    }
+                    let arr: ArrayRef = Arc::new(Int32Array::from(codes));
+                    dicts.push(Some(dict));
+                    code_columns.push(Some(arr));
+                }
+                None => {
+                    dicts.push(None);
+                    code_columns.push(None);
+                }
+            }
+        }
+
+        // --- Rewrite the AggregateSpec: each Utf8 key ColumnIO + its
+        //     output_schema field flips Utf8 -> Int32. ---
+        let mut new_inputs = aggregate.inputs.clone();
+        // Map group_by position -> whether this key is a string (for output
+        // reconstruction) and the original Utf8 field.
+        for (j, &ord) in aggregate.group_by.iter().enumerate() {
+            if dicts[j].is_some() {
+                new_inputs[ord] = ColumnIO {
+                    name: aggregate.inputs[ord].name.clone(),
+                    dtype: DataType::Int32,
+                };
+            }
+        }
+
+        // The output schema lists the group-by key columns first (in
+        // `group_by` order), then the aggregate result columns. Flip each
+        // string key field to Int32 in a cloned schema, remembering the
+        // ORIGINAL field so we can restore it (and its name) on output.
+        let m_keys = aggregate.group_by.len();
+        if aggregate.output_schema.fields.len() < m_keys {
+            return Err(BoltError::Other(
+                "execute_groupby (utf8): output_schema has fewer fields than GROUP BY keys"
+                    .into(),
+            ));
+        }
+        let mut new_fields: Vec<Field> = aggregate.output_schema.fields.clone();
+        let mut orig_key_fields: Vec<Field> = Vec::with_capacity(m_keys);
+        for j in 0..m_keys {
+            orig_key_fields.push(aggregate.output_schema.fields[j].clone());
+            if dicts[j].is_some() {
+                new_fields[j] = Field::new(
+                    aggregate.output_schema.fields[j].name.clone(),
+                    DataType::Int32,
+                    aggregate.output_schema.fields[j].nullable,
+                );
+            }
+        }
+
+        let new_aggregate = AggregateSpec {
+            inputs: new_inputs,
+            group_by: aggregate.group_by.clone(),
+            aggregates: aggregate.aggregates.clone(),
+            output_schema: Schema::new(new_fields),
+            input_has_validity: aggregate.input_has_validity.clone(),
+        };
+
+        // Sanity: the rewritten spec must no longer claim any Utf8 key.
+        debug_assert!(
+            new_aggregate
+                .group_by
+                .iter()
+                .all(|&o| new_aggregate.inputs[o].dtype != DataType::Utf8),
+            "utf8 keys must be rewritten to Int32 before recursing"
+        );
+        let _ = orig_plan;
+
+        // --- Rewrite the input batch: replace each string key column with its
+        //     Int32 code column, leaving every other column untouched. ---
+        let new_batch = rewrite_batch(table_batch, aggregate, &code_columns)?;
+
+        // --- Recurse into the integer GROUP BY. ---
+        let rewritten_plan = PhysicalPlan::Aggregate {
+            table: String::new(),
+            pre: None,
+            aggregate: new_aggregate,
+        };
+        let int_result = super::execute_groupby(&rewritten_plan, &new_batch)?;
+
+        // --- Reconstruct: map the Int32 key code columns back to Utf8. ---
+        reconstruct(&int_result, &dicts, &orig_key_fields, &aggregate.output_schema)
+    }
+
+    /// Build a new `RecordBatch` identical to `table_batch` except that each
+    /// Utf8 GROUP BY key column (located by its `ColumnIO` name) is replaced
+    /// by the matching Int32 code column. The schema field for that column is
+    /// changed to `Int32` with the same nullability.
+    fn rewrite_batch(
+        table_batch: &RecordBatch,
+        aggregate: &AggregateSpec,
+        code_columns: &[Option<ArrayRef>],
+    ) -> BoltResult<RecordBatch> {
+        // name -> code column for the string keys.
+        let mut replace: HashMap<&str, &ArrayRef> = HashMap::new();
+        for (j, &ord) in aggregate.group_by.iter().enumerate() {
+            if let Some(codes) = &code_columns[j] {
+                replace.insert(aggregate.inputs[ord].name.as_str(), codes);
+            }
+        }
+
+        let schema = table_batch.schema();
+        let mut fields: Vec<ArrowField> = Vec::with_capacity(schema.fields().len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for (i, f) in schema.fields().iter().enumerate() {
+            match replace.get(f.name().as_str()) {
+                Some(codes) => {
+                    fields.push(ArrowField::new(
+                        f.name(),
+                        ArrowDataType::Int32,
+                        f.is_nullable(),
+                    ));
+                    columns.push((*codes).clone());
+                }
+                None => {
+                    fields.push(f.as_ref().clone());
+                    columns.push(table_batch.column(i).clone());
+                }
+            }
+        }
+        let new_schema = Arc::new(ArrowSchema::new(fields));
+        RecordBatch::try_new(new_schema, columns).map_err(|e| {
+            BoltError::Other(format!(
+                "execute_groupby (utf8): failed to build dict-coded batch: {e}"
+            ))
+        })
+    }
+
+    /// Replace the Int32 key code columns in `int_result` with reconstructed
+    /// Utf8 string columns, returning a batch with the ORIGINAL output schema.
+    fn reconstruct(
+        int_result: &RecordBatch,
+        dicts: &[Option<LexDict>],
+        orig_key_fields: &[Field],
+        orig_output_schema: &Schema,
+    ) -> BoltResult<RecordBatch> {
+        let m_keys = dicts.len();
+        if int_result.num_columns() < m_keys {
+            return Err(BoltError::Other(
+                "execute_groupby (utf8): integer result has fewer columns than GROUP BY keys"
+                    .into(),
+            ));
+        }
+
+        let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(int_result.num_columns());
+        for col in 0..int_result.num_columns() {
+            if col < m_keys {
+                if let Some(dict) = &dicts[col] {
+                    // This key was a string: decode the Int32 codes back to
+                    // strings, preserving NULL slots (the synthesised NULL
+                    // group surfaces as a NULL code -> NULL string).
+                    let codes = int_result
+                        .column(col)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| {
+                            BoltError::Other(format!(
+                                "execute_groupby (utf8): key column {col} of the integer \
+                                 result was not Int32"
+                            ))
+                        })?;
+                    let mut strings: Vec<Option<String>> = Vec::with_capacity(codes.len());
+                    for i in 0..codes.len() {
+                        if codes.is_null(i) {
+                            strings.push(None);
+                        } else {
+                            let c = codes.value(i);
+                            match dict.string_of(c) {
+                                Some(s) => strings.push(Some(s.to_string())),
+                                None => {
+                                    return Err(BoltError::Other(format!(
+                                        "execute_groupby (utf8): group key code {c} out of \
+                                         dictionary range ({} entries)",
+                                        dict.decode.len()
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    out_cols.push(Arc::new(StringArray::from(strings)) as ArrayRef);
+                    continue;
+                }
+                // Non-string key: pass the column through unchanged.
+                out_cols.push(int_result.column(col).clone());
+            } else {
+                // Aggregate result column: unchanged.
+                out_cols.push(int_result.column(col).clone());
+            }
+        }
+
+        // Build the output schema: restore the ORIGINAL key fields (Utf8),
+        // keep the aggregate fields from the original output schema.
+        let mut fields: Vec<Field> = Vec::with_capacity(orig_output_schema.fields.len());
+        for f in orig_key_fields.iter() {
+            fields.push(f.clone());
+        }
+        for f in orig_output_schema.fields.iter().skip(m_keys) {
+            fields.push(f.clone());
+        }
+        let arrow_schema = super::plan_schema_to_arrow_schema(&Schema::new(fields))?;
+        RecordBatch::try_new(arrow_schema, out_cols).map_err(|e| {
+            BoltError::Other(format!(
+                "execute_groupby (utf8): failed to rebuild Utf8-keyed result: {e}"
+            ))
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Host fallback for Utf8 GROUP BY keys.
+    //
+    // Used when the GPU dict-code path can't be taken: a pre-projection
+    // kernel is present, or the distinct-string cardinality exceeds
+    // `MAX_DICT_CARDINALITY`. Computes the same SUM / MIN / MAX / COUNT / AVG
+    // result on the host, keyed by the (possibly multi-column) tuple of
+    // string + non-string key values. Output ordering matches the GPU path:
+    // groups sorted by their key tuple (string keys compared lexicographically,
+    // which equals the lex-rank order the GPU path emits).
+    // -----------------------------------------------------------------------
+
+    /// One key component value for the host fallback's group tuple.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    enum HostKey {
+        /// A string key value (`None` => SQL NULL).
+        Str(Option<String>),
+        /// A non-string key, normalised to its i64 bit/widened representation
+        /// (`None` => SQL NULL). Float bit patterns are canonicalised the same
+        /// way the GPU path packs them is NOT required here because the host
+        /// fallback only groups — equality on the raw i64 suffices.
+        Int(Option<i64>),
+    }
+
+    /// Host GROUP BY over (possibly mixed) string + integer keys. Supports the
+    /// common single-string-key shape `SELECT s, SUM(x) FROM t GROUP BY s`
+    /// plus multi-key tuples. Rejects shapes outside the host fallback's
+    /// coverage with a clear error (the caller has already established that at
+    /// least one key is a string).
+    pub(crate) fn execute_groupby_utf8_host(
+        aggregate: &AggregateSpec,
+        table_batch: &RecordBatch,
+        string_keys: &[Option<StringArray>],
+    ) -> BoltResult<RecordBatch> {
+        let n_rows = table_batch.num_rows();
+        let m_keys = aggregate.group_by.len();
+
+        // Resolve each key column to a per-row HostKey extractor.
+        // `key_arrays[j]` is the source array for group_by position `j`.
+        let mut key_is_string: Vec<bool> = Vec::with_capacity(m_keys);
+        let mut int_key_arrays: Vec<Option<Int64KeyView>> = Vec::with_capacity(m_keys);
+        for (j, &ord) in aggregate.group_by.iter().enumerate() {
+            if string_keys[j].is_some() {
+                key_is_string.push(true);
+                int_key_arrays.push(None);
+            } else {
+                let io = &aggregate.inputs[ord];
+                let idx = table_batch.schema().index_of(&io.name).map_err(|e| {
+                    BoltError::Plan(format!(
+                        "execute_groupby (utf8 host): key '{}' not in batch: {e}",
+                        io.name
+                    ))
+                })?;
+                key_is_string.push(false);
+                int_key_arrays.push(Some(Int64KeyView::new(
+                    table_batch.column(idx).as_ref(),
+                    &io.name,
+                )?));
+            }
+        }
+
+        // Build the per-row key tuple and a parallel group index.
+        let mut group_of_row: Vec<usize> = Vec::with_capacity(n_rows);
+        let mut keys_in_order: Vec<Vec<HostKey>> = Vec::new();
+        let mut index: HashMap<Vec<HostKey>, usize> = HashMap::new();
+        for row in 0..n_rows {
+            let mut tuple: Vec<HostKey> = Vec::with_capacity(m_keys);
+            for j in 0..m_keys {
+                if key_is_string[j] {
+                    let sa = string_keys[j].as_ref().expect("string key present");
+                    let v = if sa.is_null(row) {
+                        None
+                    } else {
+                        Some(sa.value(row).to_string())
+                    };
+                    tuple.push(HostKey::Str(v));
+                } else {
+                    let kv = int_key_arrays[j].as_ref().expect("int key present");
+                    tuple.push(HostKey::Int(kv.value(row)));
+                }
+            }
+            let g = match index.get(&tuple) {
+                Some(&g) => g,
+                None => {
+                    let g = keys_in_order.len();
+                    index.insert(tuple.clone(), g);
+                    keys_in_order.push(tuple);
+                    g
+                }
+            };
+            group_of_row.push(g);
+        }
+
+        let n_groups = keys_in_order.len();
+
+        // Deterministic ordering: sort groups by their key tuple. `HostKey`'s
+        // derived `Ord` compares strings lexicographically and NULLs sort
+        // before non-NULLs (matching the GPU path's i64::MAX NULL sentinel
+        // would sort NULLs LAST; we instead keep SQL's common "NULLs implied"
+        // ordering — the engine applies any explicit ORDER BY downstream, so
+        // only determinism matters here).
+        let mut order: Vec<usize> = (0..n_groups).collect();
+        order.sort_by(|&a, &b| keys_in_order[a].cmp(&keys_in_order[b]));
+        // remap[g] = output row position of group g.
+        let mut remap: Vec<usize> = vec![0; n_groups];
+        for (out_pos, &g) in order.iter().enumerate() {
+            remap[g] = out_pos;
+        }
+
+        // Compute each aggregate host-side into per-output-row buffers.
+        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(aggregate.aggregates.len());
+        for (ai, agg) in aggregate.aggregates.iter().enumerate() {
+            let out_field = aggregate.output_schema.fields.get(m_keys + ai).ok_or_else(|| {
+                BoltError::Other(format!(
+                    "execute_groupby (utf8 host): output_schema missing field for aggregate {ai}"
+                ))
+            })?;
+            let arr = compute_host_aggregate(
+                agg,
+                aggregate,
+                table_batch,
+                &group_of_row,
+                &remap,
+                n_groups,
+                out_field,
+            )?;
+            agg_arrays.push(arr);
+        }
+
+        // Build the key output columns in sorted order.
+        let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(m_keys + agg_arrays.len());
+        for j in 0..m_keys {
+            out_cols.push(build_host_key_column(j, &keys_in_order, &order)?);
+        }
+        out_cols.extend(agg_arrays);
+
+        let arrow_schema = super::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+        RecordBatch::try_new(arrow_schema, out_cols).map_err(|e| {
+            BoltError::Other(format!(
+                "execute_groupby (utf8 host): failed to build result batch: {e}"
+            ))
+        })
+    }
+
+    /// Build one key output column (position `j`) from the sorted group order.
+    fn build_host_key_column(
+        j: usize,
+        keys_in_order: &[Vec<HostKey>],
+        order: &[usize],
+    ) -> BoltResult<ArrayRef> {
+        // Inspect the first group's value to choose the column kind.
+        match keys_in_order.first().and_then(|t| t.get(j)) {
+            Some(HostKey::Str(_)) => {
+                let vals: Vec<Option<String>> = order
+                    .iter()
+                    .map(|&g| match &keys_in_order[g][j] {
+                        HostKey::Str(s) => s.clone(),
+                        HostKey::Int(_) => None,
+                    })
+                    .collect();
+                Ok(Arc::new(StringArray::from(vals)) as ArrayRef)
+            }
+            Some(HostKey::Int(_)) => {
+                // Non-string key columns in a mixed tuple are emitted as Int64
+                // here; the only Utf8-keyed host-fallback shapes the engine
+                // produces today are single-string keys, so a mixed tuple is
+                // rare. (Decoding the exact original dtype would need the
+                // per-column dtype threaded in; Int64 is a safe superset for
+                // the integer key types this fallback accepts.)
+                let vals: Vec<Option<i64>> = order
+                    .iter()
+                    .map(|&g| match &keys_in_order[g][j] {
+                        HostKey::Int(v) => *v,
+                        HostKey::Str(_) => None,
+                    })
+                    .collect();
+                Ok(Arc::new(Int64Array::from(vals)) as ArrayRef)
+            }
+            None => Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())) as ArrayRef),
+        }
+    }
+
+    /// A read-only view over a non-string key column, exposing each row as an
+    /// `Option<i64>` (NULL-aware) for the host fallback's group tuple. Only the
+    /// integer key dtypes the GPU path accepts are supported.
+    struct Int64KeyView {
+        vals: Vec<Option<i64>>,
+    }
+
+    impl Int64KeyView {
+        fn new(arr: &dyn Array, name: &str) -> BoltResult<Self> {
+            let vals: Vec<Option<i64>> = match arr.data_type() {
+                ArrowDataType::Int32 => {
+                    let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) })
+                        .collect()
+                }
+                ArrowDataType::Int64 => {
+                    let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        .collect()
+                }
+                other => {
+                    return Err(BoltError::Type(format!(
+                        "execute_groupby (utf8 host): non-string GROUP BY key '{name}' has \
+                         dtype {other:?}, which the host fallback does not support alongside \
+                         a string key"
+                    )))
+                }
+            };
+            Ok(Int64KeyView { vals })
+        }
+
+        fn value(&self, row: usize) -> Option<i64> {
+            self.vals[row]
+        }
+    }
+
+    /// Compute one aggregate host-side, scattering per-group results into an
+    /// Arrow array in the SORTED output-row order given by `remap`.
+    fn compute_host_aggregate(
+        agg: &AggregateExpr,
+        aggregate: &AggregateSpec,
+        table_batch: &RecordBatch,
+        group_of_row: &[usize],
+        remap: &[usize],
+        n_groups: usize,
+        out_field: &Field,
+    ) -> BoltResult<ArrayRef> {
+        // Resolve the aggregate's input column to host f64 values + validity.
+        // COUNT(*) has no column; everything else resolves a bare column ref.
+        let col_name: Option<String> = match agg {
+            AggregateExpr::Sum(e)
+            | AggregateExpr::Min(e)
+            | AggregateExpr::Max(e)
+            | AggregateExpr::Avg(e)
+            | AggregateExpr::Count(e) => bare_col(e),
+            AggregateExpr::VarPop(e)
+            | AggregateExpr::VarSamp(e)
+            | AggregateExpr::StddevPop(e)
+            | AggregateExpr::StddevSamp(e) => bare_col(e),
+        };
+
+        // Per-row (value, valid). For COUNT(*) (no resolvable column) value is
+        // unused and valid is always true.
+        let (vals, valid): (Vec<f64>, Vec<bool>) = match &col_name {
+            Some(name) => load_f64_column(table_batch, name)?,
+            None => (vec![0.0; group_of_row.len()], vec![true; group_of_row.len()]),
+        };
+
+        match agg {
+            AggregateExpr::Count(e) => {
+                // COUNT(col) counts non-NULL rows; COUNT(*) counts every row.
+                let is_count_col = bare_col(e).is_some();
+                let mut counts: Vec<i64> = vec![0; n_groups];
+                for (row, &g) in group_of_row.iter().enumerate() {
+                    if !is_count_col || valid[row] {
+                        counts[g] += 1;
+                    }
+                }
+                let mut out: Vec<i64> = vec![0; n_groups];
+                for (g, &c) in counts.iter().enumerate() {
+                    out[remap[g]] = c;
+                }
+                Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+            }
+            AggregateExpr::Sum(_) => {
+                let mut sums: Vec<f64> = vec![0.0; n_groups];
+                let mut seen: Vec<bool> = vec![false; n_groups];
+                for (row, &g) in group_of_row.iter().enumerate() {
+                    if valid[row] {
+                        sums[g] += vals[row];
+                        seen[g] = true;
+                    }
+                }
+                scatter_f64_to_field(&sums, Some(&seen), remap, n_groups, out_field)
+            }
+            AggregateExpr::Min(_) | AggregateExpr::Max(_) => {
+                let is_min = matches!(agg, AggregateExpr::Min(_));
+                let mut acc: Vec<f64> = vec![0.0; n_groups];
+                let mut seen: Vec<bool> = vec![false; n_groups];
+                for (row, &g) in group_of_row.iter().enumerate() {
+                    if !valid[row] {
+                        continue;
+                    }
+                    if !seen[g] {
+                        acc[g] = vals[row];
+                        seen[g] = true;
+                    } else if is_min {
+                        if vals[row] < acc[g] {
+                            acc[g] = vals[row];
+                        }
+                    } else if vals[row] > acc[g] {
+                        acc[g] = vals[row];
+                    }
+                }
+                scatter_f64_to_field(&acc, Some(&seen), remap, n_groups, out_field)
+            }
+            AggregateExpr::Avg(_) => {
+                let mut sums: Vec<f64> = vec![0.0; n_groups];
+                let mut counts: Vec<i64> = vec![0; n_groups];
+                for (row, &g) in group_of_row.iter().enumerate() {
+                    if valid[row] {
+                        sums[g] += vals[row];
+                        counts[g] += 1;
+                    }
+                }
+                let mut out: Vec<Option<f64>> = vec![None; n_groups];
+                for g in 0..n_groups {
+                    out[remap[g]] = if counts[g] == 0 {
+                        None
+                    } else {
+                        Some(sums[g] / counts[g] as f64)
+                    };
+                }
+                Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
+            }
+            AggregateExpr::VarPop(_)
+            | AggregateExpr::VarSamp(_)
+            | AggregateExpr::StddevPop(_)
+            | AggregateExpr::StddevSamp(_) => {
+                // Welford per group on the host.
+                let mut states: Vec<crate::exec::welford::WelfordState> =
+                    vec![crate::exec::welford::WelfordState::empty(); n_groups];
+                for (row, &g) in group_of_row.iter().enumerate() {
+                    if valid[row] {
+                        states[g].push(vals[row]);
+                    }
+                }
+                let mut out: Vec<Option<f64>> = vec![None; n_groups];
+                for g in 0..n_groups {
+                    let st = &states[g];
+                    out[remap[g]] = match agg {
+                        AggregateExpr::VarPop(_) => st.var_pop(),
+                        AggregateExpr::VarSamp(_) => st.var_samp(),
+                        AggregateExpr::StddevPop(_) => st.stddev_pop(),
+                        AggregateExpr::StddevSamp(_) => st.stddev_samp(),
+                        _ => unreachable!(),
+                    };
+                }
+                Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
+            }
+        }
+    }
+
+    /// Scatter a per-group f64 accumulator into the output array in `remap`
+    /// order, casting to `out_field.dtype`. `seen` (when present) marks groups
+    /// with no contributing rows as SQL NULL.
+    fn scatter_f64_to_field(
+        acc: &[f64],
+        seen: Option<&[bool]>,
+        remap: &[usize],
+        n_groups: usize,
+        out_field: &Field,
+    ) -> BoltResult<ArrayRef> {
+        // Build per-output-row Option<f64> first, then cast to the field dtype.
+        let mut ordered: Vec<Option<f64>> = vec![None; n_groups];
+        for g in 0..n_groups {
+            let present = seen.map(|s| s[g]).unwrap_or(true);
+            ordered[remap[g]] = if present { Some(acc[g]) } else { None };
+        }
+        match out_field.dtype {
+            DataType::Int32 => Ok(Arc::new(Int32Array::from(
+                ordered
+                    .into_iter()
+                    .map(|o| o.map(|v| v as i32))
+                    .collect::<Vec<Option<i32>>>(),
+            )) as ArrayRef),
+            DataType::Int64 => Ok(Arc::new(Int64Array::from(
+                ordered
+                    .into_iter()
+                    .map(|o| o.map(|v| v as i64))
+                    .collect::<Vec<Option<i64>>>(),
+            )) as ArrayRef),
+            DataType::Float32 => Ok(Arc::new(arrow_array::Float32Array::from(
+                ordered
+                    .into_iter()
+                    .map(|o| o.map(|v| v as f32))
+                    .collect::<Vec<Option<f32>>>(),
+            )) as ArrayRef),
+            DataType::Float64 => Ok(Arc::new(Float64Array::from(ordered)) as ArrayRef),
+            ref other => Err(BoltError::Type(format!(
+                "execute_groupby (utf8 host): aggregate output dtype {other:?} not supported \
+                 in the host fallback"
+            ))),
+        }
+    }
+
+    /// Load a numeric column as host `(values_f64, validity)`. Supports the
+    /// integer / float value dtypes the GPU group-by aggregates accept.
+    fn load_f64_column(
+        batch: &RecordBatch,
+        name: &str,
+    ) -> BoltResult<(Vec<f64>, Vec<bool>)> {
+        let idx = batch.schema().index_of(name).map_err(|e| {
+            BoltError::Plan(format!(
+                "execute_groupby (utf8 host): aggregate input '{name}' not in batch: {e}"
+            ))
+        })?;
+        let arr = batch.column(idx);
+        let n = arr.len();
+        let valid: Vec<bool> = (0..n).map(|i| !arr.is_null(i)).collect();
+        let vals: Vec<f64> = match arr.data_type() {
+            ArrowDataType::Int32 => {
+                let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..n).map(|i| a.value(i) as f64).collect()
+            }
+            ArrowDataType::Int64 => {
+                let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..n).map(|i| a.value(i) as f64).collect()
+            }
+            ArrowDataType::Float32 => {
+                let a = arr.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+                (0..n).map(|i| a.value(i) as f64).collect()
+            }
+            ArrowDataType::Float64 => {
+                let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                (0..n).map(|i| a.value(i)).collect()
+            }
+            other => {
+                return Err(BoltError::Type(format!(
+                    "execute_groupby (utf8 host): aggregate input '{name}' has dtype {other:?}, \
+                     which the host fallback does not support"
+                )))
+            }
+        };
+        Ok((vals, valid))
+    }
+
+    /// Extract a bare column name from an aggregate-input expression, or
+    /// `None` when the expression is not a bare column ref (e.g. COUNT(*) over
+    /// a literal).
+    fn bare_col(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Column(name) => Some(name.clone()),
+            Expr::Alias(inner, _) => bare_col(inner),
+            _ => None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-only tests for the Utf8 GROUP BY plumbing. All pure host logic —
+    // they build dictionaries, encode/decode codes, and run the host
+    // fallback group-by without touching CUDA, so they run under
+    // `--no-default-features --features cuda-stub`.
+    // -----------------------------------------------------------------------
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn agg_spec(
+            inputs: Vec<(&str, DataType)>,
+            group_by: Vec<usize>,
+            aggregates: Vec<AggregateExpr>,
+            out_fields: Vec<(&str, DataType)>,
+        ) -> AggregateSpec {
+            AggregateSpec {
+                inputs: inputs
+                    .into_iter()
+                    .map(|(n, d)| ColumnIO { name: n.to_string(), dtype: d })
+                    .collect(),
+                group_by,
+                aggregates,
+                output_schema: Schema::new(
+                    out_fields
+                        .into_iter()
+                        .map(|(n, d)| Field::new(n, d, true))
+                        .collect(),
+                ),
+                input_has_validity: Vec::new(),
+            }
+        }
+
+        /// LexDict assigns codes in byte-lexicographic order of the distinct
+        /// non-null strings, and encodes each row to its code (NULL preserved).
+        #[test]
+        fn lex_dict_build_is_lex_ranked() {
+            let arr = StringArray::from(vec![
+                Some("US"),
+                Some("EU"),
+                Some("US"),
+                None,
+                Some("AU"),
+            ]);
+            let (dict, codes) = LexDict::build(&arr);
+            // Distinct sorted: AU, EU, US => codes 0, 1, 2.
+            assert_eq!(dict.decode, vec!["AU".to_string(), "EU".into(), "US".into()]);
+            assert_eq!(
+                codes,
+                vec![Some(2), Some(1), Some(2), None, Some(0)],
+                "rows encode to their lex rank; NULL stays None"
+            );
+            // Round-trip decode.
+            assert_eq!(dict.string_of(0), Some("AU"));
+            assert_eq!(dict.string_of(2), Some("US"));
+            assert_eq!(dict.string_of(3), None, "out-of-range code -> None");
+        }
+
+        /// `as_string_array` flattens a plain Utf8 StringArray.
+        #[test]
+        fn as_string_array_passes_utf8_through() {
+            let arr = StringArray::from(vec!["a", "b"]);
+            let got = as_string_array(&arr).expect("utf8 should flatten");
+            assert_eq!(got.value(0), "a");
+            assert_eq!(got.value(1), "b");
+        }
+
+        /// `as_string_array` returns None for a non-string array.
+        #[test]
+        fn as_string_array_rejects_non_string() {
+            let arr = Int64Array::from(vec![1i64, 2]);
+            assert!(as_string_array(&arr).is_none());
+        }
+
+        /// Host fallback: `SELECT s, SUM(x) FROM t GROUP BY s` over a string
+        /// key. Groups emit in lex order (EU, US) with the correct sums.
+        #[test]
+        fn host_fallback_sum_by_string_key() {
+            let s = Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US"]))
+                as ArrayRef;
+            let x = Arc::new(Int64Array::from(vec![1i64, 10, 2, 20, 3])) as ArrayRef;
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("s", ArrowDataType::Utf8, true),
+                ArrowField::new("x", ArrowDataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![s.clone(), x]).unwrap();
+
+            let agg = agg_spec(
+                vec![("s", DataType::Utf8), ("x", DataType::Int64)],
+                vec![0],
+                vec![AggregateExpr::Sum(Expr::Column("x".into()))],
+                vec![("s", DataType::Utf8), ("sum_x", DataType::Int64)],
+            );
+            let string_keys = vec![Some(
+                s.as_any().downcast_ref::<StringArray>().unwrap().clone(),
+            )];
+
+            let out = execute_groupby_utf8_host(&agg, &batch, &string_keys).unwrap();
+            assert_eq!(out.num_rows(), 2);
+            let keys = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let sums = out
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            // Lex order: EU first (10+20=30), then US (1+2+3=6).
+            assert_eq!(keys.value(0), "EU");
+            assert_eq!(sums.value(0), 30);
+            assert_eq!(keys.value(1), "US");
+            assert_eq!(sums.value(1), 6);
+        }
+
+        /// Host fallback: COUNT(*) per string key and a NULL key form their
+        /// own group (NULL sorts first under the derived ordering).
+        #[test]
+        fn host_fallback_count_with_null_key() {
+            let s = Arc::new(StringArray::from(vec![
+                Some("b"),
+                None,
+                Some("a"),
+                Some("b"),
+                None,
+            ])) as ArrayRef;
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "s",
+                ArrowDataType::Utf8,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![s.clone()]).unwrap();
+
+            let agg = agg_spec(
+                vec![("s", DataType::Utf8)],
+                vec![0],
+                // COUNT(*) lowers to Count(Literal) — a non-column expr.
+                vec![AggregateExpr::Count(crate::plan::logical_plan::lit(1_i64))],
+                vec![("s", DataType::Utf8), ("cnt", DataType::Int64)],
+            );
+            let string_keys = vec![Some(
+                s.as_any().downcast_ref::<StringArray>().unwrap().clone(),
+            )];
+
+            let out = execute_groupby_utf8_host(&agg, &batch, &string_keys).unwrap();
+            assert_eq!(out.num_rows(), 3, "groups: NULL, a, b");
+            let keys = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let cnt = out
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            // NULL sorts first, then 'a', then 'b'.
+            assert!(keys.is_null(0), "NULL group sorts first");
+            assert_eq!(cnt.value(0), 2, "two NULL-key rows");
+            assert_eq!(keys.value(1), "a");
+            assert_eq!(cnt.value(1), 1);
+            assert_eq!(keys.value(2), "b");
+            assert_eq!(cnt.value(2), 2);
+        }
+
+        /// `reconstruct` maps an Int32 key code column back to its strings,
+        /// preserving a NULL slot, and restores the original Utf8 schema.
+        #[test]
+        fn reconstruct_decodes_codes_to_strings() {
+            // Integer-keyed result: codes [0, 1, NULL] + a SUM column.
+            let codes = Arc::new(Int32Array::from(vec![Some(0), Some(1), None]))
+                as ArrayRef;
+            let sums = Arc::new(Int64Array::from(vec![5i64, 7, 9])) as ArrayRef;
+            let int_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("s", ArrowDataType::Int32, true),
+                ArrowField::new("sum_x", ArrowDataType::Int64, true),
+            ]));
+            let int_result =
+                RecordBatch::try_new(int_schema, vec![codes, sums]).unwrap();
+
+            let dict = LexDict {
+                decode: vec!["AU".to_string(), "EU".to_string()],
+            };
+            let dicts = vec![Some(dict)];
+            let orig_key_fields = vec![Field::new("s", DataType::Utf8, true)];
+            let orig_out = Schema::new(vec![
+                Field::new("s", DataType::Utf8, true),
+                Field::new("sum_x", DataType::Int64, true),
+            ]);
+
+            let out = reconstruct(&int_result, &dicts, &orig_key_fields, &orig_out)
+                .expect("reconstruct ok");
+            let keys = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(keys.value(0), "AU");
+            assert_eq!(keys.value(1), "EU");
+            assert!(keys.is_null(2), "NULL code -> NULL string");
+            // Aggregate column carried through unchanged.
+            let sums = out
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(sums.value(2), 9);
+            // Output schema's key field is restored to Utf8.
+            assert_eq!(out.schema().field(0).data_type(), &ArrowDataType::Utf8);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

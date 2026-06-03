@@ -210,7 +210,8 @@ pub(crate) const CODEGEN_VERSION: u32 = 2;
 /// automatically-derived fingerprint into the salt when one is available
 /// at compile time. `build.rs` emits
 /// `cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT=<hash-of-codegen-surface>`
-/// (a stable 128-bit FNV-1a digest over the `src/jit/*.rs` codegen tree),
+/// (a stable 128-bit FNV-1a digest over the `src/jit/*.rs` codegen tree
+/// plus `src/plan/physical_plan.rs`, the plan IR codegen lowers into PTX),
 /// and this helper consumes it via [`option_env!`] with **no** new
 /// dependency. Because the digest rotates on *any* change to the codegen
 /// source, a forgotten [`CODEGEN_VERSION`] bump no longer silently serves
@@ -240,8 +241,9 @@ const CODEGEN_FINGERPRINT: Option<&str> = option_env!("BOLT_CODEGEN_FINGERPRINT"
 ///      stale PTX.
 ///   3. The compile-time codegen fingerprint
 ///      ([`CODEGEN_FINGERPRINT`], `fp<hash>`) — supplied by `build.rs`,
-///      which hashes the `src/jit/*.rs` codegen tree into a stable digest
-///      and exports `BOLT_CODEGEN_FINGERPRINT`. It makes the salt rotate
+///      which hashes the `src/jit/*.rs` codegen tree plus
+///      `src/plan/physical_plan.rs` into a stable digest and exports
+///      `BOLT_CODEGEN_FINGERPRINT`. It makes the salt rotate
 ///      *automatically* on any change to the codegen surface, so a
 ///      forgotten manual bump is caught even between local dev builds of
 ///      the same crate version. It is absent only in the degenerate case
@@ -251,7 +253,8 @@ const CODEGEN_FINGERPRINT: Option<&str> = option_env!("BOLT_CODEGEN_FINGERPRINT"
 /// NOTE / MAINTAINERS: this salt MUST change whenever the emitted PTX
 /// *text* changes for an otherwise-identical `KernelSpec`. The `build.rs`
 /// fingerprint (signal 3) now does this automatically for any change to
-/// the `src/jit/` codegen source; bumping [`CODEGEN_VERSION`] remains the
+/// the `src/jit/` codegen source (and `src/plan/physical_plan.rs`);
+/// bumping [`CODEGEN_VERSION`] remains the
 /// belt-and-braces in-release guard — see the maintainer note on
 /// [`CODEGEN_VERSION`].
 ///

@@ -245,40 +245,43 @@ impl DictionaryColumnAny {
                     arr.values().data_type()
                 ))
             })?;
-        // Copy values into an owned Vec<String>.
+        // Copy values into an owned Vec<String>, COMPACTING OUT null dictionary
+        // slots so they never participate in the lex ranking below.
         //
         // Review finding M6: a dictionary-level NULL entry (the dict *value*
         // itself is null — distinct from a null *key*) must NOT collide with a
-        // genuine empty-string value. The previous code pushed `String::new()`
-        // (`""`) for both, so a row keyed at a null dict slot decoded to `""`
-        // instead of NULL, and was indistinguishable from a row keyed at a real
-        // `""` entry. We instead remember which dict slots are null
-        // (`null_dict_slot[i]`) and remap any key pointing at such a slot to GPU
-        // index 0 (NULL) below — exactly the convention the null-*key* path
-        // already uses (`indices.push(0)`). The placeholder string we store for
-        // a null slot is never referenced after that remap, so its value is
-        // irrelevant; we keep `String::new()` purely so slot indices stay
-        // aligned with `dict_vals`.
+        // genuine empty-string value, and a row keyed at such a slot is
+        // semantically NULL (GPU index 0). Earlier code kept the null slot as a
+        // `""` placeholder aligned with `dict_vals` and remapped null-keyed rows
+        // to 0. That alignment trick is incompatible with R1 lex sorting: a dead
+        // `""` placeholder would sort to the front and shift every real value's
+        // rank (and could even decode-collide with a real `""`). So we instead
+        // drop null slots entirely here, building a 0-based map
+        // `arrow_slot -> compacted GPU index` where a null slot maps to 0 (NULL).
+        // Real strings get sequential 1-based codes in Arrow-slot order; the
+        // subsequent `lex_sort_dictionary` re-orders them into lex rank.
         let mut dictionary: Vec<String> = Vec::with_capacity(dict_vals.len());
-        let mut null_dict_slot: Vec<bool> = Vec::with_capacity(dict_vals.len());
+        // `slot_to_gpu[arrow_slot]` = compacted 1-based GPU index, or 0 if the
+        // Arrow slot's value is null (treated as SQL NULL).
+        let mut slot_to_gpu: Vec<i32> = Vec::with_capacity(dict_vals.len());
         for i in 0..dict_vals.len() {
             if dict_vals.is_null(i) {
-                dictionary.push(String::new());
-                null_dict_slot.push(true);
+                slot_to_gpu.push(0);
             } else {
+                // i32 ceiling guard — mirrors `DictionaryColumn::from_string_array`.
+                let next_len = dictionary.len() + 1;
+                if next_len > i32::MAX as usize {
+                    return Err(BoltError::Other(format!(
+                        "dictionary overflow: more than {} unique strings (i32 index space)",
+                        i32::MAX
+                    )));
+                }
                 dictionary.push(dict_vals.value(i).to_string());
-                null_dict_slot.push(false);
+                slot_to_gpu.push(next_len as i32);
             }
         }
-        // i32 ceiling guard — mirrors `DictionaryColumn::from_string_array`.
-        if dictionary.len().saturating_add(1) > i32::MAX as usize {
-            return Err(BoltError::Other(format!(
-                "dictionary overflow: more than {} unique strings (i32 index space)",
-                i32::MAX
-            )));
-        }
 
-        // Shift keys by +1 so slot 0 reserves NULL; NULL rows land at 0.
+        // Map Arrow keys through `slot_to_gpu`; slot 0 (GPU) reserves NULL.
         let keys_arr: &Int32Array = arr.keys();
         let n_rows = keys_arr.len();
         let mut indices: Vec<i32> = Vec::with_capacity(n_rows);
@@ -294,31 +297,26 @@ impl DictionaryColumnAny {
                         k, i
                     )));
                 }
-                // Review finding M6: if this key points at a dictionary slot
-                // whose *value* is null, the row is semantically NULL — map it
-                // to GPU index 0, never to the `""` placeholder we stored for
-                // that slot. `k` is a valid 0-based dict index here (Arrow
-                // guarantees keys index into the values array), so the bounds
-                // check is defensive against a malformed array.
-                if (k as usize) < null_dict_slot.len() && null_dict_slot[k as usize] {
-                    indices.push(0);
-                    continue;
-                }
-                // `k + 1` on an Arrow key would overflow when `k == i32::MAX`.
-                // The upstream guard a few lines up rejects dictionaries with
-                // `len >= i32::MAX`, so any valid Arrow key here satisfies
-                // `k < i32::MAX` (since `k < dictionary.len() <= i32::MAX - 1`).
-                // Lock that invariant in with a debug assertion so a future
-                // bump of the upstream bound trips this site in tests rather
-                // than silently producing `i32::MIN` from wrap-around.
-                debug_assert!(
-                    k < i32::MAX,
-                    "Arrow key i32::MAX would overflow on k+1; upstream guard \
-                     at line 166 should have rejected"
-                );
-                indices.push(k + 1);
+                // `k` is a valid 0-based Arrow dict index (Arrow guarantees keys
+                // index into the values array); the bounds check is defensive
+                // against a malformed array. A key into a null value slot maps to
+                // GPU index 0 (NULL) via `slot_to_gpu`.
+                let gpu = slot_to_gpu.get(k as usize).copied().ok_or_else(|| {
+                    BoltError::Other(format!(
+                        "dictionary key {} at row {} out of range (dictionary has {} slots)",
+                        k,
+                        i,
+                        slot_to_gpu.len()
+                    ))
+                })?;
+                indices.push(gpu);
             }
         }
+
+        // R1: re-order codes into byte-lexicographic rank and remap row indices
+        // so the integer codes match string order before upload.
+        crate::cuda::dictionary::lex_sort_dictionary(&mut dictionary, &mut indices);
+
         let device_indices = crate::cuda::GpuVec::<i32>::from_slice(&indices)?;
         let inner = DictionaryColumn {
             dictionary,

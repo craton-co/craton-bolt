@@ -761,9 +761,10 @@ fn finalize_numeric(
 /// numeric output dtypes (Int32/Int64/Float32/Float64) via [`AggNum`]. A
 /// Decimal128 output (also distributive for SUM/MIN/MAX) needs an i128 fold and
 /// scale-aware finalisation; until then the gate rejects Decimal outputs and
-/// they keep the whole-table drain. GROUP BY streaming is likewise out of scope
-/// here — a grouped partial is a multi-row keyed batch that needs a hash-merge,
-/// not a scalar fold.
+/// they keep the whole-table drain. GROUP BY streaming is now handled by the
+/// keyed hash-merge in [`crate::exec::streaming::merge_grouped_partials`]
+/// (driven by [`Engine::execute_streaming_grouped_aggregate`]); a grouped
+/// partial is a multi-row keyed batch folded there rather than here.
 fn combine_scalar_aggregate_partials(
     aggregate: &crate::plan::physical_plan::AggregateSpec,
     partials: &[RecordBatch],
@@ -4344,6 +4345,160 @@ impl Engine {
         Ok(QueryHandle { batch })
     }
 
+    /// If `phys` is a **streamable grouped aggregate** — a `GROUP BY` whose
+    /// every aggregate function is *distributive* (combinable from per-morsel
+    /// partials by re-applying a keyed fold) and whose every aggregate output
+    /// column is a primitive numeric dtype the host merge
+    /// ([`crate::exec::streaming::merge_grouped_partials`]) can fold — return
+    /// `(table, per-aggregate fold ops)`. Otherwise `None` (the caller drains
+    /// the whole table).
+    ///
+    /// The distributive set is `COUNT` / `SUM` / `MIN` / `MAX`, exactly as for
+    /// the scalar streaming gate ([`Engine::streamable_scalar_aggregate`]),
+    /// lifted to a keyed merge:
+    ///
+    /// * `COUNT` / `SUM` → per-key **Add** across morsels.
+    /// * `MIN` / `MAX` → per-key **min** / **max** across morsels.
+    ///
+    /// `AVG`, `VAR_*`, `STDDEV_*` are **not** distributive over their finalised
+    /// per-morsel output (an average of per-morsel averages is not the
+    /// whole-table average), so they return `None` and keep the whole-table
+    /// drain. A grouped aggregate with **zero** aggregate functions (a pure
+    /// `SELECT DISTINCT`-shaped `GROUP BY g`) also returns `None` — there is no
+    /// distributive value to fold and the whole-table dedup path is correct as
+    /// is. Decimal128 aggregate outputs are *also* distributive but the host
+    /// merge does not yet fold i128 partials with scale, so a Decimal output
+    /// keeps the whole-table drain (see the TODO on
+    /// [`crate::exec::streaming::merge_grouped_partials`]).
+    ///
+    /// The group-key columns are inspected only for their **count** (they are
+    /// rebuilt verbatim from the partials by the merge); their dtypes may be any
+    /// type the per-batch executor and the row-key relation support
+    /// (Int/Float/Bool/Utf8).
+    fn streamable_grouped_aggregate<'p>(
+        phys: &'p PhysicalPlan,
+    ) -> Option<(&'p str, Vec<crate::exec::streaming::GroupedFold>)> {
+        use crate::exec::streaming::GroupedFold;
+        use crate::plan::logical_plan::AggregateExpr;
+        let PhysicalPlan::Aggregate {
+            table, aggregate, ..
+        } = phys
+        else {
+            return None;
+        };
+        // Must be a GROUP BY (non-empty keys) with at least one aggregate.
+        if aggregate.group_by.is_empty() || aggregate.aggregates.is_empty() {
+            return None;
+        }
+        // Output schema is [group keys..., aggregate columns...]; the aggregate
+        // result columns start after the group keys.
+        let n_group = aggregate.group_by.len();
+        if aggregate.output_schema.fields.len() != n_group + aggregate.aggregates.len() {
+            return None;
+        }
+        let mut folds: Vec<GroupedFold> = Vec::with_capacity(aggregate.aggregates.len());
+        for (i, agg) in aggregate.aggregates.iter().enumerate() {
+            let field = &aggregate.output_schema.fields[n_group + i];
+            let fold = match agg {
+                AggregateExpr::Count(_) | AggregateExpr::Sum(_) => GroupedFold::Add,
+                AggregateExpr::Min(_) => GroupedFold::Min,
+                AggregateExpr::Max(_) => GroupedFold::Max,
+                // AVG / VAR_* / STDDEV_* are not distributive over finalised
+                // per-morsel partials — drain.
+                _ => return None,
+            };
+            let foldable_dtype = matches!(
+                field.dtype,
+                DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+            );
+            if !foldable_dtype {
+                return None;
+            }
+            folds.push(fold);
+        }
+        Some((table.as_str(), folds))
+    }
+
+    /// Drive a streamable **grouped aggregate** morsel-by-morsel instead of
+    /// materialising the whole table on the device at once.
+    ///
+    /// Mirrors [`Engine::execute_streaming_scalar_aggregate`]'s overlay-swap
+    /// discipline: for each morsel the streaming-overlay entry for `table` is
+    /// temporarily replaced with a single-batch view of that morsel, the *same*
+    /// per-batch grouped-aggregate executor the whole-table path uses
+    /// (`run_morsel`) runs against it producing a **partial grouped batch**
+    /// (group-key columns followed by per-aggregate result columns), and the
+    /// whole-table overlay is always restored afterwards (including on the error
+    /// path).
+    ///
+    /// The per-morsel partials are then hash-merged by key into the final
+    /// grouped result by [`crate::exec::streaming::merge_grouped_partials`].
+    /// Because every aggregate is distributive (see
+    /// [`Engine::streamable_grouped_aggregate`]) the merged result equals the
+    /// whole-table grouped aggregate exactly (modulo row order, which a GROUP BY
+    /// without ORDER BY does not constrain).
+    ///
+    /// A zero-morsel table (zero rows) yields an empty batch shaped by the
+    /// aggregate output schema — there is no partial to merge.
+    ///
+    /// Precondition (enforced by the caller in [`Engine::execute`]): `table` is
+    /// a streaming-registered overlay table and `aggregate.group_by` is
+    /// non-empty.
+    fn execute_streaming_grouped_aggregate(
+        &self,
+        table: &str,
+        morsel_rows: usize,
+        run_morsel: impl Fn() -> BoltResult<QueryHandle>,
+        aggregate: &crate::plan::physical_plan::AggregateSpec,
+        folds: &[crate::exec::streaming::GroupedFold],
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::{merge_grouped_partials, BatchStream, TableSource};
+
+        let whole: Vec<RecordBatch> = {
+            let overlay = self.streaming_sources.borrow();
+            match overlay.get(table) {
+                Some(TableSource::Materialized(b)) => b.clone(),
+                _ => {
+                    return Err(BoltError::Other(format!(
+                        "execute_streaming_grouped_aggregate: table '{table}' is not a \
+                         materialised streaming-overlay table"
+                    )))
+                }
+            }
+        };
+
+        let mut partials: Vec<RecordBatch> = Vec::new();
+
+        let loop_result: BoltResult<()> = (|| {
+            let stream = BatchStream::new(&whole, morsel_rows)?;
+            for morsel in stream.morsels() {
+                self.streaming_sources
+                    .borrow_mut()
+                    .insert(table.to_string(), TableSource::Materialized(vec![morsel]));
+                let handle = run_morsel()?;
+                partials.push(handle.batch);
+            }
+            Ok(())
+        })();
+
+        // Always restore the whole-table view.
+        self.streaming_sources
+            .borrow_mut()
+            .insert(table.to_string(), TableSource::Materialized(whole));
+
+        loop_result?;
+
+        // Zero morsels (zero-row table): emit an empty batch from the output
+        // schema — there is no partial to merge or to borrow a schema from.
+        let batch = if partials.is_empty() {
+            let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+            RecordBatch::new_empty(arrow_schema)
+        } else {
+            merge_grouped_partials(&partials, aggregate.group_by.len(), folds)?
+        };
+        Ok(QueryHandle { batch })
+    }
+
     /// Execute a pre-built `PhysicalPlan`.
     pub fn execute(&self, phys: &PhysicalPlan) -> BoltResult<QueryHandle> {
         // Streaming / morsel opt-in. The whole-table path below is the default
@@ -4395,6 +4550,31 @@ impl Engine {
                                 morsel_rows,
                                 || self.execute_leaf_whole(phys),
                                 aggregate,
+                            );
+                        }
+                    }
+                }
+            }
+            // Streamable grouped aggregate (GROUP BY with distributive
+            // SUM/COUNT/MIN/MAX over numeric outputs): run the per-batch
+            // group-by executor on each morsel to produce a partial grouped
+            // batch, then hash-merge the partials by key on the host. Identical
+            // to the whole-table grouped aggregate because the aggregates are
+            // distributive. Same overlay-only / over-budget gating as above.
+            if let Some((table, folds)) = Self::streamable_grouped_aggregate(phys) {
+                let is_overlay_only = !self.tables.contains_key(table)
+                    && self.streaming_sources.borrow().contains_key(table);
+                if is_overlay_only {
+                    if let Some(morsel_rows) =
+                        self.morsel_plan_for_table(table)?.morsel_rows()
+                    {
+                        if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
+                            return self.execute_streaming_grouped_aggregate(
+                                table,
+                                morsel_rows,
+                                || self.execute_leaf_whole(phys),
+                                aggregate,
+                                &folds,
                             );
                         }
                     }
@@ -8350,6 +8530,96 @@ mod tests {
         assert_eq!(Engine::streamable_scalar_aggregate(&grouped), None);
     }
 
+    // ---- streaming GROUPED-aggregate classification (host-only) ----
+
+    /// Build a grouped `Aggregate` plan: one Int64 group key (`g`, column 0 of
+    /// the output schema), followed by `aggs` aggregate output columns (all
+    /// Int64, nullable). Group-by has a single key.
+    fn grouped_agg_plan(table: &str, aggs: Vec<AggregateExpr>) -> PhysicalPlan {
+        let mut fields = vec![Field::new("g", DataType::Int64, true)];
+        for (i, _) in aggs.iter().enumerate() {
+            fields.push(Field::new(format!("a{i}"), DataType::Int64, true));
+        }
+        PhysicalPlan::Aggregate {
+            table: table.to_string(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    col_io("g", DataType::Int64),
+                    col_io("x", DataType::Int64),
+                ],
+                group_by: vec![0],
+                aggregates: aggs,
+                output_schema: Schema::new(fields),
+                input_has_validity: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn streamable_grouped_aggregate_accepts_distributive() {
+        use crate::exec::streaming::GroupedFold;
+        let p = grouped_agg_plan(
+            "t",
+            vec![
+                AggregateExpr::Count(Expr::Column("x".into())),
+                AggregateExpr::Sum(Expr::Column("x".into())),
+                AggregateExpr::Min(Expr::Column("x".into())),
+                AggregateExpr::Max(Expr::Column("x".into())),
+            ],
+        );
+        let got = Engine::streamable_grouped_aggregate(&p);
+        assert_eq!(
+            got,
+            Some((
+                "t",
+                vec![
+                    GroupedFold::Add,
+                    GroupedFold::Add,
+                    GroupedFold::Min,
+                    GroupedFold::Max,
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn streamable_grouped_aggregate_rejects_avg_and_scalar() {
+        // AVG is not distributive over finalised partials.
+        let avg = grouped_agg_plan("t", vec![AggregateExpr::Avg(Expr::Column("x".into()))]);
+        assert_eq!(Engine::streamable_grouped_aggregate(&avg), None);
+
+        // A scalar aggregate (empty group_by) is NOT the grouped path.
+        let scalar =
+            scalar_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
+        assert_eq!(Engine::streamable_grouped_aggregate(&scalar), None);
+    }
+
+    #[test]
+    fn streamable_grouped_aggregate_rejects_non_numeric_output() {
+        // A grouped SUM whose output column dtype is not a foldable primitive
+        // numeric (e.g. a Decimal128 output) must drain. Model it by flipping
+        // the aggregate output field dtype to Decimal128.
+        let mut p = grouped_agg_plan("t", vec![AggregateExpr::Sum(Expr::Column("x".into()))]);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut p {
+            // fields[0] is the group key; fields[1] is the SUM output.
+            aggregate.output_schema.fields[1].dtype = DataType::Decimal128(38, 0);
+        }
+        assert_eq!(Engine::streamable_grouped_aggregate(&p), None);
+    }
+
+    #[test]
+    fn streamable_grouped_aggregate_rejects_zero_aggregates() {
+        // GROUP BY g with no aggregate functions (DISTINCT-shaped) has nothing
+        // distributive to fold — drain.
+        let mut p = grouped_agg_plan("t", vec![]);
+        if let PhysicalPlan::Aggregate { aggregate, .. } = &mut p {
+            // grouped_agg_plan with no aggs leaves a single group-key field.
+            assert_eq!(aggregate.aggregates.len(), 0);
+        }
+        assert_eq!(Engine::streamable_grouped_aggregate(&p), None);
+    }
+
     #[test]
     fn combine_partials_sum_and_count_add() {
         // Two aggregates: COUNT(x), SUM(x). Three morsels.
@@ -8585,6 +8855,136 @@ mod tests {
         let h2 = engine.sql("SELECT COUNT(x) FROM t").expect("second query");
         let c = h2.record_batch().column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(c.value(0), total as i64, "overlay restored: full table visible");
+    }
+
+    /// Schema for the grouped streaming fixture: an Int64 group key `g` and an
+    /// Int64 value `x`.
+    fn gx_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("x", DataType::Int64, false),
+        ])
+    }
+
+    /// A single-batch `(g, x)` producer where `g = i % n_groups` and `x = i`
+    /// for `i` in `[0, total)`. Replayable.
+    fn gx_producer(total: usize, n_groups: i64) -> crate::exec::streaming::BatchProducer {
+        Box::new(move || {
+            let g: Int64Array = (0..total as i64).map(|i| i % n_groups).collect();
+            let x: Int64Array = (0..total as i64).collect();
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("g", ArrowDataType::Int64, false),
+                ArrowField::new("x", ArrowDataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(g), Arc::new(x)]).unwrap();
+            Box::new(std::iter::once(Ok(batch)))
+        })
+    }
+
+    /// End-to-end equivalence for the **streaming grouped-aggregate** path: a
+    /// distributive `SUM(x) ... GROUP BY g` over a streaming-registered table
+    /// under a budget small enough to force morsel chunking is processed
+    /// morsel-by-morsel (per-morsel grouped partials hash-merged by key) and
+    /// yields the same per-group totals as the whole-table fold.
+    ///
+    /// GPU-gated: builds an `Engine` and runs the group-by kernel per morsel.
+    #[test]
+    #[ignore = "gpu:aggregate — streaming grouped SUM equals whole-table grouped SUM"]
+    fn streaming_morsel_matches_materialized_grouped_sum() {
+        let total = 1000usize;
+        let n_groups = 7i64;
+
+        // Baseline: whole table materialised, no budget.
+        let mut whole = Engine::new().expect("ctx");
+        {
+            let g: Int64Array = (0..total as i64).map(|i| i % n_groups).collect();
+            let x: Int64Array = (0..total as i64).collect();
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("g", ArrowDataType::Int64, false),
+                ArrowField::new("x", ArrowDataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(g), Arc::new(x)]).unwrap();
+            whole.register_table("t", batch).expect("register whole");
+        }
+        let want = whole
+            .sql("SELECT g, SUM(x) AS s, COUNT(x) AS c, MIN(x) AS mn, MAX(x) AS mx FROM t GROUP BY g")
+            .expect("whole grouped query")
+            .record_batch()
+            .clone();
+
+        // Streaming source + a budget far below the table footprint, so the
+        // grouped-aggregate streaming hook fires.
+        let mut streamed = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        streamed
+            .register_table_stream_lazy("t", gx_schema(), gx_producer(total, n_groups))
+            .expect("register stream");
+        let got = streamed
+            .sql("SELECT g, SUM(x) AS s, COUNT(x) AS c, MIN(x) AS mn, MAX(x) AS mx FROM t GROUP BY g")
+            .expect("streamed grouped query")
+            .record_batch()
+            .clone();
+
+        // GROUP BY has no guaranteed row order; compare as a key->tuple map.
+        let to_map = |b: &RecordBatch| -> std::collections::HashMap<i64, (i64, i64, i64, i64)> {
+            let g = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+            let mn = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+            let mx = b.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..b.num_rows())
+                .map(|r| {
+                    (
+                        g.value(r),
+                        (s.value(r), c.value(r), mn.value(r), mx.value(r)),
+                    )
+                })
+                .collect()
+        };
+        let want_map = to_map(&want);
+        let got_map = to_map(&got);
+        assert_eq!(got.num_rows() as i64, n_groups, "all groups present");
+        assert_eq!(got_map, want_map, "streamed grouped aggregates equal whole-table");
+    }
+
+    /// The grouped drain-fallback: a non-distributive grouped `AVG` is NOT
+    /// streamable, so `streamable_grouped_aggregate` returns `None` and the
+    /// whole table drains and folds — correct even under a tiny budget.
+    ///
+    /// GPU-gated.
+    #[test]
+    #[ignore = "gpu:aggregate — grouped AVG drains over streaming source"]
+    fn streaming_drain_fallback_grouped_avg() {
+        use arrow_array::Float64Array;
+        let total = 700usize;
+        let n_groups = 5i64;
+        let mut engine = Engine::builder()
+            .memory_budget(4096)
+            .build()
+            .expect("ctx with budget");
+        engine
+            .register_table_stream_lazy("t", gx_schema(), gx_producer(total, n_groups))
+            .expect("register stream");
+        let got = engine
+            .sql("SELECT g, AVG(x) AS a FROM t GROUP BY g")
+            .expect("grouped avg query")
+            .record_batch()
+            .clone();
+        assert_eq!(got.num_rows() as i64, n_groups);
+        // Spot-check group 0's average: x in {0, n_groups, 2*n_groups, ...}.
+        let g = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let a = got.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        for r in 0..got.num_rows() {
+            let key = g.value(r);
+            let members: Vec<i64> = (0..total as i64).filter(|i| i % n_groups == key).collect();
+            let expected = members.iter().sum::<i64>() as f64 / members.len() as f64;
+            assert!(
+                (a.value(r) - expected).abs() < 1e-6,
+                "group {key} AVG over drained stream"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

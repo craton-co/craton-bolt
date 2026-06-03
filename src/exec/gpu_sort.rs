@@ -127,6 +127,14 @@ const RADIX_HISTOGRAM_I32_ENTRY: &str = "bolt_radix_histogram_i32";
 const RADIX_HISTOGRAM_I64_ENTRY: &str = "bolt_radix_histogram_i64";
 const RADIX_SCATTER_WI_I32_ENTRY: &str = "bolt_radix_scatter_i32_with_indices";
 const RADIX_SCATTER_WI_I64_ENTRY: &str = "bolt_radix_scatter_i64_with_indices";
+// R1 — float radix entry points. Floats reach the device as a transformed
+// unsigned bit-blob (the host applies the IEEE-monotonic key transform during
+// gather), so they ride the same per-pass histogram / scatter kernels as the
+// integers, but cache under distinct `f32` / `f64` tags.
+const RADIX_HISTOGRAM_F32_ENTRY: &str = "bolt_radix_histogram_f32";
+const RADIX_HISTOGRAM_F64_ENTRY: &str = "bolt_radix_histogram_f64";
+const RADIX_SCATTER_WI_F32_ENTRY: &str = "bolt_radix_scatter_f32_with_indices";
+const RADIX_SCATTER_WI_F64_ENTRY: &str = "bolt_radix_scatter_f64_with_indices";
 
 /// Compute `next_power_of_two(n)` returning `Err` if the result would overflow
 /// `u32` (i.e. `n > 2^31`). `n == 0` returns `1` — bitonic sort needs at least
@@ -1033,9 +1041,19 @@ pub fn sort_indices_on_gpu_radix_multi(
             HostKeyValues::I64(host_vals) => {
                 run_radix_pipeline_i64(host_vals, &running_perm, n_rows_u32, k.dtype, k.direction)?
             }
-            // The predicate above gates dtype to Int32/Int64; other arms
-            // are unreachable. Defensive return so a future predicate
-            // widening doesn't crash the engine.
+            // R1 — floats run through the same bit-blob pipeline as the
+            // integers; the gather step applies `radix_float_key_f32/_f64`
+            // (IEEE-monotonic transform + NaN / -0.0 canonicalization) so the
+            // uploaded key buffer is a plain unsigned `u32`/`u64` blob.
+            HostKeyValues::F32(host_vals) => {
+                run_radix_pipeline_f32(host_vals, &running_perm, n_rows_u32, k.dtype, k.direction)?
+            }
+            HostKeyValues::F64(host_vals) => {
+                run_radix_pipeline_f64(host_vals, &running_perm, n_rows_u32, k.dtype, k.direction)?
+            }
+            // The predicate above gates dtype to Int32/Int64/Float32/Float64;
+            // the Bool arm is unreachable. Defensive return so a future
+            // predicate widening doesn't crash the engine.
             _ => return Ok(None),
         };
     }
@@ -1079,6 +1097,16 @@ fn radix_pre_transform_i64(val: i64, dir: SortDirection) -> i64 {
     }
 }
 
+/// Canonical quiet-NaN bit pattern for `f32` — sign bit clear, exponent all
+/// ones, MSB of the mantissa set (quiet), rest zero. Every NaN input collapses
+/// to this single key so SQL treats all NaNs as one equal value. Sign clear
+/// means the IEEE-monotonic flip routes it to the high end (NaN-last for ASC),
+/// matching Arrow's `lexsort_to_indices` NaN ordering.
+const CANONICAL_NAN_F32: u32 = 0x7FC0_0000;
+/// Canonical quiet-NaN bit pattern for `f64` (same construction as
+/// [`CANONICAL_NAN_F32`], scaled to 64 bits).
+const CANONICAL_NAN_F64: u64 = 0x7FF8_0000_0000_0000;
+
 /// IEEE-monotonic key transform for an `f32`, producing a `u32` bit-blob whose
 /// **unsigned** ascending order equals the floating-point value order.
 ///
@@ -1094,16 +1122,40 @@ fn radix_pre_transform_i64(val: i64, dir: SortDirection) -> i64 {
 /// `dir` composes exactly as the integer pre-transform does: DESC is the
 /// bitwise-NOT of the ASC key, which inverts the unsigned order.
 ///
-/// This is the float counterpart of [`radix_pre_transform_i32`]. It is unit
-/// tested below; wiring it into the dispatch predicate is the remaining F2
-/// step (see the `RadixFlavour::for_dtype` float arm in
-/// `crate::jit::sort_kernel_radix`).
-// Implemented + unit-tested but not yet called by the dispatch path (floats
-// still fall back to bitonic/host); silence the unused warning until wired.
-#[allow(dead_code)]
+/// ## NaN / -0.0 canonicalization (R1)
+///
+/// Raw IEEE bit patterns have two oddities that break SQL value-equality
+/// semantics under a bit-pattern sort:
+///   * **`-0.0` vs `+0.0`** have *different* bit patterns (`0x8000_0000` vs
+///     `0x0000_0000`) but compare *equal* as floats. Left untransformed they
+///     would sort as distinct keys (and DISTINCT would keep both), which is
+///     wrong.
+///   * **NaN** has `2^24 - 2` distinct bit patterns (any non-zero mantissa
+///     with the exponent all-ones); under SQL semantics all NaNs are treated
+///     as a single equal value, so they must collapse to one key.
+///
+/// We therefore canonicalize *before* the IEEE-monotonic flip: map every NaN
+/// to a single canonical quiet-NaN bit pattern, and map `-0.0` to `+0.0`.
+/// After this, all NaNs share one key (equal & sorted to the high end for ASC,
+/// matching Arrow's `lexsort` NaN-last) and `-0.0 == +0.0` share one key.
+///
+/// This is the float counterpart of [`radix_pre_transform_i32`]. Unit tested
+/// below (`radix_float_key_f32_*`), and wired into the radix dispatch via the
+/// `Float32` arm of `RadixFlavour::for_dtype` in
+/// `crate::jit::sort_kernel_radix`.
 #[inline]
 pub(crate) fn radix_float_key_f32(f: f32, dir: SortDirection) -> u32 {
-    let b = f.to_bits();
+    // Canonicalize NaN (all patterns → one quiet NaN) and -0.0 (→ +0.0) so
+    // SQL value-equality holds under the bit-pattern sort. `is_nan` catches
+    // every NaN bit pattern; the `== 0.0` check catches BOTH zeros (it is true
+    // for +0.0 and -0.0 alike) and rewrites them to the +0.0 bit pattern.
+    let b = if f.is_nan() {
+        CANONICAL_NAN_F32
+    } else if f == 0.0 {
+        0u32 // +0.0 bit pattern; collapses -0.0 into +0.0
+    } else {
+        f.to_bits()
+    };
     // Arithmetic shift of the sign bit gives 0xFFFF_FFFF for negatives, else 0;
     // OR-in the sign bit so positives still flip just their sign.
     let mask = ((b as i32) >> 31) as u32 | 0x8000_0000;
@@ -1115,11 +1167,17 @@ pub(crate) fn radix_float_key_f32(f: f32, dir: SortDirection) -> u32 {
 }
 
 /// IEEE-monotonic key transform for an `f64`. Same algebra as
-/// [`radix_float_key_f32`], scaled to 64 bits.
-#[allow(dead_code)]
+/// [`radix_float_key_f32`], scaled to 64 bits, with the same NaN / -0.0
+/// canonicalization (see that function's doc for the rationale).
 #[inline]
 pub(crate) fn radix_float_key_f64(f: f64, dir: SortDirection) -> u64 {
-    let b = f.to_bits();
+    let b = if f.is_nan() {
+        CANONICAL_NAN_F64
+    } else if f == 0.0 {
+        0u64 // +0.0 bit pattern; collapses -0.0 into +0.0
+    } else {
+        f.to_bits()
+    };
     let mask = ((b as i64) >> 63) as u64 | 0x8000_0000_0000_0000;
     let asc = b ^ mask;
     match dir {
@@ -1607,6 +1665,228 @@ fn run_radix_pipeline_i64(
     Ok(perm)
 }
 
+/// R1 — inner pipeline for Float32 keys. Mirror of [`run_radix_pipeline_i32`]
+/// except the host gather applies the IEEE-monotonic float key transform
+/// (`radix_float_key_f32`, which also canonicalizes NaN and `-0.0`) instead of
+/// the signed-int pre-transform, and the device key buffer is `GpuVec<u32>` —
+/// the transformed key is already a plain unsigned bit-blob, so the b32 bit-blob
+/// histogram / scatter kernels sort it verbatim. The index payload and pass
+/// count (8) are identical to the i32 path.
+fn run_radix_pipeline_f32(
+    host_keys: &[f32],
+    running_perm: &[u32],
+    n_rows_u32: u32,
+    dtype: DataType,
+    direction: SortDirection,
+) -> BoltResult<Vec<u32>> {
+    debug_assert!(matches!(dtype, DataType::Float32));
+    debug_assert_eq!(running_perm.len(), n_rows_u32 as usize);
+    let radix_steps = radix_steps_for(dtype)?;
+
+    // Host-side gather + IEEE-monotonic key transform. `gathered[i]` is the
+    // transformed unsigned bit-blob of `host_keys[running_perm[i]]`; for the
+    // first key running_perm is identity so it collapses to a straight map.
+    let mut gathered: Vec<u32> = Vec::with_capacity(running_perm.len());
+    for &row in running_perm {
+        let v = host_keys[row as usize];
+        gathered.push(radix_float_key_f32(v, direction));
+    }
+
+    // Ping-pong key (u32 bit-blob) + index buffers. See `run_radix_pipeline_i32`
+    // for why both ping and pong are seeded via `from_slice`.
+    let mut keys_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(&gathered)?;
+    let mut keys_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(&gathered)?;
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+
+    let block_size = RADIX_BLOCK_SIZE;
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
+    let block_hist_len = (grid_x as usize) * (RADIX_BUCKETS as usize);
+
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+
+    let stream = CudaStream::null();
+    let hist_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::Histogram,
+        dtype,
+    };
+    let hist_module = module_cache::get_or_build_module_for_radix_sort(
+        &hist_spec,
+        RADIX_HISTOGRAM_F32_ENTRY,
+        |spec| compile_radix_histogram(spec.dtype),
+    )?;
+    let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
+    let scatter_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::ScatterWithIndices,
+        dtype,
+    };
+    let scatter_module = module_cache::get_or_build_module_for_radix_sort(
+        &scatter_spec,
+        RADIX_SCATTER_WI_F32_ENTRY,
+        |spec| compile_radix_scatter_with_indices(spec.dtype),
+    )?;
+    let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
+
+    let mut hist_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut offsets_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+
+    for step in 0..radix_steps {
+        let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
+
+        let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
+        // SAFETY: hist_dev was allocated with block_hist_len u32 entries.
+        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+
+        launch_radix_histogram_u32(
+            &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
+        )?;
+
+        // SAFETY: hist_dev has block_hist_len u32 entries; hist_host is pinned
+        // for block_hist_len u32s; pages stay live until the sync retires the DMA.
+        unsafe {
+            cuda_sys::memcpy_d2h_async::<u32>(
+                hist_host.as_mut_ptr(), hist_dev.device_ptr(), block_hist_len, stream.raw(),
+            )?;
+        }
+        stream.synchronize()?;
+
+        compute_block_offsets(hist_host.as_slice(), grid_x as usize, offsets_host.as_mut_slice())?;
+
+        // SAFETY: offsets_dev has block_hist_len u32 entries; pinned source
+        // outlives the loop and is fenced by the post-loop synchronize.
+        unsafe {
+            cuda_sys::memcpy_h2d_async::<u32>(
+                offsets_dev.device_ptr(), offsets_host.as_ptr(), block_hist_len, stream.raw(),
+            )?;
+        }
+
+        launch_radix_scatter_with_indices_u32(
+            &scatter_fn, &keys_ping, &keys_pong, &idx_ping, &idx_pong, &offsets_dev,
+            n_rows_u32, shift, grid_x, block_size, &stream,
+        )?;
+
+        std::mem::swap(&mut keys_ping, &mut keys_pong);
+        std::mem::swap(&mut idx_ping, &mut idx_pong);
+    }
+
+    stream.synchronize()?;
+    let perm = idx_ping.to_vec()?;
+    drop(keys_ping);
+    drop(keys_pong);
+    drop(idx_pong);
+    drop(hist_dev);
+    drop(offsets_dev);
+    Ok(perm)
+}
+
+/// R1 — inner pipeline for Float64 keys. Mirror of [`run_radix_pipeline_f32`]
+/// scaled to 64-bit keys (`GpuVec<u64>`, 16 passes, `radix_float_key_f64`).
+fn run_radix_pipeline_f64(
+    host_keys: &[f64],
+    running_perm: &[u32],
+    n_rows_u32: u32,
+    dtype: DataType,
+    direction: SortDirection,
+) -> BoltResult<Vec<u32>> {
+    debug_assert!(matches!(dtype, DataType::Float64));
+    debug_assert_eq!(running_perm.len(), n_rows_u32 as usize);
+    let radix_steps = radix_steps_for(dtype)?;
+
+    let mut gathered: Vec<u64> = Vec::with_capacity(running_perm.len());
+    for &row in running_perm {
+        let v = host_keys[row as usize];
+        gathered.push(radix_float_key_f64(v, direction));
+    }
+
+    let mut keys_ping: GpuVec<u64> = GpuVec::<u64>::from_slice(&gathered)?;
+    let mut keys_pong: GpuVec<u64> = GpuVec::<u64>::from_slice(&gathered)?;
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+
+    let block_size = RADIX_BLOCK_SIZE;
+    let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block_size);
+    let block_hist_len = (grid_x as usize) * (RADIX_BUCKETS as usize);
+
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+
+    let stream = CudaStream::null();
+    let hist_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::Histogram,
+        dtype,
+    };
+    let hist_module = module_cache::get_or_build_module_for_radix_sort(
+        &hist_spec,
+        RADIX_HISTOGRAM_F64_ENTRY,
+        |spec| compile_radix_histogram(spec.dtype),
+    )?;
+    let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
+    let scatter_spec = RadixSortKernelSpec {
+        pass: RadixSortPass::ScatterWithIndices,
+        dtype,
+    };
+    let scatter_module = module_cache::get_or_build_module_for_radix_sort(
+        &scatter_spec,
+        RADIX_SCATTER_WI_F64_ENTRY,
+        |spec| compile_radix_scatter_with_indices(spec.dtype),
+    )?;
+    let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
+
+    let mut hist_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut offsets_host: PinnedHostBuffer<u32> =
+        PinnedHostBuffer::<u32>::new(block_hist_len)?;
+
+    for step in 0..radix_steps {
+        let shift = step * crate::jit::sort_kernel_radix::RADIX_BITS;
+
+        let hist_bytes = block_hist_len * std::mem::size_of::<u32>();
+        // SAFETY: hist_dev was allocated with block_hist_len u32 entries.
+        unsafe { cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?; }
+
+        launch_radix_histogram_u64(
+            &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
+        )?;
+
+        // SAFETY: see the f32 mirror.
+        unsafe {
+            cuda_sys::memcpy_d2h_async::<u32>(
+                hist_host.as_mut_ptr(), hist_dev.device_ptr(), block_hist_len, stream.raw(),
+            )?;
+        }
+        stream.synchronize()?;
+
+        compute_block_offsets(hist_host.as_slice(), grid_x as usize, offsets_host.as_mut_slice())?;
+
+        // SAFETY: see the f32 mirror.
+        unsafe {
+            cuda_sys::memcpy_h2d_async::<u32>(
+                offsets_dev.device_ptr(), offsets_host.as_ptr(), block_hist_len, stream.raw(),
+            )?;
+        }
+
+        launch_radix_scatter_with_indices_u64(
+            &scatter_fn, &keys_ping, &keys_pong, &idx_ping, &idx_pong, &offsets_dev,
+            n_rows_u32, shift, grid_x, block_size, &stream,
+        )?;
+
+        std::mem::swap(&mut keys_ping, &mut keys_pong);
+        std::mem::swap(&mut idx_ping, &mut idx_pong);
+    }
+
+    stream.synchronize()?;
+    let perm = idx_ping.to_vec()?;
+    drop(keys_ping);
+    drop(keys_pong);
+    drop(idx_pong);
+    drop(hist_dev);
+    drop(offsets_dev);
+    Ok(perm)
+}
+
 // Note: the `bolt_radix_msb_flip_<dty>` kernel-side helpers are still
 // emitted by `crate::jit::sort_kernel_radix` (the ABI is frozen per #18),
 // but #19's driver no longer invokes them — the host-side
@@ -1772,6 +2052,181 @@ fn launch_radix_scatter_with_indices_i64(
         &mut p_shift as *mut u32 as *mut c_void,
     ];
     // SAFETY: same as the i32 variant.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// R1 — float histogram launch (32-bit key, u32 bit-blob buffer). Identical
+/// FFI shape to [`launch_radix_histogram`] but the key buffer is `GpuVec<u32>`
+/// (the host-transformed IEEE-monotonic bit-blob); the kernel reads it with
+/// `ld.global.b32`, so the element type is just the buffer's byte width.
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_histogram_u32(
+    f: &crate::jit::CudaFunction<'_>,
+    keys: &GpuVec<u32>,
+    hist: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
+    let mut hist_ptr: CUdeviceptr = hist.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut hist_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: every param slot points at a stack local that outlives the
+    // synchronous launch + sync at the end of the driver.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// R1 — float histogram launch (64-bit key, u64 bit-blob buffer). u64 mirror
+/// of [`launch_radix_histogram_u32`]; the kernel reads via `ld.global.b64`.
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_histogram_u64(
+    f: &crate::jit::CudaFunction<'_>,
+    keys: &GpuVec<u64>,
+    hist: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut keys_ptr: CUdeviceptr = keys.device_ptr();
+    let mut hist_ptr: CUdeviceptr = hist.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut keys_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut hist_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: same as the u32 variant.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// R1 — float keys+indices scatter launch (32-bit key, u32 bit-blob buffer).
+/// FFI mirror of [`launch_radix_scatter_with_indices`] over a `GpuVec<u32>`
+/// key buffer.
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_scatter_with_indices_u32(
+    f: &crate::jit::CudaFunction<'_>,
+    keys_in: &GpuVec<u32>,
+    keys_out: &GpuVec<u32>,
+    vals_in: &GpuVec<u32>,
+    vals_out: &GpuVec<u32>,
+    offsets: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut k_in_ptr: CUdeviceptr = keys_in.device_ptr();
+    let mut k_out_ptr: CUdeviceptr = keys_out.device_ptr();
+    let mut v_in_ptr: CUdeviceptr = vals_in.device_ptr();
+    let mut v_out_ptr: CUdeviceptr = vals_out.device_ptr();
+    let mut off_ptr: CUdeviceptr = offsets.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut k_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut k_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut off_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: every param slot points at a stack local that outlives the
+    // synchronous launch + sync at the end of the driver.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            f.raw(),
+            grid_x, 1, 1,
+            block_size, 1, 1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+/// R1 — float keys+indices scatter launch (64-bit key, u64 bit-blob buffer).
+/// u64 mirror of [`launch_radix_scatter_with_indices_u32`].
+#[allow(clippy::too_many_arguments)]
+fn launch_radix_scatter_with_indices_u64(
+    f: &crate::jit::CudaFunction<'_>,
+    keys_in: &GpuVec<u64>,
+    keys_out: &GpuVec<u64>,
+    vals_in: &GpuVec<u32>,
+    vals_out: &GpuVec<u32>,
+    offsets: &GpuVec<u32>,
+    n_rows_u32: u32,
+    shift: u32,
+    grid_x: u32,
+    block_size: u32,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut k_in_ptr: CUdeviceptr = keys_in.device_ptr();
+    let mut k_out_ptr: CUdeviceptr = keys_out.device_ptr();
+    let mut v_in_ptr: CUdeviceptr = vals_in.device_ptr();
+    let mut v_out_ptr: CUdeviceptr = vals_out.device_ptr();
+    let mut off_ptr: CUdeviceptr = offsets.device_ptr();
+    let mut p_n_rows: u32 = n_rows_u32;
+    let mut p_shift: u32 = shift;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut k_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut k_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_in_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut v_out_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut off_ptr as *mut CUdeviceptr as *mut c_void,
+        &mut p_n_rows as *mut u32 as *mut c_void,
+        &mut p_shift as *mut u32 as *mut c_void,
+    ];
+    // SAFETY: same as the u32 variant.
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             f.raw(),
@@ -2932,6 +3387,113 @@ mod tests {
         assert_eq!(sorted, expected);
     }
 
+    /// R1 — end-to-end Float32 ASC sort via the radix path. Builds a 16k-row
+    /// scrambled column spanning negatives, zeros and a NaN, runs the radix
+    /// driver (which applies the host IEEE-monotonic key transform with NaN /
+    /// -0.0 canonicalization), and asserts the permutation sorts ascending
+    /// with the NaN last and -0.0 adjacent to +0.0.
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_float32_asc_round_trip() {
+        let n = 16_384usize;
+        // Spread of negatives and positives; inject a -0.0 and a NaN.
+        let mut values: Vec<f32> = (0..n as i32)
+            .map(|i| ((i * 7919) % 200_000 - 100_000) as f32 * 0.5)
+            .collect();
+        values[0] = -0.0;
+        values[1] = f32::NAN;
+        // Fisher-Yates shuffle so input order is scrambled.
+        let mut rng_state: u64 = 0xc0ffee;
+        for i in (1..n).rev() {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (rng_state as usize) % (i + 1);
+            values.swap(i, j);
+        }
+        let arr = Float32Array::from(values.clone());
+
+        let perm = sort_indices_on_gpu_radix(
+            &arr,
+            DataType::Float32,
+            SortDirection::Asc,
+            false,
+        )
+        .expect("gpu radix sort f32")
+        .expect("non-fallback on float32 asc no-null");
+        assert_eq!(perm.len(), n);
+
+        let sorted: Vec<f32> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
+        // All non-NaN values must be non-decreasing; the single NaN must sort
+        // to the very end (NaN-last for ASC).
+        for w in sorted.windows(2) {
+            if w[0].is_nan() {
+                // Once we hit the NaN, everything after must also be NaN —
+                // here there's exactly one, so it must be the last element.
+                assert!(w[1].is_nan(), "non-NaN value sorted after a NaN");
+            } else if !w[1].is_nan() {
+                assert!(
+                    w[0] <= w[1],
+                    "radix f32 non-monotonic: {} > {}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+        assert!(
+            sorted[n - 1].is_nan(),
+            "NaN must sort last for ASC, got {}",
+            sorted[n - 1]
+        );
+    }
+
+    /// R1 — end-to-end Float64 ASC sort via the radix path (16-pass coverage
+    /// of the 64-bit key). Same shape as the f32 round-trip.
+    #[test]
+    #[ignore = "gpu:sort_radix"]
+    fn gpu_sort_radix_float64_asc_round_trip() {
+        let n = 16_384usize;
+        let mut values: Vec<f64> = (0..n as i64)
+            .map(|i| ((i * 7919) % 200_000 - 100_000) as f64 * 0.25)
+            .collect();
+        values[0] = -0.0;
+        values[1] = f64::NAN;
+        let mut rng_state: u64 = 0xdecafbad;
+        for i in (1..n).rev() {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (rng_state as usize) % (i + 1);
+            values.swap(i, j);
+        }
+        let arr = Float64Array::from(values.clone());
+
+        let perm = sort_indices_on_gpu_radix(
+            &arr,
+            DataType::Float64,
+            SortDirection::Asc,
+            false,
+        )
+        .expect("gpu radix sort f64")
+        .expect("non-fallback on float64 asc no-null");
+        assert_eq!(perm.len(), n);
+
+        let sorted: Vec<f64> = (0..n).map(|i| values[perm.value(i) as usize]).collect();
+        for w in sorted.windows(2) {
+            if w[0].is_nan() {
+                assert!(w[1].is_nan(), "non-NaN value sorted after a NaN");
+            } else if !w[1].is_nan() {
+                assert!(
+                    w[0] <= w[1],
+                    "radix f64 non-monotonic: {} > {}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+        assert!(sorted[n - 1].is_nan(), "NaN must sort last for ASC");
+    }
+
     // -- #19 GPU radix sort round-trips — DESC + multi-key. --
 
     /// End-to-end Int32 DESC sort via the radix path. The host pre-transform
@@ -3149,14 +3711,15 @@ mod tests {
 
     /// `radix_float_key_f32` ASC: unsigned ascending order of the transformed
     /// keys must equal value-ascending order of the original floats, including
-    /// negatives, signed zeros and infinities.
+    /// negatives and infinities. `-0.0` is excluded here (it canonicalizes to
+    /// `+0.0`, exercised separately in `radix_float_key_f32_neg_zero_*`) so the
+    /// sample has only distinct *values* and the keys stay strictly increasing.
     #[test]
     fn radix_float_key_f32_asc_orders_floats() {
         let mut samples: Vec<f32> = vec![
             f32::NEG_INFINITY,
             -1e30,
             -1.5,
-            -0.0,
             0.0,
             1.5,
             1e30,
@@ -3174,12 +3737,51 @@ mod tests {
             .map(|&f| radix_float_key_f32(f, SortDirection::Asc))
             .collect();
         assert_eq!(from_sorted, keys);
-        // The keys must be strictly increasing (no two distinct values collide;
-        // -0.0/+0.0 differ in one ulp here so they stay distinct, which is fine
-        // for a stable sort — equal *values* are not in this sample).
+        // Distinct values → strictly increasing keys.
         for w in from_sorted.windows(2) {
             assert!(w[0] < w[1], "f32 asc keys not strictly increasing");
         }
+    }
+
+    /// R1 — `-0.0` and `+0.0` are *equal* values in SQL, so the transform must
+    /// map them to the same key (for both directions). Untransformed they have
+    /// different bit patterns (`0x8000_0000` vs `0x0000_0000`).
+    #[test]
+    fn radix_float_key_f32_neg_zero_equals_pos_zero() {
+        for dir in [SortDirection::Asc, SortDirection::Desc] {
+            assert_eq!(
+                radix_float_key_f32(-0.0, dir),
+                radix_float_key_f32(0.0, dir),
+                "-0.0 and +0.0 must share a key for {:?}",
+                dir,
+            );
+        }
+    }
+
+    /// R1 — every NaN bit pattern (quiet, signalling, sign-set, payload-bearing)
+    /// must collapse to ONE canonical key so SQL treats all NaNs as equal, and
+    /// for ASC that key must sort *after* every finite value and +INF (NaN-last,
+    /// matching Arrow's `lexsort`).
+    #[test]
+    fn radix_float_key_f32_nan_canonicalizes_and_sorts_last() {
+        let nans: [f32; 4] = [
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7F80_0001), // signalling NaN
+            f32::from_bits(0xFFC0_DEAD), // sign-set NaN with payload
+        ];
+        let canon = radix_float_key_f32(nans[0], SortDirection::Asc);
+        for &n in &nans {
+            assert!(n.is_nan());
+            assert_eq!(
+                radix_float_key_f32(n, SortDirection::Asc),
+                canon,
+                "all NaN patterns must canonicalize to one ASC key",
+            );
+        }
+        // NaN-last for ASC: its key must exceed +INF's key.
+        let inf_key = radix_float_key_f32(f32::INFINITY, SortDirection::Asc);
+        assert!(canon > inf_key, "ASC NaN key must sort after +INF");
     }
 
     /// `radix_float_key_f32` DESC is the bitwise-NOT of the ASC key, so its
@@ -3195,14 +3797,14 @@ mod tests {
         }
     }
 
-    /// Same ASC ordering property for f64.
+    /// Same ASC ordering property for f64 (distinct values; `-0.0` covered
+    /// separately by `radix_float_key_f64_neg_zero_equals_pos_zero`).
     #[test]
     fn radix_float_key_f64_asc_orders_floats() {
         let mut samples: Vec<f64> = vec![
             f64::NEG_INFINITY,
             -1e300,
             -3.25,
-            -0.0,
             0.0,
             3.25,
             1e300,
@@ -3222,6 +3824,42 @@ mod tests {
         for w in from_sorted.windows(2) {
             assert!(w[0] < w[1], "f64 asc keys not strictly increasing");
         }
+    }
+
+    /// R1 — `-0.0 == +0.0` for f64 too.
+    #[test]
+    fn radix_float_key_f64_neg_zero_equals_pos_zero() {
+        for dir in [SortDirection::Asc, SortDirection::Desc] {
+            assert_eq!(
+                radix_float_key_f64(-0.0, dir),
+                radix_float_key_f64(0.0, dir),
+                "-0.0 and +0.0 must share a key for {:?}",
+                dir,
+            );
+        }
+    }
+
+    /// R1 — all f64 NaN patterns canonicalize to one key and sort after +INF
+    /// for ASC.
+    #[test]
+    fn radix_float_key_f64_nan_canonicalizes_and_sorts_last() {
+        let nans: [f64; 4] = [
+            f64::NAN,
+            -f64::NAN,
+            f64::from_bits(0x7FF0_0000_0000_0001), // signalling NaN
+            f64::from_bits(0xFFF8_0000_DEAD_BEEF), // sign-set NaN with payload
+        ];
+        let canon = radix_float_key_f64(nans[0], SortDirection::Asc);
+        for &n in &nans {
+            assert!(n.is_nan());
+            assert_eq!(
+                radix_float_key_f64(n, SortDirection::Asc),
+                canon,
+                "all NaN patterns must canonicalize to one ASC key",
+            );
+        }
+        let inf_key = radix_float_key_f64(f64::INFINITY, SortDirection::Asc);
+        assert!(canon > inf_key, "ASC NaN key must sort after +INF");
     }
 
     // -- F2 — stable multi-block radix offset construction. Pure host. --

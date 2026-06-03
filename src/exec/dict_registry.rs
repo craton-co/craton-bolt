@@ -837,11 +837,12 @@ mod tests {
         let d = reg
             .dictionary("orders", "region")
             .expect("region dictionary should exist");
-        // `from_string_array` deduplicates in first-occurrence order: US, EU, JP.
+        // R1: `from_string_array` assigns codes in byte-lexicographic order, so
+        // the distinct {US, EU, JP} come out sorted: EU, JP, US.
         // The wrapper exposes the host-side dictionary via its accessor; the
         // tiny synthetic input must land on the i32 path.
         assert!(d.is_i32(), "small input should pick i32 indices");
-        assert_eq!(d.dictionary(), &["US", "EU", "JP"]);
+        assert_eq!(d.dictionary(), &["EU", "JP", "US"]);
         // No dictionary for the numeric column.
         assert!(reg.dictionary("orders", "price").is_none());
     }
@@ -889,7 +890,8 @@ mod tests {
                 match (*left, *right) {
                     (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
                         assert_eq!(name, "__idx_region");
-                        assert_eq!(idx, 1); // "US" is the first inserted string.
+                        // R1 lex order: EU(1) < US(2), so "US" folds to 2.
+                        assert_eq!(idx, 2);
                     }
                     other => panic!("unexpected operands after rewrite: {other:?}"),
                 }
@@ -1066,7 +1068,8 @@ mod tests {
                     match (&**left, &**right) {
                         (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
                             assert_eq!(name, "__idx_region", "identical dicts fold");
-                            assert_eq!(*idx, 1);
+                            // R1 lex order: EU(1) < US(2).
+                            assert_eq!(*idx, 2);
                         }
                         other => panic!("identical dicts must fold; got {other:?}"),
                     }
@@ -1099,7 +1102,8 @@ mod tests {
             Expr::Binary { left, right, .. } => match (*left, *right) {
                 (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
                     assert_eq!(name, "__idx_region");
-                    assert_eq!(idx, 1);
+                    // R1 lex order: EU(1) < US(2).
+                    assert_eq!(idx, 2);
                 }
                 other => panic!("single table must fold; got {other:?}"),
             },
@@ -1156,12 +1160,14 @@ mod tests {
             .expect("region dictionary should exist");
         // i32 variant — keys are i32 by definition for this constructor.
         assert!(d.is_i32(), "Arrow Int32 keys should stay i32");
-        // Dictionary mirrors the Arrow dictionary's values 1:1.
+        // R1: codes are byte-lexicographic, so the Arrow values {US, EU, JP}
+        // come out sorted: EU, JP, US.
         let dict: Vec<&str> = d.dictionary().iter().map(|s| s.as_str()).collect();
-        assert_eq!(dict, vec!["US", "EU", "JP"]);
+        assert_eq!(dict, vec!["EU", "JP", "US"]);
         // Lookups against the in-memory dictionary still work; widened to i64.
-        assert_eq!(d.index_of_any("US"), Some(1));
-        assert_eq!(d.index_of_any("JP"), Some(3));
+        // EU(1), JP(2), US(3).
+        assert_eq!(d.index_of_any("US"), Some(3));
+        assert_eq!(d.index_of_any("JP"), Some(2));
         assert_eq!(d.index_of_any("missing"), None);
     }
 
@@ -1203,7 +1209,8 @@ mod tests {
                 match (*left, *right) {
                     (Expr::Column(name), Expr::Literal(Literal::Int32(idx))) => {
                         assert_eq!(name, "__idx_region");
-                        assert_eq!(idx, 1);
+                        // R1 lex order: EU(1) < US(2).
+                        assert_eq!(idx, 2);
                     }
                     other => panic!("unexpected operands: {other:?}"),
                 }
@@ -1297,9 +1304,12 @@ mod tests {
         // 3 distinct strings each + NULL slot ⇒ length 4.
         assert_eq!(ra.len(), 4);
         assert_eq!(rb.len(), 4);
-        // Cross-dictionary correctness: "apple" is dict_a slot 2, dict_b slot 3;
-        // both must rank identically in the shared universe.
-        assert_eq!(ra[2], rb[3], "shared 'apple' must share a rank");
+        // Cross-dictionary correctness: "apple" must rank identically in the
+        // shared universe regardless of each column's own code. R1: codes are
+        // lex-sorted, so dict_a = [apple, delta, mango] (apple → GPU index 1)
+        // and dict_b = [Zebra, apple, cherry] (apple → GPU index 2; 'Z' < 'a'
+        // under byte collation).
+        assert_eq!(ra[1], rb[2], "shared 'apple' must share a rank");
 
         // An unknown rank column is not registered.
         assert!(reg.rank_table("__rank_zzz").is_none());

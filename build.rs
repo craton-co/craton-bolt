@@ -6,19 +6,23 @@ fn main() {
 
     // --- Auto-rotating codegen fingerprint ------------------------------
     //
-    // Hash the codegen source tree (`src/jit/*.rs`) into a stable hex
-    // digest and export it as `BOLT_CODEGEN_FINGERPRINT`. The disk PTX
-    // cache (src/jit/disk_cache.rs) reads it via `option_env!` and folds
-    // it into the codegen salt, so ANY change to PTX-emitting source
-    // automatically rotates the on-disk cache key — removing the manual
-    // `CODEGEN_VERSION` bump as a single point of failure (it remains as
-    // a complementary in-release guard; the fingerprint is additive).
+    // Hash the codegen-relevant source — the whole `src/jit/*.rs` tree
+    // PLUS the `src/plan/physical_plan.rs` plan IR that codegen lowers
+    // into PTX — into a stable hex digest and export it as
+    // `BOLT_CODEGEN_FINGERPRINT`. The disk PTX cache
+    // (src/jit/disk_cache.rs) reads it via `option_env!` and folds it
+    // into the codegen salt, so ANY change to PTX-emitting source (or to
+    // the plan shape it lowers) automatically rotates the on-disk cache
+    // key — removing the manual `CODEGEN_VERSION` bump as a single point
+    // of failure (it remains as a complementary in-release guard; the
+    // fingerprint is additive).
     //
-    // The digest is deterministic: files are hashed in sorted filename
-    // order and only file *bytes* (plus the bare filename) feed the hash
-    // — no timestamps, no absolute paths. If the directory can't be read
-    // we emit nothing rather than panicking, so the consumer falls back
-    // to `CODEGEN_VERSION` + crate version alone (never weaker).
+    // The digest is deterministic: files are hashed in sorted *relative
+    // path* order and only file *bytes* (plus the bare relative path)
+    // feed the hash — no timestamps, no absolute paths. If a directory or
+    // file can't be read we emit nothing rather than panicking, so the
+    // consumer falls back to `CODEGEN_VERSION` + crate version alone
+    // (never weaker).
     emit_codegen_fingerprint();
 
     // --- Wave A: rust-cuda PTX generation -------------------------------
@@ -193,27 +197,35 @@ fn main() {
 // Codegen fingerprint: auto-rotate the disk PTX cache key on codegen changes.
 // ---------------------------------------------------------------------------
 //
-// Computes a stable hex digest over `src/jit/*.rs` and emits it as
+// Computes a stable hex digest over the codegen-relevant source — every
+// `src/jit/*.rs` file PLUS `src/plan/physical_plan.rs` (the plan IR that
+// codegen lowers into PTX) — and emits it as
 // `cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT=<digest>`, plus a
-// `rerun-if-changed` on the directory (and each hashed file) so the digest
-// recomputes whenever the codegen surface changes.
+// `rerun-if-changed` on each hashed directory/file so the digest recomputes
+// whenever the codegen surface changes.
 //
 // The hash is a self-contained 128-bit FNV-1a fold (no external crate): for
-// each `*.rs` file, in sorted filename order, we mix in the bare filename,
-// the byte length, and the raw file bytes. Sorted order + filename-only (no
-// absolute paths) + no timestamps make the digest reproducible across hosts
-// and checkouts for identical source.
+// each file, in sorted *relative-path* order, we mix in the relative path,
+// the byte length, and the raw file bytes. Sorted order + relative-path-only
+// (no absolute paths) + no timestamps make the digest reproducible across
+// hosts and checkouts for identical source. Using the full relative path
+// (e.g. `src/plan/physical_plan.rs`, not just `physical_plan.rs`) as the
+// domain separator keeps files from distinct directories from aliasing.
 fn emit_codegen_fingerprint() {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    // Always re-run when the directory changes (file added/removed/edited).
+    // Always re-run when the codegen dir changes (file added/removed/edited)
+    // or the explicitly-named plan file changes.
     println!("cargo:rerun-if-changed=src/jit");
+    println!("cargo:rerun-if-changed=src/plan/physical_plan.rs");
 
+    // Collect `(relpath, abspath)` for every readable codegen-relevant file,
+    // sorted by relative path so the hash is order-independent of the OS
+    // directory listing.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+
+    // 1. Every `*.rs` file in the `src/jit` codegen tree.
     let jit_dir = Path::new("src/jit");
-
-    // Collect `(filename, path)` for every readable `*.rs` file, sorted by
-    // filename so the hash is order-independent of the OS directory listing.
-    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(jit_dir) else {
         // Codegen dir unreadable: fall back gracefully — emit no env var so
         // `option_env!` resolves to `None` and the salt uses CODEGEN_VERSION
@@ -227,9 +239,20 @@ fn emit_codegen_fingerprint() {
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".rs") {
-            files.push((name, path));
+            files.push((format!("src/jit/{name}"), path));
         }
     }
+
+    // 2. The plan IR codegen lowers from. A change to PhysicalPlan can alter
+    //    emitted PTX for an otherwise-identical query, so it is part of the
+    //    codegen surface even though it lives outside `src/jit`. If it is
+    //    unreadable we fall back gracefully (emit nothing) like the dir case.
+    let plan_path = PathBuf::from("src/plan/physical_plan.rs");
+    if !plan_path.is_file() {
+        return;
+    }
+    files.push(("src/plan/physical_plan.rs".to_string(), plan_path));
+
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     // 128-bit FNV-1a, split into two 64-bit lanes seeded with distinct
@@ -248,18 +271,21 @@ fn emit_codegen_fingerprint() {
         }
     };
 
-    for (name, path) in &files {
-        // Re-run codegen fingerprinting when this individual file changes.
+    for (relpath, path) in &files {
+        // Re-run codegen fingerprinting when this individual file changes
+        // (the `src/jit` and plan-file rerun lines above already cover
+        // additions/removals; this pins per-file content edits too).
         println!("cargo:rerun-if-changed={}", path.display());
         let Ok(bytes) = std::fs::read(path) else {
             // Skip an unreadable file rather than panicking; the directory
             // rerun-if-changed still covers it on a later successful build.
             continue;
         };
-        // Domain-separate filename | length | content so two files can't
-        // alias by, e.g., shifting a byte across a file boundary.
-        mix(name.as_bytes());
-        mix(&[0x1f]); // unit separator between name and content
+        // Domain-separate relpath | length | content so two files can't
+        // alias by, e.g., shifting a byte across a file boundary or moving
+        // identical bytes between directories.
+        mix(relpath.as_bytes());
+        mix(&[0x1f]); // unit separator between path and content
         mix(&(bytes.len() as u64).to_le_bytes());
         mix(&bytes);
         mix(&[0x1e]); // record separator between files

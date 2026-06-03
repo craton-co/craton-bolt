@@ -2073,6 +2073,106 @@ fn emit_binary(
                 b.alloc.get(rhs)?
             )
         }
+        Mod => {
+            // R1-modulo-bitwise: integer remainder. Like `Div`, a bare
+            // `rem.s32`/`rem.s64` is UNDEFINED for a zero divisor and for the
+            // `INT_MIN % -1` overflow corner, so route through a guarded
+            // sequence that is fully defined for every operand pair. Only
+            // Int32/Int64 reach here (the planner rejects float/decimal).
+            if !matches!(dtype, DataType::Int32 | DataType::Int64) {
+                return Err(BoltError::Other(format!(
+                    "ptx_gen: modulo (%) requires Int32/Int64 operands, got {:?}",
+                    dtype
+                )));
+            }
+            if result_dtype != dtype {
+                return Err(BoltError::Other(format!(
+                    "ptx_gen: modulo (%) expected result dtype == operand dtype, got {:?}/{:?}",
+                    dtype, result_dtype
+                )));
+            }
+            let dst_name = b.alloc.assign(dst, result_dtype)?;
+            emit_int_rem_guarded(b, &dst_name, lhs, rhs, dtype)
+        }
+        BitAnd | BitOr | BitXor => {
+            // Bitwise AND/OR/XOR. PTX uses the untyped bit-width mnemonics
+            // (`and.b32`/`and.b64`, etc.). Integer-only; result width == the
+            // (unified) operand width.
+            if !matches!(dtype, DataType::Int32 | DataType::Int64) {
+                return Err(BoltError::Other(format!(
+                    "ptx_gen: bitwise op {:?} requires Int32/Int64 operands, got {:?}",
+                    op, dtype
+                )));
+            }
+            if result_dtype != dtype {
+                return Err(BoltError::Other(format!(
+                    "ptx_gen: bitwise op {:?} expected result dtype == operand dtype, got {:?}/{:?}",
+                    op, dtype, result_dtype
+                )));
+            }
+            let dst_name = b.alloc.assign(dst, result_dtype)?;
+            let width = match dtype {
+                DataType::Int32 => "b32",
+                DataType::Int64 => "b64",
+                _ => unreachable!(),
+            };
+            let stem = match op {
+                BitAnd => "and",
+                BitOr => "or",
+                BitXor => "xor",
+                _ => unreachable!(),
+            };
+            emit_fmt!(
+                b,
+                "{}.{} {}, {}, {};",
+                stem,
+                width,
+                dst_name,
+                b.alloc.get(lhs)?,
+                b.alloc.get(rhs)?
+            )
+        }
+        Shl | Shr => {
+            // Shifts. The result width follows the LEFT operand (`dtype` here);
+            // the right operand is a 32-bit shift count (the planner casts it
+            // to Int32, so its register is in the `%r` class). PTX:
+            //   * left shift:  `shl.b32` / `shl.b64`        (fill with zeros)
+            //   * right shift: `shr.s32` / `shr.s64`        (ARITHMETIC: sign-
+            //                                                 preserving for the
+            //                                                 signed integers we
+            //                                                 support)
+            if !matches!(dtype, DataType::Int32 | DataType::Int64) {
+                return Err(BoltError::Other(format!(
+                    "ptx_gen: shift op {:?} requires Int32/Int64 left operand, got {:?}",
+                    op, dtype
+                )));
+            }
+            if result_dtype != dtype {
+                return Err(BoltError::Other(format!(
+                    "ptx_gen: shift op {:?} expected result dtype == left-operand dtype, got {:?}/{:?}",
+                    op, dtype, result_dtype
+                )));
+            }
+            let dst_name = b.alloc.assign(dst, result_dtype)?;
+            let mnemonic = match (op, dtype) {
+                // Left shift is bit-pattern (untyped) — `shl.b{32,64}`.
+                (Shl, DataType::Int32) => "shl.b32",
+                (Shl, DataType::Int64) => "shl.b64",
+                // Right shift is ARITHMETIC for signed integers — `shr.s{32,64}`
+                // replicates the sign bit (matches SQL/two's-complement `>>`).
+                (Shr, DataType::Int32) => "shr.s32",
+                (Shr, DataType::Int64) => "shr.s64",
+                _ => unreachable!(),
+            };
+            emit_fmt!(
+                b,
+                "{} {}, {}, {};",
+                mnemonic,
+                dst_name,
+                b.alloc.get(lhs)?,
+                b.alloc.get(rhs)?
+            )
+        }
         Concat => {
             // The `||` BINARY OPERATOR (this arm) is a fused-kernel scalar op
             // that has no variable-width output-buffer allocation, so it stays
@@ -2199,6 +2299,80 @@ fn emit_int_div_guarded(
     emit_fmt!(b, "selp.{} {}, {}, {}, {};", suf, q, lhs_name, q, p_ovf)?;
     // Divide-by-zero: produce a defined 0 (see LIMITATION in the doc comment).
     emit_fmt!(b, "selp.{} {}, 0, {}, {};", suf, dst_name, q, p_dz)
+}
+
+/// Emit a guarded **signed integer** remainder `dst = lhs % rhs` that is
+/// fully defined for every operand pair, mirroring [`emit_int_div_guarded`].
+/// A bare `rem.s32`/`rem.s64` shares the same two GPU undefined-behavior
+/// hazards as integer division:
+///
+///   1. **Divide-by-zero** (`rhs == 0`). UB on the GPU; SQL/DuckDB treat
+///      integer `x % 0` as NULL. As with division (see the `emit_int_div_guarded`
+///      LIMITATION note), this layer has no access to the output-validity
+///      pointers, so it produces a deterministic, fault-free **`0`** instead.
+///
+///   2. **Signed overflow corner `INT_MIN % -1`**. The matching division
+///      `INT_MIN / -1` overflows; the *remainder* is mathematically `0`, so we
+///      detect this single pair and force a defined `0` (also dodging the
+///      trapping divisor fed to `rem`).
+///
+/// PTX shape (Int32; Int64 is identical with `.s64` / the `rl` class and the
+/// 64-bit `INT_MIN` literal):
+/// ```text
+///   setp.eq.s32     %p_dz,  %rhs, 0;            // divisor == 0 ?
+///   selp.s32        %safe,  1, %rhs, %p_dz;     // avoid UB: rem by 1 when 0
+///   setp.eq.s32     %p_min, %lhs, -2147483648;  // lhs == INT_MIN ?
+///   setp.eq.s32     %p_m1,  %rhs, -1;           // rhs == -1 ?
+///   and.pred        %p_ovf, %p_min, %p_m1;      // INT_MIN % -1 corner ?
+///   selp.s32        %safe2, 1, %safe, %p_ovf;   // also dodge the trap divisor
+///   rem.s32         %m,     %lhs, %safe2;       // defined remainder
+///   selp.s32        %m,     0,    %m, %p_ovf;   // overflow corner -> 0
+///   selp.s32        %dst,   0,    %m, %p_dz;    // div-by-zero -> defined 0
+/// ```
+fn emit_int_rem_guarded(
+    b: &mut PtxBuilder,
+    dst_name: &str,
+    lhs: Reg,
+    rhs: Reg,
+    dtype: DataType,
+) -> BoltResult<()> {
+    let (suf, class, int_min) = match dtype {
+        DataType::Int32 => ("s32", "r", "-2147483648"),
+        DataType::Int64 => ("s64", "rl", "-9223372036854775808"),
+        _ => {
+            return Err(BoltError::Other(format!(
+                "ptx_gen: emit_int_rem_guarded called on non-integer dtype {:?}",
+                dtype
+            )))
+        }
+    };
+
+    let lhs_name = b.alloc.get(lhs)?.to_string();
+    let rhs_name = b.alloc.get(rhs)?.to_string();
+
+    let p_dz = b.alloc.alloc("p");
+    let p_min = b.alloc.alloc("p");
+    let p_m1 = b.alloc.alloc("p");
+    let p_ovf = b.alloc.alloc("p");
+    let safe = b.alloc.alloc(class);
+    let safe2 = b.alloc.alloc(class);
+    let m = b.alloc.alloc(class);
+
+    // Divide-by-zero detection + a non-zero stand-in divisor (1).
+    emit_fmt!(b, "setp.eq.{} {}, {}, 0;", suf, p_dz, rhs_name)?;
+    emit_fmt!(b, "selp.{} {}, 1, {}, {};", suf, safe, rhs_name, p_dz)?;
+    // INT_MIN % -1 overflow corner detection.
+    emit_fmt!(b, "setp.eq.{} {}, {}, {};", suf, p_min, lhs_name, int_min)?;
+    emit_fmt!(b, "setp.eq.{} {}, {}, -1;", suf, p_m1, rhs_name)?;
+    emit_fmt!(b, "and.pred {}, {}, {};", p_ovf, p_min, p_m1)?;
+    // Also avoid feeding the trapping (INT_MIN, -1) pair to `rem`.
+    emit_fmt!(b, "selp.{} {}, 1, {}, {};", suf, safe2, safe, p_ovf)?;
+    // Defined remainder against the sanitised divisor.
+    emit_fmt!(b, "rem.{} {}, {}, {};", suf, m, lhs_name, safe2)?;
+    // Overflow corner: the mathematical remainder of INT_MIN % -1 is 0.
+    emit_fmt!(b, "selp.{} {}, 0, {}, {};", suf, m, m, p_ovf)?;
+    // Divide-by-zero: produce a defined 0 (see the doc-comment LIMITATION).
+    emit_fmt!(b, "selp.{} {}, 0, {}, {};", suf, dst_name, m, p_dz)
 }
 
 /// Mnemonic string for an arithmetic op at a given dtype.
@@ -5356,6 +5530,180 @@ mod temporal_arith_tests {
         assert!(
             msg.contains("unsupported arithmetic") || msg.contains("Add"),
             "rejection should mention unsupported Add on Date32, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod modulo_bitwise_tests {
+    //! R1-modulo-bitwise: PTX-shape coverage for the integer-only operators
+    //! MODULO (`%`) and the BITWISE / SHIFT family (`& | ^ << >>`).
+    //!
+    //! Each hand-built `KernelSpec` mirrors the IR the physical-plan lowerer
+    //! produces for `SELECT a OP b FROM t`: load both integer columns, emit a
+    //! single `Op::Binary`, store the integer result. We pin the emitted PTX
+    //! mnemonic (and, for modulo, the divide-by-zero / `INT_MIN % -1` guard
+    //! shape) so a future codegen regression is caught host-side.
+    use super::*;
+    use crate::plan::logical_plan::BinaryOp;
+    use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
+
+    /// Build a `out0 = in0 OP in1` kernel over two columns of `dt`, with the
+    /// given operand/result dtypes. Used for `% & | ^` (operand == result)
+    /// and the shifts (result follows the left operand).
+    fn binop_spec(op: BinaryOp, operand_dt: DataType, result_dt: DataType) -> KernelSpec {
+        let ops = vec![
+            Op::LoadColumn {
+                dst: Reg(0),
+                col_idx: 0,
+                dtype: operand_dt,
+            },
+            Op::LoadColumn {
+                dst: Reg(1),
+                col_idx: 1,
+                dtype: operand_dt,
+            },
+            Op::Binary {
+                dst: Reg(2),
+                op,
+                lhs: Reg(0),
+                rhs: Reg(1),
+                dtype: operand_dt,
+                result_dtype: result_dt,
+            },
+            Op::Store {
+                src: Reg(2),
+                col_idx: 0,
+                dtype: result_dt,
+            },
+        ];
+        KernelSpec {
+            inputs: vec![
+                ColumnIO {
+                    name: "a".into(),
+                    dtype: operand_dt,
+                },
+                ColumnIO {
+                    name: "b".into(),
+                    dtype: operand_dt,
+                },
+            ],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: result_dt,
+            }],
+            ops,
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        }
+    }
+
+    /// Int32 `%` must go through the guarded remainder sequence: `rem.s32`
+    /// plus the zero-divisor / `INT_MIN % -1` predicates and `selp` guards.
+    /// A bare `rem.s32` with no guard would be a regression (UB on the GPU).
+    #[test]
+    fn mod_int32_emits_guarded_rem_s32() {
+        let spec = binop_spec(BinaryOp::Mod, DataType::Int32, DataType::Int32);
+        let ptx = compile(&spec, "bolt_kernel_mod_i32").expect("compile");
+        assert!(ptx.contains("rem.s32"), "expected rem.s32 for Int32 %, got:\n{ptx}");
+        // Guard shape (mirrors emit_int_div_guarded): zero-divisor detect +
+        // overflow predicate combine + selp sanitisation.
+        assert!(
+            ptx.contains("setp.eq.s32") && ptx.contains("and.pred") && ptx.contains("selp.s32"),
+            "expected guarded rem (setp.eq + and.pred + selp), got:\n{ptx}"
+        );
+    }
+
+    /// Int64 `%` lowers to `rem.s64` (64-bit width) — never `rem.s32`.
+    #[test]
+    fn mod_int64_emits_rem_s64() {
+        let spec = binop_spec(BinaryOp::Mod, DataType::Int64, DataType::Int64);
+        let ptx = compile(&spec, "bolt_kernel_mod_i64").expect("compile");
+        assert!(ptx.contains("rem.s64"), "expected rem.s64 for Int64 %, got:\n{ptx}");
+        assert!(!ptx.contains("rem.s32"), "Int64 % must not use rem.s32:\n{ptx}");
+    }
+
+    /// Bitwise AND/OR/XOR lower to the untyped bit-width mnemonics at the
+    /// operand width (`.b32` for Int32, `.b64` for Int64).
+    #[test]
+    fn bitwise_emits_bit_width_mnemonics() {
+        // Int32.
+        for (op, stem) in [
+            (BinaryOp::BitAnd, "and.b32"),
+            (BinaryOp::BitOr, "or.b32"),
+            (BinaryOp::BitXor, "xor.b32"),
+        ] {
+            let spec = binop_spec(op, DataType::Int32, DataType::Int32);
+            let ptx = compile(&spec, "bolt_kernel_bit_i32").expect("compile");
+            assert!(ptx.contains(stem), "expected {stem} for {op:?} on Int32, got:\n{ptx}");
+        }
+        // Int64.
+        for (op, stem) in [
+            (BinaryOp::BitAnd, "and.b64"),
+            (BinaryOp::BitOr, "or.b64"),
+            (BinaryOp::BitXor, "xor.b64"),
+        ] {
+            let spec = binop_spec(op, DataType::Int64, DataType::Int64);
+            let ptx = compile(&spec, "bolt_kernel_bit_i64").expect("compile");
+            assert!(ptx.contains(stem), "expected {stem} for {op:?} on Int64, got:\n{ptx}");
+        }
+    }
+
+    /// Left shift uses the bit-pattern mnemonic (`shl.b32`/`shl.b64`); right
+    /// shift uses the ARITHMETIC signed mnemonic (`shr.s32`/`shr.s64`) so the
+    /// sign bit is replicated for negative values.
+    #[test]
+    fn shifts_emit_correct_mnemonics() {
+        let shl32 = compile(
+            &binop_spec(BinaryOp::Shl, DataType::Int32, DataType::Int32),
+            "bolt_kernel_shl_i32",
+        )
+        .expect("compile");
+        assert!(shl32.contains("shl.b32"), "expected shl.b32, got:\n{shl32}");
+
+        let shr32 = compile(
+            &binop_spec(BinaryOp::Shr, DataType::Int32, DataType::Int32),
+            "bolt_kernel_shr_i32",
+        )
+        .expect("compile");
+        assert!(
+            shr32.contains("shr.s32"),
+            "expected arithmetic shr.s32 (sign-preserving), got:\n{shr32}"
+        );
+        // Logical/unsigned right shift would be wrong for signed SQL ints.
+        assert!(
+            !shr32.contains("shr.u32"),
+            "signed >> must NOT lower to logical shr.u32:\n{shr32}"
+        );
+
+        let shl64 = compile(
+            &binop_spec(BinaryOp::Shl, DataType::Int64, DataType::Int64),
+            "bolt_kernel_shl_i64",
+        )
+        .expect("compile");
+        assert!(shl64.contains("shl.b64"), "expected shl.b64, got:\n{shl64}");
+
+        let shr64 = compile(
+            &binop_spec(BinaryOp::Shr, DataType::Int64, DataType::Int64),
+            "bolt_kernel_shr_i64",
+        )
+        .expect("compile");
+        assert!(shr64.contains("shr.s64"), "expected shr.s64, got:\n{shr64}");
+    }
+
+    /// Float operands must NOT reach this codegen (the planner rejects them),
+    /// but if a hand-built spec leaks one through, the codegen guard rejects
+    /// it cleanly rather than emitting nonsense.
+    #[test]
+    fn modulo_on_float_codegen_rejected() {
+        let spec = binop_spec(BinaryOp::Mod, DataType::Float64, DataType::Float64);
+        let err = compile(&spec, "bolt_kernel_mod_f64").expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Int32/Int64") || msg.contains("modulo"),
+            "expected integer-only rejection for float %, got: {msg}"
         );
     }
 }

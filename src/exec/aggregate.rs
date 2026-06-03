@@ -3365,6 +3365,222 @@ mod tests {
         assert!(ts.is_null(0));
     }
 
+    // -------- R1: nullable scalar aggregate NULL contract (primitives) --------
+    //
+    // SQL says MIN/MAX/SUM over an EMPTY or ALL-NULL input is NULL (not the
+    // reduction identity / a sentinel like i64::MIN or 0). The host-side
+    // `build_one_aggregate` short-circuits on `non_null_count_for_input == 0`
+    // (when the output field is nullable) and packs a typed NULL via
+    // `null_scalar_array` BEFORE any GPU launch — so the whole contract is
+    // host-testable with no device. These tests pin that behaviour per
+    // primitive dtype and per op, mirroring the Decimal128 / temporal paths.
+
+    /// `null_scalar_array` packs a single, typed NULL for each primitive output
+    /// dtype (Int32/Int64/Float32/Float64). Mirrors the Decimal128 / temporal
+    /// coverage above.
+    #[test]
+    fn null_scalar_array_primitive_is_typed_null() {
+        let cases: &[(DataType, &arrow_schema::DataType)] = &[
+            (DataType::Int32, &arrow_schema::DataType::Int32),
+            (DataType::Int64, &arrow_schema::DataType::Int64),
+            (DataType::Float32, &arrow_schema::DataType::Float32),
+            (DataType::Float64, &arrow_schema::DataType::Float64),
+        ];
+        for (dt, arrow_dt) in cases {
+            let arr = null_scalar_array(dt.clone()).expect("null scalar");
+            assert_eq!(arr.len(), 1, "exactly one row for {dt:?}");
+            assert_eq!(arr.data_type(), *arrow_dt, "typed NULL for {dt:?}");
+            assert!(arr.is_null(0), "row must be NULL for {dt:?}");
+        }
+    }
+
+    /// Build a single-column batch of `dtype` with ALL rows NULL.
+    fn all_null_batch(name: &str, dtype: &DataType, n: usize) -> RecordBatch {
+        let arr: ArrayRef = match dtype {
+            DataType::Int32 => Arc::new(Int32Array::from(vec![Option::<i32>::None; n])),
+            DataType::Int64 => Arc::new(Int64Array::from(vec![Option::<i64>::None; n])),
+            DataType::Float32 => Arc::new(Float32Array::from(vec![Option::<f32>::None; n])),
+            DataType::Float64 => Arc::new(Float64Array::from(vec![Option::<f64>::None; n])),
+            other => panic!("all_null_batch: unsupported dtype {other:?}"),
+        };
+        batch_one(name, arr)
+    }
+
+    /// Build an EMPTY (zero-row) single-column batch of `dtype`.
+    fn empty_batch(name: &str, dtype: &DataType) -> RecordBatch {
+        all_null_batch(name, dtype, 0)
+    }
+
+    /// R1: SUM/MIN/MAX over an ALL-NULL primitive column returns SQL NULL when
+    /// the output field is nullable — for every primitive input dtype. This
+    /// exercises the full `build_one_aggregate` dispatch and is host-only
+    /// because the all-NULL guard returns before any GPU launch.
+    #[test]
+    fn scalar_min_max_sum_all_null_input_is_null() {
+        // (input dtype, SUM output dtype) — SUM(Int32) widens to Int64; SUM of
+        // the others preserves the input dtype. MIN/MAX always preserve input.
+        let cases: &[(DataType, DataType)] = &[
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int64, DataType::Int64),
+            (DataType::Float32, DataType::Float32),
+            (DataType::Float64, DataType::Float64),
+        ];
+        for (in_dt, sum_out_dt) in cases {
+            let batch = all_null_batch("v", in_dt, 4);
+            let col = ColumnIO {
+                name: "v".to_string(),
+                dtype: in_dt.clone(),
+            };
+
+            // MIN / MAX preserve the input dtype.
+            for agg in [
+                AggregateExpr::Min(Expr::Column("v".to_string())),
+                AggregateExpr::Max(Expr::Column("v".to_string())),
+            ] {
+                let out_field = Field::new("m", in_dt.clone(), true);
+                let out = build_one_aggregate(
+                    &agg,
+                    &out_field,
+                    std::slice::from_ref(&col),
+                    &batch,
+                    4,
+                )
+                .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) all-null: {e:?}"));
+                assert_eq!(out.len(), 1);
+                assert!(
+                    out.is_null(0),
+                    "MIN/MAX({in_dt:?}) over all-NULL must be NULL"
+                );
+            }
+
+            // SUM widens Int32 -> Int64; preserves the others.
+            let out_field = Field::new("s", sum_out_dt.clone(), true);
+            let agg = AggregateExpr::Sum(Expr::Column("v".to_string()));
+            let out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 4)
+                .unwrap_or_else(|e| panic!("SUM({in_dt:?}) all-null: {e:?}"));
+            assert_eq!(out.len(), 1);
+            assert!(out.is_null(0), "SUM({in_dt:?}) over all-NULL must be NULL");
+        }
+    }
+
+    /// R1: SUM/MIN/MAX over an EMPTY (zero-row) primitive column returns SQL
+    /// NULL when the output field is nullable — for every primitive input
+    /// dtype. Host-only for the same reason as the all-NULL case.
+    #[test]
+    fn scalar_min_max_sum_empty_input_is_null() {
+        let cases: &[(DataType, DataType)] = &[
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int64, DataType::Int64),
+            (DataType::Float32, DataType::Float32),
+            (DataType::Float64, DataType::Float64),
+        ];
+        for (in_dt, sum_out_dt) in cases {
+            let batch = empty_batch("v", in_dt);
+            let col = ColumnIO {
+                name: "v".to_string(),
+                dtype: in_dt.clone(),
+            };
+            for agg in [
+                AggregateExpr::Min(Expr::Column("v".to_string())),
+                AggregateExpr::Max(Expr::Column("v".to_string())),
+            ] {
+                let out_field = Field::new("m", in_dt.clone(), true);
+                let out = build_one_aggregate(
+                    &agg,
+                    &out_field,
+                    std::slice::from_ref(&col),
+                    &batch,
+                    0,
+                )
+                .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) empty: {e:?}"));
+                assert_eq!(out.len(), 1);
+                assert!(
+                    out.is_null(0),
+                    "MIN/MAX({in_dt:?}) over empty must be NULL"
+                );
+            }
+            let out_field = Field::new("s", sum_out_dt.clone(), true);
+            let agg = AggregateExpr::Sum(Expr::Column("v".to_string()));
+            let out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 0)
+                .unwrap_or_else(|e| panic!("SUM({in_dt:?}) empty: {e:?}"));
+            assert_eq!(out.len(), 1);
+            assert!(out.is_null(0), "SUM({in_dt:?}) over empty must be NULL");
+        }
+    }
+
+    /// R1: COUNT over an empty / all-NULL primitive column is 0 (NOT NULL) —
+    /// COUNT(col) excludes NULLs but always produces a concrete count. This
+    /// distinguishes COUNT from SUM/MIN/MAX, which return NULL on empty input.
+    #[test]
+    fn scalar_count_empty_and_all_null_is_zero_not_null() {
+        for in_dt in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let col = ColumnIO {
+                name: "v".to_string(),
+                dtype: in_dt.clone(),
+            };
+            let out_field = Field::new("c", DataType::Int64, true);
+            let agg = AggregateExpr::Count(Expr::Column("v".to_string()));
+
+            for (batch, n) in [
+                (all_null_batch("v", &in_dt, 4), 4usize),
+                (empty_batch("v", &in_dt), 0usize),
+            ] {
+                let out =
+                    build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, n)
+                        .unwrap_or_else(|e| panic!("COUNT({in_dt:?}): {e:?}"));
+                let ca = out
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("COUNT -> Int64Array");
+                assert_eq!(ca.len(), 1);
+                assert!(!ca.is_null(0), "COUNT({in_dt:?}) must not be NULL");
+                assert_eq!(ca.value(0), 0, "COUNT({in_dt:?}) over no valid rows is 0");
+            }
+        }
+    }
+
+    /// R1: AVG over an empty primitive column returns SQL NULL when the output
+    /// field is nullable — routed through `build_one_aggregate` →
+    /// `fused_avg_from_batch`. Even though the fused launcher early-returns at
+    /// `n_rows == 0`, the path still constructs a `GpuVec` upload and calls
+    /// `stream.synchronize()`, which touches the driver FFI — so this is
+    /// GPU-gated. The pure host unit of the empty-AVG -> NULL contract is
+    /// covered device-free by `avg_empty_input_is_null_when_nullable` above
+    /// (asserting on `avg_result_array(0.0, 0, true)`); this test pins the
+    /// full end-to-end dispatch on a real device.
+    #[test]
+    #[ignore = "gpu:tier1 AVG dispatch uploads + synchronizes the stream"]
+    fn scalar_avg_empty_input_is_null() {
+        let _ctx = crate::cuda::CudaContext::new(0).expect("CUDA ctx");
+        for in_dt in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let batch = empty_batch("v", &in_dt);
+            let col = ColumnIO {
+                name: "v".to_string(),
+                dtype: in_dt.clone(),
+            };
+            let out_field = Field::new("a", DataType::Float64, true);
+            let agg = AggregateExpr::Avg(Expr::Column("v".to_string()));
+            let out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 0)
+                .unwrap_or_else(|e| panic!("AVG({in_dt:?}) empty: {e:?}"));
+            let fa = out
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("AVG -> Float64Array");
+            assert_eq!(fa.len(), 1);
+            assert!(fa.is_null(0), "AVG({in_dt:?}) over empty must be NULL");
+        }
+    }
+
     /// `timestamp_values_i64` extracts the raw i64 tick buffer for each unit.
     #[test]
     fn timestamp_values_i64_extracts_ticks() {

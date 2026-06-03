@@ -55,15 +55,14 @@
 //!
 //! Signed types (`i32`/`i64`) need a one-time MSB flip on entry and again on
 //! exit so the bit-pattern compare matches the value-order compare — same
-//! standard "flip top bit" trick used in Thrust's radix sort. Floats need the
+//! standard "flip top bit" trick used in Thrust's radix sort. Floats use the
 //! full IEEE-monotonic transform (flip all bits if sign==1, else flip just the
-//! sign bit). That float transform is now **implemented and unit-tested**
-//! host-side (`radix_float_key_f32` / `radix_float_key_f64` in
-//! `crate::exec::gpu_sort`), but it is **not yet wired into the dispatch
-//! predicate**, so this kernel still rejects `Float32`/`Float64` and the host
-//! falls back to the bitonic sort or the host sort. Bool / Utf8 are likewise
-//! rejected — bools have only 2 distinct keys (cheaper to count), and Utf8
-//! needs dictionary-decoding before it reaches any device-side sort.
+//! sign bit), applied **host-side** during gather (`radix_float_key_f32` /
+//! `radix_float_key_f64` in `crate::exec::gpu_sort`, which also canonicalize
+//! NaN and `-0.0`); the device then sorts the resulting `u32`/`u64` bit-blob
+//! with the same int kernels (R1). Bool / Utf8 remain rejected — bools have
+//! only 2 distinct keys (cheaper to count), and Utf8 needs dictionary-decoding
+//! before it reaches any device-side sort.
 //!
 //! ## What this PTX module emits
 //!
@@ -193,11 +192,14 @@ struct RadixFlavour {
 impl RadixFlavour {
     /// Pick the radix-flavour table for a supported dtype, or reject the dtype.
     ///
-    /// `Float32`/`Float64` are deliberately rejected: a correct float radix
-    /// sort needs the IEEE-monotonic transform (flip all bits if the sign bit
-    /// is set, else flip just the sign bit). The transform is straightforward
-    /// to add — see e.g. Thrust's `radix_sort.inl` — but deferred to v0.7 to
-    /// keep the v0.6 scaffold focused.
+    /// `Float32`/`Float64` (R1) are routed through the same bit-blob pipeline
+    /// as the signed integers, but the IEEE-monotonic key transform happens
+    /// **host-side** during gather (`radix_float_key_f32` / `radix_float_key_f64`
+    /// in `crate::exec::gpu_sort`, which also canonicalize NaN and `-0.0`) so
+    /// the device kernels see a plain unsigned `u32`/`u64` bit-blob. There is
+    /// therefore no `signed_msb_flip` for floats — the host transform already
+    /// produces an unsigned-ASC-ordered key, exactly as the integer
+    /// per-direction pre-transform does.
     ///
     /// `Bool` is rejected: 2 distinct keys means a single-pass counting
     /// sort is strictly cheaper.
@@ -218,28 +220,30 @@ impl RadixFlavour {
                 radix_steps: 16,
                 signed_msb_flip: true,
             },
-            // Float radix needs the IEEE-monotonic transform: if the sign bit
-            // is set, flip every bit; else flip just the sign bit. This makes
-            // the bit-pattern unsigned compare agree with the floating-point
-            // value compare for normals + zeros (NaNs sort to the end either
-            // way). The transform itself is implemented and unit-tested
-            // host-side (`radix_float_key_f32` / `radix_float_key_f64` in
-            // `crate::exec::gpu_sort`), but it is NOT yet wired into the radix
-            // dispatch predicate, so the executor still falls back to the
-            // bitonic / host path for float ORDER BY. See the F2 integration
-            // note: enabling it end-to-end means widening
-            // `radix_dispatch_predicate` (and its tests, which live in the
-            // executor crate) to admit Float32/Float64, then routing F32/F64
-            // through the bit-blob pipeline with the float key transform in
-            // place of the signed-int pre-transform.
-            DataType::Float32 | DataType::Float64 => {
-                return Err(BoltError::Other(format!(
-                    "sort_kernel_radix: dtype {:?} float radix transform is \
-                     implemented host-side but not yet wired into the radix \
-                     dispatch predicate; fall back to host or bitonic sort",
-                    dtype
-                )))
-            }
+            // R1 — Float radix. The IEEE-monotonic transform (flip all bits if
+            // the sign bit is set, else flip just the sign bit) is applied
+            // HOST-side during gather (`radix_float_key_f32` /
+            // `radix_float_key_f64` in `crate::exec::gpu_sort`), along with NaN
+            // and -0.0 canonicalization, so the transformed key is already a
+            // plain unsigned bit-blob the int kernels can sort verbatim. The
+            // device key buffer is reinterpreted as u32 (Float32) / u64
+            // (Float64), so the byte widths / radix step counts match the
+            // i32 / i64 flavours. `signed_msb_flip` is false: there is no
+            // kernel-side flip for floats — the host transform subsumes it
+            // (mirroring how the integer host pre-transform subsumes the
+            // signed-MSB kernel flip).
+            DataType::Float32 => Self {
+                byte_width: 4,
+                ld_st_suffix: "b32",
+                radix_steps: 8,
+                signed_msb_flip: false,
+            },
+            DataType::Float64 => Self {
+                byte_width: 8,
+                ld_st_suffix: "b64",
+                radix_steps: 16,
+                signed_msb_flip: false,
+            },
             DataType::Bool => {
                 return Err(BoltError::Other(
                     "sort_kernel_radix: Bool keys have only 2 distinct values; \
@@ -414,6 +418,13 @@ fn dtype_tag(dtype: DataType) -> BoltResult<&'static str> {
     Ok(match dtype {
         DataType::Int32 => "i32",
         DataType::Int64 => "i64",
+        // R1 — floats reach the device as a plain unsigned bit-blob (the
+        // host applies the IEEE-monotonic key transform during gather), so
+        // the kernel manipulates them exactly as it does the integer keys.
+        // The tag still reflects the *user-facing* dtype so the f32/f64
+        // modules cache distinctly from the i32/i64 ones.
+        DataType::Float32 => "f32",
+        DataType::Float64 => "f64",
         _ => {
             // Validate via the flavour table — guarantees we never silently
             // accept a dtype that has no entry-name tag.
@@ -976,10 +987,11 @@ pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String>
 ///
 /// We separate this from the per-pass kernels so the scatter kernel can ride
 /// already-flipped keys without doing per-step work that would cancel itself.
-/// Returns an error for dtypes that don't require the flip (today: none of
-/// the supported set, since `Float32`/`Float64` need the IEEE-monotonic
-/// transform instead and `Bool`/`Utf8` aren't supported at all). Callers
-/// can also gate via [`radix_needs_msb_flip`].
+/// Returns an error for dtypes that don't require the kernel-side flip:
+/// `Float32`/`Float64` are supported by the radix sort but apply their
+/// IEEE-monotonic transform host-side (so `signed_msb_flip` is false and this
+/// returns an error for them), and `Bool`/`Utf8` aren't supported at all.
+/// Callers can also gate via [`radix_needs_msb_flip`].
 pub fn compile_radix_msb_flip(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     if !flavour.signed_msb_flip {
@@ -1064,10 +1076,10 @@ pub fn radix_needs_msb_flip(dtype: DataType) -> BoltResult<bool> {
 ///
 /// Returns `Ok(true)` when both:
 ///   1. The env var `BOLT_GPU_SORT=1` is set, **and**
-///   2. The dtype is supported by the radix kernel (Int32/Int64 — see
-///      [`RadixFlavour::for_dtype`] for the gate; Float/Bool/Utf8 fall back
-///      with a doc-comment note that float radix needs the IEEE-monotonic
-///      transform — deferred).
+///   2. The dtype is supported by the radix kernel (Int32/Int64/Float32/Float64
+///      — see [`RadixFlavour::for_dtype`] for the gate; Bool/Utf8 fall back).
+///      Floats ride the int kernels via the host-side IEEE-monotonic key
+///      transform (R1).
 ///
 /// Returns `Ok(false)` otherwise. Never errors today (the gate is purely
 /// advisory) but kept `BoltResult<bool>` so future extensions can surface
@@ -1125,12 +1137,13 @@ mod tests {
 
     /// Unsupported dtypes must reject at the entry-name layer too — not just
     /// at codegen — so the executor can branch before reaching for PTX.
+    /// (Float32/Float64 are now SUPPORTED via the host IEEE-monotonic key
+    /// transform — see `float_dtypes_supported` — so only Bool/Utf8 remain
+    /// here.)
     #[test]
     fn unsupported_dtypes_rejected() {
         for dty in [
             DataType::Bool,
-            DataType::Float32,
-            DataType::Float64,
             DataType::Utf8,
         ] {
             assert!(
@@ -1149,6 +1162,84 @@ mod tests {
             assert!(radix_steps_for(dty).is_err());
             assert!(radix_needs_msb_flip(dty).is_err());
         }
+    }
+
+    /// R1 — Float32/Float64 are now first-class radix dtypes. They reach the
+    /// device as a plain unsigned bit-blob (the host applies the IEEE-monotonic
+    /// key transform during gather), so every codegen + entry-name surface must
+    /// accept them and tag them `f32` / `f64`.
+    #[test]
+    fn float_dtypes_supported() {
+        for dty in [DataType::Float32, DataType::Float64] {
+            assert!(
+                radix_supports_dtype(dty),
+                "dtype {:?} should be supported by the radix kernel",
+                dty
+            );
+            assert!(radix_histogram_entry(dty).is_ok());
+            assert!(radix_scatter_entry(dty).is_ok());
+            assert!(radix_scatter_with_indices_entry(dty).is_ok());
+            assert!(compile_radix_histogram(dty).is_ok());
+            assert!(compile_radix_scatter(dty).is_ok());
+            assert!(compile_radix_scatter_with_indices(dty).is_ok());
+            assert!(radix_steps_for(dty).is_ok());
+            // Floats apply the IEEE transform host-side, so they need NO
+            // kernel-side MSB flip — `radix_needs_msb_flip` is false and the
+            // MSB-flip codegen rejects them.
+            assert!(!radix_needs_msb_flip(dty).unwrap());
+            assert!(compile_radix_msb_flip(dty).is_err());
+        }
+    }
+
+    /// Float entry names carry the documented `f32` / `f64` tags and the
+    /// float step counts mirror their same-width integer flavours (8 passes
+    /// for 32-bit, 16 for 64-bit).
+    #[test]
+    fn float_entry_names_and_steps_pin() {
+        assert_eq!(
+            radix_histogram_entry(DataType::Float32).unwrap(),
+            "bolt_radix_histogram_f32"
+        );
+        assert_eq!(
+            radix_histogram_entry(DataType::Float64).unwrap(),
+            "bolt_radix_histogram_f64"
+        );
+        assert_eq!(
+            radix_scatter_with_indices_entry(DataType::Float32).unwrap(),
+            "bolt_radix_scatter_f32_with_indices"
+        );
+        assert_eq!(
+            radix_scatter_with_indices_entry(DataType::Float64).unwrap(),
+            "bolt_radix_scatter_f64_with_indices"
+        );
+        assert_eq!(radix_steps_for(DataType::Float32).unwrap(), 8);
+        assert_eq!(radix_steps_for(DataType::Float64).unwrap(), 16);
+    }
+
+    /// Float PTX shape: f32 rides the b32 bit-blob path (4-byte loads/stores)
+    /// just like i32 — the key is a transformed unsigned blob by the time it
+    /// reaches the device. f64 rides the b64 path like i64.
+    #[test]
+    fn float_ptx_shape_uses_bit_blob_path() {
+        let f32_hist = compile_radix_histogram(DataType::Float32).unwrap();
+        assert!(f32_hist.contains(".visible .entry bolt_radix_histogram_f32("));
+        // Bit-blob load suffix — NOT a float-typed load; the IEEE transform
+        // already happened host-side.
+        assert!(f32_hist.contains("ld.global.b32"));
+        assert!(!f32_hist.contains("ld.global.f32"));
+
+        let f32_scatter =
+            compile_radix_scatter_with_indices(DataType::Float32).unwrap();
+        assert!(
+            f32_scatter.contains(".visible .entry bolt_radix_scatter_f32_with_indices(")
+        );
+        assert!(f32_scatter.contains("ld.global.b32"));
+        assert!(f32_scatter.contains("st.global.b32"));
+
+        let f64_hist = compile_radix_histogram(DataType::Float64).unwrap();
+        assert!(f64_hist.contains(".visible .entry bolt_radix_histogram_f64("));
+        assert!(f64_hist.contains("ld.global.b64"));
+        assert!(!f64_hist.contains("ld.global.f64"));
     }
 
     /// The new keys+indices entry names pin to the documented shape — both
@@ -1403,27 +1494,27 @@ mod tests {
         // as the restore target — equivalent to the process-startup state.
         set_radix_dispatch_for_tests(Some(false));
 
-        // Float dtypes always fall back regardless of gate state because
-        // the radix kernel doesn't support them yet — IEEE-monotonic
-        // transform deferred. This exercises the dtype gate.
+        // Gate OFF: every dtype falls back regardless of support — the env
+        // gate is the outer guard.
         assert!(!try_gpu_radix_sort(DataType::Float32).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Float64).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Bool).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Utf8).unwrap());
-
-        // Gate OFF: supported dtypes also fall back.
         assert!(!try_gpu_radix_sort(DataType::Int32).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Int64).unwrap());
         assert!(!gpu_sort_env_enabled());
 
-        // Gate ON: supported dtypes engage; unsupported dtypes still fall
-        // back via the dtype gate.
+        // Gate ON: supported dtypes engage (now including floats via the
+        // host IEEE-monotonic transform); Bool/Utf8 still fall back via the
+        // dtype gate.
         set_radix_dispatch_for_tests(Some(true));
         assert!(gpu_sort_env_enabled());
         assert!(try_gpu_radix_sort(DataType::Int32).unwrap());
         assert!(try_gpu_radix_sort(DataType::Int64).unwrap());
-        assert!(!try_gpu_radix_sort(DataType::Float32).unwrap());
+        assert!(try_gpu_radix_sort(DataType::Float32).unwrap());
+        assert!(try_gpu_radix_sort(DataType::Float64).unwrap());
         assert!(!try_gpu_radix_sort(DataType::Bool).unwrap());
+        assert!(!try_gpu_radix_sort(DataType::Utf8).unwrap());
 
         // Restore to "uninitialised" so the next call latches from env —
         // the same behaviour the process would have at startup if this

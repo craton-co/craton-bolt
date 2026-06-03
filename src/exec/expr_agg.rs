@@ -1078,6 +1078,16 @@ fn eval_binary(
 
     if is_arithmetic(op) {
         eval_arithmetic(op, l, r)
+    } else if matches!(
+        op,
+        BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+    ) {
+        eval_integer_op(op, l, r)
     } else if is_comparison(op) {
         eval_comparison(op, l, r)
     } else if is_logical(op) {
@@ -1231,6 +1241,90 @@ fn eval_arithmetic(
             other_r.dtype()
         ))),
     }
+}
+
+/// Host evaluation of the integer-only operators: modulo (`%`), bitwise
+/// (`& | ^`), and shifts (`<< >>`). The GPU projection path lowers these in
+/// `ptx_gen`; this host path serves forced fallbacks (e.g. a `WHERE` Filter
+/// using `a % b`). Operands must be `Int32`/`Int64` (float/decimal rejected,
+/// matching the planner's type-check). Result width: `%`/`&`/`|`/`^` use the
+/// wider of the two operands; shifts follow the LEFT operand (the right is a
+/// count). Semantics match the kernel: `%` returns NULL on a zero divisor (and
+/// `INT_MIN % -1`); shift amounts outside `0..bits` saturate as PTX does
+/// (`shl`→0, arithmetic `shr`→sign fill). Either-side NULL propagates.
+fn eval_integer_op(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<HostColumn> {
+    let (l_dt, r_dt) = (lhs.dtype(), rhs.dtype());
+    let is_int = |dt| matches!(dt, DataType::Int32 | DataType::Int64);
+    if !is_int(l_dt) || !is_int(r_dt) {
+        return Err(BoltError::Type(format!(
+            "expr_agg: operator {:?} requires integer (Int32/Int64) operands, got {:?} and {:?}",
+            op, l_dt, r_dt
+        )));
+    }
+    let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+    // Shifts keep the left width; the others widen to the wider operand.
+    let target = if is_shift {
+        l_dt
+    } else if l_dt == DataType::Int64 || r_dt == DataType::Int64 {
+        DataType::Int64
+    } else {
+        DataType::Int32
+    };
+    let lhs_u = cast_column(lhs, target)?;
+    // The shift count is read as the same width as the value; for the other
+    // ops both sides share `target`.
+    let rhs_u = cast_column(rhs, target)?;
+    match (lhs_u, rhs_u) {
+        (HostColumn::I32(a), HostColumn::I32(b)) => Ok(HostColumn::I32(zip_integer_i32(op, a, b))),
+        (HostColumn::I64(a), HostColumn::I64(b)) => Ok(HostColumn::I64(zip_integer_i64(op, a, b))),
+        (other_l, other_r) => Err(BoltError::Other(format!(
+            "expr_agg: internal: integer-op operand shape ({:?}, {:?})",
+            other_l.dtype(),
+            other_r.dtype()
+        ))),
+    }
+}
+
+fn zip_integer_i32(op: BinaryOp, a: Vec<Option<i32>>, b: Vec<Option<i32>>) -> Vec<Option<i32>> {
+    debug_assert_eq!(a.len(), b.len());
+    a.into_iter()
+        .zip(b.into_iter())
+        .map(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => match op {
+                BinaryOp::Mod => x.checked_rem(y), // None on y==0 or i32::MIN % -1
+                BinaryOp::BitAnd => Some(x & y),
+                BinaryOp::BitOr => Some(x | y),
+                BinaryOp::BitXor => Some(x ^ y),
+                BinaryOp::Shl => Some(if (0..32).contains(&y) { x.wrapping_shl(y as u32) } else { 0 }),
+                BinaryOp::Shr => {
+                    Some(if (0..32).contains(&y) { x >> y } else { x >> 31 })
+                }
+                _ => unreachable!("non-integer op routed to zip_integer_i32"),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn zip_integer_i64(op: BinaryOp, a: Vec<Option<i64>>, b: Vec<Option<i64>>) -> Vec<Option<i64>> {
+    debug_assert_eq!(a.len(), b.len());
+    a.into_iter()
+        .zip(b.into_iter())
+        .map(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => match op {
+                BinaryOp::Mod => x.checked_rem(y),
+                BinaryOp::BitAnd => Some(x & y),
+                BinaryOp::BitOr => Some(x | y),
+                BinaryOp::BitXor => Some(x ^ y),
+                BinaryOp::Shl => Some(if (0..64).contains(&y) { x.wrapping_shl(y as u32) } else { 0 }),
+                BinaryOp::Shr => {
+                    Some(if (0..64).contains(&y) { x >> y } else { x >> 63 })
+                }
+                _ => unreachable!("non-integer op routed to zip_integer_i64"),
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// Pointwise arithmetic on an integer type. Wrapping for +/-/*; integer

@@ -361,6 +361,11 @@ fn fold_int(op: BinaryOp, a: i64, b: i64) -> Option<FoldVal> {
         LtEq => FoldVal::Bool(a <= b),
         Gt => FoldVal::Bool(a > b),
         GtEq => FoldVal::Bool(a >= b),
+        // Modulo/bitwise/shift are left to runtime evaluation: folding them is
+        // a pure optimization and skipping it is always safe, which avoids any
+        // fold-vs-kernel semantic mismatch (esp. shift-amount masking and
+        // INT_MIN % -1). The codegen path (ptx_gen) is the source of truth.
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr => return None,
         And | Or | Concat => return None,
     })
 }
@@ -382,6 +387,9 @@ fn fold_float(op: BinaryOp, a: f64, b: f64) -> Option<Literal> {
         LtEq => Literal::Bool(a <= b),
         Gt => Literal::Bool(a > b),
         GtEq => Literal::Bool(a >= b),
+        // Integer-only ops never reach the float folder (type-check rejects
+        // float operands); listed for exhaustiveness, never folded here.
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr => return None,
         And | Or | Concat => return None,
     })
 }

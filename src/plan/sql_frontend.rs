@@ -11997,21 +11997,17 @@ fn lower_binary_op(op: &BinaryOperator) -> BoltResult<BinaryOp> {
         BinaryOperator::And => BinaryOp::And,
         BinaryOperator::Or => BinaryOp::Or,
         BinaryOperator::StringConcat => BinaryOp::Concat,
-        // Modulo / bitwise / shift have no GPU kernel codegen yet. Surface a
-        // clear "not yet supported" message rather than the generic
-        // "unsupported binary operator" so users know the operator is
-        // recognised but simply not implemented.
-        BinaryOperator::Modulo
-        | BinaryOperator::BitwiseAnd
-        | BinaryOperator::BitwiseOr
-        | BinaryOperator::BitwiseXor
-        | BinaryOperator::PGBitwiseXor
-        | BinaryOperator::PGBitwiseShiftLeft
-        | BinaryOperator::PGBitwiseShiftRight => {
-            return Err(BoltError::Sql(format!(
-                "operator not yet supported: {op}"
-            )));
-        }
+        // Modulo / bitwise / shift — integer-only operators (Int32/Int64).
+        // The logical-plan type-checker rejects float / decimal operands with
+        // a clear message; the physical plan lowers these to guarded modulo /
+        // bitwise / shift PTX. Both Postgres-flavoured `#` (PGBitwiseXor) and
+        // ANSI `^` (BitwiseXor) spell XOR.
+        BinaryOperator::Modulo => BinaryOp::Mod,
+        BinaryOperator::BitwiseAnd => BinaryOp::BitAnd,
+        BinaryOperator::BitwiseOr => BinaryOp::BitOr,
+        BinaryOperator::BitwiseXor | BinaryOperator::PGBitwiseXor => BinaryOp::BitXor,
+        BinaryOperator::PGBitwiseShiftLeft => BinaryOp::Shl,
+        BinaryOperator::PGBitwiseShiftRight => BinaryOp::Shr,
         other => {
             return Err(BoltError::Sql(format!(
                 "unsupported binary operator: {other}"
@@ -15364,9 +15360,10 @@ mod setop_coercion_tests {
     }
 
     #[test]
-    fn modulo_and_bitwise_report_not_yet_supported() {
-        // Scope note: %/bitwise have no codegen; the lowering must surface a
-        // clear "operator not yet supported" message (no codegen added here).
+    fn modulo_and_bitwise_lower_for_integers() {
+        // R1-modulo-bitwise: % and the bitwise/shift family now lower
+        // end-to-end for integer columns. The single output column keeps an
+        // integer dtype (Int64 here, since `x` is Int64).
         for sql in [
             "SELECT x % 2 FROM i64t",
             "SELECT x & 1 FROM i64t",
@@ -15375,11 +15372,33 @@ mod setop_coercion_tests {
             "SELECT x << 1 FROM i64t",
             "SELECT x >> 1 FROM i64t",
         ] {
-            let err = parse(sql, &provider())
-                .expect_err("modulo/bitwise should not lower (no codegen)");
+            assert_eq!(
+                col0_dtype(sql),
+                DataType::Int64,
+                "expected Int64 result for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modulo_and_bitwise_reject_float_operands() {
+        // Float operands are rejected with a clear integer-only message. The
+        // integer-only type-check fires during schema/dtype resolution, which
+        // for a plain projection happens at `lower_physical`; accept the error
+        // from whichever layer surfaces it (parse or lowering).
+        for sql in [
+            "SELECT x % 2 FROM f64t",
+            "SELECT x & 1 FROM f64t",
+            "SELECT x << 1 FROM f64t",
+        ] {
+            let err = match parse(sql, &provider()) {
+                Ok(plan) => crate::plan::physical_plan::lower(&plan)
+                    .expect_err("float operand must be rejected at parse or lowering"),
+                Err(e) => e,
+            };
             assert!(
-                err.to_string().contains("not yet supported"),
-                "expected 'not yet supported' for {sql:?}, got: {err}"
+                err.to_string().contains("requires integer"),
+                "expected integer-operand error for {sql:?}, got: {err}"
             );
         }
     }

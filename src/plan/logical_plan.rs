@@ -348,6 +348,27 @@ pub enum BinaryOp {
     /// result is Utf8. Lowered host-side (the GPU codegen path has no
     /// Utf8 support); see `crate::exec::string_ops::host_concat_strings`.
     Concat,
+    /// `a % b` — integer modulo (remainder). Both operands must be integer
+    /// (Int32/Int64); the result is the unified integer width. Division-class
+    /// trap behaviour matches `Div`: a zero divisor (and the `INT_MIN % -1`
+    /// overflow corner) is sanitised in codegen so the kernel never faults.
+    Mod,
+    /// `a & b` — bitwise AND. Integer operands only; result is the unified
+    /// integer width.
+    BitAnd,
+    /// `a | b` — bitwise OR. Integer operands only; result is the unified
+    /// integer width.
+    BitOr,
+    /// `a ^ b` — bitwise XOR. Integer operands only; result is the unified
+    /// integer width.
+    BitXor,
+    /// `a << b` — left shift. Integer operands only; the result dtype is the
+    /// LEFT operand's integer width (the right operand is the shift amount).
+    Shl,
+    /// `a >> b` — arithmetic right shift (sign-preserving for signed values).
+    /// Integer operands only; the result dtype is the LEFT operand's integer
+    /// width.
+    Shr,
 }
 
 impl BinaryOp {
@@ -373,6 +394,40 @@ impl BinaryOp {
     /// operands must be Utf8 (the type-checker enforces this).
     fn is_string(self) -> bool {
         matches!(self, BinaryOp::Concat)
+    }
+
+    /// True for the integer-only operators: modulo (`%`) and the bitwise /
+    /// shift family (`& | ^ << >>`). These require integer (Int32/Int64)
+    /// operands; float / decimal operands are rejected with a clear message.
+    fn is_integer_op(self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+        )
+    }
+
+    /// True for the shift operators (`<<` / `>>`), whose result dtype follows
+    /// the LEFT operand's integer width (the right operand is a shift count).
+    fn is_shift(self) -> bool {
+        matches!(self, BinaryOp::Shl | BinaryOp::Shr)
+    }
+
+    /// SQL spelling for error messages on the integer-only operators.
+    fn integer_op_symbol(self) -> &'static str {
+        match self {
+            BinaryOp::Mod => "%",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
+            _ => "?",
+        }
     }
 }
 
@@ -909,6 +964,39 @@ impl Expr {
         binary(BinaryOp::Concat, self, rhs)
     }
 
+    /// `self % rhs` — integer modulo. Both sides must type-check to an integer
+    /// type. See [`BinaryOp::Mod`].
+    pub fn modulo(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::Mod, self, rhs)
+    }
+
+    /// `self & rhs` — bitwise AND. Integer operands only.
+    pub fn bit_and(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::BitAnd, self, rhs)
+    }
+
+    /// `self | rhs` — bitwise OR. Integer operands only.
+    pub fn bit_or(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::BitOr, self, rhs)
+    }
+
+    /// `self ^ rhs` — bitwise XOR. Integer operands only.
+    pub fn bit_xor(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::BitXor, self, rhs)
+    }
+
+    /// `self << rhs` — left shift. Integer operands only; result dtype follows
+    /// the left operand.
+    pub fn shl(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::Shl, self, rhs)
+    }
+
+    /// `self >> rhs` — arithmetic right shift. Integer operands only; result
+    /// dtype follows the left operand.
+    pub fn shr(self, rhs: Expr) -> Expr {
+        binary(BinaryOp::Shr, self, rhs)
+    }
+
     /// `self IS NULL`. Returns a Bool expression, never null.
     pub fn is_null(self) -> Expr {
         Expr::Unary {
@@ -1046,6 +1134,25 @@ impl Expr {
                         Err(BoltError::Type(format!(
                             "string {op:?} requires Utf8 operands, got {l:?} and {r:?}"
                         )))
+                    }
+                } else if op.is_integer_op() {
+                    // Modulo (`%`) and the bitwise / shift family (`& | ^ <<
+                    // >>`) are integer-only. Float / decimal operands are
+                    // rejected with a clear message naming the operator's SQL
+                    // spelling. The result dtype is the unified integer width
+                    // for `% & | ^`; for the shifts (`<< >>`) it follows the
+                    // LEFT operand's width (the right side is a shift count).
+                    if !l.is_int() || !r.is_int() {
+                        return Err(BoltError::Type(format!(
+                            "operator {} requires integer (Int32/Int64) operands, \
+                             got {l:?} and {r:?}",
+                            op.integer_op_symbol()
+                        )));
+                    }
+                    if op.is_shift() {
+                        Ok(l)
+                    } else {
+                        unify_numeric(l, r)
                     }
                 } else {
                     Err(BoltError::Type(format!("unsupported operator {op:?}")))
@@ -3042,6 +3149,85 @@ mod date_scalar_typecheck_tests {
                 unit
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod integer_op_typecheck_tests {
+    //! Type-check contract for MODULO (`%`) and the BITWISE / SHIFT family
+    //! (`& | ^ << >>`). Integer operands only; the result width is the
+    //! unified integer width for `% & | ^`, and the LEFT operand's width for
+    //! the shifts. Float / decimal operands are rejected with a message that
+    //! names the operator.
+    use super::*;
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("d", DataType::Decimal128(12, 2), false),
+        ])
+    }
+
+    #[test]
+    fn int32_int32_stays_int32() {
+        let s = schema();
+        for e in [
+            col("a").modulo(col("b")),
+            col("a").bit_and(col("b")),
+            col("a").bit_or(col("b")),
+            col("a").bit_xor(col("b")),
+        ] {
+            assert_eq!(e.dtype(&s).unwrap(), DataType::Int32, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn mixed_int_widths_widen_to_int64() {
+        let s = schema();
+        assert_eq!(col("a").modulo(col("c")).dtype(&s).unwrap(), DataType::Int64);
+        assert_eq!(col("a").bit_and(col("c")).dtype(&s).unwrap(), DataType::Int64);
+        assert_eq!(col("c").bit_or(col("a")).dtype(&s).unwrap(), DataType::Int64);
+    }
+
+    #[test]
+    fn shift_result_follows_left_operand() {
+        let s = schema();
+        // Int32 << Int64 → Int32 (left operand wins; right is a shift count).
+        assert_eq!(col("a").shl(col("c")).dtype(&s).unwrap(), DataType::Int32);
+        // Int64 >> Int32 → Int64.
+        assert_eq!(col("c").shr(col("a")).dtype(&s).unwrap(), DataType::Int64);
+    }
+
+    #[test]
+    fn float_operands_rejected() {
+        let s = schema();
+        for e in [
+            col("a").modulo(col("f")),
+            col("f").bit_and(col("a")),
+            col("a").shl(col("f")),
+        ] {
+            let err = e.dtype(&s).expect_err("float operand must be rejected");
+            assert!(
+                err.to_string().contains("requires integer"),
+                "expected integer-operand error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_operands_rejected() {
+        let s = schema();
+        let err = col("a")
+            .bit_xor(col("d"))
+            .dtype(&s)
+            .expect_err("decimal operand must be rejected");
+        assert!(
+            err.to_string().contains("requires integer"),
+            "expected integer-operand error, got: {err}"
+        );
     }
 }
 
