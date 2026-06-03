@@ -68,6 +68,19 @@ tracing = "0.1"
 # only need `driver` for Stage 1.
 cudarc = { version = "0.13", optional = true, default-features = false, features = ["driver", "cuda-12060"] }
 
+# --- Optional subsystem deps (off by default) -------------------------------
+# Arrow Flight SQL server frontend (feature `flight`, src/flight/). tonic/prost
+# versions are pinned to what arrow-flight 53 expects.
+arrow-flight = { version = "53", optional = true, features = ["flight-sql-experimental"] }
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "net"] }
+# Substrait plan ingestion (feature `substrait`, src/plan/substrait/). Ships the
+# generated prost protos under `substrait::proto`.
+substrait = { version = "0.55", optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 polars = { version = "0.42", default-features = false, features = ["lazy"] }
@@ -95,6 +108,19 @@ tracing-subscriber = "0.3"
 default = []
 # Stub-mode lets non-CUDA hosts at least compile; real builds use the linked CUDA path.
 cuda-stub = []
+# Arrow Flight SQL server frontend (src/flight/). EXPERIMENTAL / WIP — the
+# module skeleton (service, SQL commands, encode) is in-tree but the three
+# sub-modules' internal ABI (server <-> sql <-> encode fn names/signatures)
+# still needs reconciliation before it compiles; off by default and NOT built
+# by CI. Pulls the tonic/arrow-flight gRPC stack. See src/flight/.
+flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:futures", "dep:bytes", "dep:tokio"]
+# Substrait plan ingestion (src/plan/substrait/). EXPERIMENTAL / WIP — the
+# rel/expr/mod converters are in-tree but their shared converter-context API
+# (mod.rs ConvertCtx vs expr.rs SubstraitCtx trait vs rel.rs Ctx) plus the
+# function-extension registry and substrait-0.55 FetchRel proto shape still
+# need reconciliation before it compiles. Requires `protoc` on PATH/PROTOC.
+# Off by default and NOT built by CI. See src/plan/substrait/.
+substrait = ["dep:substrait"]
 # `cudarc` backend (Stage 1, spike): routes a handful of low-level CUDA
 # driver calls through the `cudarc` crate instead of our hand-rolled
 # `extern "C"` FFI. Not the default yet — turn on with

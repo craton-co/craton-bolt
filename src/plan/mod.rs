@@ -13,6 +13,9 @@ pub mod rewrite;
 pub mod optimizer;
 pub mod statistics;
 pub mod subquery;
+/// Substrait plan ingestion (optional, `--features substrait`).
+#[cfg(feature = "substrait")]
+pub mod substrait;
 
 pub use logical_plan::{
     AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind, Schema,

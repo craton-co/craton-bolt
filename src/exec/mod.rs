@@ -9,6 +9,16 @@ mod engine_cache_key;
 mod engine_device_col;
 mod engine_provider;
 mod engine_support;
+// Pure-reorg split (engine-split): coherent `impl Engine` method clusters
+// lifted out of `engine.rs` into sibling modules. These define additional
+// `impl Engine { .. }` blocks (no new types); `engine.rs` keeps the struct,
+// builder, and top-level dispatch. `engine_query` / `engine_join_impl` are
+// reserved placeholders for follow-up extraction (see their module docs).
+mod engine_agg_impl;
+mod engine_join_impl;
+mod engine_query;
+mod engine_streaming_impl;
+mod engine_string_impl;
 /// Process-wide JIT-module cache shared across executors. Lifted out of
 /// per-file `static MODULE_CACHE` declarations to avoid the multi-GPU
 /// hazard described in the module docs.

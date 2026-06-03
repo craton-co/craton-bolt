@@ -28,6 +28,9 @@ pub mod jit;
 pub mod exec;
 pub mod observability;
 pub mod metrics;
+/// Arrow Flight SQL server frontend (optional, `--features flight`).
+#[cfg(feature = "flight")]
+pub mod flight;
 
 mod error;
 pub use error::{BoltError, BoltResult};
