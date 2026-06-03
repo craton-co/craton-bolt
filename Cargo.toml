@@ -108,18 +108,17 @@ tracing-subscriber = "0.3"
 default = []
 # Stub-mode lets non-CUDA hosts at least compile; real builds use the linked CUDA path.
 cuda-stub = []
-# Arrow Flight SQL server frontend (src/flight/). EXPERIMENTAL / WIP — the
-# module skeleton (service, SQL commands, encode) is in-tree but the three
-# sub-modules' internal ABI (server <-> sql <-> encode fn names/signatures)
-# still needs reconciliation before it compiles; off by default and NOT built
-# by CI. Pulls the tonic/arrow-flight gRPC stack. See src/flight/.
+# Arrow Flight SQL server frontend (src/flight/). EXPERIMENTAL but compiles +
+# unit-tests pass: a tonic FlightService skeleton that decodes Flight SQL
+# CommandStatementQuery, runs it through Engine::sql, and streams the Arrow
+# result as FlightData. Off by default (pulls the tonic/arrow-flight gRPC
+# stack); not built by CI's default lane. Build: `--features flight`.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:futures", "dep:bytes", "dep:tokio"]
-# Substrait plan ingestion (src/plan/substrait/). EXPERIMENTAL / WIP — the
-# rel/expr/mod converters are in-tree but their shared converter-context API
-# (mod.rs ConvertCtx vs expr.rs SubstraitCtx trait vs rel.rs Ctx) plus the
-# function-extension registry and substrait-0.55 FetchRel proto shape still
-# need reconciliation before it compiles. Requires `protoc` on PATH/PROTOC.
-# Off by default and NOT built by CI. See src/plan/substrait/.
+# Substrait plan ingestion (src/plan/substrait/). EXPERIMENTAL but compiles +
+# unit-tests pass: converts a substrait::proto::Plan into the engine
+# LogicalPlan (Read/Filter/Project/Aggregate/Sort/Join/Fetch + expressions).
+# Off by default. NOTE: the `substrait` crate's build script needs `protoc`
+# (set the PROTOC env var or put protoc on PATH). Build: `--features substrait`.
 substrait = ["dep:substrait"]
 # `cudarc` backend (Stage 1, spike): routes a handful of low-level CUDA
 # driver calls through the `cudarc` crate instead of our hand-rolled

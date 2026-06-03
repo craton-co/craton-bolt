@@ -71,6 +71,18 @@ impl FlightService for FlightSqlServer {
         Err(Status::unimplemented("list_flights is not yet supported"))
     }
 
+    /// Long-running / pollable query info (arrow-flight 0.53 added this to the
+    /// FlightService trait). The skeleton resolves queries synchronously via
+    /// `get_flight_info`, so polling is not supported.
+    ///
+    /// TODO: back this with an async query handle once execution is incremental.
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<arrow_flight::PollInfo>, Status> {
+        Err(Status::unimplemented("poll_flight_info is not yet supported"))
+    }
+
     /// Resolve a [`FlightDescriptor`] into a [`FlightInfo`] — the schema plus
     /// the endpoint/ticket the client uses to fetch the data via `do_get`.
     ///

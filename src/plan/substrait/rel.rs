@@ -10,66 +10,35 @@
 //! the sibling [`super::expr`] module and is called here for every predicate,
 //! projection, grouping key, aggregate argument, sort key and join condition.
 //!
-//! # Contract with the converter context ([`super::Ctx`], owned by B2a/mod.rs)
+//! # Contract with the converter context ([`super::ConvertCtx`], owned by mod.rs)
 //!
 //! Relation conversion needs three things from the shared converter context:
 //!
 //! 1. **Table-schema resolution.** [`ReadRel`] carries a `NamedTable` whose
-//!    `names` identify a registered table; we resolve its [`Schema`] via the
-//!    context (which wraps the engine's [`TableProvider`]).
+//!    `names` identify a registered table; we resolve its [`Schema`] via
+//!    [`ConvertCtx::resolve_table`] (which wraps the engine's `TableProvider`).
 //! 2. **The "current input schema".** Substrait expressions reference columns
 //!    *positionally* (`FieldReference` → struct field index), not by name. The
 //!    sibling `convert_expr` therefore needs to know the schema of the relation
 //!    it is being evaluated against so it can turn an ordinal into a
-//!    [`Expr::Column`] with the right name. We push/pop that schema around each
-//!    recursive descent through [`Ctx::with_input_schema`].
+//!    [`Expr::Column`] with the right name. We narrow the context to that
+//!    schema with [`ConvertCtx::with_input_schema`] before converting the
+//!    expressions that reference it.
 //! 3. **Extension-function resolution.** Substrait aggregate / scalar functions
-//!    are referenced by a numeric `function_reference` anchor that indexes into
-//!    the plan's extension declarations. The context resolves an anchor to a
-//!    canonical function name via [`Ctx::function_name`].
+//!    are referenced by a numeric `function_reference` anchor declared in the
+//!    plan's extensions. The context resolves an anchor to its compound
+//!    function name via [`ConvertCtx::function_name`].
 //!
-//! The concrete `Ctx` type is owned by the `mod.rs` author (task B2a). This
-//! module is written against the following **minimal required surface** (see
-//! the `integration_notes` in the task summary):
-//!
-//! ```ignore
-//! impl Ctx {
-//!     /// Resolve a NamedTable's fully-qualified name parts to a base schema.
-//!     pub(crate) fn resolve_table(&self, names: &[String])
-//!         -> BoltResult<(String, Schema)>;
-//!     /// The schema of the relation currently being converted, if any.
-//!     pub(crate) fn input_schema(&self) -> Option<&Schema>;
-//!     /// Run `f` with `schema` installed as the current input schema,
-//!     /// restoring the previous one afterwards.
-//!     pub(crate) fn with_input_schema<T>(
-//!         &mut self,
-//!         schema: Schema,
-//!         f: impl FnOnce(&mut Ctx) -> BoltResult<T>,
-//!     ) -> BoltResult<T>;
-//!     /// Canonical function name for an extension function anchor.
-//!     pub(crate) fn function_name(&self, anchor: u32) -> BoltResult<String>;
-//! }
-//! ```
-//!
-//! and against this **sibling expr.rs surface**:
-//!
-//! ```ignore
-//! pub(crate) fn convert_expr(
-//!     expr: &substrait::proto::Expression,
-//!     ctx: &mut Ctx,
-//! ) -> BoltResult<Expr>;
-//! ```
-//!
-//! If B2a's final `Ctx` differs, only the thin adapter calls in this file need
-//! to change — the conversion logic stays intact.
+//! `ConvertCtx` is `Copy` (it holds only references), so it is threaded *by
+//! value* and narrowed allocation-free via `with_input_schema`.
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, Expr, JoinType, LogicalPlan, Schema, SortExpr,
+    AggregateExpr, Expr, JoinType, LogicalPlan, SortExpr,
 };
 
 use super::expr::convert_expr;
-use super::Ctx;
+use super::ConvertCtx;
 
 use substrait::proto::{
     aggregate_function::AggregationInvocation,
@@ -86,7 +55,7 @@ use substrait::proto::{
 /// the sibling [`convert_expr`]. Unsupported relation kinds surface a
 /// [`BoltError::Plan`] naming the operator so the caller gets a precise
 /// diagnostic rather than a generic failure.
-pub(crate) fn convert_rel(rel: &Rel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+pub(crate) fn convert_rel(rel: &Rel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     let rel_type = rel
         .rel_type
         .as_ref()
@@ -139,7 +108,7 @@ fn rel_type_name(rt: &RelType) -> &'static str {
 /// the registered schema over the (optional) `base_schema` carried in the
 /// message so downstream type-checking sees exactly the columns the engine
 /// knows about.
-fn convert_read(read: &ReadRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+fn convert_read(read: &ReadRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     use substrait::proto::read_rel::ReadType;
 
     let read_type = read
@@ -163,6 +132,13 @@ fn convert_read(read: &ReadRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
             return Err(BoltError::Plan(
                 "Substrait ReadRel: ExtensionTable source is not supported".into(),
             ))
+        }
+        // substrait 0.55 added further read-type variants (e.g. IcebergTable);
+        // only NamedTable is supported by this engine.
+        other => {
+            return Err(BoltError::Plan(format!(
+                "Substrait ReadRel: unsupported read_type {other:?}; only NamedTable is supported"
+            )))
         }
     };
 
@@ -191,7 +167,7 @@ fn convert_read(read: &ReadRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
 /// Recurses on the input, then converts the boolean `condition` against the
 /// input's schema (pushed onto the context so positional field references
 /// resolve correctly).
-fn convert_filter(filter: &FilterRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+fn convert_filter(filter: &FilterRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     let input = convert_boxed_input(filter.input.as_deref(), ctx, "FilterRel")?;
     let input_schema = input.schema()?;
 
@@ -200,7 +176,8 @@ fn convert_filter(filter: &FilterRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> 
         .as_deref()
         .ok_or_else(|| BoltError::Plan("Substrait FilterRel has no condition".into()))?;
 
-    let predicate = ctx.with_input_schema(input_schema, |ctx| convert_expr(condition, ctx))?;
+    let c2 = ctx.with_input_schema(&input_schema);
+    let predicate = convert_expr(condition, &c2)?;
 
     Ok(LogicalPlan::Filter {
         input: Box::new(input),
@@ -216,17 +193,16 @@ fn convert_filter(filter: &FilterRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> 
 /// emitted by producers that set an explicit emit. TODO: honour
 /// `RelCommon.emit` to drop pass-through input columns when the producer asked
 /// for a strict subset.
-fn convert_project(project: &ProjectRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+fn convert_project(project: &ProjectRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     let input = convert_boxed_input(project.input.as_deref(), ctx, "ProjectRel")?;
     let input_schema = input.schema()?;
 
-    let exprs = ctx.with_input_schema(input_schema, |ctx| {
-        project
-            .expressions
-            .iter()
-            .map(|e| convert_expr(e, ctx))
-            .collect::<BoltResult<Vec<_>>>()
-    })?;
+    let c2 = ctx.with_input_schema(&input_schema);
+    let exprs = project
+        .expressions
+        .iter()
+        .map(|e| convert_expr(e, &c2))
+        .collect::<BoltResult<Vec<_>>>()?;
 
     if exprs.is_empty() {
         return Err(BoltError::Plan(
@@ -248,7 +224,7 @@ fn convert_project(project: &ProjectRel, ctx: &mut Ctx) -> BoltResult<LogicalPla
 /// reject the multi-grouping case with a clear message. Each `Measure` carries
 /// an [`AggregateFunction`] whose `function_reference` anchor is resolved to a
 /// canonical name (`sum` / `min` / `max` / `count` / `avg`) via the context.
-fn convert_aggregate(agg: &AggregateRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+fn convert_aggregate(agg: &AggregateRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     let input = convert_boxed_input(agg.input.as_deref(), ctx, "AggregateRel")?;
     let input_schema = input.schema()?;
 
@@ -260,20 +236,18 @@ fn convert_aggregate(agg: &AggregateRel, ctx: &mut Ctx) -> BoltResult<LogicalPla
         )));
     }
 
-    let (group_by, aggregates) = ctx.with_input_schema(input_schema, |ctx| {
-        let mut group_by = Vec::new();
-        if let Some(grouping) = agg.groupings.first() {
-            for e in &grouping.grouping_expressions {
-                group_by.push(convert_expr(e, ctx)?);
-            }
+    let c2 = ctx.with_input_schema(&input_schema);
+    let mut group_by = Vec::new();
+    if let Some(grouping) = agg.groupings.first() {
+        for e in &grouping.grouping_expressions {
+            group_by.push(convert_expr(e, &c2)?);
         }
+    }
 
-        let mut aggregates = Vec::with_capacity(agg.measures.len());
-        for measure in &agg.measures {
-            aggregates.push(convert_measure(measure, ctx)?);
-        }
-        Ok((group_by, aggregates))
-    })?;
+    let mut aggregates = Vec::with_capacity(agg.measures.len());
+    for measure in &agg.measures {
+        aggregates.push(convert_measure(measure, &c2)?);
+    }
 
     if aggregates.is_empty() {
         return Err(BoltError::Plan(
@@ -289,7 +263,7 @@ fn convert_aggregate(agg: &AggregateRel, ctx: &mut Ctx) -> BoltResult<LogicalPla
 }
 
 /// Convert one Substrait aggregate [`Measure`] into an [`AggregateExpr`].
-fn convert_measure(measure: &Measure, ctx: &mut Ctx) -> BoltResult<AggregateExpr> {
+fn convert_measure(measure: &Measure, ctx: &ConvertCtx) -> BoltResult<AggregateExpr> {
     let func: &AggregateFunction = measure
         .measure
         .as_ref()
@@ -352,7 +326,7 @@ fn take_one_arg(mut args: Vec<Expr>, agg: &str) -> BoltResult<Expr> {
 /// only value arguments).
 fn convert_function_arg(
     arg: &substrait::proto::FunctionArgument,
-    ctx: &mut Ctx,
+    ctx: &ConvertCtx,
 ) -> BoltResult<Expr> {
     use substrait::proto::function_argument::ArgType;
     match arg.arg_type.as_ref() {
@@ -381,7 +355,7 @@ fn canonical_agg_name(name: &str) -> String {
 }
 
 /// `SortRel` → [`LogicalPlan::Sort`].
-fn convert_sort(sort: &SortRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+fn convert_sort(sort: &SortRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     let input = convert_boxed_input(sort.input.as_deref(), ctx, "SortRel")?;
     let input_schema = input.schema()?;
 
@@ -391,12 +365,12 @@ fn convert_sort(sort: &SortRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
         ));
     }
 
-    let sort_exprs = ctx.with_input_schema(input_schema, |ctx| {
-        sort.sorts
-            .iter()
-            .map(|sf| convert_sort_field(sf, ctx))
-            .collect::<BoltResult<Vec<_>>>()
-    })?;
+    let c2 = ctx.with_input_schema(&input_schema);
+    let sort_exprs = sort
+        .sorts
+        .iter()
+        .map(|sf| convert_sort_field(sf, &c2))
+        .collect::<BoltResult<Vec<_>>>()?;
 
     Ok(LogicalPlan::Sort {
         input: Box::new(input),
@@ -409,7 +383,7 @@ fn convert_sort(sort: &SortRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
 /// Substrait's `SortDirection` packs direction *and* NULL placement into a
 /// single enum. We map the four directional variants; `Clustered` (group-but-
 /// don't-order) and any custom `ComparisonFunctionReference` are rejected.
-fn convert_sort_field(sf: &SortField, ctx: &mut Ctx) -> BoltResult<SortExpr> {
+fn convert_sort_field(sf: &SortField, ctx: &ConvertCtx) -> BoltResult<SortExpr> {
     let expr_proto = sf
         .expr
         .as_ref()
@@ -466,7 +440,7 @@ fn convert_sort_field(sf: &SortField, ctx: &mut Ctx) -> BoltResult<SortExpr> {
 /// later optimisation. TODO: pattern-match a top-level conjunction of
 /// `left.col = right.col` equalities and lift them into `on` for the hash-join
 /// fast path.
-fn convert_join(join: &JoinRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+fn convert_join(join: &JoinRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     use substrait::proto::join_rel::JoinType as SJoinType;
 
     let left = convert_boxed_input(join.left.as_deref(), ctx, "JoinRel (left)")?;
@@ -497,8 +471,8 @@ fn convert_join(join: &JoinRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
 
     let filter = match join.expression.as_deref() {
         Some(expr) => {
-            let converted = ctx.with_input_schema(combined, |ctx| convert_expr(expr, ctx))?;
-            Some(converted)
+            let c2 = ctx.with_input_schema(&combined);
+            Some(convert_expr(expr, &c2)?)
         }
         None => None,
     };
@@ -514,27 +488,74 @@ fn convert_join(join: &JoinRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
 
 /// `FetchRel` → [`LogicalPlan::Limit`].
 ///
-/// Substrait's `offset` / `count` are `i64`; a negative `count` means
-/// "unbounded" in newer Substrait revisions, which the engine's `usize`-typed
-/// limit cannot represent, so we reject it. A negative `offset` is invalid.
-fn convert_fetch(fetch: &FetchRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
+/// Substrait 0.55 models the row window with two `oneof`s rather than plain
+/// scalar fields:
+///
+/// * `offset_mode` — either the deprecated literal `offset` (`i64`) or an
+///   `offset_expr` (an arbitrary [`Expression`]). Unset means offset 0.
+/// * `count_mode` — either the deprecated literal `count` (`i64`, `-1` =
+///   "all rows") or a `count_expr` ([`Expression`]). Unset means "all rows".
+///
+/// The engine's [`LogicalPlan::Limit`] takes a concrete `usize` limit/offset,
+/// so we only support the literal forms here. An expression-typed offset/count
+/// would need constant-folding the [`Expression`] to an integer, which is out
+/// of scope for the ingestion core. An unset/`-1` ("all rows") count maps to
+/// `usize::MAX` (an effectively unbounded limit) so a bare `OFFSET` still works.
+///
+/// TODO: constant-fold `offset_expr` / `count_expr` (a literal-or-cast-of-
+/// literal `i64`) so producers emitting the non-deprecated expression form are
+/// also accepted.
+fn convert_fetch(fetch: &FetchRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
+    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+
     let input = convert_boxed_input(fetch.input.as_deref(), ctx, "FetchRel")?;
 
-    if fetch.count < 0 {
-        return Err(BoltError::Plan(
-            "Substrait FetchRel with an unbounded/negative count is not supported".into(),
-        ));
-    }
-    if fetch.offset < 0 {
-        return Err(BoltError::Plan(
-            "Substrait FetchRel has a negative offset".into(),
-        ));
-    }
+    // OFFSET: unset → 0; literal i64 → that value (negative is invalid);
+    // expression form is not yet constant-folded.
+    let offset = match &fetch.offset_mode {
+        None => 0usize,
+        Some(OffsetMode::Offset(n)) => {
+            if *n < 0 {
+                return Err(BoltError::Plan(
+                    "Substrait FetchRel has a negative offset".into(),
+                ));
+            }
+            *n as usize
+        }
+        Some(OffsetMode::OffsetExpr(_)) => {
+            return Err(BoltError::Plan(
+                "Substrait FetchRel offset_expr (expression-typed offset) is not \
+                 yet supported (only a literal offset)"
+                    .into(),
+            ))
+        }
+    };
+
+    // COUNT: unset → "all rows" (usize::MAX); literal -1 → "all rows";
+    // literal >= 0 → that value; expression form is not yet constant-folded.
+    let limit = match &fetch.count_mode {
+        None => usize::MAX,
+        Some(CountMode::Count(n)) => {
+            if *n < 0 {
+                // -1 is the Substrait sentinel for "return ALL records".
+                usize::MAX
+            } else {
+                *n as usize
+            }
+        }
+        Some(CountMode::CountExpr(_)) => {
+            return Err(BoltError::Plan(
+                "Substrait FetchRel count_expr (expression-typed count) is not \
+                 yet supported (only a literal count)"
+                    .into(),
+            ))
+        }
+    };
 
     Ok(LogicalPlan::Limit {
         input: Box::new(input),
-        limit: fetch.count as usize,
-        offset: fetch.offset as usize,
+        limit,
+        offset,
     })
 }
 
@@ -542,7 +563,7 @@ fn convert_fetch(fetch: &FetchRel, ctx: &mut Ctx) -> BoltResult<LogicalPlan> {
 /// input to a precise [`BoltError::Plan`] naming the parent relation.
 fn convert_boxed_input(
     input: Option<&Rel>,
-    ctx: &mut Ctx,
+    ctx: &ConvertCtx,
     parent: &str,
 ) -> BoltResult<LogicalPlan> {
     let rel =
@@ -556,16 +577,16 @@ mod tests {
     //! Substrait proto messages by hand (no network / no real plan producer)
     //! and assert the resulting [`LogicalPlan`] shape.
     //!
-    //! NOTE: the tests below depend on the `Ctx` constructor / helpers owned
-    //! by `mod.rs` (task B2a). They are written against the documented
-    //! minimal `Ctx` surface; if B2a's constructor differs, only the
-    //! `test_ctx()` helper needs adjusting.
+    //! The tests build a [`ConvertCtx`] over a [`MemTableProvider`] seeded
+    //! with one table `t` plus a small function registry (see [`fixtures`]).
 
     use super::*;
-    use crate::plan::logical_plan::{DataType, Field};
+    use crate::plan::logical_plan::{DataType, Field, Schema};
+    use crate::plan::sql_frontend::MemTableProvider;
+    use std::collections::HashMap;
     use substrait::proto::{
         expression::{
-            field_reference::{ReferenceType, RootReference},
+            field_reference::{ReferenceType, RootReference, RootType},
             reference_segment, FieldReference, ReferenceSegment, RexType,
         },
         read_rel::{NamedTable, ReadType},
@@ -580,11 +601,23 @@ mod tests {
         ])
     }
 
-    /// A converter context seeded with one table `t`. Constructed via the
-    /// test-only helper B2a's mod.rs is expected to expose
-    /// (`Ctx::for_test(table_name, schema)`); see integration_notes.
-    fn test_ctx() -> Ctx {
-        Ctx::for_test("t", fixture_schema())
+    /// The converter context's backing state: a provider seeded with one table
+    /// `t` and a function registry with anchor `0 -> "equal"`. The owned values
+    /// live in the caller's stack frame; [`ctx`] borrows them.
+    fn fixtures() -> (MemTableProvider, HashMap<u32, String>) {
+        let provider = MemTableProvider::new().with_table("t", fixture_schema());
+        let mut functions = HashMap::new();
+        functions.insert(0u32, "equal".to_string());
+        (provider, functions)
+    }
+
+    /// Build a [`ConvertCtx`] borrowing `provider` / `functions` produced by
+    /// [`fixtures`].
+    fn ctx<'a>(
+        provider: &'a MemTableProvider,
+        functions: &'a HashMap<u32, String>,
+    ) -> ConvertCtx<'a> {
+        ConvertCtx::new(provider, functions)
     }
 
     /// A bare positional column reference `#idx` (Substrait field reference
@@ -600,9 +633,7 @@ mod tests {
                         }),
                     )),
                 })),
-                root_type: Some(RootReference::RootReference(
-                    substrait::proto::expression::field_reference::RootReference {},
-                )),
+                root_type: Some(RootType::RootReference(RootReference {})),
             }))),
         }
     }
@@ -621,8 +652,9 @@ mod tests {
 
     #[test]
     fn read_rel_becomes_scan() {
-        let mut ctx = test_ctx();
-        let plan = convert_rel(&read_rel(), &mut ctx).expect("read converts");
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let plan = convert_rel(&read_rel(), &ctx).expect("read converts");
         match plan {
             LogicalPlan::Scan { table, schema, .. } => {
                 assert_eq!(table, "t");
@@ -635,7 +667,8 @@ mod tests {
 
     #[test]
     fn filter_over_read_becomes_filter_scan() {
-        let mut ctx = test_ctx();
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
         // condition: `#0 = #1`  (a = b) — build via the equal scalar fn so we
         // exercise the expr.rs path; if expr.rs maps a binary eq differently
         // this still asserts the *relational* shape (Filter wrapping Scan).
@@ -672,7 +705,7 @@ mod tests {
             }))),
         };
 
-        let plan = convert_rel(&filter, &mut ctx).expect("filter converts");
+        let plan = convert_rel(&filter, &ctx).expect("filter converts");
         match plan {
             LogicalPlan::Filter { input, .. } => {
                 assert!(
@@ -686,8 +719,9 @@ mod tests {
 
     #[test]
     fn missing_rel_type_errors() {
-        let mut ctx = test_ctx();
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
         let rel = Rel { rel_type: None };
-        assert!(convert_rel(&rel, &mut ctx).is_err());
+        assert!(convert_rel(&rel, &ctx).is_err());
     }
 }

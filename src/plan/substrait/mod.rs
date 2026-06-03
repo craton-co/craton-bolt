@@ -20,7 +20,7 @@
 //!   `rel::convert_rel`.
 //! * `expr.rs` — expression conversion: Substrait `Expression` →
 //!   [`Expr`](crate::plan::logical_plan::Expr). Entry point
-//!   `expr::convert_expression`.
+//!   `expr::convert_expr` (re-exported here as [`convert_expr`]).
 //!
 //! # Scope (v0 core)
 //!
@@ -35,16 +35,18 @@
 mod expr;
 mod rel;
 
+use std::collections::HashMap;
+
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{DataType, Literal, Schema, TimeUnit};
-use crate::plan::sql_frontend::MemTableProvider;
+use crate::plan::sql_frontend::{MemTableProvider, TableProvider};
 use crate::plan::logical_plan::LogicalPlan;
 
 // Re-export the sibling converter entry points so callers (and tests) can
 // reach the lower-level conversions without going through the full plan
 // entry point. `pub(crate)` keeps them crate-internal — the only *public*
 // surface of this module is [`substrait_to_logical_plan`].
-pub(crate) use expr::convert_expression;
+pub(crate) use expr::convert_expr;
 pub(crate) use rel::convert_rel;
 
 use substrait::proto;
@@ -98,8 +100,32 @@ pub fn substrait_to_logical_plan(
         }
     };
 
-    let ctx = ConvertCtx::new(provider);
+    // Build the function-extension registry: a Substrait `Plan` carries its
+    // function vocabulary out-of-band in `plan.extensions`, each a
+    // `SimpleExtensionDeclaration` whose `mapping_type` oneof may be an
+    // `ExtensionFunction { function_anchor, name, .. }`. Scalar / aggregate
+    // expressions then reference a function by its numeric `function_anchor`.
+    // We index anchor -> compound name here once so the converters can resolve
+    // anchors without re-walking the declaration list.
+    let functions = build_function_registry(plan);
+
+    let ctx = ConvertCtx::new(provider, &functions);
     convert_rel(rel, &ctx)
+}
+
+/// Build the `anchor -> function name` map from a plan's extension
+/// declarations. Only `ExtensionFunction` mappings contribute; type / type-
+/// variation mappings are irrelevant to expression conversion and skipped.
+fn build_function_registry(plan: &proto::Plan) -> HashMap<u32, String> {
+    use proto::extensions::simple_extension_declaration::MappingType;
+
+    let mut map = HashMap::new();
+    for decl in &plan.extensions {
+        if let Some(MappingType::ExtensionFunction(f)) = &decl.mapping_type {
+            map.insert(f.function_anchor, f.name.clone());
+        }
+    }
+    map
 }
 
 /// Shared conversion context threaded through the relation and expression
@@ -141,6 +167,10 @@ pub fn substrait_to_logical_plan(
 pub(crate) struct ConvertCtx<'a> {
     /// Table catalog used to resolve `ReadRel` named tables to a [`Schema`].
     pub(crate) provider: &'a MemTableProvider,
+    /// `anchor -> function name` registry built from the plan's extension
+    /// declarations. Resolves a Substrait `function_reference` /
+    /// `function_anchor` to its compound name (e.g. `"add:i32_i32"`).
+    pub(crate) functions: &'a HashMap<u32, String>,
     /// Schema of the current input relation, used to resolve positional
     /// `FieldReference`s to column names. `None` at leaf relations that have
     /// no input (e.g. `ReadRel`).
@@ -150,21 +180,62 @@ pub(crate) struct ConvertCtx<'a> {
 impl<'a> ConvertCtx<'a> {
     /// Root context with no input schema yet (used at the plan entry point;
     /// `rel.rs` narrows it via [`Self::with_input_schema`] as it descends).
-    pub(crate) fn new(provider: &'a MemTableProvider) -> Self {
+    pub(crate) fn new(
+        provider: &'a MemTableProvider,
+        functions: &'a HashMap<u32, String>,
+    ) -> Self {
         Self {
             provider,
+            functions,
             input_schema: None,
         }
     }
 
     /// Return a copy of this context with `schema` installed as the input
-    /// schema (provider unchanged). Used by `rel.rs` to give the expression
-    /// converter the column-name table for the relation's child output.
-    pub(crate) fn with_input_schema(self, schema: &'a Schema) -> Self {
-        Self {
+    /// schema (provider / function registry unchanged). Used by `rel.rs` to
+    /// give the expression converter the column-name table for the relation's
+    /// child output.
+    ///
+    /// The returned context borrows `schema` for a (possibly) shorter lifetime
+    /// `'b` than `'a`; the provider / function references covariantly reborrow
+    /// to `'b`. This lets `rel.rs` pass a *locally-owned* combined schema (e.g.
+    /// the join output schema) without having to leak it for `'a`.
+    pub(crate) fn with_input_schema<'b>(&self, schema: &'b Schema) -> ConvertCtx<'b>
+    where
+        'a: 'b,
+    {
+        ConvertCtx {
             provider: self.provider,
+            functions: self.functions,
             input_schema: Some(schema),
         }
+    }
+
+    /// Resolve a `NamedTable`'s multi-part name to a base `(table, Schema)`.
+    ///
+    /// Substrait identifies a base table by a list of name parts (e.g.
+    /// `["my_db", "t"]`). The engine catalog is flat and keyed by a single
+    /// table name, so we resolve against the *last* (most-specific) segment —
+    /// the bare table name — and return it alongside the registered schema.
+    pub(crate) fn resolve_table(&self, names: &[String]) -> BoltResult<(String, Schema)> {
+        let table = names
+            .last()
+            .ok_or_else(|| {
+                BoltError::Plan("substrait: NamedTable has no name parts".into())
+            })?
+            .clone();
+        let schema = self.provider.schema(&table)?;
+        Ok((table, schema))
+    }
+
+    /// Resolve a Substrait function anchor to its registered extension name.
+    pub(crate) fn function_name(&self, anchor: u32) -> BoltResult<String> {
+        self.functions.get(&anchor).cloned().ok_or_else(|| {
+            BoltError::Plan(format!(
+                "substrait: unknown function anchor {anchor} \
+                 (not declared in plan extensions)"
+            ))
+        })
     }
 
     /// Resolve a 0-based field index against the current input schema,
@@ -187,6 +258,27 @@ impl<'a> ConvertCtx<'a> {
                     schema.fields.len()
                 ))
             })
+    }
+}
+
+/// `ConvertCtx` is THE concrete context the expression converter
+/// ([`expr::convert_expr`]) runs against: it implements [`expr::SubstraitCtx`]
+/// by delegating to its own inherent methods plus the module-level literal
+/// mapping.
+impl<'a> expr::SubstraitCtx for ConvertCtx<'a> {
+    fn field_name(&self, index: usize) -> BoltResult<String> {
+        ConvertCtx::field_name(self, index)
+    }
+
+    fn function_name(&self, anchor: u32) -> BoltResult<String> {
+        ConvertCtx::function_name(self, anchor)
+    }
+
+    fn literal_to_literal(
+        &self,
+        lit: &proto::expression::Literal,
+    ) -> BoltResult<Literal> {
+        substrait_literal_to_literal(lit)
     }
 }
 
