@@ -1,0 +1,28 @@
+# Per-member nightly pin for the rust-cuda kernel crate.
+#
+# `rustc_codegen_nvvm` is a codegen backend that links rustc's internal
+# crates, so it must be built against the exact nightly it was written for.
+# This pin MUST match the `cuda_std`/`cuda_builder` Rust-GPU/Rust-CUDA git rev
+# that `kernels/Cargo.toml` targets. That rev
+# (103a8d56935c4e0885ff7c3d25402319df1a8e00, HEAD of `main` on 2026-04-29)
+# ships its own `rust-toolchain.toml` pinning `nightly-2026-04-02` with the
+# components below, so the three (toolchain pin, cuda_std rev, source
+# attributes) are mutually consistent. See `docs/JIT_PIPELINE.md` and the top
+# comment block of `kernels/src/lib.rs` for the full prerequisites.
+#
+# This file applies ONLY when cargo is invoked from inside `kernels/`.
+# `cuda_builder` does exactly that, so the host crate (which lives in
+# the parent directory) stays on stable.
+
+[toolchain]
+channel    = "nightly-2026-04-02"
+components = [
+    "rust-src",
+    "rustc-dev",
+    "llvm-tools-preview",
+    "rustfmt",
+    "clippy",
+]
+# The codegen backend handles the nvptx64-nvidia-cuda target via libnvvm;
+# we deliberately do NOT add it as a rustup target component because the
+# backend supplies its own target spec.

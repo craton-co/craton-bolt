@@ -1,0 +1,22 @@
+﻿# Craton Bolt code owners
+#
+# These owners are requested for review on every pull request automatically.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+#
+# PLACEHOLDER — the GitHub team `@craton-co/craton-bolt-maintainers` does NOT
+# yet exist. Until the org/team is provisioned, GitHub will silently skip the
+# auto-review-request (the PR is still mergeable; no failure is raised).
+#
+# In the interim, see MAINTAINERS.md at the repo root for the human(s) to
+# contact for reviews (currently routed via opensource@craton.com.ar).
+# Once the team is created on GitHub, this file works as-is — no edit needed.
+#
+# REQUIRED MANUAL STEP (orchestrator): the @craton-co/craton-bolt-maintainers
+# team MUST be created in the craton-co GitHub org BEFORE enabling branch
+# protection that "requires review from Code Owners." Until that team exists,
+# such a rule is UNSATISFIABLE and will block all merges (no owner can ever be
+# auto-requested or satisfy the rule). Do not enable required-CODEOWNER-review
+# branch protection until the team is provisioned. No real usernames are
+# hard-coded here on purpose — provision the team instead.
+
+* @craton-co/craton-bolt-maintainers

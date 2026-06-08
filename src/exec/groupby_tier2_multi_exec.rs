@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Tier-2 hash-partitioned GROUP BY executor for **multiple SUM** aggregates
+//! (top-level shim).
+//!
+//! Sibling of [`crate::exec::groupby_tier2_exec`]; composes:
+//! - shape eligibility (single Int32 key, 1..=4 SUM(Float64) aggregates)
+//! - cardinality gating via [`crate::exec::groupby_tier2_dispatch`]
+//! - the multi-SUM orchestrator and merger
+//!
+//! Returns `Some(Ok(batch))` on success, `None` on eligibility miss (so the
+//! caller layers fast paths uniformly: first to return `Some(_)` wins),
+//! `Some(Err(_))` only on a genuine GPU/build failure encountered after we
+//! committed to the path.
+//!
+//! Target query: h2o.ai q2 (`SELECT id2, SUM(v1), SUM(v2) FROM x GROUP BY id2`)
+//! at medium-to-high cardinality.
+
+use arrow_array::{Array, Float64Array, Int32Array, RecordBatch};
+
+use crate::cuda::GpuVec;
+use crate::error::{BoltError, BoltResult};
+use crate::exec::groupby_tier2_dispatch::{
+    dispatch_v2, AggOp, DispatchInputsV2, GroupByStrategyV2,
+};
+use crate::exec::groupby_tier2_multi_merge::build_tier2_multi_result;
+use crate::exec::groupby_tier2_multi_orchestrator::execute_tier2_multi_sum;
+use crate::exec::launch::CudaStream;
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr};
+use crate::plan::physical_plan::PhysicalPlan;
+
+/// Maximum number of SUM aggregates this fast path will accept in one launch.
+/// Beyond this we fall through to the next strategy. Matches the v0 scope
+/// the orchestrator advertises (1..=4).
+pub const MAX_VALS: usize = 4;
+
+/// Try the Tier-2 multi-SUM fast path. Returns `None` on any precondition
+/// miss so the caller falls through to the next strategy.
+pub fn try_execute(plan: &PhysicalPlan, batch: &RecordBatch) -> Option<BoltResult<RecordBatch>> {
+    // --- Plan-shape eligibility ------------------------------------------
+    let (pre, aggregate) = match plan {
+        PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+        _ => return None,
+    };
+    if pre.is_some() {
+        return None;
+    }
+    if aggregate.group_by.len() != 1 {
+        return None;
+    }
+    let n_vals = aggregate.aggregates.len();
+    if n_vals == 0 || n_vals > MAX_VALS {
+        return None;
+    }
+
+    // The single group-by column must be Int32.
+    let key_io_idx = aggregate.group_by[0];
+    let key_io = match aggregate.inputs.get(key_io_idx) {
+        Some(io) if io.dtype == DataType::Int32 => io,
+        _ => return None,
+    };
+
+    // Every aggregate must be SUM(<bare-column>). Collect names up-front for
+    // a single batch lookup pass.
+    let mut sum_col_names: Vec<&str> = Vec::with_capacity(n_vals);
+    for agg in &aggregate.aggregates {
+        let name = match agg {
+            AggregateExpr::Sum(Expr::Column(n)) => n.as_str(),
+            _ => return None,
+        };
+        sum_col_names.push(name);
+    }
+
+    // Look up key + value arrays. Every value column must be Float64.
+    let key_arr = batch
+        .column_by_name(&key_io.name)
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())?;
+    let mut val_arrs: Vec<&Float64Array> = Vec::with_capacity(n_vals);
+    for name in &sum_col_names {
+        let arr = batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())?;
+        if arr.len() != key_arr.len() {
+            return None;
+        }
+        val_arrs.push(arr);
+    }
+
+    // GB-S1: NULL handling — this fast path reads `key_arr.values()` /
+    // `arr.values()` straight off the Arrow data buffers, which carry
+    // garbage bytes at NULL positions (NULL values fold in as 0; a NULL key
+    // synthesizes a group-0). Defer NULL-bearing batches back to
+    // `groupby::execute_groupby` → the global-atomic path, which consults
+    // the validity bitmap. Mirrors the guard in
+    // `groupby_tier2_twokey_exec::try_execute`.
+    if key_arr.null_count() > 0 || val_arrs.iter().any(|a| a.null_count() > 0) {
+        return None;
+    }
+
+    let n_rows = key_arr.len();
+    if n_rows < 256 * 1024 {
+        // Precondition: n_rows >= 256K (matches TIER2_MIN_ROWS in the
+        // dispatcher; restated here so eligibility is auditable without
+        // tracing through the dispatcher).
+        return None;
+    }
+
+    // --- Range check on keys ---------------------------------------------
+    //
+    // Cheap upper-bound estimator for n_groups via max(key) + 1. Same
+    // strategy as the single-SUM Tier-2 exec — h2o.ai keys are dense from 0
+    // so max-based is tight. Reject negatives and bound the upper end at
+    // the Tier-2 dispatcher's cap.
+    // dedup (tier2/shmem): max-nonneg-key scan extracted to
+    // `groupby_tier2_common`. `None` (negative key) and `Some(-1)` (empty)
+    // both decline, matching the prior inline behaviour.
+    let max_key = crate::exec::groupby_tier2_common::scan_max_nonneg_key(key_arr.values())?;
+    if max_key < 0 {
+        return None;
+    }
+    let n_groups_est = (max_key as u32).saturating_add(1);
+
+    // Tier-1 multi-SUM owns max(key) <= 1024 — by precondition we require
+    // max(key) > 1024 so this executor doesn't shadow the better fast path.
+    if n_groups_est <= 1024 {
+        return None;
+    }
+    // Tier-2.1 (pass-2-on-GPU) brought the multi-SUM fixed overhead down
+    // to roughly the single-SUM Tier-2.1 floor. The historical 100 K-group
+    // gate existed to keep host-HashMap pass-2 from regressing q2-class
+    // workloads (10 K groups); with GPU pass-2 that gate is obsolete and
+    // the floor moves back to Tier-1's cap (BLOCK_GROUPS = 1024), matching
+    // the single-SUM dispatcher.
+    //
+    // The kernel itself doesn't care about absolute group count — it
+    // walks each partition's slice with a grid-stride loop. The only
+    // residual concern is fixed setup cost (one partition kernel + N
+    // scatter launches + one reduce launch), which empirically amortises
+    // by ~5 K groups at h2o.ai N=10 M. We pin to 1024 for symmetry.
+    const MULTI_SUM_MIN_GROUPS: u32 = 1024;
+    if n_groups_est < MULTI_SUM_MIN_GROUPS {
+        return None;
+    }
+    // Tier-2 cap (matches TIER2_MAX_GROUPS in the dispatcher).
+    if n_groups_est >= 100_000_000 {
+        return None;
+    }
+
+    // --- Final dispatcher gate -------------------------------------------
+    //
+    // The shared dispatcher only knows about single-aggregate queries; we
+    // re-use it because every aggregate here has the same op+dtype (SUM +
+    // Float64), so a single dispatch call covers all N.
+    let inputs = DispatchInputsV2 {
+        n_groups: n_groups_est,
+        n_rows: n_rows as u32,
+        n_key_cols: 1,
+        op: AggOp::Sum,
+        value_dtype: DataType::Float64,
+        key_dtype: DataType::Int32,
+    };
+    if dispatch_v2(inputs) != GroupByStrategyV2::Tier2Partitioned {
+        return None;
+    }
+
+    Some(execute_inner(plan, key_arr, &val_arrs))
+}
+
+/// All the fallible launch + result-marshal work, factored out so
+/// `try_execute` cleanly returns `Option<Result<_>>`.
+fn execute_inner(
+    plan: &PhysicalPlan,
+    key_arr: &Int32Array,
+    val_arrs: &[&Float64Array],
+) -> BoltResult<RecordBatch> {
+    let n_rows = key_arr.len() as u32;
+
+    // Stage-4 (P1b): mint a per-call stream for the input H2D uploads.
+    // The orchestrator mints its own stream for the kernel + D2H phase;
+    // splitting the input upload from the launch keeps the orchestrator
+    // signature stable (it doesn't take a stream parameter).
+    let stream = CudaStream::null_or_default();
+
+    // Upload key column + each value column independently. Sharing a single
+    // buffer would require concatenation; the scatter kernel reads per-row
+    // from one `vals_ptr` so independent buffers are the natural shape.
+    let keys_gpu = GpuVec::<i32>::from_slice_async(key_arr.values(), stream.raw())?;
+    let mut vals_gpus: Vec<GpuVec<f64>> = Vec::with_capacity(val_arrs.len());
+    for v in val_arrs {
+        vals_gpus.push(GpuVec::<f64>::from_slice_async(v.values(), stream.raw())?);
+    }
+    // Synchronize before handing off to the orchestrator: its stream is a
+    // distinct ordering domain, so we must finish the H2D before the
+    // orchestrator's kernels start reading these buffers.
+    stream.synchronize()?;
+
+    // Build the borrow slice the orchestrator wants. The orchestrator never
+    // mutates these — `&[&GpuVec<f64>]` matches its signature exactly so we
+    // don't need an extra trait or wrapper here.
+    let vals_refs: Vec<&GpuVec<f64>> = vals_gpus.iter().collect();
+
+    let partial = execute_tier2_multi_sum(&keys_gpu, &vals_refs, n_rows)?;
+
+    let aggregate = match plan {
+        PhysicalPlan::Aggregate { aggregate, .. } => aggregate,
+        _ => {
+            return Err(BoltError::Other(
+                "groupby_tier2_multi_exec: non-Aggregate plan reached execute_inner".into(),
+            ))
+        }
+    };
+
+    build_tier2_multi_result(partial, &aggregate.output_schema)
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 (P1b) async round-trip smoke test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_tests {
+    use super::*;
+    use crate::plan::logical_plan::{Field, Schema};
+    use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires CUDA toolkit at runtime"]
+    fn async_tier2_multi_sum_round_trip() {
+        let n: usize = 300_000;
+        let n_groups: usize = 4096;
+        let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
+        let v1: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let v2: Vec<f64> = (0..n).map(|i| (i as f64) * 2.0).collect();
+        let mut sum1 = vec![0.0f64; n_groups];
+        let mut sum2 = vec![0.0f64; n_groups];
+        for (i, &k) in keys.iter().enumerate() {
+            sum1[k as usize] += v1[i];
+            sum2[k as usize] += v2[i];
+        }
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO {
+                        name: "k".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColumnIO {
+                        name: "v1".into(),
+                        dtype: DataType::Float64,
+                    },
+                    ColumnIO {
+                        name: "v2".into(),
+                        dtype: DataType::Float64,
+                    },
+                ],
+                group_by: vec![0],
+                aggregates: vec![
+                    AggregateExpr::Sum(Expr::Column("v1".into())),
+                    AggregateExpr::Sum(Expr::Column("v2".into())),
+                ],
+                output_schema: Schema::new(vec![
+                    Field::new("k", DataType::Int32, false),
+                    Field::new("sum_v1", DataType::Float64, true),
+                    Field::new("sum_v2", DataType::Float64, true),
+                ]),
+                input_has_validity: Vec::new(),
+            },
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v1", ArrowDataType::Float64, false),
+            ArrowField::new("v2", ArrowDataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v1)) as arrow_array::ArrayRef,
+                Arc::new(Float64Array::from(v2)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = match try_execute(&plan, &batch) {
+            Some(Ok(b)) => b,
+            _ => return,
+        };
+        let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let s1 = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let s2 = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..out.num_rows() {
+            let k = ks.value(i) as usize;
+            assert_eq!(s1.value(i), sum1[k]);
+            assert_eq!(s2.value(i), sum2[k]);
+        }
+    }
+}
