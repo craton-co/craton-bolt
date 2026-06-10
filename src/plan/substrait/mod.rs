@@ -57,9 +57,11 @@ use substrait::proto;
 /// A Substrait `Plan` carries one or more `relations`; each top-level
 /// relation is a [`PlanRel`](proto::PlanRel) that is either a bare `Rel` or a
 /// [`RelRoot`](proto::RelRoot) (a `Rel` plus the output column *names*). This
-/// entry point converts the **first** relation in the plan — the common case
-/// for a single-statement query — and dispatches its root `Rel` to the
-/// relation converter ([`rel::convert_rel`]).
+/// entry point converts a **single** relation — the common case for a
+/// single-statement query — and dispatches its root `Rel` to the relation
+/// converter ([`rel::convert_rel`]). A plan that carries *more than one*
+/// relation is rejected (see below) rather than silently dropping all but the
+/// first.
 ///
 /// `provider` resolves base-table names (from Substrait `ReadRel` named
 /// tables) to their engine [`Schema`]. The same provider the SQL frontend
@@ -69,6 +71,12 @@ use substrait::proto;
 /// # Errors
 ///
 /// * `BoltError::Plan("substrait: plan has no relations")` — empty plan.
+/// * `BoltError::Unsupported(..)` — the plan declares more than one top-level
+///   relation (only a single relation tree is converted), or a non-default
+///   `plan.version` whose `major_number` is outside the supported `0.x` line.
+/// * `BoltError::Unsupported(..)` — a relation / expression field that is
+///   present but cannot be faithfully represented (propagated from the
+///   sibling converters).
 /// * `BoltError::Plan("substrait: <node> not yet supported")` — a relation /
 ///   expression node outside the implemented core (propagated from the
 ///   sibling converters).
@@ -76,23 +84,41 @@ pub fn substrait_to_logical_plan(
     plan: &proto::Plan,
     provider: &MemTableProvider,
 ) -> BoltResult<LogicalPlan> {
+    // Reject a plan version we do not understand before walking the tree, so a
+    // mismatched producer surfaces a clear diagnostic rather than a confusing
+    // downstream failure. An unset version is permitted (it was optional up to
+    // Substrait 0.17.0).
+    check_plan_version(plan)?;
+
+    // This converter models a single relation tree. A plan carrying multiple
+    // top-level relations (e.g. references / CTE roots in addition to the
+    // query root) would have all but the first silently dropped, so reject it
+    // loudly instead.
+    if plan.relations.len() > 1 {
+        return Err(BoltError::Unsupported(format!(
+            "substrait: plan declares {} top-level relations; only a single \
+             relation tree is supported",
+            plan.relations.len()
+        )));
+    }
+
     let plan_rel = plan
         .relations
         .first()
         .ok_or_else(|| BoltError::Plan("substrait: plan has no relations".into()))?;
 
     // A `PlanRel` is a oneof of `Rel` (bare) or `Root` (RelRoot = Rel +
-    // output names). We accept either; the output-name list on a RelRoot is
-    // advisory for the engine's purposes (our `Schema` already carries the
-    // column names produced by the converted plan), so we currently convert
-    // the inner `Rel` and ignore the explicit names. A follow-up can apply
-    // them as a final rename projection.
-    let rel = match &plan_rel.rel_type {
-        Some(proto::plan_rel::RelType::Rel(rel)) => rel,
-        Some(proto::plan_rel::RelType::Root(root)) => root
-            .input
-            .as_ref()
-            .ok_or_else(|| BoltError::Plan("substrait: RelRoot has no input Rel".into()))?,
+    // output names). We accept either; a `RelRoot` additionally carries the
+    // explicit output column `names`, which we honour below as a final rename.
+    let (rel, output_names): (&proto::Rel, &[String]) = match &plan_rel.rel_type {
+        Some(proto::plan_rel::RelType::Rel(rel)) => (rel, &[]),
+        Some(proto::plan_rel::RelType::Root(root)) => {
+            let rel = root
+                .input
+                .as_ref()
+                .ok_or_else(|| BoltError::Plan("substrait: RelRoot has no input Rel".into()))?;
+            (rel, root.names.as_slice())
+        }
         None => {
             return Err(BoltError::Plan(
                 "substrait: PlanRel carries neither a Rel nor a RelRoot".into(),
@@ -110,7 +136,84 @@ pub fn substrait_to_logical_plan(
     let functions = build_function_registry(plan);
 
     let ctx = ConvertCtx::new(provider, &functions);
-    convert_rel(rel, &ctx)
+    let plan = convert_rel(rel, &ctx)?;
+
+    // Honour the RelRoot output names by renaming the converted plan's output
+    // columns (the names list is otherwise silently dropped).
+    apply_root_names(plan, output_names)
+}
+
+/// Reject a plan whose declared Substrait `version.major_number` is outside the
+/// `0.x` line this converter targets (the version family the bundled
+/// `substrait` crate generates). An unset version is accepted (it was optional
+/// up to Substrait 0.17.0); a `0.x` version is accepted; a `>= 1.x` (or
+/// otherwise unknown future major) version is rejected so a mismatched producer
+/// fails loudly rather than silently mis-converting.
+fn check_plan_version(plan: &proto::Plan) -> BoltResult<()> {
+    if let Some(version) = plan.version.as_ref() {
+        if version.major_number > 0 {
+            return Err(BoltError::Unsupported(format!(
+                "substrait: unsupported plan version {}.{}.{}; this engine targets \
+                 the Substrait 0.x line",
+                version.major_number, version.minor_number, version.patch_number
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Apply a [`RelRoot`](proto::RelRoot)'s explicit output `names` to the
+/// converted plan by wrapping it in a rename [`LogicalPlan::Project`].
+///
+/// Substrait's `RelRoot.names` is a *depth-first* field-name list: for a flat
+/// (non-nested) output it is one name per output column, in order. This
+/// converter only produces flat outputs, so we honour the names when their
+/// count equals the output column count and rename each column via an
+/// `Expr::Alias(Column(old), new)`. An empty list means "no explicit names"
+/// (pass-through). A non-empty list whose length does not match the flat
+/// output column count implies nested (struct) output names we cannot map, so
+/// it is rejected rather than silently ignored.
+fn apply_root_names(plan: LogicalPlan, names: &[String]) -> BoltResult<LogicalPlan> {
+    use crate::plan::logical_plan::Expr;
+
+    if names.is_empty() {
+        return Ok(plan);
+    }
+
+    let schema = plan.schema()?;
+    if names.len() != schema.fields.len() {
+        return Err(BoltError::Unsupported(format!(
+            "substrait: RelRoot declares {} output names but the converted plan \
+             produces {} columns; depth-first names over nested output are not \
+             supported",
+            names.len(),
+            schema.fields.len()
+        )));
+    }
+
+    // Fast path: names already match the produced column names exactly — no
+    // rename projection needed.
+    if names
+        .iter()
+        .zip(&schema.fields)
+        .all(|(n, f)| *n == f.name)
+    {
+        return Ok(plan);
+    }
+
+    let exprs = schema
+        .fields
+        .iter()
+        .zip(names)
+        .map(|(field, new_name)| {
+            Expr::Column(field.name.clone()).alias(new_name.clone())
+        })
+        .collect::<Vec<_>>();
+
+    Ok(LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs,
+    })
 }
 
 /// Build the `anchor -> function name` map from a plan's extension
@@ -736,5 +839,157 @@ mod literal_mapping_tests {
         let msg = err.to_string();
         assert!(msg.contains("substrait"), "msg = {msg}");
         assert!(msg.contains("not yet supported"), "msg = {msg}");
+    }
+}
+
+#[cfg(test)]
+mod plan_entry_tests {
+    //! Host-side coverage for the [`substrait_to_logical_plan`] entry point:
+    //! the plan-level honor/reject behaviour (version check, multi-relation
+    //! rejection, RelRoot output-name renaming).
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field, Schema};
+    use substrait::proto;
+
+    /// Provider seeded with one table `t(a Int64, b Int64)`.
+    fn provider() -> MemTableProvider {
+        MemTableProvider::new().with_table(
+            "t",
+            Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ]),
+        )
+    }
+
+    /// A bare `Rel` reading the fixture table `t`.
+    fn read_rel() -> proto::Rel {
+        use proto::read_rel::{NamedTable, ReadType};
+        proto::Rel {
+            rel_type: Some(proto::rel::RelType::Read(Box::new(proto::ReadRel {
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec!["t".to_string()],
+                    advanced_extension: None,
+                })),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    /// Wrap a `Rel` in a single-relation `Plan` carrying it as a bare `Rel`.
+    fn plan_with_bare_rel(rel: proto::Rel) -> proto::Plan {
+        proto::Plan {
+            relations: vec![proto::PlanRel {
+                rel_type: Some(proto::plan_rel::RelType::Rel(rel)),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn single_bare_relation_converts() {
+        let plan = plan_with_bare_rel(read_rel());
+        let logical = substrait_to_logical_plan(&plan, &provider()).expect("converts");
+        assert!(matches!(logical, LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn empty_plan_rejected() {
+        let plan = proto::Plan::default();
+        assert!(substrait_to_logical_plan(&plan, &provider()).is_err());
+    }
+
+    #[test]
+    fn multiple_relations_rejected() {
+        let mut plan = plan_with_bare_rel(read_rel());
+        plan.relations.push(proto::PlanRel {
+            rel_type: Some(proto::plan_rel::RelType::Rel(read_rel())),
+        });
+        let err = substrait_to_logical_plan(&plan, &provider())
+            .expect_err("multi-relation plan must be rejected");
+        assert!(matches!(err, BoltError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn unsupported_major_version_rejected() {
+        let mut plan = plan_with_bare_rel(read_rel());
+        plan.version = Some(proto::Version {
+            major_number: 1,
+            minor_number: 0,
+            patch_number: 0,
+            ..Default::default()
+        });
+        let err = substrait_to_logical_plan(&plan, &provider())
+            .expect_err("major version 1.x must be rejected");
+        assert!(matches!(err, BoltError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn supported_zerox_version_accepted() {
+        let mut plan = plan_with_bare_rel(read_rel());
+        plan.version = Some(proto::Version {
+            major_number: 0,
+            minor_number: 55,
+            patch_number: 1,
+            ..Default::default()
+        });
+        assert!(substrait_to_logical_plan(&plan, &provider()).is_ok());
+    }
+
+    #[test]
+    fn rel_root_names_rename_output() {
+        // RelRoot with output names ["x", "y"] over t(a, b) → a rename
+        // Project aliasing a→x, b→y.
+        let plan = proto::Plan {
+            relations: vec![proto::PlanRel {
+                rel_type: Some(proto::plan_rel::RelType::Root(proto::RelRoot {
+                    input: Some(read_rel()),
+                    names: vec!["x".to_string(), "y".to_string()],
+                })),
+            }],
+            ..Default::default()
+        };
+        let logical = substrait_to_logical_plan(&plan, &provider()).expect("converts");
+        let schema = logical.schema().expect("type-checks");
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[0].name, "x");
+        assert_eq!(schema.fields[1].name, "y");
+    }
+
+    #[test]
+    fn rel_root_matching_names_no_extra_projection() {
+        // Names already equal the produced column names → no rename Project.
+        let plan = proto::Plan {
+            relations: vec![proto::PlanRel {
+                rel_type: Some(proto::plan_rel::RelType::Root(proto::RelRoot {
+                    input: Some(read_rel()),
+                    names: vec!["a".to_string(), "b".to_string()],
+                })),
+            }],
+            ..Default::default()
+        };
+        let logical = substrait_to_logical_plan(&plan, &provider()).expect("converts");
+        assert!(
+            matches!(logical, LogicalPlan::Scan { .. }),
+            "matching names should not add a rename Project, got {logical:?}"
+        );
+    }
+
+    #[test]
+    fn rel_root_name_count_mismatch_rejected() {
+        // Three names over a two-column output (would be depth-first nested
+        // names) → rejected rather than silently dropped.
+        let plan = proto::Plan {
+            relations: vec![proto::PlanRel {
+                rel_type: Some(proto::plan_rel::RelType::Root(proto::RelRoot {
+                    input: Some(read_rel()),
+                    names: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+                })),
+            }],
+            ..Default::default()
+        };
+        let err = substrait_to_logical_plan(&plan, &provider())
+            .expect_err("name-count mismatch must be rejected");
+        assert!(matches!(err, BoltError::Unsupported(_)), "got {err:?}");
     }
 }
