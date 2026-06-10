@@ -33,7 +33,7 @@
 //! value* and narrowed allocation-free via `with_input_schema`.
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{AggregateExpr, Expr, JoinType, LogicalPlan, SortExpr};
+use crate::plan::logical_plan::{AggregateExpr, BinaryOp, Expr, JoinType, LogicalPlan, SortExpr};
 
 use super::expr::convert_expr;
 use super::ConvertCtx;
@@ -42,9 +42,10 @@ use substrait::proto::{
     aggregate_function::AggregationInvocation,
     aggregate_rel::Measure,
     rel::RelType,
+    rel_common::EmitKind,
     sort_field::{SortDirection, SortKind},
-    AggregateFunction, AggregateRel, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel, Rel,
-    SortField, SortRel,
+    AggregateFunction, AggregateRel, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel, RelCommon,
+    Rel, SortField, SortRel,
 };
 
 /// Convert a Substrait [`Rel`] node into the engine's [`LogicalPlan`].
@@ -59,21 +60,29 @@ pub(crate) fn convert_rel(rel: &Rel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan
         .as_ref()
         .ok_or_else(|| BoltError::Plan("Substrait Rel has no rel_type set".into()))?;
 
-    match rel_type {
-        RelType::Read(read) => convert_read(read, ctx),
-        RelType::Filter(filter) => convert_filter(filter, ctx),
-        RelType::Project(project) => convert_project(project, ctx),
-        RelType::Aggregate(agg) => convert_aggregate(agg, ctx),
-        RelType::Sort(sort) => convert_sort(sort, ctx),
-        RelType::Join(join) => convert_join(join, ctx),
-        RelType::Fetch(fetch) => convert_fetch(fetch, ctx),
+    // Convert the operator, then honour its `RelCommon.emit` column remap (if
+    // any). Emit is applied uniformly here so every relation kind — not just
+    // ProjectRel — reorders / selects its output columns as the producer asked;
+    // downstream positional field references resolve against the remapped shape.
+    let (plan, common) = match rel_type {
+        RelType::Read(read) => (convert_read(read, ctx)?, read.common.as_ref()),
+        RelType::Filter(filter) => (convert_filter(filter, ctx)?, filter.common.as_ref()),
+        RelType::Project(project) => (convert_project(project, ctx)?, project.common.as_ref()),
+        RelType::Aggregate(agg) => (convert_aggregate(agg, ctx)?, agg.common.as_ref()),
+        RelType::Sort(sort) => (convert_sort(sort, ctx)?, sort.common.as_ref()),
+        RelType::Join(join) => (convert_join(join, ctx)?, join.common.as_ref()),
+        RelType::Fetch(fetch) => (convert_fetch(fetch, ctx)?, fetch.common.as_ref()),
         // Relation kinds outside the current ingestion envelope. Each carries
         // a distinct message so the user knows exactly which operator tripped.
-        other => Err(BoltError::Plan(format!(
-            "Substrait relation kind {} is not supported by the engine yet",
-            rel_type_name(other)
-        ))),
-    }
+        other => {
+            return Err(BoltError::Plan(format!(
+                "Substrait relation kind {} is not supported by the engine yet",
+                rel_type_name(other)
+            )))
+        }
+    };
+
+    apply_emit(plan, common)
 }
 
 /// A short human-readable label for an unsupported [`RelType`], for errors.
@@ -95,6 +104,65 @@ fn rel_type_name(rt: &RelType) -> &'static str {
         // this exhaustive-by-intent without breaking on crate upgrades.
         _ => "unknown Rel",
     }
+}
+
+/// Honour a relation's [`RelCommon::emit_kind`] by reordering / selecting the
+/// converted plan's output columns to match the producer's requested output.
+///
+/// Every Substrait relation carries an optional `RelCommon` whose `emit_kind`
+/// oneof is either `Direct` (output the operator's columns unchanged) or
+/// `Emit { output_mapping }` — a list of 0-based ordinals into the operator's
+/// output that selects *and reorders* the visible columns. This is **not**
+/// advisory: when a producer sets an explicit `Emit`, downstream relations
+/// reference columns *positionally* against the emitted (remapped) shape, so
+/// ignoring it silently mis-resolves every later field reference. We therefore
+/// honour it here by wrapping the converted plan in a
+/// [`LogicalPlan::Project`] of the selected columns in mapping order.
+///
+/// `Direct` (and an unset `emit_kind` / unset `common`) are pass-through and
+/// return `plan` unchanged. An out-of-range mapping ordinal is rejected.
+fn apply_emit(plan: LogicalPlan, common: Option<&RelCommon>) -> BoltResult<LogicalPlan> {
+    let emit = match common.and_then(|c| c.emit_kind.as_ref()) {
+        // Explicit column remap: honour it.
+        Some(EmitKind::Emit(e)) => e,
+        // Direct / unset: the operator's natural output is the visible output.
+        Some(EmitKind::Direct(_)) | None => return Ok(plan),
+    };
+
+    if emit.output_mapping.is_empty() {
+        // An empty emit selects no columns, which the engine's relational
+        // model cannot represent (a zero-column relation). Reject rather than
+        // silently producing the full passthrough.
+        return Err(BoltError::Unsupported(
+            "substrait: RelCommon.emit with an empty output_mapping (zero output \
+             columns) is not supported"
+                .into(),
+        ));
+    }
+
+    let schema = plan.schema()?;
+    let mut exprs = Vec::with_capacity(emit.output_mapping.len());
+    for &ordinal in &emit.output_mapping {
+        if ordinal < 0 {
+            return Err(BoltError::Plan(format!(
+                "substrait: RelCommon.emit output_mapping has a negative ordinal {ordinal}"
+            )));
+        }
+        let idx = ordinal as usize;
+        let field = schema.fields.get(idx).ok_or_else(|| {
+            BoltError::Plan(format!(
+                "substrait: RelCommon.emit output_mapping ordinal {idx} out of range \
+                 (relation has {} output columns)",
+                schema.fields.len()
+            ))
+        })?;
+        exprs.push(Expr::Column(field.name.clone()));
+    }
+
+    Ok(LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs,
+    })
 }
 
 /// `ReadRel` → [`LogicalPlan::Scan`].
@@ -146,18 +214,61 @@ fn convert_read(read: &ReadRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
         ));
     }
 
+    // A `ReadRel.projection` is an `Expression.MaskExpression` (a nested
+    // struct-select mask), not a flat ordinal list. The engine's `Scan`
+    // projection is a flat column-name subset and cannot faithfully represent
+    // an arbitrary mask, so reject a present projection loudly rather than
+    // silently reading every column.
+    if read.projection.is_some() {
+        return Err(BoltError::Unsupported(
+            "substrait: ReadRel.projection (MaskExpression) is not supported; \
+             a projection mask cannot be faithfully represented as a flat Scan \
+             projection"
+                .into(),
+        ));
+    }
+
     let (table, schema) = ctx.resolve_table(names)?;
 
-    Ok(LogicalPlan::Scan {
+    let scan = LogicalPlan::Scan {
         table,
-        // A `ReadRel.projection` mask exists in Substrait but is optional and
-        // expressed as a field-select emit list; we leave projection pushdown
-        // to a later pass and read all columns here. TODO: honour
-        // `read.projection` (an emit mask) by mapping the selected ordinals to
-        // their column names.
         projection: None,
         schema,
-    })
+    };
+
+    // `ReadRel.filter` is a mandatory post-read predicate and
+    // `best_effort_filter` is a predicate the source may have applied
+    // opportunistically; both are real boolean predicates over the scanned
+    // rows, so honouring either as a `Filter` above the `Scan` is correct
+    // (applying `best_effort_filter` as a hard filter never changes the result
+    // set, since it is a genuine predicate on the data). When both are present
+    // they are ANDed. The predicates reference the scan's columns positionally.
+    let scan_schema = scan.schema()?;
+    let c2 = ctx.with_input_schema(&scan_schema);
+
+    let mut predicate: Option<Expr> = None;
+    if let Some(filter) = read.filter.as_deref() {
+        predicate = Some(convert_expr(filter, &c2)?);
+    }
+    if let Some(best_effort) = read.best_effort_filter.as_deref() {
+        let extra = convert_expr(best_effort, &c2)?;
+        predicate = Some(match predicate {
+            Some(existing) => Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(existing),
+                right: Box::new(extra),
+            },
+            None => extra,
+        });
+    }
+
+    match predicate {
+        None => Ok(scan),
+        Some(predicate) => Ok(LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate,
+        }),
+    }
 }
 
 /// `FilterRel` → [`LogicalPlan::Filter`].
@@ -185,28 +296,41 @@ fn convert_filter(filter: &FilterRel, ctx: &ConvertCtx) -> BoltResult<LogicalPla
 
 /// `ProjectRel` → [`LogicalPlan::Project`].
 ///
-/// Substrait's `ProjectRel` *appends* its computed expressions to the input's
-/// columns (the `emit` list then chooses the final visible set). For the core
-/// slice we treat `expressions` as the full projection list — the common shape
-/// emitted by producers that set an explicit emit. TODO: honour
-/// `RelCommon.emit` to drop pass-through input columns when the producer asked
-/// for a strict subset.
+/// Substrait's `ProjectRel` *appends* its computed `expressions` to the input's
+/// columns; the operator's natural output is therefore `input_columns ++
+/// expressions`. The producer then uses `RelCommon.emit` to choose the final
+/// visible set / order, which [`convert_rel`] applies uniformly via
+/// [`apply_emit`] after this converter returns. We model the append here by
+/// emitting the input's pass-through columns followed by the computed
+/// expressions so that emit ordinals (and downstream positional field
+/// references) resolve against the correct combined shape.
 fn convert_project(project: &ProjectRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     let input = convert_boxed_input(project.input.as_deref(), ctx, "ProjectRel")?;
     let input_schema = input.schema()?;
 
     let c2 = ctx.with_input_schema(&input_schema);
-    let exprs = project
+    let computed = project
         .expressions
         .iter()
         .map(|e| convert_expr(e, &c2))
         .collect::<BoltResult<Vec<_>>>()?;
 
-    if exprs.is_empty() {
+    if computed.is_empty() {
         return Err(BoltError::Plan(
             "Substrait ProjectRel has no expressions".into(),
         ));
     }
+
+    // Output = pass-through input columns ++ computed expressions. Without an
+    // explicit `emit`, this is the full visible output (matching Substrait's
+    // "Direct" emit). With an `emit`, `apply_emit` selects/reorders from this
+    // combined column list, so the pass-through columns must be present here
+    // for those ordinals to resolve.
+    let mut exprs = Vec::with_capacity(input_schema.fields.len() + computed.len());
+    for field in &input_schema.fields {
+        exprs.push(Expr::Column(field.name.clone()));
+    }
+    exprs.extend(computed);
 
     Ok(LogicalPlan::Project {
         input: Box::new(input),
@@ -262,6 +386,18 @@ fn convert_aggregate(agg: &AggregateRel, ctx: &ConvertCtx) -> BoltResult<Logical
 
 /// Convert one Substrait aggregate [`Measure`] into an [`AggregateExpr`].
 fn convert_measure(measure: &Measure, ctx: &ConvertCtx) -> BoltResult<AggregateExpr> {
+    // A per-measure `filter` is SQL `SUM(x) FILTER (WHERE p)`. The engine's
+    // [`AggregateExpr`] has no filtered-aggregate variant, so we cannot
+    // faithfully represent it; reject loudly rather than silently computing the
+    // unfiltered aggregate (which would be a wrong result).
+    if measure.filter.is_some() {
+        return Err(BoltError::Unsupported(
+            "substrait: per-measure Measure.filter (aggregate FILTER (WHERE ..)) \
+             is not supported"
+                .into(),
+        ));
+    }
+
     let func: &AggregateFunction = measure
         .measure
         .as_ref()
@@ -438,6 +574,14 @@ fn convert_sort_field(sf: &SortField, ctx: &ConvertCtx) -> BoltResult<SortExpr> 
 /// later optimisation. TODO: pattern-match a top-level conjunction of
 /// `left.col = right.col` equalities and lift them into `on` for the hash-join
 /// fast path.
+///
+/// `JoinRel.post_join_filter` — a predicate applied to the join's *output*
+/// rows — is honoured by wrapping the converted [`LogicalPlan::Join`] in a
+/// [`LogicalPlan::Filter`]. It also references the combined left ++ right
+/// schema. (It is kept distinct from the join's own `expression`: the join
+/// condition governs which rows match — and, for outer joins, which rows are
+/// NULL-extended — whereas `post_join_filter` filters the produced rows after
+/// that, so the two are NOT equivalent for outer joins and must not be merged.)
 fn convert_join(join: &JoinRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
     use substrait::proto::join_rel::JoinType as SJoinType;
 
@@ -467,21 +611,38 @@ fn convert_join(join: &JoinRel, ctx: &ConvertCtx) -> BoltResult<LogicalPlan> {
         join_type,
     );
 
+    let c2 = ctx.with_input_schema(&combined);
+
     let filter = match join.expression.as_deref() {
-        Some(expr) => {
-            let c2 = ctx.with_input_schema(&combined);
-            Some(convert_expr(expr, &c2)?)
-        }
+        Some(expr) => Some(convert_expr(expr, &c2)?),
         None => None,
     };
 
-    Ok(LogicalPlan::Join {
+    // Convert the post-join filter (if any) against the same combined schema
+    // before consuming `left`/`right` into the Join node.
+    let post_join_filter = match join.post_join_filter.as_deref() {
+        Some(expr) => Some(convert_expr(expr, &c2)?),
+        None => None,
+    };
+
+    let join_plan = LogicalPlan::Join {
         left: Box::new(left),
         right: Box::new(right),
         join_type,
         on: Vec::new(),
         filter,
-    })
+    };
+
+    // `post_join_filter` is a predicate over the join's output rows; honour it
+    // as a `Filter` above the `Join` rather than folding it into the join
+    // condition (the two differ for outer joins — see the doc comment).
+    match post_join_filter {
+        None => Ok(join_plan),
+        Some(predicate) => Ok(LogicalPlan::Filter {
+            input: Box::new(join_plan),
+            predicate,
+        }),
+    }
 }
 
 /// `FetchRel` → [`LogicalPlan::Limit`].
@@ -584,10 +745,12 @@ mod tests {
     use substrait::proto::{
         expression::{
             field_reference::{ReferenceType, RootReference, RootType},
-            reference_segment, FieldReference, ReferenceSegment, RexType,
+            reference_segment, FieldReference, MaskExpression, ReferenceSegment, RexType,
+            ScalarFunction,
         },
         read_rel::{NamedTable, ReadType},
-        Expression, FilterRel, ReadRel, Rel,
+        rel_common::{Emit, EmitKind},
+        Expression, FilterRel, FunctionArgument, RelCommon, ReadRel, Rel,
     };
 
     /// Build a `t(a Int64, b Int64)` schema for the fixture table.
@@ -647,6 +810,42 @@ mod tests {
         }
     }
 
+    /// A bare `ReadRel` (not wrapped in a `Rel`) over the fixture table `t`,
+    /// so tests can set its `filter` / `projection` / `common` fields before
+    /// dispatching through `convert_rel`.
+    fn read_rel_inner() -> ReadRel {
+        ReadRel {
+            read_type: Some(ReadType::NamedTable(NamedTable {
+                names: vec!["t".to_string()],
+                advanced_extension: None,
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// The predicate `#0 = #1` (a = b), built via the test ctx's `equal`
+    /// (anchor 0) scalar function so it exercises the real expr.rs path.
+    fn eq_a_b() -> Expression {
+        Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference: 0, // resolves to "equal" in test ctx
+                arguments: vec![
+                    FunctionArgument {
+                        arg_type: Some(substrait::proto::function_argument::ArgType::Value(
+                            field_ref(0),
+                        )),
+                    },
+                    FunctionArgument {
+                        arg_type: Some(substrait::proto::function_argument::ArgType::Value(
+                            field_ref(1),
+                        )),
+                    },
+                ],
+                ..Default::default()
+            })),
+        }
+    }
+
     #[test]
     fn read_rel_becomes_scan() {
         let (provider, functions) = fixtures();
@@ -666,34 +865,12 @@ mod tests {
     fn filter_over_read_becomes_filter_scan() {
         let (provider, functions) = fixtures();
         let ctx = ctx(&provider, &functions);
-        // condition: `#0 = #1`  (a = b) — build via the equal scalar fn so we
-        // exercise the expr.rs path; if expr.rs maps a binary eq differently
-        // this still asserts the *relational* shape (Filter wrapping Scan).
-        let condition = Expression {
-            rex_type: Some(RexType::ScalarFunction(
-                substrait::proto::expression::ScalarFunction {
-                    function_reference: 0, // resolves to "equal" in test ctx
-                    arguments: vec![
-                        substrait::proto::FunctionArgument {
-                            arg_type: Some(substrait::proto::function_argument::ArgType::Value(
-                                field_ref(0),
-                            )),
-                        },
-                        substrait::proto::FunctionArgument {
-                            arg_type: Some(substrait::proto::function_argument::ArgType::Value(
-                                field_ref(1),
-                            )),
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )),
-        };
-
+        // condition: `#0 = #1` (a = b) — asserts the *relational* shape
+        // (Filter wrapping Scan).
         let filter = Rel {
             rel_type: Some(RelType::Filter(Box::new(FilterRel {
                 input: Some(Box::new(read_rel())),
-                condition: Some(Box::new(condition)),
+                condition: Some(Box::new(eq_a_b())),
                 ..Default::default()
             }))),
         };
@@ -716,5 +893,193 @@ mod tests {
         let ctx = ctx(&provider, &functions);
         let rel = Rel { rel_type: None };
         assert!(convert_rel(&rel, &ctx).is_err());
+    }
+
+    /// `ReadRel.filter` is honoured as a `Filter` wrapping the `Scan` rather
+    /// than silently dropped.
+    #[test]
+    fn read_rel_filter_becomes_filter_over_scan() {
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let mut read = read_rel_inner();
+        read.filter = Some(Box::new(eq_a_b()));
+        let rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(read))),
+        };
+        let plan = convert_rel(&rel, &ctx).expect("read with filter converts");
+        match plan {
+            LogicalPlan::Filter { input, .. } => assert!(
+                matches!(*input, LogicalPlan::Scan { .. }),
+                "ReadRel.filter should wrap the Scan in a Filter"
+            ),
+            other => panic!("expected Filter over Scan, got {other:?}"),
+        }
+    }
+
+    /// `ReadRel.best_effort_filter` is likewise honoured as a `Filter`.
+    #[test]
+    fn read_rel_best_effort_filter_honoured() {
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let mut read = read_rel_inner();
+        read.best_effort_filter = Some(Box::new(eq_a_b()));
+        let rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(read))),
+        };
+        let plan = convert_rel(&rel, &ctx).expect("read with best_effort_filter converts");
+        assert!(
+            matches!(plan, LogicalPlan::Filter { .. }),
+            "ReadRel.best_effort_filter should be honoured as a Filter, got {plan:?}"
+        );
+    }
+
+    /// `ReadRel.projection` (a MaskExpression) cannot be faithfully represented
+    /// and is rejected loudly rather than silently ignored.
+    #[test]
+    fn read_rel_projection_mask_rejected() {
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let mut read = read_rel_inner();
+        read.projection = Some(MaskExpression::default());
+        let rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(read))),
+        };
+        let err = convert_rel(&rel, &ctx).expect_err("projection mask must be rejected");
+        assert!(matches!(err, BoltError::Unsupported(_)), "got {err:?}");
+    }
+
+    /// `RelCommon.emit` reorders/selects the output columns: an emit of `[1]`
+    /// over `t(a, b)` yields a single-column `b` projection above the Scan.
+    #[test]
+    fn rel_common_emit_reorders_columns() {
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let mut read = read_rel_inner();
+        read.common = Some(RelCommon {
+            emit_kind: Some(EmitKind::Emit(Emit {
+                output_mapping: vec![1], // select only column `b`
+            })),
+            ..Default::default()
+        });
+        let rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(read))),
+        };
+        let plan = convert_rel(&rel, &ctx).expect("read with emit converts");
+        match plan {
+            LogicalPlan::Project { input, exprs } => {
+                assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                assert_eq!(exprs.len(), 1, "emit [1] selects exactly one column");
+                assert!(
+                    matches!(&exprs[0], Expr::Column(n) if n == "b"),
+                    "emit [1] over t(a,b) should select column b, got {:?}",
+                    exprs[0]
+                );
+            }
+            other => panic!("expected Project over Scan, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range emit ordinal is a hard error.
+    #[test]
+    fn rel_common_emit_out_of_range_rejected() {
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let mut read = read_rel_inner();
+        read.common = Some(RelCommon {
+            emit_kind: Some(EmitKind::Emit(Emit {
+                output_mapping: vec![5], // t has only 2 columns
+            })),
+            ..Default::default()
+        });
+        let rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(read))),
+        };
+        assert!(convert_rel(&rel, &ctx).is_err());
+    }
+
+    /// A `Direct` emit is pass-through: the Scan is returned unchanged.
+    #[test]
+    fn rel_common_direct_emit_is_passthrough() {
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+        let mut read = read_rel_inner();
+        read.common = Some(RelCommon {
+            emit_kind: Some(EmitKind::Direct(Default::default())),
+            ..Default::default()
+        });
+        let rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(read))),
+        };
+        let plan = convert_rel(&rel, &ctx).expect("read with direct emit converts");
+        assert!(
+            matches!(plan, LogicalPlan::Scan { .. }),
+            "Direct emit should pass through unchanged, got {plan:?}"
+        );
+    }
+
+    /// A per-measure `Measure.filter` has no faithful representation and is
+    /// rejected.
+    #[test]
+    fn measure_filter_rejected() {
+        use substrait::proto::{
+            aggregate_rel::{Grouping, Measure},
+            AggregateFunction, AggregateRel,
+        };
+        let (provider, functions) = fixtures();
+        // Add a `sum` aggregate anchor for the measure.
+        let mut functions = functions;
+        functions.insert(7u32, "sum:i64".to_string());
+        let ctx = ctx(&provider, &functions);
+
+        let measure = Measure {
+            measure: Some(AggregateFunction {
+                function_reference: 7,
+                arguments: vec![FunctionArgument {
+                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(field_ref(
+                        0,
+                    ))),
+                }],
+                ..Default::default()
+            }),
+            filter: Some(eq_a_b()),
+        };
+        let agg = Rel {
+            rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(read_rel())),
+                groupings: vec![Grouping::default()],
+                measures: vec![measure],
+                ..Default::default()
+            }))),
+        };
+        let err = convert_rel(&agg, &ctx).expect_err("Measure.filter must be rejected");
+        assert!(matches!(err, BoltError::Unsupported(_)), "got {err:?}");
+    }
+
+    /// `JoinRel.post_join_filter` is honoured as a `Filter` above the `Join`.
+    #[test]
+    fn join_post_join_filter_becomes_filter_over_join() {
+        use substrait::proto::{join_rel::JoinType as SJoinType, JoinRel};
+        let (provider, functions) = fixtures();
+        let ctx = ctx(&provider, &functions);
+
+        // post_join_filter `#0 = #1` references the combined (left ++ right)
+        // schema; with t(a,b) on both sides, #0 = left.a, #1 = left.b.
+        let join = Rel {
+            rel_type: Some(RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(read_rel())),
+                right: Some(Box::new(read_rel())),
+                r#type: SJoinType::Inner as i32,
+                post_join_filter: Some(Box::new(eq_a_b())),
+                ..Default::default()
+            }))),
+        };
+        let plan = convert_rel(&join, &ctx).expect("join with post_join_filter converts");
+        match plan {
+            LogicalPlan::Filter { input, .. } => assert!(
+                matches!(*input, LogicalPlan::Join { .. }),
+                "post_join_filter should wrap the Join in a Filter"
+            ),
+            other => panic!("expected Filter over Join, got {other:?}"),
+        }
     }
 }
