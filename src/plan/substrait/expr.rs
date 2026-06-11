@@ -49,6 +49,7 @@ use crate::plan::logical_plan::{BinaryOp, DataType, Expr, Literal};
 
 use substrait::proto::expression::{
     field_reference::ReferenceType as FieldReferenceType,
+    field_reference::RootType as FieldRootType,
     reference_segment::ReferenceType as SegmentReferenceType, Cast as SubstraitCast,
     FieldReference, IfThen, Literal as SubstraitLiteral, ReferenceSegment, ScalarFunction,
     SwitchExpression,
@@ -169,13 +170,39 @@ fn rex_type_name(rex: &substrait::proto::expression::RexType) -> &'static str {
 ///
 /// Only the common case is supported: a [`FieldReference`] whose
 /// `reference_type` is `DirectReference` wrapping a single
-/// `StructField { field, child: None }`. Masked references, indirect
-/// references, nested struct paths, list/map element access, and references
-/// rooted in an outer query / enum are rejected with a clear message.
+/// `StructField { field, child: None }` **and** whose `root_type` is the
+/// `RootReference` (i.e. the reference is rooted at the current input row).
+/// Masked references, indirect references, nested struct paths, list/map
+/// element access, and references rooted in an outer query (correlated
+/// subquery) or in another expression's output are rejected with a clear
+/// message.
+///
+/// The `root_type` check matters for correctness: an `OuterReference` is a
+/// *correlated* column from an enclosing query and an `expression`-rooted
+/// reference is resolved against a different relation. Resolving either as a
+/// plain input-row column (by ignoring `root_type`) would silently return the
+/// wrong column, so we reject them rather than mis-lower.
 fn convert_field_reference<C: SubstraitCtx + ?Sized>(
     field_ref: &FieldReference,
     ctx: &C,
 ) -> BoltResult<Expr> {
+    // Validate the reference is rooted at the current input row. An unset
+    // `root_type` defaults to "rooted at the input" per the Substrait
+    // convention (the historical pre-root_type behaviour), so it is accepted.
+    match field_ref.root_type.as_ref() {
+        None | Some(FieldRootType::RootReference(_)) => {}
+        Some(FieldRootType::OuterReference(_)) => {
+            return Err(BoltError::Unsupported(
+                "substrait: correlated FieldReference (OuterReference) is not supported".into(),
+            ));
+        }
+        Some(FieldRootType::Expression(_)) => {
+            return Err(BoltError::Unsupported(
+                "substrait: expression-rooted FieldReference is not supported".into(),
+            ));
+        }
+    }
+
     let rt = field_ref
         .reference_type
         .as_ref()
@@ -823,6 +850,29 @@ mod tests {
         let c = ctx();
         let err = convert_expr(&field(9), &c).unwrap_err();
         assert!(matches!(err, BoltError::Plan(_)));
+    }
+
+    /// A correlated `OuterReference`-rooted field reference must be rejected
+    /// loudly rather than silently resolved as a plain input-row column.
+    #[test]
+    fn outer_reference_field_rejected() {
+        use substrait::proto::expression::field_reference::{OuterReference, RootType};
+        let c = ctx();
+        let e = Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(FieldReferenceType::DirectReference(ReferenceSegment {
+                    reference_type: Some(SegmentReferenceType::StructField(Box::new(
+                        StructField {
+                            field: 0,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(RootType::OuterReference(OuterReference { steps_out: 1 })),
+            }))),
+        };
+        let err = convert_expr(&e, &c).unwrap_err();
+        assert!(matches!(err, BoltError::Unsupported(_)), "got {err:?}");
     }
 
     #[test]
