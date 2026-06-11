@@ -1041,7 +1041,10 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            filter: Some(eq_a_b()),
+            // `.into()` so this compiles whether prost boxed `Measure.filter`
+            // (`Option<Box<Expression>>`) or not (`Option<Expression>`):
+            // `Expression: Into<Expression>` and `Expression: Into<Box<_>>`.
+            filter: Some(eq_a_b().into()),
         };
         let agg = Rel {
             rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
