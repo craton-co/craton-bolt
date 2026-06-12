@@ -902,7 +902,7 @@ mod tests {
         let (provider, functions) = fixtures();
         let ctx = ctx(&provider, &functions);
         let mut read = read_rel_inner();
-        read.filter = Some(Box::new(eq_a_b()));
+        read.filter = Some(eq_a_b().into());
         let rel = Rel {
             rel_type: Some(RelType::Read(Box::new(read))),
         };
@@ -922,7 +922,7 @@ mod tests {
         let (provider, functions) = fixtures();
         let ctx = ctx(&provider, &functions);
         let mut read = read_rel_inner();
-        read.best_effort_filter = Some(Box::new(eq_a_b()));
+        read.best_effort_filter = Some(eq_a_b().into());
         let rel = Rel {
             rel_type: Some(RelType::Read(Box::new(read))),
         };
@@ -1072,7 +1072,8 @@ mod tests {
                 left: Some(Box::new(read_rel())),
                 right: Some(Box::new(read_rel())),
                 r#type: SJoinType::Inner as i32,
-                post_join_filter: Some(Box::new(eq_a_b())),
+                // `.into()` keeps this agnostic to prost's boxing choice.
+                post_join_filter: Some(eq_a_b().into()),
                 ..Default::default()
             }))),
         };
