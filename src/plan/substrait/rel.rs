@@ -44,8 +44,8 @@ use substrait::proto::{
     rel::RelType,
     rel_common::EmitKind,
     sort_field::{SortDirection, SortKind},
-    AggregateFunction, AggregateRel, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel, RelCommon,
-    Rel, SortField, SortRel,
+    AggregateFunction, AggregateRel, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel, Rel,
+    RelCommon, SortField, SortRel,
 };
 
 /// Convert a Substrait [`Rel`] node into the engine's [`LogicalPlan`].
@@ -750,7 +750,7 @@ mod tests {
         },
         read_rel::{NamedTable, ReadType},
         rel_common::{Emit, EmitKind},
-        Expression, FilterRel, FunctionArgument, RelCommon, ReadRel, Rel,
+        Expression, FilterRel, FunctionArgument, ReadRel, Rel, RelCommon,
     };
 
     /// Build a `t(a Int64, b Int64)` schema for the fixture table.
@@ -1035,9 +1035,9 @@ mod tests {
             measure: Some(AggregateFunction {
                 function_reference: 7,
                 arguments: vec![FunctionArgument {
-                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(field_ref(
-                        0,
-                    ))),
+                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(
+                        field_ref(0),
+                    )),
                 }],
                 ..Default::default()
             }),

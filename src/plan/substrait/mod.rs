@@ -193,11 +193,7 @@ fn apply_root_names(plan: LogicalPlan, names: &[String]) -> BoltResult<LogicalPl
 
     // Fast path: names already match the produced column names exactly — no
     // rename projection needed.
-    if names
-        .iter()
-        .zip(&schema.fields)
-        .all(|(n, f)| *n == f.name)
-    {
+    if names.iter().zip(&schema.fields).all(|(n, f)| *n == f.name) {
         return Ok(plan);
     }
 
@@ -205,9 +201,7 @@ fn apply_root_names(plan: LogicalPlan, names: &[String]) -> BoltResult<LogicalPl
         .fields
         .iter()
         .zip(names)
-        .map(|(field, new_name)| {
-            Expr::Column(field.name.clone()).alias(new_name.clone())
-        })
+        .map(|(field, new_name)| Expr::Column(field.name.clone()).alias(new_name.clone()))
         .collect::<Vec<_>>();
 
     Ok(LogicalPlan::Project {
