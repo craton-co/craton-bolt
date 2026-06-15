@@ -478,6 +478,40 @@ pub fn check(code: CUresult) -> BoltResult<()> {
     Err(BoltError::CudaWithCode { code, message: msg })
 }
 
+/// Ensure the active CUDA context is current on the **calling thread** before
+/// a raw driver call, under `--features cudarc`.
+///
+/// CUDA context currency is per-thread (`cuCtxSetCurrent` affects only the
+/// caller), and the synchronous driver entry points wrapped in this module —
+/// `cuMemset*`, `cuMemcpyDtoD`, `cuMemGetInfo`, the event API, pinned-host
+/// alloc/free, and the graph API — all act against the thread's *current*
+/// context. The cudarc backend owns a single process-wide primary context but
+/// its raw `malloc_sync` / `cuMemcpy*` escape hatch does NOT auto-bind, so a
+/// thread that reaches one of these wrappers as its first CUDA action (which
+/// happens in a many-engines-per-process run, e.g.
+/// `cargo test --features cudarc -- --ignored`) would otherwise hit
+/// `CUDA_ERROR_INVALID_CONTEXT` (201). This funnels every such wrapper through
+/// cudarc's idempotent, never-releasing bind. It is a cheap thread-local
+/// `cuCtxSetCurrent` once the device cell is latched (the common case).
+///
+/// Under the default (non-cudarc) backend there is one `cuCtxCreate_v2`
+/// context per `Engine` and `cuda_sys` does not retain a handle to "the"
+/// context, so we cannot unilaterally rebind here — this is a no-op and the
+/// historical per-thread currency contract (the engine thread bound its own
+/// context) is preserved exactly.
+#[inline]
+#[allow(clippy::unnecessary_wraps)] // reason: signature is uniform across backends
+fn ensure_ctx_current() -> BoltResult<()> {
+    #[cfg(feature = "cudarc")]
+    {
+        crate::cuda::cudarc_backend::ensure_primary_ctx_current()
+    }
+    #[cfg(not(feature = "cudarc"))]
+    {
+        Ok(())
+    }
+}
+
 /// Successful-init latch. Stores `true` exactly once when `cuInit(0)`
 /// has returned `CUDA_SUCCESS`. Deliberately *not* an `OnceLock<CUresult>`:
 /// the old design cached the first result, success or failure, so a
@@ -597,6 +631,11 @@ pub fn device_name(dev: CUdevice) -> BoltResult<String> {
 /// error `CUDA_ERROR_INVALID_CONTEXT`).
 pub(crate) fn current_device() -> BoltResult<i32> {
     let mut dev: CUdevice = 0;
+    // cudarc: `cuCtxGetDevice` reports the device of the thread's *current*
+    // context; bind the primary context first so a thread that asks before any
+    // alloc still resolves the right device instead of failing with
+    // `CUDA_ERROR_INVALID_CONTEXT`.
+    ensure_ctx_current()?;
     check(unsafe { cuCtxGetDevice(&mut dev) })?;
     Ok(dev as i32)
 }
@@ -814,6 +853,11 @@ impl Drop for CudaContext {
 /// Allocate `bytes` of device memory and return the raw pointer.
 pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
     let mut ptr: CUdeviceptr = 0;
+    // cudarc: ensure the primary context is current before `cuMemAlloc_v2`.
+    // (Under cudarc the pool routes device allocations through
+    // `cudarc_backend::mem_alloc`, which self-binds; this guard keeps the
+    // hand-rolled wrapper correct for any direct caller and the test path.)
+    ensure_ctx_current()?;
     check(unsafe { cuMemAlloc_v2(&mut ptr, bytes) })?;
     Ok(ptr)
 }
@@ -852,6 +896,16 @@ pub fn mem_alloc(bytes: usize) -> BoltResult<CUdeviceptr> {
 /// Caller must guarantee `ptr` is live, came from `mem_alloc`, is not aliased,
 /// and that no in-flight kernel still references it.
 pub unsafe fn mem_free(ptr: CUdeviceptr) -> BoltResult<()> {
+    // cudarc: there is exactly one process-wide primary context and we can
+    // always make it current, so proactively bind it here — turning the
+    // no-context "leak rather than free unsafely" fallback below into a clean
+    // free even on a worker/teardown thread that never touched the alloc path.
+    // (Under cudarc the pool routes frees through `cudarc_backend::mem_free`,
+    // which self-binds; this keeps the hand-rolled wrapper correct for any
+    // direct caller.) A bind failure is non-fatal here — fall through to the
+    // detect-and-refuse guard, which will surface the no-context case.
+    #[cfg(feature = "cudarc")]
+    let _ = ensure_ctx_current();
     // Guard: a free with no current context would either error (silent leak)
     // or free against the wrong context. Detect the no-context case and bail
     // before touching `cuMemFree_v2`. `ctx_get_current` returns `Ok(None)`
@@ -891,6 +945,10 @@ pub unsafe fn memcpy_h2d<T>(dst: CUdeviceptr, src: *const T, count: usize) -> Bo
             std::mem::size_of::<T>()
         ))
     })?;
+    // cudarc: ensure the primary context is current on this thread before the
+    // raw `cuMemcpyHtoD_v2` (no-op on the default backend). See
+    // `ensure_ctx_current`.
+    ensure_ctx_current()?;
     check(cuMemcpyHtoD_v2(dst, src as *const c_void, bytes))
 }
 
@@ -907,6 +965,8 @@ pub unsafe fn memcpy_d2h<T>(dst: *mut T, src: CUdeviceptr, count: usize) -> Bolt
             std::mem::size_of::<T>()
         ))
     })?;
+    // cudarc: ensure the primary context is current before `cuMemcpyDtoH_v2`.
+    ensure_ctx_current()?;
     check(cuMemcpyDtoH_v2(dst as *mut c_void, src, bytes))
 }
 
@@ -935,6 +995,8 @@ pub unsafe fn memcpy_d2d<T>(dst: CUdeviceptr, src: CUdeviceptr, count: usize) ->
     if bytes == 0 {
         return Ok(());
     }
+    // cudarc: ensure the primary context is current before `cuMemcpyDtoD_v2`.
+    ensure_ctx_current()?;
     check(cuMemcpyDtoD_v2(dst, src, bytes))
 }
 
@@ -954,6 +1016,10 @@ pub unsafe fn memcpy_d2d<T>(dst: CUdeviceptr, src: CUdeviceptr, count: usize) ->
 /// it with [`event_query`] to decide when the block is safe to reclaim.
 pub fn event_create() -> BoltResult<CUevent> {
     let mut ev: CUevent = std::ptr::null_mut();
+    // cudarc: events are created in the thread's current context; bind the
+    // primary context first so a thread that reaches the deferred-free pool
+    // before any alloc still creates the event in the right context.
+    ensure_ctx_current()?;
     // SAFETY: `&mut ev` is a valid out-pointer; the driver writes the handle
     // on success. `CU_EVENT_DISABLE_TIMING` is a valid flag bit.
     check(unsafe { cuEventCreate(&mut ev, CU_EVENT_DISABLE_TIMING) })?;
@@ -970,6 +1036,8 @@ pub fn event_create() -> BoltResult<CUevent> {
 /// is dereferenced here — they are forwarded to the driver.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe fn event_record(event: CUevent, stream: CUstream) -> BoltResult<()> {
+    // cudarc: `cuEventRecord` acts on the thread's current context; bind first.
+    ensure_ctx_current()?;
     check(cuEventRecord(event, stream))
 }
 
@@ -984,6 +1052,8 @@ pub unsafe fn event_record(event: CUevent, stream: CUstream) -> BoltResult<()> {
 /// # Safety
 /// `event` must be a live handle from [`event_create`].
 pub unsafe fn event_query(event: CUevent) -> BoltResult<bool> {
+    // cudarc: bind the primary context before the query (no-op default backend).
+    ensure_ctx_current()?;
     let rc = cuEventQuery(event);
     if rc == CUDA_SUCCESS {
         Ok(true)
@@ -1003,6 +1073,8 @@ pub unsafe fn event_query(event: CUevent) -> BoltResult<bool> {
 /// # Safety
 /// `event` must be a live handle from [`event_create`].
 pub unsafe fn event_synchronize(event: CUevent) -> BoltResult<()> {
+    // cudarc: bind the primary context before the blocking wait.
+    ensure_ctx_current()?;
     check(cuEventSynchronize(event))
 }
 
@@ -1013,6 +1085,8 @@ pub unsafe fn event_synchronize(event: CUevent) -> BoltResult<()> {
 /// `event` must be a live handle from [`event_create`] that is not used again
 /// after this call.
 pub unsafe fn event_destroy(event: CUevent) -> BoltResult<()> {
+    // cudarc: bind the primary context before destroying the event.
+    ensure_ctx_current()?;
     check(cuEventDestroy_v2(event))
 }
 
@@ -1023,6 +1097,10 @@ pub unsafe fn event_destroy(event: CUevent) -> BoltResult<()> {
 /// `free`/`Box::from_raw`/etc. The driver determines validity and alignment.
 pub unsafe fn mem_alloc_host(bytes: usize) -> BoltResult<*mut c_void> {
     let mut ptr: *mut c_void = std::ptr::null_mut();
+    // cudarc: pinned host pages are registered against the current context;
+    // bind the primary context first so the registration (and the matching
+    // free) target the one process-wide context.
+    ensure_ctx_current()?;
     check(cuMemAllocHost_v2(&mut ptr, bytes))?;
     Ok(ptr)
 }
@@ -1050,6 +1128,9 @@ pub const CU_MEMHOSTALLOC_WRITECOMBINED: c_uint = 0x04;
 /// `free`/`Box::from_raw`/etc. The driver determines validity and alignment.
 pub unsafe fn mem_host_alloc(bytes: usize, flags: c_uint) -> BoltResult<*mut c_void> {
     let mut ptr: *mut c_void = std::ptr::null_mut();
+    // cudarc: bind the primary context before the pinned allocation (mirrors
+    // `mem_alloc_host`).
+    ensure_ctx_current()?;
     check(cuMemHostAlloc(&mut ptr, bytes, flags))?;
     Ok(ptr)
 }
@@ -1060,6 +1141,9 @@ pub unsafe fn mem_host_alloc(bytes: usize, flags: c_uint) -> BoltResult<*mut c_v
 /// Caller must guarantee `p` came from [`mem_alloc_host`], is not aliased, and
 /// is not still in use by any in-flight async copy.
 pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
+    // cudarc: bind the primary context before freeing the pinned pages so the
+    // free targets the context that registered them.
+    ensure_ctx_current()?;
     check(cuMemFreeHost(p))
 }
 
@@ -1068,6 +1152,8 @@ pub unsafe fn mem_free_host(p: *mut c_void) -> BoltResult<()> {
 /// # Safety
 /// `ptr` must point to a live device allocation of at least `count` bytes.
 pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult<()> {
+    // cudarc: ensure the primary context is current before `cuMemsetD8_v2`.
+    ensure_ctx_current()?;
     check(cuMemsetD8_v2(ptr, value, count))
 }
 
@@ -1084,6 +1170,12 @@ pub unsafe fn memset_d8(ptr: CUdeviceptr, value: u8, count: usize) -> BoltResult
 pub fn mem_get_info() -> BoltResult<(usize, usize)> {
     let mut free: usize = 0;
     let mut total: usize = 0;
+    // cudarc: `cuMemGetInfo_v2` needs a current context. Under cudarc the one
+    // process-wide primary context is the right one to query, so bind it here
+    // — this also makes the background pool-watcher thread (which otherwise
+    // inherits no context) poll successfully without depending on the
+    // captured-context rebind that only the default backend performs.
+    ensure_ctx_current()?;
     check(unsafe { cuMemGetInfo_v2(&mut free, &mut total) })?;
     Ok((free, total))
 }
@@ -1497,6 +1589,8 @@ pub(crate) fn memset_d8_async(
 ///   call on the same stream. Leaving a stream in capture state leaks
 ///   any operations submitted on it.
 pub(crate) fn stream_begin_capture(stream: CUstream, mode: u32) -> BoltResult<()> {
+    // cudarc: bind the primary context before capture begins (no-op default).
+    ensure_ctx_current()?;
     check(unsafe { cuStreamBeginCapture_v2(stream, mode as c_uint) })
 }
 
@@ -1509,6 +1603,8 @@ pub(crate) fn stream_begin_capture(stream: CUstream, mode: u32) -> BoltResult<()
 /// immediately (the instantiated `CUgraphExec` holds its own copy).
 pub(crate) fn stream_end_capture(stream: CUstream) -> BoltResult<CUgraph> {
     let mut g: CUgraph = std::ptr::null_mut();
+    // cudarc: bind the primary context before ending capture.
+    ensure_ctx_current()?;
     check(unsafe { cuStreamEndCapture(stream, &mut g) })?;
     Ok(g)
 }
@@ -1525,6 +1621,8 @@ pub(crate) fn stream_end_capture(stream: CUstream) -> BoltResult<CUgraph> {
 /// `gpu_sort.rs`.
 pub(crate) fn graph_instantiate(graph: CUgraph) -> BoltResult<CUgraphExec> {
     let mut exec: CUgraphExec = std::ptr::null_mut();
+    // cudarc: bind the primary context before instantiation.
+    ensure_ctx_current()?;
     check(unsafe {
         cuGraphInstantiate_v2(
             &mut exec,
@@ -1548,6 +1646,8 @@ pub(crate) fn graph_instantiate(graph: CUgraph) -> BoltResult<CUgraphExec> {
 /// path enforces this by keying its graph cache on the input device
 /// pointer — see `gpu_sort::GRAPH_CACHE`.
 pub(crate) fn graph_launch(graph_exec: CUgraphExec, stream: CUstream) -> BoltResult<()> {
+    // cudarc: bind the primary context before launching the graph.
+    ensure_ctx_current()?;
     check(unsafe { cuGraphLaunch(graph_exec, stream) })
 }
 
@@ -1560,6 +1660,8 @@ pub(crate) fn graph_launch(graph_exec: CUgraphExec, stream: CUstream) -> BoltRes
 /// races against the context-destroy path on some drivers.
 #[allow(dead_code)] // reason: kept for symmetry; the cache leaks intentionally
 pub(crate) unsafe fn graph_exec_destroy(graph_exec: CUgraphExec) -> BoltResult<()> {
+    // cudarc: bind the primary context before destroying the graph exec.
+    ensure_ctx_current()?;
     check(cuGraphExecDestroy(graph_exec))
 }
 
@@ -1568,6 +1670,8 @@ pub(crate) unsafe fn graph_exec_destroy(graph_exec: CUgraphExec) -> BoltResult<(
 /// own copy of the recorded operations, so the source graph can be
 /// released right away.
 pub(crate) fn graph_destroy(graph: CUgraph) -> BoltResult<()> {
+    // cudarc: bind the primary context before destroying the graph.
+    ensure_ctx_current()?;
     check(unsafe { cuGraphDestroy(graph) })
 }
 
