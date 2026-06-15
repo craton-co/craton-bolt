@@ -581,6 +581,12 @@ impl CudaModule {
     /// Internal: drive `cuModuleLoadDataEx` and wrap the resulting handle in
     /// an `Arc<CudaModuleInner>`. Used only by the cache miss path.
     fn load_uncached(ptx: &str) -> BoltResult<Self> {
+        // Bind the (cudarc primary) context to THIS thread before the raw
+        // cuModuleLoadDataEx FFI. A PTX cache miss can run the load on a worker
+        // thread that never established context currency, which the driver
+        // rejects with CUDA_ERROR_INVALID_CONTEXT (201). No-op under the
+        // default per-Engine-context backend.
+        cuda_sys::ensure_ctx_current()?;
         let ptx_cstr = CString::new(ptx).map_err(|e| {
             BoltError::Cuda(format!("PTX source contains interior NUL byte: {}", e))
         })?;
