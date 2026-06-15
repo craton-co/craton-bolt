@@ -45,6 +45,22 @@ use crate::error::{BoltError, BoltResult};
 /// latched here, but `ensure_device(n)` lets `CudaContext::new`
 /// initialise the cell with a non-default ordinal on a single-GPU
 /// system as a transitional step.
+///
+/// # Process-lifetime retention invariant (multi-engine context-lifetime fix)
+///
+/// `CudaDevice::new` calls `cuDevicePrimaryCtxRetain` (refcount 0→1) and
+/// `cudarc::CudaDevice::Drop` calls the matching `cuDevicePrimaryCtxRelease`
+/// (refcount →0, which RESETS the primary context and invalidates every
+/// pointer/module/stream bound to it). Because we stash the `Arc<CudaDevice>`
+/// in this `'static` `OnceCell`, the `Arc` is NEVER dropped while the process
+/// runs — so the release never fires and the primary context stays valid and
+/// retained for the whole process. This is the load-bearing guarantee that
+/// lets a SECOND (and Nth) `Engine` reuse the same still-valid context after
+/// the first engine's `CudaContext` is dropped: per-engine teardown
+/// (`CudaContext::Drop` under `--features cudarc`) only drains the pool /
+/// streams / module caches; it must NEVER release or reset this primary
+/// context. See `cuda_sys::CudaContext::Drop`, which is gated to skip
+/// `cuCtxDestroy_v2` under `--features cudarc` precisely to uphold this.
 static GLOBAL_DEVICE: once_cell::sync::OnceCell<Arc<CudaDevice>> = once_cell::sync::OnceCell::new();
 
 /// Initialise the cudarc primary context on `ordinal` if it isn't
@@ -81,6 +97,39 @@ pub(crate) fn ensure_device(ordinal: i32) -> BoltResult<()> {
 /// thread's *current* context, so a launch-only worker thread that never
 /// touched the alloc path must bind here before it issues a launch.
 pub(crate) fn bind_current_thread() -> BoltResult<()> {
+    ensure_primary_ctx_current()
+}
+
+/// Make cudarc's process-wide primary context current on the **calling
+/// thread**, retaining it on first use. Idempotent and cheap — on the hot
+/// path this is a single thread-local `cuCtxSetCurrent` (the device cell is
+/// already latched after the first `ensure_device`/`mem_alloc`), and it NEVER
+/// releases or resets the context.
+///
+/// # Why this exists (multi-engine context-lifetime fix)
+///
+/// CUDA context currency is **per-thread**: `cuCtxSetCurrent` sets the context
+/// for the calling thread only, and `cuModuleLoadDataEx` / `cuLaunchKernel` /
+/// `cuStreamCreate` / `cuStreamSynchronize` / `cuCtxSynchronize` / the
+/// synchronous `cuMemset*` / `cuMemcpyDtoD` / `cuMemGetInfo` / event / pinned-
+/// host FFI all operate against whatever context is current on the thread that
+/// invokes them. The cudarc backend's raw `malloc_sync` / `cuMemcpy*` escape
+/// hatch does NOT auto-bind the way cudarc's safe `CudaSlice` API does, so the
+/// ONLY ops that previously established currency were `device_ref()` (alloc /
+/// free / memcpy / async memset) and `CudaContext::new` / `set_current`.
+///
+/// In a single-engine, single-thread run this is invisible: `Engine::new`
+/// binds once and every later op happens on that same thread. But when MANY
+/// engines/operations run in ONE process (e.g. `cargo test --features cudarc
+/// -- --ignored`, which schedules tests across libtest's worker-thread pool),
+/// a thread can issue a raw-FFI GPU op — most visibly a module load — as its
+/// first CUDA action with no current context, yielding
+/// `CUDA_ERROR_INVALID_CONTEXT` (201) or `initialization error` (3). This
+/// helper is the single, idempotent "ensure the right context is current
+/// here" call that every such op should funnel through. It is exported so the
+/// `cuda_sys` safe wrappers can call it before their FFI under
+/// `--features cudarc`.
+pub(crate) fn ensure_primary_ctx_current() -> BoltResult<()> {
     device_ref().map(|_| ())
 }
 
