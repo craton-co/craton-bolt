@@ -101,6 +101,11 @@ impl CudaStream {
 
     /// Create a new non-blocking stream.
     pub fn new() -> BoltResult<Self> {
+        // Make the (cudarc primary) context current on this thread before the
+        // raw cuStreamCreate FFI — a thread issuing its first CUDA op needs a
+        // current context or the driver returns 201. No-op under the default
+        // per-Engine-context backend.
+        cuda_sys::ensure_ctx_current()?;
         let mut s: CUstream = ptr::null_mut();
         unsafe {
             cuda_sys::check(cuda_sys::cuStreamCreate(&mut s, 0))?;
@@ -317,6 +322,11 @@ pub fn launch_with_geometry(
         kernel_params.push(s as *mut u32 as *mut c_void);
     }
 
+    // Bind the (cudarc primary) context to this thread before the raw launch —
+    // a launch may run on a thread that loaded the module / created the stream
+    // elsewhere; without a current context the driver returns 201. No-op under
+    // the default per-Engine-context backend.
+    cuda_sys::ensure_ctx_current()?;
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),
@@ -372,6 +382,9 @@ pub fn launch_1d(
     }
     kernel_params.push(&mut args.n_rows as *mut u32 as *mut c_void);
 
+    // Bind the (cudarc primary) context to this thread before the raw launch
+    // (no-op under the default per-Engine-context backend); see launch_with_geometry.
+    cuda_sys::ensure_ctx_current()?;
     unsafe {
         cuda_sys::check(cuda_sys::cuLaunchKernel(
             function.raw(),

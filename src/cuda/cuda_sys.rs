@@ -501,7 +501,7 @@ pub fn check(code: CUresult) -> BoltResult<()> {
 /// context) is preserved exactly.
 #[inline]
 #[allow(clippy::unnecessary_wraps)] // reason: signature is uniform across backends
-fn ensure_ctx_current() -> BoltResult<()> {
+pub(crate) fn ensure_ctx_current() -> BoltResult<()> {
     #[cfg(feature = "cudarc")]
     {
         crate::cuda::cudarc_backend::ensure_primary_ctx_current()
