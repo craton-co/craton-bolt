@@ -2053,7 +2053,32 @@ impl ReduceScalar for i32 {
              the i32 finalize Sum arm is unreachable for a real SUM"
         );
         let acc = match op {
-            ReduceOp::Sum | ReduceOp::Count => host.iter().copied().fold(0i32, i32::wrapping_add),
+            // V-10: even though SUM(Int32) is supposed to widen to i64 before
+            // this finalize (see the debug_assert above and the i64 impl), the
+            // Sum arm must NOT silently wrap if a dispatch regression ever
+            // routes a native i32 SUM here in a release build (where the
+            // debug_assert is compiled out). Accumulate with `checked_add` and
+            // error loudly on overflow, mirroring the i64 Sum arm and the
+            // SUM(Decimal128) checked_add path. For in-range inputs this folds
+            // to the identical value the previous `wrapping_add` produced.
+            ReduceOp::Sum => {
+                let mut sum: i32 = 0;
+                for &v in host {
+                    sum = match sum.checked_add(v) {
+                        Some(s) => s,
+                        None => {
+                            return Err(BoltError::Type(
+                                "SUM(integer) overflow: accumulator exceeds i32 range".to_string(),
+                            ));
+                        }
+                    };
+                }
+                sum
+            }
+            // COUNT (synthesized as a sum-over-ones) keeps wrapping_add and stays
+            // infallible: a row count cannot realistically overflow i32, and the
+            // i32 COUNT accumulator matches the i64 impl's COUNT contract.
+            ReduceOp::Count => host.iter().copied().fold(0i32, i32::wrapping_add),
             ReduceOp::Min => host.iter().copied().fold(i32::MAX, i32::min),
             ReduceOp::Max => host.iter().copied().fold(i32::MIN, i32::max),
         };
@@ -2478,6 +2503,115 @@ mod tests {
         let dt = arr.data_type().clone();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(name, dt, true)]));
         RecordBatch::try_new(schema, vec![arr]).expect("batch")
+    }
+
+    // -----------------------------------------------------------------------
+    // V-10: i32 ReduceScalar::finalize Sum-arm overflow guard.
+    //
+    // The Sum arm of the i32 finalize is unreachable for a real SUM today
+    // (SUM(Int32) widens to i64 first), but it must still error rather than
+    // silently wrap if a dispatch regression ever routes a native i32 SUM
+    // through it in a RELEASE build (where the debug_assert is compiled out).
+    // These tests pin the checked-arithmetic contract: in-range folds match
+    // the old wrapping_add value byte-for-byte, and an out-of-range fold
+    // returns a BoltError::Type instead of a wrapped (wrong) answer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn i32_finalize_sum_in_range_matches_plain_fold() {
+        // A normal in-range sum must be unchanged by the switch from
+        // wrapping_add to checked_add.
+        let host = [1i32, 2, 3, -4, 100];
+        let got = <i32 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int32, &host)
+            .expect("in-range i32 SUM must succeed");
+        match got {
+            Scalar::I32(v) => assert_eq!(v, 102),
+            other => panic!("expected Scalar::I32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i32_finalize_sum_empty_is_zero() {
+        // Folding an empty slice yields the additive identity, 0 — same as the
+        // previous fold(0i32, ...).
+        let got = <i32 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int32, &[])
+            .expect("empty i32 SUM must succeed");
+        match got {
+            Scalar::I32(v) => assert_eq!(v, 0),
+            other => panic!("expected Scalar::I32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i32_finalize_sum_at_max_no_overflow() {
+        // Summing exactly to i32::MAX is in range and must NOT error: the guard
+        // only fires on a true overflow, so the boundary value succeeds.
+        let host = [i32::MAX - 1, 1];
+        let got = <i32 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int32, &host)
+            .expect("sum to i32::MAX must succeed");
+        match got {
+            Scalar::I32(v) => assert_eq!(v, i32::MAX),
+            other => panic!("expected Scalar::I32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i32_finalize_sum_positive_overflow_errors() {
+        // i32::MAX + 1 would wrap to i32::MIN under wrapping_add; the checked
+        // guard must instead return a BoltError::Type (no silent wrap).
+        let host = [i32::MAX, 1];
+        let err = <i32 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int32, &host)
+            .expect_err("positive i32 SUM overflow must error");
+        match err {
+            BoltError::Type(msg) => {
+                assert!(
+                    msg.contains("SUM(integer) overflow") && msg.contains("i32"),
+                    "unexpected overflow message: {msg}"
+                );
+            }
+            other => panic!("expected BoltError::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i32_finalize_sum_negative_overflow_errors() {
+        // Underflow past i32::MIN must also error rather than wrap to a large
+        // positive value.
+        let host = [i32::MIN, -1];
+        let err = <i32 as ReduceScalar>::finalize(ReduceOp::Sum, DataType::Int32, &host)
+            .expect_err("negative i32 SUM overflow must error");
+        assert!(
+            matches!(err, BoltError::Type(_)),
+            "expected BoltError::Type on negative overflow, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn i32_finalize_count_still_wraps_infallibly() {
+        // COUNT (sum-over-ones) intentionally keeps wrapping_add and stays
+        // infallible — even a synthetic overflow does not error.
+        let host = [i32::MAX, 1];
+        let got = <i32 as ReduceScalar>::finalize(ReduceOp::Count, DataType::Int32, &host)
+            .expect("COUNT must remain infallible");
+        match got {
+            Scalar::I32(v) => assert_eq!(v, i32::MAX.wrapping_add(1)),
+            other => panic!("expected Scalar::I32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i32_finalize_minmax_unaffected_by_overflow_guard() {
+        // MIN/MAX are non-arithmetic and never touch the checked-add path; a
+        // slice straddling the i32 extremes must still reduce cleanly.
+        let host = [3i32, i32::MIN, 7, i32::MAX, -2];
+        match <i32 as ReduceScalar>::finalize(ReduceOp::Min, DataType::Int32, &host).unwrap() {
+            Scalar::I32(v) => assert_eq!(v, i32::MIN),
+            other => panic!("expected Scalar::I32, got {other:?}"),
+        }
+        match <i32 as ReduceScalar>::finalize(ReduceOp::Max, DataType::Int32, &host).unwrap() {
+            Scalar::I32(v) => assert_eq!(v, i32::MAX),
+            other => panic!("expected Scalar::I32, got {other:?}"),
+        }
     }
 
     /// `filter_primitive_to_vec` drops NULL positions and preserves order for
