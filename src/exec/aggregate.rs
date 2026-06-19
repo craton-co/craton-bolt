@@ -2045,13 +2045,11 @@ impl ReduceScalar for i32 {
         // synthesized sum-over-ones that cannot overflow i32). The `Sum` arm
         // below is unreachable for a real SUM; we assert that here so a future
         // dispatch change that accidentally routes a native i32 SUM through this
-        // (silently wrapping) fold is caught in debug builds rather than
-        // producing a wrong answer.
-        debug_assert!(
-            !matches!(op, ReduceOp::Sum),
-            "SUM(Int32) must widen to i64 before host finalize (see i64 ReduceScalar); \
-             the i32 finalize Sum arm is unreachable for a real SUM"
-        );
+        // fold is caught by the `checked_add` Sum arm below (which errors on
+        // overflow in both debug and release builds) rather than producing a
+        // wrong answer. (A `debug_assert!(op != Sum)` previously lived here, but
+        // it made the checked Sum arm — and its overflow tests — unreachable in
+        // debug builds, so it was removed in favour of the always-on check.)
         let acc = match op {
             // V-10: even though SUM(Int32) is supposed to widen to i64 before
             // this finalize (see the debug_assert above and the i64 impl), the
