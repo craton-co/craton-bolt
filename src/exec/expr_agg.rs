@@ -121,6 +121,14 @@
 //! evaluator on top of the classic groupby path) must replicate the same
 //! filter-then-evaluate ordering or they will reintroduce the bug.
 //!
+//! That invariant is now CHECKABLE rather than merely documented:
+//! [`HostColumn::ensure_no_surviving_nulls`] enforces it at the collapse
+//! point — a surviving `None` trips a `debug_assert!` in debug builds and
+//! returns a `BoltError::Other` internal-error in release builds, so a
+//! contract-violating caller fails loudly instead of silently corrupting the
+//! aggregate via the `None → 0` collapse. Collapse callers should invoke it
+//! immediately before flattening `Option<T>` into a dense `Vec<T>`.
+//!
 //! ## Tests
 //!
 //! Self-contained unit tests live in the `#[cfg(test)] mod tests` at the
@@ -207,6 +215,59 @@ impl HostColumn {
             HostColumn::F64(_) => DataType::Float64,
             HostColumn::Utf8(_) => DataType::Utf8,
         }
+    }
+
+    /// True iff any cell of this column is SQL `NULL` (`None`).
+    pub fn has_nulls(&self) -> bool {
+        match self {
+            HostColumn::Bool(v) => v.iter().any(Option::is_none),
+            HostColumn::I32(v) => v.iter().any(Option::is_none),
+            HostColumn::I64(v) => v.iter().any(Option::is_none),
+            HostColumn::F32(v) => v.iter().any(Option::is_none),
+            HostColumn::F64(v) => v.iter().any(Option::is_none),
+            HostColumn::Utf8(v) => v.iter().any(Option::is_none),
+        }
+    }
+
+    /// H1 / V-10 invariant guard for the GPU-reduction collapse points.
+    ///
+    /// The collapse callers (`agg_with_pre::from_expr_host`,
+    /// `groupby_with_pre::from_expr_host`) flatten this column's `Option<T>`
+    /// cells into a dense `Vec<T>` before the primitive GPU reduction, mapping
+    /// `None → dtype zero`. As documented in the module-level `TODO(h1)`, that
+    /// is only sound because the pre-stage predicate mask is supposed to have
+    /// already removed every NULL row upstream of `eval_expr`. A caller that
+    /// bypasses the pre-stage (e.g. a future inline evaluator on the classic
+    /// groupby path) would reintroduce the H1 zero-injection bug, where a
+    /// surviving `None` becomes a real `0` candidate and corrupts
+    /// `MIN`/`MAX`/`SUM`.
+    ///
+    /// That invariant was previously documented but UNENFORCED. This guard
+    /// makes it checkable: callers invoke it immediately before collapsing,
+    /// naming the call site via `context`. In debug builds a surviving NULL
+    /// trips a `debug_assert!` so the contract violation is loud during
+    /// development; in release builds it returns a `BoltError::Other`
+    /// internal-error (rather than silently producing a wrong answer) so the
+    /// engine's "never silently wrong" invariant holds even if the assertion
+    /// is compiled out.
+    ///
+    /// For a correct caller (no surviving NULLs) this is a cheap scan that
+    /// returns `Ok(())` and changes no observable behavior.
+    pub fn ensure_no_surviving_nulls(&self, context: &str) -> BoltResult<()> {
+        debug_assert!(
+            !self.has_nulls(),
+            "expr_agg: surviving NULL reached the GPU-reduction collapse in {context}; \
+             the pre-stage predicate mask must filter NULL rows before from_expr_host \
+             (see TODO(h1)) — collapsing None→0 here would corrupt MIN/MAX/SUM",
+        );
+        if self.has_nulls() {
+            return Err(BoltError::Other(format!(
+                "expr_agg: internal invariant violated — surviving NULL reached the \
+                 GPU-reduction collapse in {context}; None→0 collapse would corrupt \
+                 the aggregate (see TODO(h1))"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1996,6 +2057,61 @@ mod tests {
             m.insert((*n).to_string(), *c);
         }
         m
+    }
+
+    // -----------------------------------------------------------------------
+    // H1 / V-10: ensure_no_surviving_nulls collapse-point guard.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ensure_no_surviving_nulls_ok_when_all_some() {
+        // A correct caller (NULLs already filtered upstream) passes the guard
+        // and observes no behavior change.
+        let col = HostColumn::I32(vec![Some(1), Some(2), Some(3)]);
+        assert!(!col.has_nulls());
+        col.ensure_no_surviving_nulls("test_all_some")
+            .expect("dense column must pass the guard");
+    }
+
+    #[test]
+    fn ensure_no_surviving_nulls_ok_when_empty() {
+        // An empty column trivially has no surviving NULLs.
+        let col = HostColumn::F64(Vec::new());
+        col.ensure_no_surviving_nulls("test_empty")
+            .expect("empty column must pass the guard");
+    }
+
+    // In release builds (debug_assertions off) the guard returns an error;
+    // in debug builds it panics via debug_assert! before reaching the error.
+    // Gate the error-path assertion on the build profile so the test reflects
+    // the active behavior either way.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "surviving NULL"))]
+    fn ensure_no_surviving_nulls_catches_violation_i64() {
+        let col = HostColumn::I64(vec![Some(1), None, Some(3)]);
+        assert!(col.has_nulls());
+        let res = col.ensure_no_surviving_nulls("test_violation");
+        // Only reached in release builds (debug_assert compiled out); in debug
+        // the debug_assert! above panics first and `should_panic` validates it.
+        match res {
+            Err(BoltError::Other(msg)) => {
+                assert!(
+                    msg.contains("surviving NULL") && msg.contains("test_violation"),
+                    "unexpected guard error message: {msg}"
+                );
+            }
+            other => panic!("expected BoltError::Other on contract violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_nulls_detects_none_in_each_variant() {
+        assert!(HostColumn::Bool(vec![Some(true), None]).has_nulls());
+        assert!(HostColumn::I32(vec![None]).has_nulls());
+        assert!(HostColumn::F32(vec![Some(1.0), None]).has_nulls());
+        assert!(HostColumn::Utf8(vec![Some("a".to_string()), None]).has_nulls());
+        assert!(!HostColumn::I64(vec![Some(1), Some(2)]).has_nulls());
+        assert!(!HostColumn::Utf8(vec![Some("x".to_string())]).has_nulls());
     }
 
     #[test]
