@@ -13,8 +13,12 @@
 //! PTXAS assembly inside `cuModuleLoadDataEx` is the dominant cost of
 //! `Engine::sql` for short queries — typically tens of milliseconds per
 //! invocation. To eliminate that cost for repeated identical queries we keep
-//! a process-wide cache keyed by a 128-bit hash of the PTX text (a pair of
-//! `DefaultHasher` outputs with domain-separation bytes — see [`hash_ptx`]).
+//! a process-wide cache keyed by a 128-bit hash of the PTX text **plus the
+//! active device ordinal** (a pair of `DefaultHasher` outputs with
+//! domain-separation bytes and the device folded into both halves — see
+//! [`hash_ptx`]). Folding the device keeps a module loaded on one GPU from
+//! being served to an executor bound to another; the same-device,
+//! different-context case is handled by [`clear_ptx_cache`] on teardown.
 //!
 //! **Invariant.** The codegen pipeline is deterministic: for a given
 //! `(PhysicalPlan, kernel_name)` pair the emitted PTX text is byte-identical
@@ -424,11 +428,15 @@ fn ptx_cache() -> &'static Mutex<PtxCache> {
 /// `exec::module_cache::clear_all_caches`).
 ///
 /// A cached [`CudaModule`] wraps a `CUmodule` that is valid ONLY in the context
-/// that loaded it, but this cache keys purely on the PTX-text hash — there is
-/// no device or context in the key. So once a context is destroyed, every
-/// module it loaded is dangling; a later `Engine` (new context, same PTX) would
-/// be handed that dead handle and fail with `cuModuleGetFunction ... invalid
-/// resource handle`. Clearing here drops the cache's `Arc<CudaModuleInner>`
+/// that loaded it. The key now folds in the active *device* ordinal (see
+/// [`hash_ptx`]), which closes the multi-GPU hole — a device-0 module can no
+/// longer be served to a device-1 executor — but the device ordinal does NOT
+/// distinguish two contexts on the *same* device. So once a context is
+/// destroyed, every module it loaded is dangling; a later `Engine` (a new
+/// context on the same device, same PTX) hashes to the SAME slot and would be
+/// handed that dead handle, failing with `cuModuleGetFunction ... invalid
+/// resource handle`. Clearing here is what closes that same-device,
+/// cross-context case. Clearing drops the cache's `Arc<CudaModuleInner>`
 /// clones; the real `cuModuleUnload` runs (when the last clone drops) while the
 /// outgoing context is still current. No-op if the cache was never initialised.
 pub(crate) fn clear_ptx_cache() {
@@ -467,13 +475,55 @@ pub fn ptx_cache_stats() -> (usize, usize, usize) {
 /// but more than adequate for collision-resistance against our own
 /// deterministic PTX output. The `Slot::Collision` fallback is retained
 /// as defence-in-depth — at 128 bits it is effectively unreachable.
+///
+/// ## Multi-GPU keying (W03 caches fix)
+///
+/// A loaded `CUmodule` is valid only in the CUDA context that produced it, and
+/// that context is pinned to one physical device. This cache historically keyed
+/// *only* on the PTX text, so a module loaded on device 0 could be served to an
+/// executor bound to device 1 — handing back a handle that is invalid in the
+/// requesting context (`cuModuleGetFunction ... invalid resource handle`, or
+/// worse, silent cross-device UB on two GPUs). We fold the **active device
+/// ordinal** into both 64-bit halves so two devices key into disjoint slots,
+/// mirroring `exec::module_cache::hash128` (which already mixes the same
+/// ordinal into its spec-cache keys). The *same-device, different-context* case
+/// (a later `Engine::new()` on a single-GPU host) is handled orthogonally by
+/// [`clear_ptx_cache`], which empties this cache on context teardown.
+///
+/// Device-folding is delegated to [`active_device_id`], which returns `0` when
+/// no context is current (always the case under `--features cuda-stub`): a
+/// single-GPU production rig and the stub test build both see exactly the key
+/// shape they did before this change.
 fn hash_ptx(ptx: &str) -> (u64, u64) {
+    hash_ptx_for_device(ptx, active_device_id())
+}
+
+/// Active CUDA device ordinal for PTX-cache-key disambiguation.
+///
+/// Thin reuse of [`crate::cuda::cuda_sys::current_device`] (a `cuCtxGetDevice`
+/// wrapper). It errors when no context is current on the calling thread — the
+/// normal case under `--features cuda-stub`, where `cuCtxGetDevice` is a stub
+/// returning an error — so we fall back to a stable placeholder of device `0`.
+/// The fallback is intentionally silent (the no-context path is expected under
+/// the stub) and keeps single-GPU rigs keying exactly as before. This is the
+/// same convention `exec::module_cache::active_device_id` uses.
+fn active_device_id() -> i32 {
+    crate::cuda::cuda_sys::current_device().unwrap_or(0)
+}
+
+/// Device-explicit body of [`hash_ptx`], split out so the device-folding logic
+/// is unit-testable without a live CUDA context (the stub build can only ever
+/// observe device `0` from [`active_device_id`]). Production callers go through
+/// [`hash_ptx`], which supplies the active ordinal.
+fn hash_ptx_for_device(ptx: &str, dev: i32) -> (u64, u64) {
     use std::collections::hash_map::DefaultHasher;
     let mut hi = DefaultHasher::new();
     hi.write_u8(0x10);
+    hi.write_i32(dev);
     hi.write(ptx.as_bytes());
     let mut lo = DefaultHasher::new();
     lo.write_u8(0x20);
+    lo.write_i32(dev);
     lo.write(ptx.as_bytes());
     (hi.finish(), lo.finish())
 }
@@ -1185,6 +1235,51 @@ mod tests {
         // domain byte alone distinguishes them).
         let (hi, lo) = hash_ptx("");
         assert_ne!(hi, lo);
+    }
+
+    /// Multi-GPU keying (W03): the active device ordinal participates in the
+    /// 128-bit key, so the *same* PTX text hashed against two different devices
+    /// yields two different keys. This is what stops a module loaded on device
+    /// 0 from being served — and dereferenced as an invalid handle — to a
+    /// device-1 executor.
+    ///
+    /// We exercise the device-explicit `hash_ptx_for_device` directly because
+    /// the live accessor (`active_device_id`) can only report device 0 under
+    /// `--features cuda-stub` (no CUDA context exists).
+    #[test]
+    fn hash_ptx_folds_in_device_id() {
+        let ptx = "// device-fold probe — unique tag 9e4d\n.version 7.0\n";
+        let dev0 = hash_ptx_for_device(ptx, 0);
+        let dev1 = hash_ptx_for_device(ptx, 1);
+        assert_ne!(
+            dev0, dev1,
+            "the device ordinal must change the key so device-0 and device-1 \
+             modules occupy disjoint PTX-cache slots"
+        );
+
+        // Same device hashes stably (the warm-cache invariant the PTX cache
+        // relies on for hit detection).
+        assert_eq!(dev0, hash_ptx_for_device(ptx, 0), "same device must be stable");
+
+        // Both halves stay domain-separated after device folding.
+        assert_ne!(dev0.0, dev0.1, "device folding must not collapse the halves");
+
+        // Under cuda-stub no context exists, so `active_device_id` (the
+        // production source of the ordinal) falls back to the device-0
+        // placeholder and `hash_ptx` keys exactly as the device-0 path does.
+        #[cfg(feature = "cuda-stub")]
+        {
+            assert_eq!(
+                active_device_id(),
+                0,
+                "under cuda-stub (no CUDA context) the device id must fall back to 0"
+            );
+            assert_eq!(
+                hash_ptx(ptx),
+                dev0,
+                "on the stub build hash_ptx must equal the device-0 explicit hash"
+            );
+        }
     }
 
     // -- decode_log boundary logic (NUL-terminated driver log buffer) ------
