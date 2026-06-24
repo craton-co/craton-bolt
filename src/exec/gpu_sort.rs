@@ -2327,16 +2327,33 @@ const SHMEM_VARIANT_MAX_NPOW2: u32 = SORT_BLOCK_SIZE;
 // Batch 6. The pointer-keyed cache is the simpler win for the common case
 // where the caller re-uses the same buffers across queries.
 //
-// ## Lifetime
+// ## Lifetime & context binding (W03 caches fix)
 //
-// `CUgraphExec` handles are stored process-wide and intentionally LEAKED at
-// process exit — destroying graph execs during context teardown races on
-// some drivers and we have no signal that says "the engine is shutting
-// down cleanly" before `Drop` runs on the global cache. The cache is
-// monotone-grow during a process's lifetime; in practice the number of
-// distinct `(n_pow2, dtype, ptr)` triples is small (one per registered
-// table per dtype) and the per-entry footprint is the size of a
-// `CUgraphExec` (one pointer).
+// A `CUgraphExec` is instantiated inside the CUDA context current at capture
+// time and is valid only there; `cuGraphExecDestroy` reclaims it against that
+// context. This cache is process-global, so it can hold graphs instantiated
+// under different live contexts (multiple `Engine`s, possibly multiple GPUs).
+// Two hazards follow if the cache is context-blind:
+//
+//   * Device pointers are per-context, so two contexts can legitimately hand
+//     back the *same* numeric `CUdeviceptr`. The old key
+//     `(n_pow2, dtype, idx_ptr, keys_fp)` carried no context, so engine B could
+//     hit a graph exec instantiated in engine A's (possibly different-GPU)
+//     context — an invalid handle. We close this by folding the owning
+//     `CUcontext` into the key.
+//   * The cache must be reclaimed at context teardown, but only for the dying
+//     context — destroying another live context's graph execs would be a UAF.
+//     We tag each stored entry with its owning context and, on teardown
+//     ([`invalidate_graph_cache_on_context_teardown`], wired into
+//     `module_cache::clear_all_caches` → `CudaContext::Drop`), destroy only the
+//     entries owned by the context being torn down and retain the rest.
+//
+// Within a single context this remains a monotone-grow cache (one entry per
+// registered table per dtype); the per-entry footprint is a `CUgraphExec`
+// pointer plus the owning-context tag. The historical "leaked at process exit"
+// behaviour still applies to any entries a context never explicitly tears down
+// (e.g. the global primary context under `--features cudarc`, whose `drop`
+// fires only at process exit).
 //
 // ## Opt-in
 //
@@ -2367,6 +2384,13 @@ fn dtype_tag(dt: DataType) -> u8 {
 /// Process-wide cache of instantiated bitonic-sort graphs.
 ///
 /// Key tuple (in order):
+///   - `owning_ctx`       — the `CUcontext` (as `usize`) the graph was
+///                          instantiated under. Device pointers are per-context,
+///                          so two contexts can hand back the same numeric
+///                          `CUdeviceptr`; without this field engine B could hit
+///                          a graph exec owned by engine A's context (an invalid
+///                          handle, possibly on another GPU). `0` means the
+///                          owning context was unknown at capture time.
 ///   - `n_pow2`           — recorded grid size baked into the graph.
 ///   - `dtype_tag`        — keeps different-typed sorts on the same
 ///                          buffer from aliasing.
@@ -2380,17 +2404,86 @@ fn dtype_tag(dt: DataType) -> u8 {
 ///
 /// The value is a `CUgraphExec` — a raw pointer that's wrapped in
 /// `GraphExecHandle` so we can `Send` it across threads via the `static`.
-type GraphCacheKey = (u32, u8, u64, u64);
+type GraphCacheKey = (usize, u32, u8, u64, u64);
 
-/// `Send + Sync` wrapper around `CUgraphExec`. The driver permits using
-/// a `CUgraphExec` from any thread once its context is current; we only
-/// dereference the handle while we already hold the engine's `CudaContext`.
-struct GraphExecHandle(CUgraphExec);
+/// `Send + Sync` wrapper around a `CUgraphExec` plus the `CUcontext` (as
+/// `usize`) it was instantiated under. The driver permits using a `CUgraphExec`
+/// from any thread once its context is current; we only dereference the handle
+/// while we already hold the engine's `CudaContext`. The owning-context tag lets
+/// [`invalidate_graph_cache_on_context_teardown`] destroy only the entries
+/// belonging to the context being torn down.
+struct GraphExecHandle {
+    exec: CUgraphExec,
+    owning_ctx: usize,
+}
 // SAFETY: a `CUgraphExec` is a raw opaque handle the driver dereferences;
 // the engine serialises capture and launch through `GRAPH_CACHE.lock()`
 // and only launches with a live context bound to the calling thread.
 unsafe impl Send for GraphExecHandle {}
 unsafe impl Sync for GraphExecHandle {}
+
+/// The `CUcontext` currently bound to the calling thread as a `usize` tag, or
+/// `0` ("unknown") when no context is current or the driver query fails. `0` is
+/// not a valid *current* `CUcontext` (the driver reports null as "none"), so it
+/// is a safe sentinel. Mirrors `cuda::stream_pool::active_ctx_tag`.
+fn active_ctx_tag() -> usize {
+    match cuda_sys::ctx_get_current() {
+        Ok(Some(ctx)) => ctx as usize,
+        Ok(None) | Err(_) => 0,
+    }
+}
+
+/// Destroy the cached bitonic-sort graph execs owned by the **currently bound
+/// context** and remove them from the cache, leaving every other context's
+/// entries intact.
+///
+/// Wired into `crate::exec::module_cache::clear_all_caches`, which runs from
+/// `CudaContext::Drop` while the context being torn down is still alive and
+/// current. A `CUgraphExec` is valid only in the context that instantiated it,
+/// so once that context is destroyed every graph it owns is dangling; a later
+/// `Engine` on the same device could otherwise key into a surviving entry
+/// (device pointers can recur across contexts) and launch a dead handle. We
+/// reclaim those execs here — while the owning context is still current — via
+/// `cuGraphExecDestroy`.
+///
+/// Crucially this destroys ONLY the entries whose owning-context tag matches the
+/// active context: a process-global cache may also hold graphs owned by another,
+/// still live context (a second `Engine`, possibly on another GPU), and
+/// destroying those here would be a use-after-free the moment that engine next
+/// launches one. Entries tagged "unknown" (`owning_ctx == 0`) are also retained
+/// — we can't prove they belong to the dying context. If the active context
+/// itself can't be determined we destroy nothing (leak for the process
+/// remainder rather than risk a wrong-context destroy). No-op when the cache was
+/// never populated (the default path: `BOLT_SORT_USE_GRAPH` unset).
+pub(crate) fn invalidate_graph_cache_on_context_teardown() {
+    let me = active_ctx_tag();
+    if me == 0 {
+        return;
+    }
+    let mut cache = GRAPH_CACHE.lock();
+    // Collect the keys we own first, then destroy + remove — avoids mutating
+    // the map while iterating it.
+    let owned: Vec<GraphCacheKey> = cache
+        .iter()
+        .filter(|(_, h)| h.owning_ctx == me)
+        .map(|(k, _)| *k)
+        .collect();
+    for k in owned {
+        if let Some(h) = cache.remove(&k) {
+            // SAFETY: `h.exec` was instantiated under the context now being torn
+            // down (matching `owning_ctx`) and is not in flight at teardown
+            // (all engine work has quiesced before `CudaContext::Drop`).
+            // Destroying it now, while that context is still current, reclaims
+            // it cleanly.
+            if let Err(e) = unsafe { cuda_sys::graph_exec_destroy(h.exec) } {
+                log::warn!(
+                    "craton-bolt: gpu_sort graph-cache teardown cuGraphExecDestroy \
+                     failed ({e}); graph exec leaked for this context"
+                );
+            }
+        }
+    }
+}
 
 /// Lazily-initialised cache. Allocated on first lookup, monotone-grow,
 /// leaked at process exit (see module-level rationale).
@@ -2641,7 +2734,13 @@ pub fn sort_indices_on_gpu_multi<'a>(
                 // single launch shares the same kernel ABI, but the first key
                 // is the load-bearing one for grid sizing.
                 let tag = dtype_tag(key_descs[0].dtype);
-                let cache_key: GraphCacheKey = (n_pow2, tag, indices_ptr, keys_fp);
+                // Fold the owning context into the key (W03): device pointers
+                // are per-context, so without it a different context could hit
+                // a graph exec it doesn't own (invalid handle, possibly another
+                // GPU). `0` ("unknown") is the conservative fallback when no
+                // context is current; it still keys consistently for this run.
+                let owning_ctx = active_ctx_tag();
+                let cache_key: GraphCacheKey = (owning_ctx, n_pow2, tag, indices_ptr, keys_fp);
 
                 // Cache lookup. We hold the mutex for the entire capture /
                 // instantiate critical section to serialise concurrent first
@@ -2650,7 +2749,7 @@ pub fn sort_indices_on_gpu_multi<'a>(
                 // is a non-issue.
                 let mut cache = GRAPH_CACHE.lock();
                 let exec_handle: CUgraphExec = match cache.get(&cache_key) {
-                    Some(h) => h.0,
+                    Some(h) => h.exec,
                     None => {
                         // MISS: capture the launch sequence on a dedicated
                         // stream (cuStreamBeginCapture rejects the NULL
@@ -2733,7 +2832,7 @@ pub fn sort_indices_on_gpu_multi<'a>(
                         // (the CUgraphExec keeps its own copy).
                         let exec = cuda_sys::graph_instantiate(graph)?;
                         let _ = cuda_sys::graph_destroy(graph);
-                        cache.insert(cache_key, GraphExecHandle(exec));
+                        cache.insert(cache_key, GraphExecHandle { exec, owning_ctx });
                         exec
                     }
                 };
@@ -4188,9 +4287,11 @@ mod graph_cache_tests {
         let fake_b: CUgraphExec = 0xB000_0000_usize as CUgraphExec;
         let fake_c: CUgraphExec = 0xC000_0000_usize as CUgraphExec;
 
-        let key_a: GraphCacheKey = (1024, dtype_tag(DataType::Int32), 0x1111, 0x2222);
-        let key_b: GraphCacheKey = (1024, dtype_tag(DataType::Int64), 0x1111, 0x2222);
-        let key_c: GraphCacheKey = (2048, dtype_tag(DataType::Int32), 0x1111, 0x2222);
+        // A single synthetic owning context for the aliasing checks below.
+        const CTX: usize = 0xC7;
+        let key_a: GraphCacheKey = (CTX, 1024, dtype_tag(DataType::Int32), 0x1111, 0x2222);
+        let key_b: GraphCacheKey = (CTX, 1024, dtype_tag(DataType::Int64), 0x1111, 0x2222);
+        let key_c: GraphCacheKey = (CTX, 2048, dtype_tag(DataType::Int32), 0x1111, 0x2222);
 
         // Miss on every key (cache was just cleared).
         {
@@ -4203,26 +4304,45 @@ mod graph_cache_tests {
         // Insert.
         {
             let mut cache = GRAPH_CACHE.lock();
-            cache.insert(key_a, GraphExecHandle(fake_a));
-            cache.insert(key_b, GraphExecHandle(fake_b));
-            cache.insert(key_c, GraphExecHandle(fake_c));
+            cache.insert(
+                key_a,
+                GraphExecHandle {
+                    exec: fake_a,
+                    owning_ctx: CTX,
+                },
+            );
+            cache.insert(
+                key_b,
+                GraphExecHandle {
+                    exec: fake_b,
+                    owning_ctx: CTX,
+                },
+            );
+            cache.insert(
+                key_c,
+                GraphExecHandle {
+                    exec: fake_c,
+                    owning_ctx: CTX,
+                },
+            );
         }
 
         // Lookup must return the same handle we inserted, keyed
         // independently — dtype_tag and n_pow2 must NOT alias.
         {
             let cache = GRAPH_CACHE.lock();
-            assert_eq!(cache.get(&key_a).map(|h| h.0), Some(fake_a));
-            assert_eq!(cache.get(&key_b).map(|h| h.0), Some(fake_b));
-            assert_eq!(cache.get(&key_c).map(|h| h.0), Some(fake_c));
+            assert_eq!(cache.get(&key_a).map(|h| h.exec), Some(fake_a));
+            assert_eq!(cache.get(&key_b).map(|h| h.exec), Some(fake_b));
+            assert_eq!(cache.get(&key_c).map(|h| h.exec), Some(fake_c));
             assert_eq!(cache.len(), 3, "three distinct keys → three entries");
         }
 
-        // Distinct idx_ptr must miss even when (n_pow2, dtype, keys_fp)
+        // Distinct idx_ptr must miss even when (ctx, n_pow2, dtype, keys_fp)
         // match an existing entry — this is the load-bearing property
         // that protects us from the "caller passes a different GpuVec"
         // failure mode documented at the top of the module.
-        let key_other_ptr: GraphCacheKey = (1024, dtype_tag(DataType::Int32), 0x3333, 0x2222);
+        let key_other_ptr: GraphCacheKey =
+            (CTX, 1024, dtype_tag(DataType::Int32), 0x3333, 0x2222);
         {
             let cache = GRAPH_CACHE.lock();
             assert!(
@@ -4235,13 +4355,87 @@ mod graph_cache_tests {
         // a different key-buffer fingerprint means the captured key
         // pointers no longer match what the caller will pass to the
         // graph at launch time.
-        let key_other_fp: GraphCacheKey = (1024, dtype_tag(DataType::Int32), 0x1111, 0xDEAD);
+        let key_other_fp: GraphCacheKey =
+            (CTX, 1024, dtype_tag(DataType::Int32), 0x1111, 0xDEAD);
         {
             let cache = GRAPH_CACHE.lock();
             assert!(
                 cache.get(&key_other_fp).is_none(),
                 "different keys fingerprint must NOT hit an existing entry"
             );
+        }
+
+        // W03: a different OWNING CONTEXT must miss even when every other key
+        // field matches — device pointers recur across contexts, so this is
+        // what stops engine B from hitting engine A's graph exec.
+        let key_other_ctx: GraphCacheKey =
+            (0xD8, 1024, dtype_tag(DataType::Int32), 0x1111, 0x2222);
+        {
+            let cache = GRAPH_CACHE.lock();
+            assert!(
+                cache.get(&key_other_ctx).is_none(),
+                "a different owning context must NOT hit another context's entry"
+            );
+        }
+
+        _test_clear_graph_cache();
+    }
+
+    /// W03 teardown partitioning: invalidating context A's entries (modelled
+    /// here by removing only the matching-context keys, without calling the
+    /// driver's `cuGraphExecDestroy`) must reclaim exactly A's graphs and leave
+    /// context B's — and any unknown-tagged — entries intact. This mirrors the
+    /// per-context filter in `invalidate_graph_cache_on_context_teardown`.
+    #[test]
+    fn teardown_only_invalidates_its_own_context() {
+        let _g = TEST_GATE.lock();
+        _test_clear_graph_cache();
+
+        const CTX_A: usize = 0xA1;
+        const CTX_B: usize = 0xB2;
+        const UNKNOWN: usize = 0;
+
+        let mk = |ctx: usize, n: u32| -> GraphCacheKey {
+            (ctx, n, dtype_tag(DataType::Int32), 0x1111, 0x2222)
+        };
+        {
+            let mut cache = GRAPH_CACHE.lock();
+            for (ctx, n, exec) in [
+                (CTX_A, 1024u32, 0xA000_0001usize),
+                (CTX_A, 2048, 0xA000_0002),
+                (CTX_B, 1024, 0xB000_0001),
+                (UNKNOWN, 1024, 0x0000_0001),
+            ] {
+                cache.insert(
+                    mk(ctx, n),
+                    GraphExecHandle {
+                        exec: exec as CUgraphExec,
+                        owning_ctx: ctx,
+                    },
+                );
+            }
+            assert_eq!(cache.len(), 4);
+        }
+
+        // Model `invalidate_..._teardown` for CTX_A: drop only A's keys.
+        {
+            let mut cache = GRAPH_CACHE.lock();
+            let owned: Vec<GraphCacheKey> = cache
+                .iter()
+                .filter(|(_, h)| h.owning_ctx == CTX_A)
+                .map(|(k, _)| *k)
+                .collect();
+            assert_eq!(owned.len(), 2, "exactly context A's two graphs must match");
+            for k in owned {
+                cache.remove(&k);
+            }
+            assert_eq!(
+                cache.len(),
+                2,
+                "context B's and the unknown-tagged graph must survive A's teardown"
+            );
+            // Neither survivor is owned by A.
+            assert!(cache.values().all(|h| h.owning_ctx != CTX_A));
         }
 
         _test_clear_graph_cache();

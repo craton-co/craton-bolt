@@ -256,6 +256,17 @@ pub(crate) fn clear_all_caches() {
     // `CudaModule` handles and keys WITHOUT any context/device — it is the real
     // source of cross-context stale handles, so it must be cleared too.
     crate::jit::jit_compiler::clear_ptx_cache();
+    // The bitonic-sort CUDA-graph cache (`exec::gpu_sort::GRAPH_CACHE`) holds
+    // instantiated `CUgraphExec` handles, each valid only in the context that
+    // captured it. Like the module caches above it is a process-global static,
+    // so a graph exec owned by THIS now-dying context must be reclaimed here
+    // (while the context is still current) before it is destroyed — otherwise a
+    // later `Engine` on the same device could key into the surviving entry
+    // (device pointers can recur across contexts) and launch a dead handle.
+    // This destroys ONLY the dying context's entries (tagged by owning
+    // `CUcontext`); another live context's graphs are retained. No-op unless the
+    // `BOLT_SORT_USE_GRAPH` graph path was exercised.
+    crate::exec::gpu_sort::invalidate_graph_cache_on_context_teardown();
 }
 
 /// Look up (or build, on a miss) the `CudaModule` for `(namespace, spec_id)`.
