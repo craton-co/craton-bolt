@@ -4341,8 +4341,7 @@ mod graph_cache_tests {
         // match an existing entry — this is the load-bearing property
         // that protects us from the "caller passes a different GpuVec"
         // failure mode documented at the top of the module.
-        let key_other_ptr: GraphCacheKey =
-            (CTX, 1024, dtype_tag(DataType::Int32), 0x3333, 0x2222);
+        let key_other_ptr: GraphCacheKey = (CTX, 1024, dtype_tag(DataType::Int32), 0x3333, 0x2222);
         {
             let cache = GRAPH_CACHE.lock();
             assert!(
@@ -4355,8 +4354,7 @@ mod graph_cache_tests {
         // a different key-buffer fingerprint means the captured key
         // pointers no longer match what the caller will pass to the
         // graph at launch time.
-        let key_other_fp: GraphCacheKey =
-            (CTX, 1024, dtype_tag(DataType::Int32), 0x1111, 0xDEAD);
+        let key_other_fp: GraphCacheKey = (CTX, 1024, dtype_tag(DataType::Int32), 0x1111, 0xDEAD);
         {
             let cache = GRAPH_CACHE.lock();
             assert!(
@@ -4368,8 +4366,7 @@ mod graph_cache_tests {
         // W03: a different OWNING CONTEXT must miss even when every other key
         // field matches — device pointers recur across contexts, so this is
         // what stops engine B from hitting engine A's graph exec.
-        let key_other_ctx: GraphCacheKey =
-            (0xD8, 1024, dtype_tag(DataType::Int32), 0x1111, 0x2222);
+        let key_other_ctx: GraphCacheKey = (0xD8, 1024, dtype_tag(DataType::Int32), 0x1111, 0x2222);
         {
             let cache = GRAPH_CACHE.lock();
             assert!(
