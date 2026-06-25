@@ -1259,10 +1259,17 @@ mod tests {
 
         // Same device hashes stably (the warm-cache invariant the PTX cache
         // relies on for hit detection).
-        assert_eq!(dev0, hash_ptx_for_device(ptx, 0), "same device must be stable");
+        assert_eq!(
+            dev0,
+            hash_ptx_for_device(ptx, 0),
+            "same device must be stable"
+        );
 
         // Both halves stay domain-separated after device folding.
-        assert_ne!(dev0.0, dev0.1, "device folding must not collapse the halves");
+        assert_ne!(
+            dev0.0, dev0.1,
+            "device folding must not collapse the halves"
+        );
 
         // Under cuda-stub no context exists, so `active_device_id` (the
         // production source of the ordinal) falls back to the device-0

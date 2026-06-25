@@ -88,7 +88,7 @@
 
 use std::sync::Mutex;
 
-use crate::cuda::cuda_sys::{self, CUcontext, CUstream};
+use crate::cuda::cuda_sys::{self, CUstream};
 
 /// One pooled entry: the reusable stream handle plus the `CUcontext` it was
 /// minted under, both stored as `usize` so the `Vec` is `Send` for the static
@@ -263,7 +263,10 @@ fn drain_tagged_no_driver(ctx: usize) -> usize {
 /// Test seam: empty the pool without touching the driver.
 #[cfg(test)]
 fn clear_no_driver() {
-    STREAM_POOL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    STREAM_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
@@ -305,7 +308,10 @@ mod tests {
         // Tearing down context A removes ONLY A's two streams; B's and the
         // unknown one survive (destroying them would be a UAF / a guess).
         let removed_a = drain_tagged_no_driver(CTX_A);
-        assert_eq!(removed_a, 2, "drain must reclaim exactly context A's streams");
+        assert_eq!(
+            removed_a, 2,
+            "drain must reclaim exactly context A's streams"
+        );
         assert_eq!(
             pool_len(),
             2,
@@ -316,8 +322,15 @@ mod tests {
         // with a real `me == 0` returns early and touches nothing — modelled
         // here by simply never calling drain with ctx 0).
         let removed_b = drain_tagged_no_driver(CTX_B);
-        assert_eq!(removed_b, 1, "drain must reclaim exactly context B's stream");
-        assert_eq!(pool_len(), 1, "the unknown-tagged entry is conservatively retained");
+        assert_eq!(
+            removed_b, 1,
+            "drain must reclaim exactly context B's stream"
+        );
+        assert_eq!(
+            pool_len(),
+            1,
+            "the unknown-tagged entry is conservatively retained"
+        );
 
         clear_no_driver();
     }
@@ -351,8 +364,15 @@ mod tests {
         #[cfg(feature = "cuda-stub")]
         {
             assert_eq!(active_ctx_tag(), 0, "no context current under cuda-stub");
-            assert!(acquire().is_none(), "acquire must refuse when the context is unknown");
-            assert_eq!(pool_len(), 1, "the foreign-context entry must remain pooled");
+            assert!(
+                acquire().is_none(),
+                "acquire must refuse when the context is unknown"
+            );
+            assert_eq!(
+                pool_len(),
+                1,
+                "the foreign-context entry must remain pooled"
+            );
         }
 
         clear_no_driver();
