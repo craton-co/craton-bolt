@@ -205,7 +205,10 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tld.global.s32 %r12, [%rd15];").map_err(write_err)?;
 
     // Overflow check: unsigned compare so a (defensively-allowed) negative
-    // key takes the safe global path instead of corrupting a shared slot.
+    // key is routed to the global path instead of corrupting a shared slot.
+    // The unsigned compare alone is NOT sufficient for safety — a negative
+    // key still reinterprets as a huge unsigned value and would write far
+    // out of bounds; the overflow path below explicitly drops it.
     writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
@@ -222,11 +225,23 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
     // Overflow path: hit out_count directly with a global u64 atomic add.
+    //
+    // Negative-key guard: the unsigned overflow test above sends *any*
+    // out-of-range key here, negatives included. A negative key must NOT be
+    // counted into `out_count`: with the old `mul.wide.s32` it sign-extended
+    // to a negative byte offset and the `atom.global.add.u64` incremented a
+    // counter before the `out_count` base pointer (out-of-bounds device
+    // write / UB). We now (a) skip the atomic entirely for negative keys and
+    // (b) use `mul.wide.u32` so a valid non-negative key still produces the
+    // correct unsigned byte offset.
     writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd22, %r12, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.lt.s32 %p5, %r12, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra OVERFLOW_SKIP;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r12, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd23, %rd4, %rd22;").map_err(write_err)?;
     writeln!(ptx, "\tmov.u64 %rd28, 1;").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.add.u64 %rd29, [%rd23], %rd28;").map_err(write_err)?;
+    writeln!(ptx, "OVERFLOW_SKIP:").map_err(write_err)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r3, %r3, %r5;").map_err(write_err)?;
@@ -337,6 +352,37 @@ mod tests {
         assert!(
             ptx.contains("bar.sync 0"),
             "PTX must include bar.sync 0 (__syncthreads()):\n{ptx}"
+        );
+    }
+
+    /// The OVERFLOW (global-atomic) path must NOT write for negative keys,
+    /// and must index `out_count` with an unsigned multiply. A negative key
+    /// reinterprets as a huge unsigned value by the `setp.ge.u32` overflow
+    /// test, so it lands in the OVERFLOW block; without the guard the
+    /// `mul.wide.s32` sign-extends it to a negative byte offset and the
+    /// `atom.global.add.u64` corrupts memory before the `out_count` base.
+    #[test]
+    fn overflow_path_guards_negative_keys() {
+        let ptx = compile_shmem_count_kernel().expect("kernel compiles");
+        assert!(
+            ptx.contains("setp.lt.s32 %p5, %r12, 0"),
+            "OVERFLOW path must test for a negative key before the global atomic:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p5 bra OVERFLOW_SKIP"),
+            "OVERFLOW path must branch over the global atomic for negative keys:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("OVERFLOW_SKIP:"),
+            "OVERFLOW path must declare an OVERFLOW_SKIP: label:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("mul.wide.u32 %rd22, %r12, 8"),
+            "OVERFLOW address must use mul.wide.u32 (not s32):\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("mul.wide.s32 %rd22"),
+            "OVERFLOW address must not use the signed mul.wide.s32:\n{ptx}"
         );
     }
 }

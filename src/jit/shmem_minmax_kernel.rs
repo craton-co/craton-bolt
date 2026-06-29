@@ -188,9 +188,11 @@ pub fn compile_shmem_minmax_kernel(op: MinMaxOp, dtype: MinMaxDtype) -> BoltResu
     };
     writeln!(ptx, "\t{val_load} {val_reg}, [%rd17];").map_err(write_err)?;
 
-    // Out-of-range key (key >= BLOCK_GROUPS): write directly to
-    // global out_vals[key] using atom.global.<op>.<dtype>. Slot map
-    // can't hold them.
+    // Out-of-range key (key >= BLOCK_GROUPS, unsigned): write directly to
+    // global out_vals[key] using atom.global.<op>.<dtype>. Slot map can't
+    // hold them. A negative key reinterprets as a huge unsigned value and is
+    // also routed here; the OVERFLOW block below explicitly drops it before
+    // any global write.
     writeln!(ptx, "\tsetp.ge.u32 %p2, %r13, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
@@ -219,7 +221,17 @@ pub fn compile_shmem_minmax_kernel(op: MinMaxOp, dtype: MinMaxDtype) -> BoltResu
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
     // Overflow: direct global atomic into out_vals[key].
+    //
+    // Negative-key guard: the unsigned overflow test above (`setp.ge.u32`)
+    // routes *any* out-of-range key here, negatives included. Unlike the SUM
+    // kernels the address math here is already `mul.wide.u32`, but a negative
+    // key still reinterprets as a huge unsigned value, so the
+    // `atom.global.{min,max}` into out_vals[key] and the `st.global.u8` into
+    // out_set[key] would land far PAST the array bounds (out-of-bounds device
+    // write / UB). Skip both global writes entirely for negative keys.
     writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.lt.s32 %p5, %r13, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra OVERFLOW_SKIP;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd24, %r13, {vbpw};").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd25, %rd4, %rd24;").map_err(write_err)?;
     let scratch2 = if dtype == MinMaxDtype::Int64 {
@@ -240,6 +252,7 @@ pub fn compile_shmem_minmax_kernel(op: MinMaxOp, dtype: MinMaxDtype) -> BoltResu
     writeln!(ptx, "\tmul.wide.u32 %rd27, %r13, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd28, %rd5, %rd27;").map_err(write_err)?;
     writeln!(ptx, "\tst.global.u8 [%rd28], 1;").map_err(write_err)?;
+    writeln!(ptx, "OVERFLOW_SKIP:").map_err(write_err)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r11, %r11, %r12;").map_err(write_err)?;
@@ -367,5 +380,33 @@ mod tests {
             ptx.contains("atom.global.min.s32"),
             "missing global atomic on overflow path"
         );
+    }
+
+    /// The OVERFLOW path must NOT touch global memory for negative keys.
+    /// The address math here is already `mul.wide.u32`, but a negative key
+    /// reinterprets as a huge unsigned value, so without the guard both the
+    /// `atom.global.{min,max}` into out_vals[key] and the `st.global.u8` into
+    /// out_set[key] would write far past the arrays (out-of-bounds device
+    /// write / UB). The guard brackets both global writes via OVERFLOW_SKIP.
+    /// Key lives in %r13 for every (op, dtype) variant of this kernel.
+    #[test]
+    fn overflow_path_guards_negative_keys() {
+        for op in [MinMaxOp::Min, MinMaxOp::Max] {
+            for dt in [MinMaxDtype::Int32, MinMaxDtype::Int64] {
+                let ptx = compile_shmem_minmax_kernel(op, dt).unwrap();
+                assert!(
+                    ptx.contains("setp.lt.s32 %p5, %r13, 0"),
+                    "{op:?}/{dt:?}: OVERFLOW path must test for a negative key before the global writes:\n{ptx}"
+                );
+                assert!(
+                    ptx.contains("@%p5 bra OVERFLOW_SKIP"),
+                    "{op:?}/{dt:?}: OVERFLOW path must branch over the global writes for negative keys:\n{ptx}"
+                );
+                assert!(
+                    ptx.contains("OVERFLOW_SKIP:"),
+                    "{op:?}/{dt:?}: OVERFLOW path must declare an OVERFLOW_SKIP: label:\n{ptx}"
+                );
+            }
+        }
     }
 }

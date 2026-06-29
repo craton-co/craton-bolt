@@ -334,6 +334,9 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
     }
 
     // Overflow check on key (unsigned comparison — see single-SUM notes).
+    // As in the single-SUM kernel, the unsigned compare only routes a
+    // negative key away from the shared table; the OVERFLOW block below
+    // explicitly drops negative keys before any global atomic.
     writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
@@ -365,8 +368,19 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
 
     // Overflow path: skip the shared table for this row; emit one
     // atom.global.add.f64 per aggregate, straight into its `out_j`.
+    //
+    // Negative-key guard: the unsigned overflow test above routes *any*
+    // out-of-range key here, negatives included. A negative key must NOT be
+    // written to any `out_j`: with the old `mul.wide.s32` it sign-extended
+    // to a negative byte offset and every per-aggregate `atom.global.add.f64`
+    // corrupted memory before the `out_j` base pointer (out-of-bounds device
+    // write / UB). We now (a) skip the whole per-aggregate global block for
+    // negative keys and (b) use `mul.wide.u32` so a valid non-negative key
+    // still produces the correct unsigned byte offset.
     writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd92, %r12, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.lt.s32 %p5, %r12, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra OVERFLOW_SKIP;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd92, %r12, 8;").map_err(write_err)?;
     for j in 0..n_vals {
         writeln!(
             ptx,
@@ -384,6 +398,7 @@ pub fn compile_shmem_multi_sum_kernel(n_vals: u32) -> BoltResult<String> {
         )
         .map_err(write_err)?;
     }
+    writeln!(ptx, "OVERFLOW_SKIP:").map_err(write_err)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r3, %r3, %r5;").map_err(write_err)?;
@@ -602,6 +617,40 @@ mod tests {
             let a = compile_shmem_multi_sum_kernel(n).expect("a");
             let b = compile_shmem_multi_sum_kernel(n).expect("b");
             assert_eq!(a, b, "n_vals={n}: emitter must be deterministic");
+        }
+    }
+
+    /// The OVERFLOW (global-atomic) path must NOT write any `out_j` for
+    /// negative keys, and must index with an unsigned multiply. A negative
+    /// key reinterprets as a huge unsigned value by the `setp.ge.u32`
+    /// overflow test, so it lands in the OVERFLOW block; without the guard
+    /// the `mul.wide.s32` sign-extends it to a negative byte offset and every
+    /// per-aggregate `atom.global.add.f64` corrupts memory before its `out_j`
+    /// base. The guard is emitted once (it brackets the whole per-aggregate
+    /// global block) regardless of n_vals.
+    #[test]
+    fn overflow_path_guards_negative_keys() {
+        for (n, ptx) in compile_all() {
+            assert!(
+                ptx.contains("setp.lt.s32 %p5, %r12, 0"),
+                "n_vals={n}: OVERFLOW path must test for a negative key before the global atomics:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("@%p5 bra OVERFLOW_SKIP"),
+                "n_vals={n}: OVERFLOW path must branch over the global atomics for negative keys:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("OVERFLOW_SKIP:"),
+                "n_vals={n}: OVERFLOW path must declare an OVERFLOW_SKIP: label:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("mul.wide.u32 %rd92, %r12, 8"),
+                "n_vals={n}: OVERFLOW address must use mul.wide.u32 (not s32):\n{ptx}"
+            );
+            assert!(
+                !ptx.contains("mul.wide.s32 %rd92"),
+                "n_vals={n}: OVERFLOW address must not use the signed mul.wide.s32:\n{ptx}"
+            );
         }
     }
 

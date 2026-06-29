@@ -257,9 +257,11 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
 
     // Overflow check: if (unsigned)key >= BLOCK_GROUPS, take the global path.
     // We compare unsigned: a negative key (which shouldn't happen because the
-    // caller bounds keys to [0, n_groups)) would otherwise wrap into the
-    // shared table and corrupt arbitrary slots. Treating it as unsigned makes
-    // any out-of-range key (negative or >= BLOCK_GROUPS) take the safe path.
+    // caller bounds keys to [0, n_groups)) reinterprets as a huge unsigned
+    // value, so it is routed to the overflow path here. The overflow path
+    // itself then explicitly drops negative keys (see OVERFLOW below) — the
+    // unsigned compare alone does NOT make a negative key safe, it only keeps
+    // it out of the shared table.
     writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
@@ -279,10 +281,22 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     // SAME atomic the legacy single-table kernel issues — so even worst-case
     // (every key overflows) we degrade to parity with the old kernel, never
     // worse.
+    //
+    // Negative-key guard: the `setp.ge.u32` overflow test above sends *any*
+    // out-of-range key here, including negative keys (which reinterpret as a
+    // huge unsigned value). A negative key must NOT be written to `out`:
+    // with the old `mul.wide.s32` it sign-extended to a negative byte offset
+    // and corrupted memory *before* the `out` base pointer (out-of-bounds
+    // device write / UB). We now (a) skip the atomic entirely for negative
+    // keys and (b) use `mul.wide.u32` so a valid non-negative key still
+    // produces the correct unsigned byte offset.
     writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
-    writeln!(ptx, "\tmul.wide.s32 %rd22, %r12, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.lt.s32 %p5, %r12, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p5 bra OVERFLOW_SKIP;").map_err(write_err)?;
+    writeln!(ptx, "\tmul.wide.u32 %rd22, %r12, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd23, %rd4, %rd22;").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.add.f64 %fd2, [%rd23], %fd0;").map_err(write_err)?;
+    writeln!(ptx, "OVERFLOW_SKIP:").map_err(write_err)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r3, %r3, %r5;").map_err(write_err)?;
@@ -450,6 +464,41 @@ mod tests {
         assert!(
             ptx.contains("OVERFLOW:"),
             "PTX should declare an OVERFLOW: label so the row loop has somewhere to branch when key >= BLOCK_GROUPS:\n{ptx}"
+        );
+    }
+
+    /// The OVERFLOW (global-atomic) path must NOT write for negative keys,
+    /// and must index `out` with an unsigned multiply. A negative key
+    /// reinterprets as a huge unsigned value by the `setp.ge.u32` overflow
+    /// test, so it lands in the OVERFLOW block; without the guard the
+    /// `mul.wide.s32` sign-extends it to a negative byte offset and the
+    /// `atom.global.add.f64` corrupts memory before the `out` base pointer.
+    #[test]
+    fn overflow_path_guards_negative_keys() {
+        let ptx = compile_shmem_sum_kernel().expect("kernel compiles");
+        // Explicit negative-key test + branch to a skip label.
+        assert!(
+            ptx.contains("setp.lt.s32 %p5, %r12, 0"),
+            "OVERFLOW path must test for a negative key before the global atomic:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("@%p5 bra OVERFLOW_SKIP"),
+            "OVERFLOW path must branch over the global atomic for negative keys:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("OVERFLOW_SKIP:"),
+            "OVERFLOW path must declare an OVERFLOW_SKIP: label:\n{ptx}"
+        );
+        // Address computation must be an UNSIGNED widening multiply so a
+        // valid non-negative key indexes `out` correctly.
+        assert!(
+            ptx.contains("mul.wide.u32 %rd22, %r12, 8"),
+            "OVERFLOW address must use mul.wide.u32 (not s32):\n{ptx}"
+        );
+        // The buggy signed multiply must be gone from the global path.
+        assert!(
+            !ptx.contains("mul.wide.s32 %rd22"),
+            "OVERFLOW address must not use the signed mul.wide.s32:\n{ptx}"
         );
     }
 
