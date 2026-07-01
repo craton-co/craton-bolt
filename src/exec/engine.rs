@@ -1969,29 +1969,62 @@ impl Engine {
     /// memory pool, where the new upload can recycle them.
     pub fn replace_table(&mut self, name: impl Into<String>, batch: RecordBatch) -> BoltResult<()> {
         let name = name.into();
+
+        // ---- STAGE (fallible): compute the entire replacement into locals.
+        //
+        // P2 fix — transactional swap. Every fallible step below runs BEFORE
+        // we mutate ANY engine field, so an error on any `?` returns with the
+        // engine exactly as it was: the old `GpuTable`, dictionaries, provider
+        // schema, host batches and revisions all remain in place and mutually
+        // consistent. Previously this function removed the old GpuTable and
+        // unregistered the old dictionaries *before* re-registering the new
+        // ones / converting the new schema, so a failure there left the engine
+        // half-replaced (no GPU table + no dicts, but stale host data/schema).
+        //
+        // Stage 6: see `register_table` — the flatten step is gone from the
+        // hot path. Dict ingest is native through `DictRegistry::register_table`
+        // and `GpuTable::from_record_batch::upload_dict_utf8`.
+        //
+        // Build the new GPU table first (upload may fail).
+        let mut new_gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
+        let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
+        // Re-register the dictionaries for the new batch. This is the LAST
+        // fallible step, and it is itself transactional w.r.t. the old dicts:
+        //   * `DictRegistry::register_table` is replace-not-merge — it builds
+        //     the new per-column dictionaries into a local map and only does
+        //     `by_table.insert(name, cols)` AFTER that build loop fully
+        //     succeeds (see dict_registry.rs). So an error here leaves the
+        //     OLD `by_table[name]` entry untouched.
+        //   * Because it overwrites wholesale, no prior `unregister_table` is
+        //     required. The pre-fix code called `unregister_table` first,
+        //     which opened a window where — on a later failure — the old dicts
+        //     were already gone with no replacement. Dropping that call closes
+        //     the window: the live registry only changes once, infallibly,
+        //     when this overwrite commits.
+        self.dict_registry.register_table(name.clone(), &batch)?;
+        // `extended_schema` is an infallible read against the now-installed
+        // dicts. It is computed here (still before the engine-state mutations
+        // below) but cannot fail, so it does not affect the transactional
+        // guarantee.
+        let extended = self.dict_registry.extended_schema(&name, &base_schema);
+
+        // ---- SWAP (infallible): from here on nothing can fail, so the
+        // remaining engine fields are mutated only after every fallible step
+        // above has already succeeded.
+        //
         // Drop any lazy streaming overlay entry under this name — a replace
         // installs an eager `tables` entry, and `materialize_table` prefers
         // `tables`, so a lingering overlay entry would just be stale dead
         // weight (and would block a future `register_table` overlay guard).
         self.streaming_sources.borrow_mut().remove(&name);
-        // Stage 6: see `register_table` — the flatten step is gone from the
-        // hot path. Dict ingest is native through `DictRegistry::register_table`
-        // and `GpuTable::from_record_batch::upload_dict_utf8`.
-        //
-        // Build the new GPU table FIRST so an upload failure can't leave the
-        // engine half-replaced (we have not yet touched any existing entry).
-        let mut new_gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
-        let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
-
         // Drop the old GpuTable explicitly so its device allocations return
-        // to the pool BEFORE we mint the dictionary index columns for the
-        // replacement (those may also allocate from the pool — letting the
-        // pool churn rather than grow keeps RAII tidy).
+        // to the pool. (Ordering note: the new table's device allocations were
+        // already minted above during staging, so the pool can't recycle them
+        // for this upload — but freeing here still returns them for the next
+        // upload and keeps RAII tidy. The pre-fix code freed *before* minting
+        // the new index columns to enable that recycling; preserving the strict
+        // transactional guarantee is worth forgoing the intra-call recycle.)
         self.gpu_tables.borrow_mut().remove(&name);
-        self.dict_registry.unregister_table(&name);
-        // Re-register dictionaries for the new batch.
-        self.dict_registry.register_table(name.clone(), &batch)?;
-        let extended = self.dict_registry.extended_schema(&name, &base_schema);
         // `MemTableProvider::register` already overwrites — no separate `replace`
         // entry point needed.
         self.provider.register(name.clone(), extended);
