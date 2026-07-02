@@ -7,18 +7,21 @@
 //! primitive on which the typed, lifetime-tracked `GpuVec<T>` (Step 3) will be
 //! built.
 
-use std::cell::RefCell;
 // `Cell` is only used by the test-only `DROP_FENCE_OVERRIDE` thread-local
 // (the production `StreamSet` tracking on both `GpuBuffer` and
-// `PinnedHostBuffer` uses `RefCell<StreamSet>` after review finding V-2
-// removed the single-stream `Cell<Option<CUstream>>`); gate the import so a
-// non-test build doesn't warn on an unused import.
+// `PinnedHostBuffer` uses `parking_lot::Mutex<StreamSet>` — see finding P1,
+// "make `Send` genuinely sound" — which replaced the earlier non-atomic
+// `RefCell<StreamSet>` so concurrent tagging is synchronized rather than UB,
+// after review finding V-2 had already removed the single-stream
+// `Cell<Option<CUstream>>`); gate the import so a non-test build doesn't warn
+// on an unused import.
 #[cfg(test)]
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 
 use bytemuck::Pod;
+use parking_lot::Mutex;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr, CUstream};
 use crate::error::{BoltError, BoltResult};
@@ -105,33 +108,43 @@ impl StreamSet {
 /// [`GpuViewMut`](crate::cuda::smart_ptrs::GpuViewMut) carries so it can tag
 /// the parent buffer's stream set at kernel-launch time (closing C-1 without
 /// the view needing a `&GpuVec`). It is a raw pointer to the parent buffer's
-/// private stream-set cell; `null` means "no parent" (empty/placeholder
+/// private stream-set lock; `null` means "no parent" (empty/placeholder
 /// view) and tagging is a no-op. Always paired with the view's lifetime, so
 /// the pointee outlives every dereference. See [`tag_stream_set`].
-pub(crate) type StreamSetRef = *const RefCell<StreamSet>;
+///
+/// The pointee is a [`parking_lot::Mutex<StreamSet>`](parking_lot::Mutex)
+/// (finding P1): because `GpuView`/`GpuViewMut` are `Send`, the stream set
+/// they reach into may be tagged from a thread other than the buffer's
+/// owner, so the lock — not a non-atomic `RefCell` borrow flag — is what
+/// makes concurrent access defined behaviour rather than a data race.
+pub(crate) type StreamSetRef = *const Mutex<StreamSet>;
 
 /// Tag `stream` into the stream set at `cell`, used by the view-level
 /// `mark_launch_use` back-reference (see [`crate::cuda::smart_ptrs`]).
 ///
 /// # Safety
 ///
-/// `cell` must point to a live `RefCell<StreamSet>` owned by a `GpuBuffer`
-/// that outlives this call. In practice the only caller is `GpuView` /
-/// `GpuViewMut`, whose lifetime is bounded by a borrow of the parent
-/// `GpuVec` (and hence the parent buffer), so the cell is always live for
-/// the duration of the view — the borrow checker guarantees the buffer is
-/// not dropped while a view exists. A null `cell` (a view over an empty /
-/// placeholder buffer) is a no-op.
+/// `cell` must point to a live `Mutex<StreamSet>` owned by a `GpuBuffer`
+/// (or `PinnedHostBuffer`) that outlives this call. In practice the only
+/// caller is `GpuView` / `GpuViewMut`, whose lifetime is bounded by a borrow
+/// of the parent `GpuVec` (and hence the parent buffer), so the lock is
+/// always live for the duration of the view — the borrow checker guarantees
+/// the buffer is not dropped while a view exists. A null `cell` (a view over
+/// an empty / placeholder buffer) is a no-op.
 ///
-/// No other thread can hold a borrow concurrently: `GpuBuffer` is `!Sync`,
-/// so the cell is only ever touched from the single owning thread.
+/// Thread-safety (finding P1): the views are `Send`, so this tag may run on
+/// a thread other than the buffer's owner. The `Mutex` synchronizes that
+/// access — a concurrent tag, `Drop`-time read, or `mark_stream_use` blocks
+/// on the lock rather than racing the set's `Vec`, so there is no UB even if
+/// Craton Bolt's single-threaded-launch discipline is ever violated.
 pub(crate) unsafe fn tag_stream_set(cell: StreamSetRef, stream: CUstream) {
     if cell.is_null() {
         return;
     }
-    // SAFETY: caller contract — `cell` is a live cell owned by a buffer
-    // that outlives this call.
-    (*cell).borrow_mut().insert(stream);
+    // SAFETY: caller contract — `cell` is a live lock owned by a buffer
+    // that outlives this call. The lock is released before this returns;
+    // `insert` does not re-enter the same lock, so no deadlock is possible.
+    (*cell).lock().insert(stream);
 }
 
 /// Raw, untyped GPU memory region. Arrow-aligned. Owns the allocation.
@@ -165,12 +178,23 @@ pub struct GpuBuffer<T: Pod> {
     ///   which forwards into this same set). The async DMA helpers on this
     ///   type tag automatically.
     ///
-    /// `RefCell` (interior mutability) so the read-only async helpers
-    /// (`copy_to_async`, taking `&self`) and the view back-reference can
-    /// tag the buffer without forcing every call site onto `&mut self`.
-    /// Sound because `GpuBuffer` is `!Sync`, so there is never a concurrent
-    /// borrow from another thread.
-    used_streams: RefCell<StreamSet>,
+    /// `parking_lot::Mutex` (interior mutability) so the read-only async
+    /// helpers (`copy_to_async`, taking `&self`) and the view back-reference
+    /// can tag the buffer without forcing every call site onto `&mut self`.
+    ///
+    /// ## Why a lock, not a `RefCell` (finding P1 — making `Send` sound)
+    ///
+    /// `GpuView`/`GpuViewMut` are `Send` and carry a raw [`StreamSetRef`]
+    /// back into this set, so it can in principle be tagged from a thread
+    /// other than the buffer's owner. A non-atomic `RefCell` borrow flag
+    /// would make that a data race / UB; today it was sound only by the
+    /// operational single-threaded-launch discipline. A `Mutex` synchronizes
+    /// every access (tag, `mark_stream_use`, the `Drop`-time read), so the
+    /// invariant is now type-level true rather than convention-only. There is
+    /// no poisoning (`parking_lot`), so the guard is taken directly with no
+    /// `unwrap`. The lock is uncontended on the normal single-threaded path,
+    /// so this is a cheap atomic CAS, not a syscall.
+    used_streams: Mutex<StreamSet>,
     _t: PhantomData<T>,
 }
 
@@ -183,7 +207,7 @@ impl<T: Pod> GpuBuffer<T> {
             len: 0,
             capacity: 0,
             alloc_bytes: 0,
-            used_streams: RefCell::new(StreamSet::default()),
+            used_streams: Mutex::new(StreamSet::default()),
             _t: PhantomData,
         }
     }
@@ -227,7 +251,7 @@ impl<T: Pod> GpuBuffer<T> {
             len: 0,
             capacity,
             alloc_bytes,
-            used_streams: RefCell::new(StreamSet::default()),
+            used_streams: Mutex::new(StreamSet::default()),
             _t: PhantomData,
         })
     }
@@ -430,11 +454,12 @@ impl<T: Pod> GpuBuffer<T> {
         // `&self` (not `&mut self`) because the buffer's read-only async
         // helpers like `copy_to_async`, and the view back-reference used by
         // `GpuView::mark_launch_use`, need to tag the stream too — and the
-        // `RefCell` makes that sound (`GpuBuffer: !Sync`). The borrow is
-        // held only for the duration of this `insert` call, so it cannot
-        // overlap the `borrow()` taken in `Drop` (the buffer is not being
-        // dropped concurrently with its own methods).
-        self.used_streams.borrow_mut().insert(stream);
+        // `Mutex` makes that sound even though `GpuView` is `Send` (finding
+        // P1): a tag from another thread synchronizes on the lock rather than
+        // racing. The guard is held only for the duration of this `insert`
+        // call and `insert` never re-enters the lock, so it cannot deadlock
+        // against the lock taken in `Drop`.
+        self.used_streams.lock().insert(stream);
     }
 
     /// Number of distinct streams currently recorded for this buffer.
@@ -443,7 +468,7 @@ impl<T: Pod> GpuBuffer<T> {
     /// bookkeeping (dedup, multi-stream accumulation) without a GPU.
     #[doc(hidden)]
     pub fn recorded_stream_count(&self) -> usize {
-        self.used_streams.borrow().len()
+        self.used_streams.lock().len()
     }
 
     /// Block until every stream this buffer has been enqueued on
@@ -469,7 +494,12 @@ impl<T: Pod> GpuBuffer<T> {
     /// defense-in-depth fallback). A no-op for a buffer never touched by any
     /// stream (the common synchronous case).
     pub fn fence_recorded_streams(&self) {
-        let streams = self.used_streams.borrow();
+        // Hold the lock across the fence loop. `fence_all_streams` only reads
+        // the set and forwards each handle to `cuStreamSynchronize`; it never
+        // re-enters this lock (nor does any `&self` path it can reach), so
+        // holding the guard cannot deadlock. `parking_lot` guards return
+        // directly — no `Result`, no poisoning.
+        let streams = self.used_streams.lock();
         if streams.is_empty() {
             return;
         }
@@ -500,7 +530,7 @@ impl<T: Pod> GpuBuffer<T> {
             len: 0,
             capacity: 0,
             alloc_bytes,
-            used_streams: RefCell::new(StreamSet::default()),
+            used_streams: Mutex::new(StreamSet::default()),
             _t: PhantomData,
         }
     }
@@ -1227,11 +1257,15 @@ impl<T: Pod> Drop for GpuBuffer<T> {
         if self.ptr == 0 {
             return;
         }
-        // The borrow is short-lived and cannot alias any other borrow:
         // `Drop` runs with exclusive ownership of `self`, so no other
-        // `&self` method (which is what takes `borrow_mut` in
-        // `mark_stream_use`) can be executing concurrently.
-        let streams = self.used_streams.borrow();
+        // `&self` method (which is what locks the set in `mark_stream_use`)
+        // can be executing concurrently — the lock is therefore uncontended
+        // here. We still take it through the `Mutex` (finding P1) so the
+        // access is synchronized at the type level rather than relying on
+        // that ownership argument. `parking_lot` returns the guard directly
+        // (no poisoning), and the reclaim call below borrows the set but
+        // never re-enters the lock, so there is no deadlock.
+        let streams = self.used_streams.lock();
         if streams.is_empty() {
             drop(streams);
             // Fast path: the buffer was never enqueued on any stream (only
@@ -1330,13 +1364,21 @@ pub struct PinnedHostBuffer<T: Pod> {
     /// already fixed, so we reuse the same [`StreamSet`] machinery here:
     /// track every distinct stream and fence all of them at `Drop`.
     ///
-    /// `RefCell<StreamSet>` (mirroring `GpuBuffer::used_streams`) so
-    /// `mark_stream_use` can take `&self`: typical async copy helpers borrow
-    /// the pinned buffer shared (`as_ptr()` reads through `&self`), and
-    /// forcing them to `&mut self` here would ripple needlessly through the
-    /// call sites. The cell is single-threaded (the struct is `!Sync`), so
-    /// no atomic is required.
-    used_streams: RefCell<StreamSet>,
+    /// `parking_lot::Mutex<StreamSet>` (mirroring `GpuBuffer::used_streams`)
+    /// so `mark_stream_use` can take `&self`: typical async copy helpers
+    /// borrow the pinned buffer shared (`as_ptr()` reads through `&self`),
+    /// and forcing them to `&mut self` here would ripple needlessly through
+    /// the call sites.
+    ///
+    /// A `Mutex`, not a `RefCell` (finding P1): although `PinnedHostBuffer`
+    /// owns no view back-reference of its own, this field shares the
+    /// [`StreamSetRef`] type and tagging machinery with `GpuBuffer`, and the
+    /// buffer is `Send`. Using the lock keeps the synchronized invariant
+    /// uniform across both buffer kinds and rules out a data race on the
+    /// set's `Vec` rather than relying on the single-threaded discipline.
+    /// `parking_lot` does not poison, so guards are taken with no `unwrap`,
+    /// and the lock is uncontended on the normal path (a cheap atomic CAS).
+    used_streams: Mutex<StreamSet>,
 }
 
 impl<T: Pod> PinnedHostBuffer<T> {
@@ -1353,7 +1395,7 @@ impl<T: Pod> PinnedHostBuffer<T> {
                 ptr: std::ptr::null_mut(),
                 len: 0,
                 byte_len: 0,
-                used_streams: RefCell::new(StreamSet::default()),
+                used_streams: Mutex::new(StreamSet::default()),
             });
         }
         let byte_len = len.checked_mul(size_of::<T>()).ok_or_else(|| {
@@ -1377,7 +1419,7 @@ impl<T: Pod> PinnedHostBuffer<T> {
             ptr: raw as *mut T,
             len,
             byte_len,
-            used_streams: RefCell::new(StreamSet::default()),
+            used_streams: Mutex::new(StreamSet::default()),
         })
     }
 
@@ -1505,19 +1547,20 @@ impl<T: Pod> PinnedHostBuffer<T> {
     /// the eventual per-stream sync on a completed stream is a no-op.
     /// Recording the same stream twice is a no-op (the set dedups).
     ///
-    /// Takes `&self` (interior mutability via `RefCell`) so call sites
-    /// holding a shared borrow — typical for an async helper that only
-    /// reads `as_ptr()` — don't have to be rewritten to `&mut self`.
-    /// The cell is single-threaded (the struct is `!Sync`) so no atomic
-    /// is required, and the borrow is held only for the `insert` call so it
-    /// cannot overlap the `borrow()` taken in `Drop`.
+    /// Takes `&self` (interior mutability via `parking_lot::Mutex`) so call
+    /// sites holding a shared borrow — typical for an async helper that only
+    /// reads `as_ptr()` — don't have to be rewritten to `&mut self`. The lock
+    /// (finding P1) synchronizes the access — the buffer is `Send`, so a tag
+    /// must not race the `Drop`-time read — and is held only for the `insert`
+    /// call; `insert` never re-enters the lock, so it cannot deadlock against
+    /// the lock taken in `Drop`.
     // `stream` is an opaque CUstream handle; we just store it. No deref,
     // no FFI. The outer fn stays safe to keep the call-site ergonomics
     // identical to the analogous helper on `GpuBuffer`.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     #[inline]
     pub fn mark_stream_use(&self, stream: CUstream) {
-        self.used_streams.borrow_mut().insert(stream);
+        self.used_streams.lock().insert(stream);
     }
 
     /// Number of distinct streams currently recorded for this buffer.
@@ -1530,7 +1573,7 @@ impl<T: Pod> PinnedHostBuffer<T> {
     #[doc(hidden)]
     #[inline]
     pub fn recorded_stream_count(&self) -> usize {
-        self.used_streams.borrow().len()
+        self.used_streams.lock().len()
     }
 
     /// Override the logical length — used after an async D2H that filled
@@ -1589,9 +1632,12 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         // for the device side. The set is deduped, so each stream is fenced
         // at most once.
         //
-        // The borrow is short-lived and cannot alias: `Drop` runs with
-        // exclusive ownership of `self`, so no `&self` method (which is what
-        // takes `borrow_mut` in `mark_stream_use`) can run concurrently.
+        // `Drop` runs with exclusive ownership of `self`, so no `&self`
+        // method (which is what locks the set in `mark_stream_use`) can run
+        // concurrently — the lock taken below is uncontended here. We still
+        // route through the `Mutex` (finding P1) so the access is
+        // synchronized at the type level; the fence loop reads the set but
+        // never re-enters the lock, so it cannot deadlock.
         //
         // TODO(perf, cross-file — the cuEvent FFI now EXISTS in `cuda_sys`
         // (`event_create`/`event_record`/`event_query`/`event_destroy`,
@@ -1654,7 +1700,7 @@ impl<T: Pod> Drop for PinnedHostBuffer<T> {
         // The `is_empty()` guard below mirrors `GpuBuffer::Drop`: a pinned
         // buffer only ever touched synchronously (never `mark_stream_use`d)
         // records no streams and skips the fence loop entirely.
-        let streams = self.used_streams.borrow();
+        let streams = self.used_streams.lock();
         if streams.is_empty() {
             drop(streams);
             // No stream ever referenced these pages, so nothing can still be
@@ -2126,7 +2172,7 @@ mod stream_set_tests {
         buf.mark_stream_use(a); // duplicate — must not produce a 3rd fence
 
         drop_fence_with(recording_fence, || {
-            let set = buf.used_streams.borrow();
+            let set = buf.used_streams.lock();
             fence_all_streams(&set, current_drop_fence());
         });
 
@@ -2146,7 +2192,7 @@ mod stream_set_tests {
         FENCED.with(|f| f.borrow_mut().clear());
         let buf: GpuBuffer<u8> = GpuBuffer::empty();
         drop_fence_with(recording_fence, || {
-            let set = buf.used_streams.borrow();
+            let set = buf.used_streams.lock();
             if !set.is_empty() {
                 fence_all_streams(&set, current_drop_fence());
             }
@@ -2249,7 +2295,7 @@ mod stream_set_tests {
 
         drop_fence_with(failing_fence, || {
             drop_ctx_fence_with(recording_ctx_fence, || {
-                let set = buf.used_streams.borrow();
+                let set = buf.used_streams.lock();
                 fence_all_streams(&set, current_drop_fence());
             });
         });
@@ -2274,7 +2320,7 @@ mod stream_set_tests {
 
         drop_fence_with(recording_fence, || {
             drop_ctx_fence_with(recording_ctx_fence, || {
-                let set = buf.used_streams.borrow();
+                let set = buf.used_streams.lock();
                 fence_all_streams(&set, current_drop_fence());
             });
         });
