@@ -81,7 +81,8 @@ echo "========================================"
     set +e
     docker run --rm --cpus 2 \
         "${CACHE_COMMON[@]}" \
-        -v "local-ci-target-tests:/workspace/target" \
+        -v "local-ci-target-tests:/target" \
+        -e CARGO_TARGET_DIR=/target \
         local-ci-tests bash -c "
   set -ex
 
@@ -100,7 +101,8 @@ TESTS_PID=$!
     set +e
     docker run --rm --cpus 2 \
         "${CACHE_COMMON[@]}" \
-        -v "local-ci-target-others:/workspace/target" \
+        -v "local-ci-target-others:/target" \
+        -e CARGO_TARGET_DIR=/target \
         local-ci-others bash -c "
   set -ex
 

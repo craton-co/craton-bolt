@@ -284,8 +284,14 @@ jobs:
       # human-readable summary in the job log.
       - name: cargo llvm-cov (lcov + summary)
         run: |
-          cargo llvm-cov --no-default-features --features cuda-stub --lib --lcov --output-path lcov.info
-          cargo llvm-cov --no-default-features --features cuda-stub --lib --summary-only
+          # Measure BOTH the library and the integration tests under tests/
+          # (`--lib --tests`); `--lib` alone excluded every integration test.
+          # `--ignore-filename-regex 'src/cuda/'` drops the GPU-only FFI module
+          # from the report: that code is dark on github-hosted runners (no
+          # CUDA device, cuda-stub stubs the FFI), so including it would tank
+          # the host coverage number for paths that physically cannot run here.
+          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info
+          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only
 
       - name: Upload coverage report (lcov)
         uses: actions/upload-artifact@v4
@@ -442,9 +448,23 @@ jobs:
       # device; `-- --ignored` runs the `#[ignore = "gpu:*"]` integration tests.
       - name: cargo test (GPU, ignored)
         run: |
-          # Build + run ONLY the #[ignore]-gated live-GPU tests.
+          # Build + run ONLY the #[ignore]-gated live-GPU tests against the
+          # REAL CUDA backend. We MUST use `--no-default-features --features
+          # cudarc` here, NOT `cuda-stub`: the stub makes every CUDA FFI call
+          # return CUDA_ERROR_STUB, so building this lane with `cuda-stub`
+          # would exercise ZERO real GPU code and defeat the lane's entire
+          # purpose (matches the FUTURE(ci) note on the coverage job).
+          #
+          # BOLT_BENCH_GPU=1 is REQUIRED, not just a bench knob: the
+          # #[ignore]-gated integration tests (e.g.
+          # tests/groupby_resident_replace_regression.rs) early-return unless
+          # it is "1", and the lib's GPU unit tests (src/cuda/mem_pool.rs
+          # gpu_gate_enabled) route to the real backend instead of the
+          # synthetic pointer pool only when it is set. Without it `--ignored`
+          # would run but silently skip the real-device work.
+          #
           # RUSTFLAGS is cleared because the GPU tree can carry warnings we
           # do not want to gate the GPU lane on.
-          BOLT_BENCH_GPU=1 cargo test --features cuda-stub -- --ignored
+          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored
         env:
           RUSTFLAGS: ""
