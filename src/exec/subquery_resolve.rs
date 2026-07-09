@@ -31,6 +31,9 @@
 //! inject its `&self` execution path without this module taking an `Engine`
 //! dependency.
 
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -40,8 +43,77 @@ use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{
-    AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, SortExpr, UnaryOp,
+    AggregateExpr, BinaryOp, Expr, Literal, LogicalPlan, SortExpr, TimeUnit, UnaryOp,
 };
+
+/// Upper bound on the number of **distinct** values an `IN`/`NOT IN` subquery
+/// may materialise into a host-side membership set.
+///
+/// Without a cap, `x IN (SELECT high_cardinality_col …)` is a memory-DoS /
+/// stack-overflow surface on user-controlled input: [`in_set_from_batch`]
+/// would buffer one [`Literal`] per distinct row and [`build_in_predicate`]
+/// would fold all of them into a single boolean expression tree that every
+/// later recursive pass (resolve / lower / JIT codegen) walks. The cap turns
+/// unbounded growth into a clean [`BoltError::Other`] long before the OOM
+/// killer (or a stack overflow during a deep recursive walk) gets involved.
+///
+/// This mirrors `setops::SETOP_HOST_MAX_ROWS` (and `DISTINCT_HOST_MAX_ROWS`):
+/// the default (10M) matches those so the host set-building paths share a
+/// single resource budget. Overridable at runtime via [`IN_SET_MAX_ROWS_ENV`]
+/// (parsed once on first call; see [`in_set_max_rows`]).
+const IN_SET_MAX_ROWS: usize = 10_000_000;
+
+/// Environment variable that overrides [`IN_SET_MAX_ROWS`] at runtime. Parsed
+/// as a base-10 `usize`; `0` is rejected (it would disable the cap and
+/// reintroduce the unbounded-growth bug). On any parse failure a `log::warn!`
+/// is emitted and the default is used. Mirrors `CRATON_SETOP_HOST_MAX_ROWS`.
+const IN_SET_MAX_ROWS_ENV: &str = "CRATON_IN_SET_MAX_ROWS";
+
+/// Latch for the per-process IN-set host-row cap. First call resolves the env
+/// var; subsequent calls hit the cached `usize`. Mirrors the `OnceLock` latch
+/// in `setops.rs` / `distinct.rs`.
+static IN_SET_MAX_ROWS_CACHE: OnceLock<usize> = OnceLock::new();
+
+/// Resolve the per-process IN-set host-row cap. First call performs the
+/// env-var lookup; subsequent calls hit the latch. On any parse failure a
+/// one-time `log::warn!` is emitted and the compile-time default
+/// [`IN_SET_MAX_ROWS`] is used.
+fn in_set_max_rows() -> usize {
+    *IN_SET_MAX_ROWS_CACHE.get_or_init(parse_in_set_max_rows_env)
+}
+
+/// Pure parser for [`IN_SET_MAX_ROWS_ENV`]. Extracted from the `OnceLock` so
+/// tests can exercise the parsing rules without touching the latch. Returns
+/// the compile-time default on unset / empty / unparseable / zero values,
+/// logging a warning in the unparseable / zero cases. Mirrors
+/// `setops::parse_setop_host_max_rows_env`.
+fn parse_in_set_max_rows_env() -> usize {
+    let raw = match std::env::var(IN_SET_MAX_ROWS_ENV) {
+        Ok(v) => v,
+        Err(_) => return IN_SET_MAX_ROWS,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return IN_SET_MAX_ROWS;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) => {
+            log::warn!(
+                "subquery_resolve: {IN_SET_MAX_ROWS_ENV}='0' would disable the host-side cap; \
+                 using default of {IN_SET_MAX_ROWS}"
+            );
+            IN_SET_MAX_ROWS
+        }
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "subquery_resolve: {IN_SET_MAX_ROWS_ENV}='{trimmed}' is not a valid usize ({e}); \
+                 using default of {IN_SET_MAX_ROWS}"
+            );
+            IN_SET_MAX_ROWS
+        }
+    }
+}
 
 /// Extract the value at row `row` of the (single) first column of `batch` as a
 /// [`Literal`]. A null at that position yields [`Literal::Null`]. Unsupported
@@ -145,93 +217,224 @@ pub fn scalar_value_from_batch(batch: &RecordBatch) -> BoltResult<Literal> {
 /// [`build_in_predicate`] for how SQL three-valued `NULL` membership is
 /// handled.
 pub fn in_set_from_batch(batch: &RecordBatch) -> BoltResult<Vec<Literal>> {
+    in_set_from_batch_capped(batch, in_set_max_rows())
+}
+
+/// Cap-parameterised core of [`in_set_from_batch`]. Split out so the cap can be
+/// exercised in unit tests without going through the process-wide `OnceLock`
+/// latch in [`in_set_max_rows`].
+fn in_set_from_batch_capped(batch: &RecordBatch, max_rows: usize) -> BoltResult<Vec<Literal>> {
     if batch.num_columns() != 1 {
         return Err(BoltError::Plan(format!(
             "IN subquery must return exactly one column, got {}",
             batch.num_columns()
         )));
     }
-    let mut out: Vec<Literal> = Vec::new();
+    // Up-front capacity is clamped to `min(n_rows, max_rows)` so a giant
+    // `num_rows` whose distinct cardinality is tiny can't drive a multi-GiB
+    // reservation (mirrors `setops`).
+    let cap_hint = batch.num_rows().min(max_rows);
+    let mut out: Vec<Literal> = Vec::with_capacity(cap_hint);
+    // O(1)-amortised dedup keyed on a hashable form of the literal, replacing
+    // the previous O(N^2) `out.iter().any(..)` linear scan per row that made a
+    // high-cardinality subquery quadratic to materialise.
+    let mut seen: HashSet<LiteralKey> = HashSet::with_capacity(cap_hint);
     for row in 0..batch.num_rows() {
         let lit = literal_from_column(batch, row)?;
-        if !out.iter().any(|existing| literal_eq(existing, &lit)) {
+        if seen.insert(LiteralKey::from(&lit)) {
             out.push(lit);
+            // Bound the *distinct* set size: a source full of duplicates still
+            // completes; only the distinct cardinality is capped. Fires when
+            // the distinct count crosses the cap, converting an unbounded
+            // membership set into a clean error (memory-DoS / deep-recursion
+            // stack-overflow guard — see [`IN_SET_MAX_ROWS`]).
+            if out.len() > max_rows {
+                return Err(BoltError::Other(format!(
+                    "IN/NOT IN subquery produced more than {max_rows} distinct values; \
+                     LIMIT the subquery or rewrite as a join (override via {IN_SET_MAX_ROWS_ENV})"
+                )));
+            }
         }
     }
     Ok(out)
 }
 
-/// Structural equality for two literals, treating two `Null`s as equal so the
-/// distinct-collection step dedups them. NaN floats compare unequal (matching
-/// IEEE-754 / Rust `PartialEq`), so two NaN entries are both retained — that
-/// is harmless for the OR-of-equalities we build (a NaN probe never matches a
-/// NaN literal under `=` anyway).
-fn literal_eq(a: &Literal, b: &Literal) -> bool {
-    match (a, b) {
-        (Literal::Null, Literal::Null) => true,
-        _ => a == b,
+/// A hashable, `Eq`-able projection of a [`Literal`] used purely to dedup the
+/// IN-subquery value set in [`in_set_from_batch`].
+///
+/// [`Literal`] is not `Eq`/`Hash` (it carries `f32`/`f64`), so we key on the
+/// raw bit pattern of the floats. Two `Null`s map to the same key (deduped
+/// like any other value, matching the previous `literal_eq` behaviour). NaN
+/// floats hash by their bit pattern: identical NaN encodings collapse to one
+/// entry, which is harmless for the `=` fold we build (a NaN probe never
+/// matches a NaN literal under SQL `=` anyway). A `Decimal128` is keyed on its
+/// raw `i128` value *and* its precision/scale so two numerically-equal but
+/// differently-scaled decimals are not wrongly merged. Timestamps key on the
+/// tick / unit / (interned) tz pointer triple.
+#[derive(PartialEq, Eq, Hash)]
+enum LiteralKey {
+    Null,
+    Bool(bool),
+    Int32(i32),
+    Int64(i64),
+    /// `f32` keyed by raw bits (so `Hash`/`Eq` are well-defined).
+    Float32(u32),
+    /// `f64` keyed by raw bits.
+    Float64(u64),
+    Utf8(String),
+    Decimal128(i128, u8, i8),
+    Date32(i32),
+    Timestamp(i64, TimeUnit, Option<&'static str>),
+}
+
+impl From<&Literal> for LiteralKey {
+    fn from(lit: &Literal) -> Self {
+        match lit {
+            Literal::Null => LiteralKey::Null,
+            Literal::Bool(b) => LiteralKey::Bool(*b),
+            Literal::Int32(v) => LiteralKey::Int32(*v),
+            Literal::Int64(v) => LiteralKey::Int64(*v),
+            Literal::Float32(v) => LiteralKey::Float32(v.to_bits()),
+            Literal::Float64(v) => LiteralKey::Float64(v.to_bits()),
+            Literal::Utf8(s) => LiteralKey::Utf8(s.clone()),
+            Literal::Decimal128(v, p, s) => LiteralKey::Decimal128(*v, *p, *s),
+            Literal::Date32(v) => LiteralKey::Date32(*v),
+            Literal::Timestamp(ticks, unit, tz) => LiteralKey::Timestamp(*ticks, *unit, *tz),
+        }
     }
+}
+
+/// Fold `leaves` (each a comparison over the probe) into a single boolean
+/// expression with `op` (`Or` for `IN`, `And` for `NOT IN`), as a **balanced**
+/// binary tree.
+///
+/// The previous implementation built a *left-deep* chain (`((a op b) op c)…`)
+/// whose nesting depth equals `leaves.len()`. A high-cardinality subquery
+/// (millions of distinct values) therefore produced a tree millions of nodes
+/// deep, and every later *recursive* pass over the expression — `resolve_expr`,
+/// physical lowering, JIT codegen — would blow the host stack walking it. A
+/// balanced tree bounds the depth to `O(log N)`, so the same N leaves are safe
+/// to recurse over. (The total node count is unchanged; only the depth shrinks.)
+///
+/// `leaves` must be non-empty. With a single leaf the result is that leaf
+/// (no wrapper node).
+fn fold_balanced(mut leaves: Vec<Expr>, op: BinaryOp) -> Expr {
+    debug_assert!(!leaves.is_empty(), "fold_balanced requires >= 1 leaf");
+    // Pairwise reduction: combine adjacent nodes level by level until one
+    // remains. Each pass halves the count, giving a tree of depth ceil(log2 N).
+    while leaves.len() > 1 {
+        let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
+        let mut it = leaves.into_iter();
+        while let Some(left) = it.next() {
+            match it.next() {
+                Some(right) => next.push(Expr::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }),
+                // Odd one out: carry it up to the next level unchanged.
+                None => next.push(left),
+            }
+        }
+        leaves = next;
+    }
+    leaves.pop().expect("non-empty leaves")
 }
 
 /// Build the boolean expression that replaces an `expr [NOT] IN (subquery)`
 /// node once the subquery's value set is known.
 ///
-/// `values` is the distinct set produced by [`in_set_from_batch`]. The result:
+/// `values` is the distinct set produced by [`in_set_from_batch`]. The shape
+/// of the membership test:
 ///
-/// * **`IN` (not negated):** `expr = v1 OR expr = v2 OR …`. An empty set →
-///   `Bool(false)` (nothing is a member of the empty set).
-/// * **`NOT IN` (negated):** `expr <> v1 AND expr <> v2 AND …`. An empty set →
-///   `Bool(true)`.
+/// * **`IN` (not negated):** `expr = v1 OR expr = v2 OR …` (balanced tree).
+/// * **`NOT IN` (negated):** `expr <> v1 AND expr <> v2 AND …` (balanced tree).
 ///
-/// # NULL handling (strict SQL three-valued logic — finding F-6)
+/// `filter_context` selects between two *correct* lowerings that differ only
+/// in how a SQL `UNKNOWN` (NULL) result is represented:
 ///
-/// Strict SQL says:
-/// * `x IN (… , NULL , …)` is `TRUE` if `x` matches a non-NULL element, else
-///   `NULL` (never `FALSE`) — so a row whose `x` matches nothing but where the
-///   set contains a NULL evaluates to `NULL` (filtered out by `WHERE`, same as
-///   `FALSE`).
-/// * `x NOT IN (…, NULL, …)` is `FALSE` if `x` matches a non-NULL element,
-///   else `NULL` (never `TRUE`) — so when the set contains *any* NULL **no
-///   row can pass**: a match makes it `FALSE`, a non-match makes it `NULL`,
-///   and both are excluded by `WHERE`.
+/// * `filter_context == true` — the predicate sits at (or on the boolean
+///   conjunction/disjunction spine of) a `WHERE` clause, where a row is kept
+///   iff the predicate is `TRUE`; `FALSE` and `UNKNOWN` are both dropped. Here
+///   we may legitimately collapse `UNKNOWN` to `FALSE` (cheaper folds, and the
+///   `NOT IN` path can use the GPU-friendly `IS NOT NULL` guard described
+///   below).
+/// * `filter_context == false` — the predicate's *value* is observed (e.g.
+///   `SELECT x IN (sub)`, `CASE WHEN x IN (sub) …`, or under an explicit
+///   `NOT (x IN (sub))`), so `UNKNOWN` must be emitted as a genuine NULL, never
+///   silently turned into `FALSE`. Collapsing to `FALSE` here would be a
+///   correctness bug (e.g. `NOT (x IN (NULL-set))` would yield `TRUE` instead
+///   of `UNKNOWN`).
 ///
-/// We **drop `NULL`s from the value set** before building the fold. For the
-/// non-negated `IN` form this matches SQL exactly under a `WHERE` clause: a row
-/// that doesn't match any non-NULL element yields `FALSE` here vs `NULL` in
-/// strict SQL, and both are filtered out.
+/// # NULL handling (strict SQL three-valued logic)
 ///
-/// For the negated `NOT IN` form we honour the strict semantics: if the value
-/// set contains **any** NULL, the predicate can never be `TRUE` for any row, so
-/// we fold straight to `Bool(false)` (no rows pass). Only when the set is
-/// NULL-free do we build the per-row `<>`/`AND` fold over the non-NULL
-/// elements. This closes the classic `x NOT IN (SELECT nullable_col …)` footgun
-/// that previously let rows through incorrectly.
-pub fn build_in_predicate(expr: &Expr, values: &[Literal], negated: bool) -> Expr {
+/// Let `S+` be the non-NULL elements of `values` and `has_null` whether
+/// `values` contains a NULL.
+///
+/// * **`IN`**: `x IN S` is `TRUE` if `x` matches some `v in S+`, else
+///   `UNKNOWN` if `has_null` (the NULL element makes the membership unknown),
+///   else `FALSE`. We build `OR(x = v for v in S+)`; this already gives
+///   `TRUE`/`FALSE`/`UNKNOWN(NULL probe)` correctly. When `has_null` and we are
+///   **not** in filter context we OR in a bare `NULL` literal so a non-match
+///   becomes `UNKNOWN` rather than `FALSE` (`TRUE OR NULL = TRUE`,
+///   `FALSE OR NULL = NULL`). In filter context the `NULL` is omitted (FALSE
+///   and UNKNOWN are filtered identically).
+/// * **`NOT IN`**: `x NOT IN S` is `FALSE` if `x` matches some `v in S+`, else
+///   `UNKNOWN` if `has_null`, else `TRUE`/`UNKNOWN(NULL probe)`. We build
+///   `AND(x <> v for v in S+)`; when `has_null` and not in filter context we
+///   AND in a bare `NULL` so a non-match becomes `UNKNOWN`
+///   (`FALSE AND NULL = FALSE`, `TRUE AND NULL = NULL`). In filter context a
+///   set containing any NULL can never make the predicate `TRUE`, so we fold
+///   straight to `Bool(false)` (no row passes).
+///
+/// Empty `S+`: with no non-NULL elements there is nothing to compare against.
+/// `x IN ()` is `FALSE` and `x NOT IN ()` is `TRUE` for a *truly* empty set.
+/// If instead the set was non-empty but all-NULL, strict SQL says `UNKNOWN`;
+/// outside filter context we emit a bare `NULL` for that case, while in filter
+/// context `FALSE`/`TRUE` (IN/NOT IN) is sound because UNKNOWN filters like
+/// FALSE and the already-handled negated-with-NULL branch folded NOT IN to
+/// `Bool(false)`.
+pub fn build_in_predicate(
+    expr: &Expr,
+    values: &[Literal],
+    negated: bool,
+    filter_context: bool,
+) -> Expr {
     // Does the value set contain a NULL? Under SQL 3VL, equality / inequality
     // against a NULL literal yields UNKNOWN, never TRUE.
     let set_has_null = values.iter().any(|l| matches!(l, Literal::Null));
 
-    // F-6: strict `NOT IN` semantics. If the set contains any NULL, the whole
-    // negated predicate is UNKNOWN for every row (a match → FALSE, a non-match
-    // → NULL), so no row passes. Fold to `Bool(false)`. Note this also subsumes
-    // the "set of only NULLs" case for the negated form below.
-    if negated && set_has_null {
+    // Strict `NOT IN` under a WHERE filter: a NULL anywhere in the set makes
+    // the predicate UNKNOWN for every row (a match → FALSE, a non-match →
+    // NULL), so no row passes. Collapsing to `Bool(false)` is sound ONLY when
+    // UNKNOWN filters like FALSE — i.e. in filter context. Outside it we must
+    // preserve the UNKNOWN (handled by the general path below).
+    if negated && set_has_null && filter_context {
         return Expr::Literal(Literal::Bool(false));
     }
 
-    // Drop NULLs: equality / inequality against a NULL literal is never TRUE
-    // in SQL, so a NULL element can only ever contribute UNKNOWN. For the
-    // negated form we have already returned above when a NULL was present, so
-    // by this point `negated` implies a NULL-free set.
+    // Non-NULL elements: equality / inequality against a NULL literal is never
+    // TRUE in SQL (it is UNKNOWN), so a NULL element never contributes a
+    // comparison leaf — its only effect is to poison non-matches to UNKNOWN,
+    // captured by the `set_has_null` handling below.
     let non_null: Vec<&Literal> = values
         .iter()
         .filter(|l| !matches!(l, Literal::Null))
         .collect();
 
     if non_null.is_empty() {
-        // Empty membership set: `IN` → false, `NOT IN` → true. (A set of only
-        // NULLs reaches here for the non-negated `IN` form, which is also
-        // `false`; the negated form was already handled above.)
+        // No comparison leaves to build.
+        if set_has_null && !filter_context {
+            // Non-empty all-NULL set, value observed: `x IN (NULL)` /
+            // `x NOT IN (NULL)` are both UNKNOWN for every row → emit NULL.
+            return Expr::Literal(Literal::Null);
+        }
+        // Truly empty set (subquery returned 0 rows): `IN` → FALSE,
+        // `NOT IN` → TRUE — correct for every probe, NULL included. Also the
+        // filter-context all-NULL case: UNKNOWN filters like the constant we
+        // emit here (`IN`→FALSE drops the row; `NOT IN`→TRUE was already
+        // intercepted above for the has_null branch, so here `set_has_null`
+        // is false and TRUE is exactly right).
         return Expr::Literal(Literal::Bool(negated));
     }
 
@@ -241,37 +444,73 @@ pub fn build_in_predicate(expr: &Expr, values: &[Literal], negated: bool) -> Exp
         (BinaryOp::Eq, BinaryOp::Or)
     };
 
-    let mut iter = non_null.into_iter().map(|v| Expr::Binary {
-        op: cmp_op,
-        left: Box::new(expr.clone()),
-        right: Box::new(Expr::Literal(v.clone())),
-    });
-    // `non_null` is non-empty, so `next()` is `Some`.
-    let first = iter.next().expect("non_null checked non-empty");
-    let folded = iter.fold(first, |acc, eq| Expr::Binary {
-        op: fold_op,
-        left: Box::new(acc),
-        right: Box::new(eq),
-    });
+    // One comparison leaf per non-NULL element, folded into a BALANCED tree so
+    // the nesting depth is O(log N) rather than O(N) (see `fold_balanced`).
+    let leaves: Vec<Expr> = non_null
+        .into_iter()
+        .map(|v| Expr::Binary {
+            op: cmp_op,
+            left: Box::new(expr.clone()),
+            right: Box::new(Expr::Literal(v.clone())),
+        })
+        .collect();
+    let folded = fold_balanced(leaves, fold_op);
 
     if negated {
-        // SQL 3VL: `expr NOT IN (set)` evaluates to UNKNOWN (→ row excluded
-        // under a WHERE clause) whenever `expr` itself is NULL, regardless of
-        // the set contents. The lowered `expr <> v AND …` does NOT capture
-        // this: the GPU `<>` comparator reads a NULL probe as its raw stored
-        // value (e.g. 0) and would wrongly include it. AND in an explicit
-        // `expr IS NOT NULL` guard so NULL probe rows are dropped. (For the
-        // non-negated `IN` form a NULL probe yields UNKNOWN through the `=`
-        // fold and is already excluded under WHERE, so no guard is added there.)
+        if set_has_null {
+            // Reachable only outside filter context (the filter-context
+            // has_null case folded to `Bool(false)` above). Strict 3VL: with a
+            // NULL in the set the predicate is FALSE on a match and UNKNOWN on
+            // a non-match — never TRUE. `AND NULL` over the inequality fold
+            // does exactly this: `FALSE AND NULL = FALSE` (match),
+            // `TRUE AND NULL = NULL` (non-match), `NULL AND NULL = NULL` (NULL
+            // probe). No `IS NOT NULL` guard: that guard forces NULL→FALSE,
+            // which is wrong when the value is observed.
+            Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(folded),
+                right: Box::new(Expr::Literal(Literal::Null)),
+            }
+        } else if filter_context {
+            // NULL-free `NOT IN` under WHERE. SQL 3VL: `x NOT IN (set)` is
+            // UNKNOWN (→ row excluded) when `x` itself is NULL. The lowered
+            // `expr <> v AND …` does NOT capture this on the GPU: the `<>`
+            // comparator reads a NULL probe as its raw stored value (e.g. 0)
+            // and would wrongly include the row. AND in an explicit
+            // `expr IS NOT NULL` guard so NULL probe rows are dropped. This is
+            // only valid in filter context, where forcing the UNKNOWN result
+            // to FALSE is indistinguishable from the correct UNKNOWN (both
+            // exclude the row).
+            Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(folded),
+                right: Box::new(Expr::Unary {
+                    op: UnaryOp::IsNotNull,
+                    operand: Box::new(expr.clone()),
+                }),
+            }
+        } else {
+            // NULL-free `NOT IN`, value observed. The bare `expr <> v AND …`
+            // fold is already correct 3VL: a NULL probe yields
+            // `NULL <> v` = UNKNOWN, AND-folded to UNKNOWN. No guard (it would
+            // corrupt UNKNOWN into FALSE).
+            folded
+        }
+    } else if set_has_null && !filter_context {
+        // Non-negated `IN` with a NULL in the set, value observed. Strict 3VL:
+        // TRUE on a match, UNKNOWN otherwise (never FALSE). `OR NULL` over the
+        // equality fold: `TRUE OR NULL = TRUE` (match), `FALSE OR NULL = NULL`
+        // (non-match), `NULL OR NULL = NULL` (NULL probe). In filter context
+        // this `OR NULL` is omitted: UNKNOWN and FALSE filter identically.
         Expr::Binary {
-            op: BinaryOp::And,
+            op: BinaryOp::Or,
             left: Box::new(folded),
-            right: Box::new(Expr::Unary {
-                op: UnaryOp::IsNotNull,
-                operand: Box::new(expr.clone()),
-            }),
+            right: Box::new(Expr::Literal(Literal::Null)),
         }
     } else {
+        // Non-negated `IN`: the equality fold is correct 3VL on its own
+        // (TRUE on match, FALSE on non-match, UNKNOWN on NULL probe). In filter
+        // context any set-NULL is irrelevant (UNKNOWN filters like FALSE).
         folded
     }
 }
@@ -291,7 +530,11 @@ where
         LogicalPlan::Scan { .. } => plan,
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(resolve_plan(*input, exec)?),
-            predicate: resolve_expr(predicate, exec)?,
+            // The predicate is consumed by a WHERE-style filter: a row is kept
+            // iff the predicate is TRUE, so SQL UNKNOWN filters identically to
+            // FALSE. This is the one position where the IN/NOT-IN fold may use
+            // its WHERE-only shortcuts — see `build_in_predicate`.
+            predicate: resolve_expr_ctx(predicate, exec, true)?,
         },
         LogicalPlan::Project { input, exprs } => LogicalPlan::Project {
             input: Box::new(resolve_plan(*input, exec)?),
@@ -388,7 +631,11 @@ where
                 .into_iter()
                 .map(|(l, r)| Ok::<_, BoltError>((resolve_expr(l, exec)?, resolve_expr(r, exec)?)))
                 .collect::<BoltResult<Vec<_>>>()?,
-            filter: filter.map(|f| resolve_expr(f, exec)).transpose()?,
+            // The residual join `filter` is WHERE-style: the joined row is kept
+            // iff it is TRUE, so UNKNOWN filters like FALSE here too.
+            filter: filter
+                .map(|f| resolve_expr_ctx(f, exec, true))
+                .transpose()?,
         },
     })
 }
@@ -421,30 +668,75 @@ where
     })
 }
 
-/// Recursively resolve subqueries in a single [`Expr`].
+/// Recursively resolve subqueries in a single [`Expr`] that is **not** in a
+/// WHERE-style filter context (its boolean value is observed). Thin wrapper
+/// over [`resolve_expr_ctx`] with `filter_context = false` for the many plan
+/// positions where that is the right default (projections, sort/group keys,
+/// join equi-keys, …).
+fn resolve_expr<F>(expr: Expr, exec: &mut F) -> BoltResult<Expr>
+where
+    F: FnMut(LogicalPlan) -> BoltResult<RecordBatch>,
+{
+    resolve_expr_ctx(expr, exec, false)
+}
+
+/// Recursively resolve subqueries in a single [`Expr`], tracking whether the
+/// expression sits in a WHERE-style **filter context** (a position where a row
+/// is kept iff the value is `TRUE`, so SQL `UNKNOWN` is indistinguishable from
+/// `FALSE`).
 ///
 /// For the two subquery variants the subplan is itself run through
 /// `resolve_plan` first (inner subqueries resolve before the outer one
 /// executes), then executed via `exec`, then folded to a constant.
-fn resolve_expr<F>(expr: Expr, exec: &mut F) -> BoltResult<Expr>
+///
+/// `filter_context` is threaded down the **boolean connective spine** only:
+///
+/// * It is preserved across `AND` / `OR` (at a WHERE root, a sub-result being
+///   `FALSE` vs `UNKNOWN` never changes whether the row is ultimately kept —
+///   `FALSE AND x` and `NULL AND x` both drop, `_ OR _` likewise) and across
+///   an `Alias` wrapper.
+/// * It is **reset to `false`** the moment the value is otherwise observed:
+///   under a `NOT` (negation turns "drop on UNKNOWN" into "keep on UNKNOWN" —
+///   the classic `NOT (x IN sub)` footgun), inside a `CASE` (its WHEN/THEN
+///   values are read), under a comparison / arithmetic operator, a cast, a
+///   scalar function, etc.
+///
+/// The flag only affects how `Expr::InSubquery` folds (see
+/// [`build_in_predicate`]); every other variant just propagates it so a nested
+/// `InSubquery` deeper in the spine sees the right context.
+fn resolve_expr_ctx<F>(expr: Expr, exec: &mut F, filter_context: bool) -> BoltResult<Expr>
 where
     F: FnMut(LogicalPlan) -> BoltResult<RecordBatch>,
 {
     Ok(match expr {
         Expr::Column(_) | Expr::Literal(_) => expr,
-        Expr::Binary { op, left, right } => Expr::Binary {
-            op,
-            left: Box::new(resolve_expr(*left, exec)?),
-            right: Box::new(resolve_expr(*right, exec)?),
-        },
-        Expr::Unary { op, operand } => Expr::Unary {
-            op,
-            operand: Box::new(resolve_expr(*operand, exec)?),
-        },
+        Expr::Binary { op, left, right } => {
+            // `AND` / `OR` keep the row-keep semantics of the WHERE root, so a
+            // nested IN/NOT-IN on this spine may still use the filter-context
+            // shortcut. Any other operator (comparison, arithmetic, …) observes
+            // the boolean value, so the operands are NOT in filter context.
+            let child_ctx = filter_context && matches!(op, BinaryOp::And | BinaryOp::Or);
+            Expr::Binary {
+                op,
+                left: Box::new(resolve_expr_ctx(*left, exec, child_ctx)?),
+                right: Box::new(resolve_expr_ctx(*right, exec, child_ctx)?),
+            }
+        }
+        Expr::Unary { op, operand } => {
+            // `NOT` flips row-keep semantics (UNKNOWN would now be *kept*), so
+            // its operand is no longer in filter context. `IS [NOT] NULL`
+            // observe the value too. Conservatively drop the flag for any unary.
+            Expr::Unary {
+                op,
+                operand: Box::new(resolve_expr_ctx(*operand, exec, false)?),
+            }
+        }
         Expr::Case {
             branches,
             else_branch,
         } => Expr::Case {
+            // CASE reads its WHEN conditions and THEN/ELSE values, so none of
+            // them are in filter context.
             branches: branches
                 .into_iter()
                 .map(|(w, t)| Ok::<_, BoltError>((resolve_expr(w, exec)?, resolve_expr(t, exec)?)))
@@ -494,7 +786,11 @@ where
             unit,
             expr: Box::new(resolve_expr(*expr, exec)?),
         },
-        Expr::Alias(inner, name) => Expr::Alias(Box::new(resolve_expr(*inner, exec)?), name),
+        // An alias is transparent: it neither observes nor negates the value,
+        // so the filter context flows straight through.
+        Expr::Alias(inner, name) => {
+            Expr::Alias(Box::new(resolve_expr_ctx(*inner, exec, filter_context)?), name)
+        }
         Expr::ScalarSubquery(subplan) => {
             // Resolve inner subqueries first, then execute, then fold.
             let resolved = resolve_plan(*subplan, exec)?;
@@ -508,12 +804,14 @@ where
             negated,
         } => {
             // The probe `expr` lives in the *outer* query's schema and may
-            // itself contain a subquery — resolve it too.
+            // itself contain a subquery — resolve it too. The probe's value is
+            // observed by the `=`/`<>` comparison, so it is never itself in a
+            // filter context regardless of where this InSubquery sits.
             let probe = resolve_expr(*expr, exec)?;
             let resolved_sub = resolve_plan(*subquery, exec)?;
             let batch = exec(resolved_sub)?;
             let values = in_set_from_batch(&batch)?;
-            build_in_predicate(&probe, &values, negated)
+            build_in_predicate(&probe, &values, negated, filter_context)
         }
     })
 }
@@ -598,22 +896,27 @@ mod tests {
     #[test]
     fn build_in_empty_set() {
         let probe = Expr::Column("x".into());
-        assert!(matches!(
-            build_in_predicate(&probe, &[], false),
-            Expr::Literal(Literal::Bool(false))
-        ));
-        assert!(matches!(
-            build_in_predicate(&probe, &[], true),
-            Expr::Literal(Literal::Bool(true))
-        ));
+        // Truly empty set (0-row subquery): `IN` → FALSE, `NOT IN` → TRUE in
+        // BOTH contexts (these constants are exact, not WHERE-only shortcuts).
+        for fc in [false, true] {
+            assert!(matches!(
+                build_in_predicate(&probe, &[], false, fc),
+                Expr::Literal(Literal::Bool(false))
+            ));
+            assert!(matches!(
+                build_in_predicate(&probe, &[], true, fc),
+                Expr::Literal(Literal::Bool(true))
+            ));
+        }
     }
 
     #[test]
     fn build_in_only_nulls_set() {
         let probe = Expr::Column("x".into());
-        // A set of only NULLs collapses to the empty non-null case.
+        // Under WHERE (filter context): a set of only NULLs collapses to the
+        // empty non-null case → `Bool(false)` (UNKNOWN filters like FALSE).
         assert!(matches!(
-            build_in_predicate(&probe, &[Literal::Null], false),
+            build_in_predicate(&probe, &[Literal::Null], false, true),
             Expr::Literal(Literal::Bool(false))
         ));
     }
@@ -621,7 +924,8 @@ mod tests {
     #[test]
     fn build_in_or_of_equalities() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], false);
+        let got =
+            build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], false, true);
         // `Expr` doesn't implement `PartialEq`, so destructure and compare the
         // structure / scalar leaves (which do) instead of `assert_eq!`.
         match got {
@@ -661,7 +965,8 @@ mod tests {
     #[test]
     fn build_not_in_and_of_inequalities() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true);
+        // Filter context: the WHERE-only `IS NOT NULL` guard is added.
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true, true);
         // NOT IN lowers to `(x <> 1 AND x <> 2) AND x IS NOT NULL` — the trailing
         // IS NOT NULL guard drops NULL probe rows (SQL 3VL: NULL NOT IN ... is
         // UNKNOWN → excluded under WHERE).
@@ -702,8 +1007,10 @@ mod tests {
     #[test]
     fn in_predicate_drops_nulls_keeps_non_null() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false);
-        // Single non-null element → bare equality, no OR fold.
+        // Filter context: a set-NULL is irrelevant under WHERE (UNKNOWN filters
+        // like FALSE), so it is dropped and a single non-null element → bare
+        // equality, no OR fold.
+        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false, true);
         check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
     }
 
@@ -716,9 +1023,12 @@ mod tests {
     #[test]
     fn not_in_with_null_in_set_excludes_all_rows() {
         let probe = Expr::Column("x".into());
+        // Filter context (WHERE): UNKNOWN filters like FALSE, so the whole
+        // predicate folds to `Bool(false)` (no rows).
         let got = build_in_predicate(
             &probe,
             &[Literal::Int32(1), Literal::Int32(2), Literal::Null],
+            true,
             true,
         );
         assert!(
@@ -733,7 +1043,8 @@ mod tests {
     #[test]
     fn not_in_with_only_null_set_excludes_all_rows() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(&probe, &[Literal::Null], true);
+        // Filter context (WHERE).
+        let got = build_in_predicate(&probe, &[Literal::Null], true, true);
         assert!(
             matches!(got, Expr::Literal(Literal::Bool(false))),
             "NOT IN over an all-NULL set must yield Bool(false), got {got:?}"
@@ -745,7 +1056,8 @@ mod tests {
     #[test]
     fn not_in_without_null_builds_and_of_inequalities() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true);
+        // Filter context keeps the WHERE-only `IS NOT NULL` guard.
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true, true);
         // `(x <> 1 AND x <> 2) AND x IS NOT NULL` — the IS NOT NULL guard drops
         // NULL probe rows (SQL 3VL); the inequality fold is over the non-NULL set.
         match got {
@@ -786,7 +1098,8 @@ mod tests {
     #[test]
     fn in_with_null_in_set_keeps_non_null_membership() {
         let probe = Expr::Column("x".into());
-        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false);
+        // Filter context: the set-NULL is dropped under WHERE.
+        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false, true);
         // Single non-null element → bare equality (the NULL is dropped).
         check_cmp(&got, "x", BinaryOp::Eq, Literal::Int32(7));
     }
@@ -802,7 +1115,8 @@ mod tests {
         // A probe that is itself a literal NULL — the builder must still emit
         // the equality fold; runtime 3VL (NULL = v → UNKNOWN) handles exclusion.
         let probe = Expr::Literal(Literal::Null);
-        let got = build_in_predicate(&probe, &[Literal::Int32(3)], false);
+        // NULL-free set → context-independent; assert in filter context.
+        let got = build_in_predicate(&probe, &[Literal::Int32(3)], false, true);
         match got {
             Expr::Binary {
                 op: BinaryOp::Eq,
@@ -857,6 +1171,408 @@ mod tests {
                     other => panic!("expected folded literal, got {other:?}"),
                 },
                 other => panic!("unexpected predicate {other:?}"),
+            },
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+
+    // ---- IN-set size cap (memory-DoS / deep-recursion guard) ---------------
+
+    /// Override the IN-set cap via env around `f`, restoring the prior value.
+    /// Because [`in_set_max_rows`] latches in an `OnceLock`, these tests use the
+    /// pure parser [`parse_in_set_max_rows_env`] (which re-reads the env every
+    /// call) rather than the latched accessor, mirroring `setops`'s approach.
+    fn with_in_set_env<R>(val: Option<&str>, f: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(IN_SET_MAX_ROWS_ENV).ok();
+        match val {
+            Some(v) => std::env::set_var(IN_SET_MAX_ROWS_ENV, v),
+            None => std::env::remove_var(IN_SET_MAX_ROWS_ENV),
+        }
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var(IN_SET_MAX_ROWS_ENV, v),
+            None => std::env::remove_var(IN_SET_MAX_ROWS_ENV),
+        }
+        out
+    }
+
+    #[test]
+    fn in_set_env_parser_rules() {
+        with_in_set_env(None, || {
+            assert_eq!(parse_in_set_max_rows_env(), IN_SET_MAX_ROWS)
+        });
+        with_in_set_env(Some(""), || {
+            assert_eq!(parse_in_set_max_rows_env(), IN_SET_MAX_ROWS)
+        });
+        // `0` is rejected (it would disable the cap) → default.
+        with_in_set_env(Some("0"), || {
+            assert_eq!(parse_in_set_max_rows_env(), IN_SET_MAX_ROWS)
+        });
+        with_in_set_env(Some("not-a-number"), || {
+            assert_eq!(parse_in_set_max_rows_env(), IN_SET_MAX_ROWS)
+        });
+        with_in_set_env(Some("7"), || assert_eq!(parse_in_set_max_rows_env(), 7));
+    }
+
+    /// The HashSet-based dedup collapses a large duplicate-heavy run into its
+    /// distinct values without the old O(N^2) linear-scan blowup. Feeds 50k
+    /// rows of only 100 distinct values and asserts the deduped set is exactly
+    /// 100 (a quadratic dedup would be ~2.5e9 comparisons).
+    #[test]
+    fn in_set_dedups_large_duplicate_run_without_quadratic_blowup() {
+        // 50k rows but only 100 distinct values: the HashSet dedup collapses
+        // them. (A quadratic linear-scan dedup would be ~2.5e9 comparisons.)
+        let vals: Vec<i32> = (0..50_000).map(|i| i % 100).collect();
+        let arr = Arc::new(Int32Array::from(vals)) as arrow_array::ArrayRef;
+        let b = single_col_batch(arr);
+        let set = in_set_from_batch(&b).unwrap();
+        assert_eq!(set.len(), 100, "distinct set must be exactly {{0..100}}");
+    }
+
+    #[test]
+    fn in_set_cap_rejects_oversized_distinct_set() {
+        // 25 distinct values, cap of 10 → clean error (not a panic / OOM).
+        let vals: Vec<i32> = (0..25).collect();
+        let b = set_batch(vals.into_iter().map(Some).collect());
+        let err = in_set_from_batch_capped(&b, 10).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("more than 10 distinct values"),
+            "cap error should name the bound, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn in_set_cap_allows_duplicates_under_distinct_bound() {
+        // 50 rows but only 5 DISTINCT values, cap of 10 → completes (only the
+        // distinct cardinality is bounded, a duplicate-heavy source is fine).
+        let vals: Vec<Option<i32>> = (0..50).map(|i| Some(i % 5)).collect();
+        let b = set_batch(vals);
+        let set = in_set_from_batch_capped(&b, 10).unwrap();
+        assert_eq!(set.len(), 5, "5 distinct values are under the cap of 10");
+    }
+
+    #[test]
+    fn in_set_cap_boundary_exactly_at_limit_ok() {
+        // Exactly `max` distinct values is allowed; `max + 1` errors (the guard
+        // is `> max`).
+        let exactly: Vec<Option<i32>> = (0..10).map(Some).collect();
+        let b = set_batch(exactly);
+        assert!(in_set_from_batch_capped(&b, 10).is_ok());
+        let over: Vec<Option<i32>> = (0..11).map(Some).collect();
+        let b2 = set_batch(over);
+        assert!(in_set_from_batch_capped(&b2, 10).is_err());
+    }
+
+    // ---- balanced-tree fold (bounded recursion depth) ----------------------
+
+    /// Build the OR-fold over N distinct values and assert the resulting tree
+    /// depth is O(log N), not O(N) — the property that keeps the later
+    /// recursive walks (resolve / lower / JIT) off a deep-recursion stack
+    /// overflow. A left-deep chain over N leaves has depth N.
+    #[test]
+    fn build_in_fold_is_balanced_logarithmic_depth() {
+        fn depth(e: &Expr) -> usize {
+            match e {
+                Expr::Binary { left, right, .. } => 1 + depth(left).max(depth(right)),
+                _ => 0,
+            }
+        }
+        let probe = Expr::Column("x".into());
+        let n = 1024usize;
+        let values: Vec<Literal> = (0..n as i32).map(Literal::Int32).collect();
+        let folded = build_in_predicate(&probe, &values, false, true);
+        let d = depth(&folded);
+        // ceil(log2(1024)) = 10 for the OR spine, +1 for each Eq leaf = 11.
+        // A left-deep chain would be ~1024. Assert it is far below linear.
+        assert!(
+            d <= 12,
+            "balanced fold over {n} values should have depth ~log2(n)+1, got {d}"
+        );
+    }
+
+    /// `fold_balanced` over a single leaf returns that leaf unwrapped.
+    #[test]
+    fn fold_balanced_single_leaf_is_unwrapped() {
+        let leaf = Expr::Column("x".into());
+        let got = fold_balanced(vec![leaf], BinaryOp::Or);
+        assert!(matches!(got, Expr::Column(ref n) if n == "x"));
+    }
+
+    // ---- SQL-3VL-correct folds OUTSIDE filter context ----------------------
+
+    /// `SELECT x IN (sub)` with a NULL in the set (value observed, NOT a WHERE
+    /// filter): strict 3VL is TRUE-on-match, UNKNOWN otherwise — never FALSE.
+    /// The builder must OR a bare NULL onto the equality fold so a non-match
+    /// becomes NULL (`FALSE OR NULL = NULL`), not FALSE.
+    #[test]
+    fn in_with_null_set_non_filter_or_nulls() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Int32(7), Literal::Null], false, false);
+        match got {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                check_cmp(&left, "x", BinaryOp::Eq, Literal::Int32(7));
+                assert!(
+                    matches!(&*right, Expr::Literal(Literal::Null)),
+                    "expected trailing NULL to poison non-matches, got {right:?}"
+                );
+            }
+            other => panic!("expected (x = 7) OR NULL, got {other:?}"),
+        }
+    }
+
+    /// `SELECT x IN (NULL)` (all-NULL non-empty set, value observed): every row
+    /// is UNKNOWN → a bare NULL literal (NOT Bool(false)).
+    #[test]
+    fn in_with_only_null_set_non_filter_is_null() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Null], false, false);
+        assert!(
+            matches!(got, Expr::Literal(Literal::Null)),
+            "all-NULL IN set with value observed must be NULL, got {got:?}"
+        );
+    }
+
+    /// Truly empty set (0-row subquery): `x IN ()` is FALSE even with the value
+    /// observed — `Bool(false)` is exact here, not a WHERE shortcut.
+    #[test]
+    fn in_with_empty_set_non_filter_is_false() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[], false, false);
+        assert!(matches!(got, Expr::Literal(Literal::Bool(false))));
+    }
+
+    /// `SELECT x NOT IN (sub)` with a NULL in the set (value observed): strict
+    /// 3VL is FALSE-on-match, UNKNOWN otherwise — never the WHERE shortcut
+    /// `Bool(false)`. The builder ANDs a bare NULL onto the inequality fold so
+    /// a non-match becomes NULL (`TRUE AND NULL = NULL`), and there is NO
+    /// `IS NOT NULL` guard (which would corrupt UNKNOWN into FALSE).
+    #[test]
+    fn not_in_with_null_set_non_filter_ands_null() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(
+            &probe,
+            &[Literal::Int32(1), Literal::Int32(2), Literal::Null],
+            true,
+            false,
+        );
+        match got {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                // The poisoning NULL, NOT an IS NOT NULL guard.
+                assert!(
+                    matches!(&*right, Expr::Literal(Literal::Null)),
+                    "expected trailing NULL (not an IS NOT NULL guard), got {right:?}"
+                );
+                // The left subtree is the AND of the two inequalities.
+                match &*left {
+                    Expr::Binary {
+                        op: BinaryOp::And,
+                        left: l2,
+                        right: r2,
+                    } => {
+                        check_cmp(l2, "x", BinaryOp::NotEq, Literal::Int32(1));
+                        check_cmp(r2, "x", BinaryOp::NotEq, Literal::Int32(2));
+                    }
+                    other => panic!("expected AND of inequalities, got {other:?}"),
+                }
+            }
+            other => panic!("expected (x<>1 AND x<>2) AND NULL, got {other:?}"),
+        }
+    }
+
+    /// `SELECT x NOT IN (1, 2)` (NULL-free, value observed): the bare
+    /// `x <> 1 AND x <> 2` fold is already correct 3VL — NO `IS NOT NULL`
+    /// guard (that guard is a WHERE-only GPU workaround that would force a NULL
+    /// probe's UNKNOWN result to FALSE).
+    #[test]
+    fn not_in_null_free_non_filter_has_no_guard() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], true, false);
+        match got {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                // Both sides are inequalities — there is no IS NOT NULL guard.
+                check_cmp(&left, "x", BinaryOp::NotEq, Literal::Int32(1));
+                check_cmp(&right, "x", BinaryOp::NotEq, Literal::Int32(2));
+            }
+            other => panic!("expected bare AND of inequalities, got {other:?}"),
+        }
+    }
+
+    /// `SELECT x NOT IN (NULL)` (all-NULL, value observed): every row is
+    /// UNKNOWN → a bare NULL (NOT Bool(false)).
+    #[test]
+    fn not_in_only_null_set_non_filter_is_null() {
+        let probe = Expr::Column("x".into());
+        let got = build_in_predicate(&probe, &[Literal::Null], true, false);
+        assert!(
+            matches!(got, Expr::Literal(Literal::Null)),
+            "all-NULL NOT IN set with value observed must be NULL, got {got:?}"
+        );
+    }
+
+    // ---- filter-context threading through resolve_plan / resolve_expr ------
+
+    /// Helper: a 1-column Int32 batch with an optional trailing NULL, used as
+    /// the IN-subquery result.
+    fn set_batch(vals: Vec<Option<i32>>) -> RecordBatch {
+        let arr = Arc::new(Int32Array::from(vals)) as arrow_array::ArrayRef;
+        single_col_batch(arr)
+    }
+
+    fn scan(table: &str, col: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: table.into(),
+            projection: None,
+            schema: crate::plan::Schema::new(vec![crate::plan::Field::new(
+                col,
+                crate::plan::DataType::Int32,
+                true,
+            )]),
+        }
+    }
+
+    fn in_sub(col: &str, negated: bool) -> Expr {
+        Expr::InSubquery {
+            expr: Box::new(Expr::Column(col.into())),
+            subquery: Box::new(scan("other", "id")),
+            negated,
+        }
+    }
+
+    /// In a `Filter` predicate (WHERE), a `NOT IN` with a NULL in the set folds
+    /// to the WHERE shortcut `Bool(false)`.
+    #[test]
+    fn resolve_filter_predicate_uses_filter_context() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "k")),
+            predicate: in_sub("k", true),
+        };
+        let mut exec =
+            |_p: LogicalPlan| -> BoltResult<RecordBatch> { Ok(set_batch(vec![Some(1), None])) };
+        let resolved = resolve_plan(plan, &mut exec).unwrap();
+        match resolved {
+            LogicalPlan::Filter { predicate, .. } => assert!(
+                matches!(predicate, Expr::Literal(Literal::Bool(false))),
+                "WHERE NOT IN with set-NULL must fold to Bool(false), got {predicate:?}"
+            ),
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+
+    /// In a `Project` expression (value observed), the SAME `NOT IN` with a
+    /// NULL in the set must NOT use the WHERE shortcut — it folds to the strict
+    /// 3VL `(… ) AND NULL` form so the projected value is genuinely NULL.
+    #[test]
+    fn resolve_projection_does_not_use_filter_context() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan("t", "k")),
+            exprs: vec![in_sub("k", true)],
+        };
+        let mut exec =
+            |_p: LogicalPlan| -> BoltResult<RecordBatch> { Ok(set_batch(vec![Some(1), None])) };
+        let resolved = resolve_plan(plan, &mut exec).unwrap();
+        match resolved {
+            LogicalPlan::Project { exprs, .. } => match &exprs[0] {
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    right,
+                    ..
+                } => assert!(
+                    matches!(&**right, Expr::Literal(Literal::Null)),
+                    "projected NOT IN with set-NULL must AND in NULL (3VL), got {right:?}"
+                ),
+                other => panic!("expected (…) AND NULL, got {other:?}"),
+            },
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+
+    /// An explicit `WHERE NOT (k IN (sub))` reaches `resolve_expr` as a Unary
+    /// NOT wrapping a NON-negated `InSubquery` (the sqlparser `negated` flag is
+    /// only set for the `NOT IN` spelling). Crossing the `NOT` must RESET the
+    /// filter context: with a NULL in the set the inner non-negated IN must
+    /// fold to the strict `(x = v) OR NULL` 3VL form, so `NOT (...)` evaluates
+    /// to UNKNOWN (excluded) rather than the wrong `NOT FALSE = TRUE`.
+    #[test]
+    fn resolve_not_wrapped_in_subquery_resets_filter_context() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "k")),
+            predicate: Expr::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(in_sub("k", false)),
+            },
+        };
+        let mut exec =
+            |_p: LogicalPlan| -> BoltResult<RecordBatch> { Ok(set_batch(vec![Some(1), None])) };
+        let resolved = resolve_plan(plan, &mut exec).unwrap();
+        match resolved {
+            LogicalPlan::Filter { predicate, .. } => match predicate {
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand,
+                } => match *operand {
+                    // Inner IN with set-NULL, value observed → (k = 1) OR NULL.
+                    Expr::Binary {
+                        op: BinaryOp::Or,
+                        right,
+                        ..
+                    } => assert!(
+                        matches!(*right, Expr::Literal(Literal::Null)),
+                        "NOT-wrapped IN must keep 3VL OR-NULL form, got {right:?}"
+                    ),
+                    other => panic!("expected (k = 1) OR NULL under NOT, got {other:?}"),
+                },
+                other => panic!("expected Unary NOT, got {other:?}"),
+            },
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+
+    /// Filter context is preserved across an `AND` spine: `WHERE (k NOT IN sub)
+    /// AND (k > 0)` still lets the NOT-IN use the WHERE shortcut.
+    #[test]
+    fn resolve_filter_context_flows_through_and() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "k")),
+            predicate: Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(in_sub("k", true)),
+                right: Box::new(Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column("k".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(0))),
+                }),
+            },
+        };
+        let mut exec =
+            |_p: LogicalPlan| -> BoltResult<RecordBatch> { Ok(set_batch(vec![Some(1), None])) };
+        let resolved = resolve_plan(plan, &mut exec).unwrap();
+        match resolved {
+            LogicalPlan::Filter { predicate, .. } => match predicate {
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    left,
+                    ..
+                } => assert!(
+                    matches!(*left, Expr::Literal(Literal::Bool(false))),
+                    "NOT IN on the AND spine should keep filter context, got {left:?}"
+                ),
+                other => panic!("expected AND, got {other:?}"),
             },
             other => panic!("unexpected plan {other:?}"),
         }
