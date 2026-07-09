@@ -227,6 +227,116 @@ fn not_in_subquery_with_null_in_set_returns_zero_rows() {
     );
 }
 
+/// `SELECT k NOT IN (SELECT id FROM other)` in the PROJECTION (value observed,
+/// NOT a WHERE filter) where the subquery set contains a NULL. Strict SQL 3VL:
+/// the projected value is FALSE for a row that MATCHES a non-NULL set element
+/// and UNKNOWN (SQL NULL) otherwise — never the WHERE-only `Bool(false)`
+/// shortcut that would print `false` for every row.
+///
+/// Probe {1,2,3}, set {2, NULL}: row k=2 matches 2 → FALSE; rows k=1,3 match
+/// nothing but the set has a NULL → NULL. The fold is `(k <> 2) AND NULL`
+/// (NO `IS NOT NULL` guard), which yields exactly this:
+/// `FALSE AND NULL = FALSE` (k=2), `TRUE AND NULL = NULL` (k=1,3).
+#[test]
+#[ignore = "gpu:e2e"]
+fn not_in_subquery_with_null_in_projection_is_3vl() {
+    use arrow_array::BooleanArray;
+    let engine = engine_with_probe_and_set(
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(2), None], // set {2, NULL}
+    );
+
+    let h = engine
+        .sql("SELECT k, k NOT IN (SELECT id FROM other) AS m FROM t ORDER BY k")
+        .expect("projected NOT IN with NULL in set");
+    let out = h.record_batch();
+    assert_eq!(out.num_rows(), 3, "one row per probe row");
+    let k = col_int32(&out, 0);
+    let m = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("NOT IN result is Boolean");
+    for row in 0..out.num_rows() {
+        if k.value(row) == 2 {
+            assert!(
+                !m.is_null(row) && !m.value(row),
+                "row k=2 matches the set → must be FALSE (not NULL), got null={} val={:?}",
+                m.is_null(row),
+                (!m.is_null(row)).then(|| m.value(row)),
+            );
+        } else {
+            assert!(
+                m.is_null(row),
+                "row k={} matches nothing but the set has a NULL → must be SQL NULL (3VL)",
+                k.value(row),
+            );
+        }
+    }
+}
+
+/// Explicit `WHERE NOT (k IN (SELECT id FROM other))` where the set contains a
+/// NULL. The outer `NOT` wraps a NON-negated `IN`, so resolution crosses a
+/// Unary-NOT that RESETS the filter context: the inner IN must fold to the
+/// strict `(k = v) OR NULL` 3VL form, making `NOT (UNKNOWN) = UNKNOWN`, so NO
+/// row passes. A naive fold of the inner IN to `Bool(false)` would make
+/// `NOT FALSE = TRUE` and wrongly return ALL rows.
+#[test]
+#[ignore = "gpu:e2e"]
+fn not_wrapped_in_subquery_with_null_returns_zero_rows() {
+    let engine = engine_with_probe_and_set(
+        vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+        vec![Some(1), None], // set {1, NULL}
+    );
+
+    let h = engine
+        .sql("SELECT k FROM t WHERE NOT (k IN (SELECT id FROM other)) ORDER BY k")
+        .expect("NOT (k IN (subquery)) with NULL in set");
+    let out = h.record_batch();
+    assert_eq!(
+        out.num_rows(),
+        0,
+        "NOT (k IN (set-with-NULL)) is UNKNOWN for every row (3VL) → zero rows; \
+         a fold that collapsed the inner IN to FALSE would wrongly return all 5",
+    );
+}
+
+// ===========================================================================
+// IN-subquery host-set size cap (memory-DoS / deep-recursion guard).
+// ===========================================================================
+
+/// A high-cardinality `IN (SELECT …)` must be rejected with a clean
+/// `BoltError` once the DISTINCT set exceeds the host cap, instead of building
+/// an unbounded membership set / deeply-nested expression tree (which risked an
+/// OOM or a stack overflow during the later recursive lower/JIT walks).
+///
+/// The cap is lowered to a tiny value via `CRATON_IN_SET_MAX_ROWS` so the test
+/// stays cheap. NOTE: the cap latches process-wide on first use
+/// (`OnceLock`), so this test sets the env before constructing the `Engine`;
+/// run it in its own process (the default for `cargo test` integration
+/// binaries) to guarantee the latch resolves to the lowered value.
+#[test]
+#[ignore = "gpu:e2e"]
+fn in_subquery_oversized_set_is_capped_cleanly() {
+    std::env::set_var("CRATON_IN_SET_MAX_ROWS", "8");
+
+    // `other` has 20 DISTINCT ids → exceeds the cap of 8.
+    let probe: Vec<Option<i32>> = (0..5).map(Some).collect();
+    let set: Vec<Option<i32>> = (0..20).map(Some).collect();
+    let engine = engine_with_probe_and_set(probe, set);
+
+    let err = engine
+        .sql("SELECT k FROM t WHERE k IN (SELECT id FROM other)")
+        .expect_err("oversized IN subquery must be rejected, not OOM / stack-overflow");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("distinct values") || msg.contains("more than 8"),
+        "cap error should name the distinct-value bound, got: {msg}",
+    );
+
+    std::env::remove_var("CRATON_IN_SET_MAX_ROWS");
+}
+
 // ===========================================================================
 // Supported form 3 — scalar subquery in a predicate.
 // ===========================================================================
