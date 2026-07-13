@@ -788,9 +788,10 @@ where
         },
         // An alias is transparent: it neither observes nor negates the value,
         // so the filter context flows straight through.
-        Expr::Alias(inner, name) => {
-            Expr::Alias(Box::new(resolve_expr_ctx(*inner, exec, filter_context)?), name)
-        }
+        Expr::Alias(inner, name) => Expr::Alias(
+            Box::new(resolve_expr_ctx(*inner, exec, filter_context)?),
+            name,
+        ),
         Expr::ScalarSubquery(subplan) => {
             // Resolve inner subqueries first, then execute, then fold.
             let resolved = resolve_plan(*subplan, exec)?;
@@ -924,8 +925,7 @@ mod tests {
     #[test]
     fn build_in_or_of_equalities() {
         let probe = Expr::Column("x".into());
-        let got =
-            build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], false, true);
+        let got = build_in_predicate(&probe, &[Literal::Int32(1), Literal::Int32(2)], false, true);
         // `Expr` doesn't implement `PartialEq`, so destructure and compare the
         // structure / scalar leaves (which do) instead of `assert_eq!`.
         match got {
