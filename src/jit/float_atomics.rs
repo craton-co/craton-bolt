@@ -111,6 +111,41 @@ pub const FLOAT_ATOMIC_AGG_ENTRY: &str = "bolt_groupby_agg";
 /// codegen complexity.
 const SPIN_BACKOFF_NS: u32 = 32;
 
+/// Maximum number of linear-probe steps before the kernel gives up on a row
+/// and records an overflow instead of spinning forever.
+///
+/// Expressed as a multiple of the table size `k`: we allow up to `k *
+/// MAX_PROBE_FACTOR` probe steps. Mirrors the `MAX_PROBE_FACTOR` convention in
+/// `hash_kernels.rs` so the two kernels bail under the same load conditions.
+/// Because the keys kernel fully populates the table before this kernel runs,
+/// any walk longer than the whole table (factor >= 1) means the row's key is
+/// genuinely absent — a corrupt/under-populated keys table — so a small factor
+/// is sufficient and keeps the bound cheap to evaluate.
+const MAX_PROBE_FACTOR: u32 = 2;
+
+/// Overflow-counter contract shared with `hash_kernels.rs`.
+///
+/// The kernel ABI is fixed at six parameters (see the module-level "ABI"
+/// note), so there is no dedicated `.param` for an overflow counter. By
+/// convention the host over-allocates the accumulator table
+/// (`acc_table_ptr`, ABI `param_3`) by one extra 32-bit slot *past* the `k`
+/// accumulator entries and zero-initialises it. This kernel bumps that slot
+/// with `atom.global.add.u32` whenever a row is dropped (probe exhaustion or
+/// an EMPTY-sentinel miss). The host reads the slot after the launch to detect
+/// dropped rows.
+///
+/// The counter slot byte offset is `k * elem_bytes` (immediately after the
+/// last accumulator element). This keeps the counter co-allocated with the
+/// table it guards and avoids touching the otherwise-full six-parameter ABI.
+///
+/// NOTE (cross-branch contract): `hash_kernels.rs` is out of this worktree's
+/// edit/read set, so the *exact* slot location it uses could differ (it may,
+/// for example, carry a seventh parameter of its own). The convention encoded
+/// here — trailing u32 slot in the accumulator allocation — is the
+/// ABI-preserving choice for this module; the host launcher and any sibling
+/// kernel must agree on it.
+const OVERFLOW_COUNTER_TRAILING_SLOT: bool = true;
+
 /// Generate a PTX kernel for `GROUP BY MIN(float)` / `MAX(float)`.
 ///
 /// Performs the same hash + linear probe against `keys_table_ptr` as the
@@ -164,10 +199,29 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
 
     // Per-dtype PTX type info. `bits_ty` is the integer width used for the
     // CAS, `float_ty` is the matching float type for the comparison, `elem_bytes`
-    // is the stride for both the input column and accumulator table.
-    let (bits_ty, float_ty, elem_bytes, atom_cas, bits_reg, float_reg) = match dtype {
-        DataType::Float32 => ("b32", "f32", 4usize, "atom.global.cas.b32", "vr", "vf"),
-        DataType::Float64 => ("b64", "f64", 8usize, "atom.global.cas.b64", "vrl", "vfd"),
+    // is the stride for both the input column and accumulator table. `pos_zero`
+    // is the PTX hex-float literal for `+0.0` of this type, used to canonicalise
+    // `-0.0 -> +0.0` so the total order is deterministic (see the `-0.0`
+    // canonicalisation note below).
+    let (bits_ty, float_ty, elem_bytes, atom_cas, bits_reg, float_reg, pos_zero) = match dtype {
+        DataType::Float32 => (
+            "b32",
+            "f32",
+            4usize,
+            "atom.global.cas.b32",
+            "vr",
+            "vf",
+            "0f00000000",
+        ),
+        DataType::Float64 => (
+            "b64",
+            "f64",
+            8usize,
+            "atom.global.cas.b64",
+            "vrl",
+            "vfd",
+            "0d0000000000000000",
+        ),
         // Unreachable thanks to the validation above, but keep the match total.
         _ => {
             return Err(BoltError::Other(format!(
@@ -204,7 +258,7 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
 
     // `.reg` declarations. Generous because PTX `.reg` decls only allocate
     // names, not real hardware registers.
-    writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .pred  %p<9>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b32   %r<24>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<24>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rl<16>;").map_err(write_err)?;
@@ -284,8 +338,38 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     // probe loop.
     writeln!(ptx, "\tmov.s64 %rl4, {};", EMPTY_KEY_LITERAL).map_err(write_err)?;
 
+    // Probe bound: allow at most `k * MAX_PROBE_FACTOR` steps before declaring
+    // the row's key absent and recording an overflow. `%r9` is the live probe
+    // budget, decremented each iteration and tested against zero in the loop.
+    // Mirrors the MAX_PROBE_FACTOR bail convention in `hash_kernels.rs` so both
+    // kernels give up under the same conditions instead of spinning forever on
+    // a corrupt / under-populated keys table.
+    writeln!(ptx, "\tmul.lo.u32 %r9, %r5, {f};", f = MAX_PROBE_FACTOR).map_err(write_err)?;
+
+    // Pre-compute the host-checkable overflow-counter address: the u32 slot
+    // immediately past the `k` accumulator entries in `acc_table_ptr`
+    // (ABI param_3). See `OVERFLOW_COUNTER_TRAILING_SLOT` for the cross-branch
+    // contract. `%rd20` ends up pointing at `acc_base + k * elem_bytes`.
+    writeln!(
+        ptx,
+        "\tld.param.u64 %rd18, [{}_param_3];",
+        FLOAT_ATOMIC_AGG_ENTRY
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tcvta.to.global.u64 %rd18, %rd18;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmul.wide.u32 %rd19, %r5, {bytes};",
+        bytes = elem_bytes
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd20, %rd18, %rd19;").map_err(write_err)?;
+    // Constant +1 used for the overflow `atom.global.add.u32` bumps below.
+    writeln!(ptx, "\tmov.u32 %r11, 1;").map_err(write_err)?;
+
     // Probe loop. Non-mutating: keys kernel already populated the table; we
-    // just walk slots until we find the one whose key matches ours.
+    // just walk slots until we find the one whose key matches ours, bounded by
+    // the probe budget in %r9.
     writeln!(ptx, "PROBE_LOOP:").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd4, %r8, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd5, %rd3, %rd4;").map_err(write_err)?;
@@ -293,20 +377,31 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra FOUND;").map_err(write_err)?;
     // Defensive: if we hit an EMPTY sentinel during the probe the keys kernel
-    // didn't populate this row's slot — shouldn't happen in practice, but bail
-    // to avoid spinning forever.
+    // didn't populate this row's slot — shouldn't happen in practice. Record
+    // the dropped row on the host-checkable overflow counter before bailing,
+    // so the drop is observable rather than silent (matching the
+    // `atom.global.add.u32` overflow accounting in `hash_kernels.rs`).
     writeln!(ptx, "\tsetp.eq.s64 %p2, %rl5, %rl4;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p2 bra DONE;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
+    // Exhausted the probe budget without finding our key: also an overflow.
+    writeln!(ptx, "\tsetp.eq.u32 %p3, %r9, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra OVERFLOW;").map_err(write_err)?;
+    writeln!(ptx, "\tsub.u32 %r9, %r9, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
     writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
     // Occupancy-friendly back-off on the probe-advance path. Reached only
     // when the probed slot held the wrong key (collision) — yielding SM
     // cycles here frees the warp scheduler to run peer warps that may be
-    // populating slots ahead of us. The FOUND and EMPTY-sentinel paths
+    // populating slots ahead of us. The FOUND and OVERFLOW paths
     // skip this via early branches above.
     writeln!(ptx, "\tmov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
+    // Overflow sink: bump the host-checkable counter and drop this row. Shared
+    // by the EMPTY-sentinel miss and probe-budget exhaustion above.
+    writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
+    writeln!(ptx, "\tatom.global.add.u32 %r12, [%rd20], %r11;").map_err(write_err)?;
+    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
     writeln!(ptx, "FOUND:").map_err(write_err)?;
 
     // Compute the accumulator slot address (acc_table + slot * elem_bytes).
@@ -349,6 +444,33 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     )
     .map_err(write_err)?;
 
+    // Canonicalise the candidate's signed zero: -0.0 -> +0.0. Under IEEE,
+    // `setp.lt`/`setp.gt` treat -0.0 and +0.0 as EQUAL (both `-0.0 < +0.0` and
+    // `+0.0 < -0.0` are false), and the bits-equal short-circuit below then
+    // skips the CAS — so a group containing both signs would keep whichever
+    // landed first, a nondeterministic result that disagrees with the module's
+    // float_total_cmp total order. We fold -0.0 to +0.0 so the stored bits are
+    // deterministic. The test `setp.eq.{fty} cand, +0.0` is true for EXACTLY
+    // +0.0 and -0.0 and false for NaN, so the `selp` rewrites only signed zero
+    // and leaves every other value — including all NaN bit patterns — untouched,
+    // preserving the NaN handling documented above.
+    writeln!(ptx, "\tmov.{fty} %{fr}3, {z};", fty = float_ty, fr = float_reg, z = pos_zero)
+        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.eq.{fty} %p8, %{fr}0, %{fr}3;",
+        fty = float_ty,
+        fr = float_reg
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tselp.{fty} %{fr}0, %{fr}3, %{fr}0, %p8;",
+        fty = float_ty,
+        fr = float_reg
+    )
+    .map_err(write_err)?;
+
     // === CAS retry loop. ===
     //
     //   %{bits_reg}0 = old_bits      (snapshot of accumulator)
@@ -370,6 +492,28 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
         bty = bits_ty,
         fr = float_reg,
         br = bits_reg
+    )
+    .map_err(write_err)?;
+    // Canonicalise the slot's signed zero the same way as the candidate above,
+    // so a -0.0 already resident in the accumulator is compared/stored as +0.0
+    // and the result is independent of arrival order. NaN-safe: `setp.eq.{fty}`
+    // is true only for ±0.0 and false for NaN, so NaN slot bits are preserved.
+    // %{fr}3 holds +0.0 (re-materialised here so the canonicalisation does not
+    // depend on register liveness across the CAS back-edge).
+    writeln!(ptx, "\tmov.{fty} %{fr}3, {z};", fty = float_ty, fr = float_reg, z = pos_zero)
+        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tsetp.eq.{fty} %p8, %{fr}1, %{fr}3;",
+        fty = float_ty,
+        fr = float_reg
+    )
+    .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tselp.{fty} %{fr}1, %{fr}3, %{fr}1, %p8;",
+        fty = float_ty,
+        fr = float_reg
     )
     .map_err(write_err)?;
     // Compute %p3 = "candidate sorts strictly past the slot under the DuckDB
@@ -559,6 +703,111 @@ mod tests {
         assert!(
             ptx.contains(&entry),
             "PTX should declare entry as {entry:?}, got:\n{ptx}"
+        );
+    }
+
+    /// Finding (a): the probe walk must be bounded and must bump a
+    /// host-checkable overflow counter on probe exhaustion / sentinel miss,
+    /// instead of spinning forever or dropping the row silently.
+    #[test]
+    fn probe_loop_is_bounded_and_counts_overflow() {
+        for (op, dt) in [
+            (ReduceOp::Min, DataType::Float32),
+            (ReduceOp::Max, DataType::Float32),
+            (ReduceOp::Min, DataType::Float64),
+            (ReduceOp::Max, DataType::Float64),
+        ] {
+            let ptx = compile_groupby_float_atomic_kernel(op, dt)
+                .unwrap_or_else(|e| panic!("kernel {op:?}/{dt:?} should compile: {e}"));
+
+            // The probe budget is derived from k (param_5, loaded into %r5)
+            // scaled by MAX_PROBE_FACTOR.
+            assert!(
+                ptx.contains(&format!("mul.lo.u32 %r9, %r5, {MAX_PROBE_FACTOR};")),
+                "expected probe budget = k * MAX_PROBE_FACTOR in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+            // Budget is tested against zero and decremented inside the loop.
+            assert!(
+                ptx.contains("setp.eq.u32 %p3, %r9, 0;"),
+                "expected probe-budget exhaustion test in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+            assert!(
+                ptx.contains("sub.u32 %r9, %r9, 1;"),
+                "expected probe-budget decrement in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+            // Both the exhaustion and the EMPTY-sentinel-miss paths branch to a
+            // shared OVERFLOW sink rather than silently dropping the row.
+            assert!(
+                ptx.contains("OVERFLOW:"),
+                "expected OVERFLOW sink label in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+            // The overflow sink bumps a host-checkable counter via atomic add.
+            assert!(
+                ptx.contains("atom.global.add.u32 %r12, [%rd20], %r11;"),
+                "expected overflow-counter atomic bump in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+            // The old silent `@%p2 bra DONE` sentinel drop must be gone: the
+            // sentinel-miss path now routes through OVERFLOW.
+            assert!(
+                ptx.contains("@%p2 bra OVERFLOW;"),
+                "EMPTY-sentinel miss should route to OVERFLOW for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+        }
+
+        // Document the assumed cross-branch counter convention at test time so
+        // a change to the contract surfaces here.
+        assert!(
+            OVERFLOW_COUNTER_TRAILING_SLOT,
+            "overflow counter is expected to live in a trailing u32 slot of acc_table"
+        );
+    }
+
+    /// Finding (b): -0.0 must be canonicalised to +0.0 before the compare/CAS
+    /// so MIN/MAX over a group containing both signed zeros is deterministic.
+    /// The canonicalisation must be NaN-safe (only ±0.0 is rewritten).
+    #[test]
+    fn signed_zero_is_canonicalized() {
+        // f32: +0.0 literal is 0f00000000.
+        let ptx32 = compile_groupby_float_atomic_kernel(ReduceOp::Min, DataType::Float32).unwrap();
+        assert!(
+            ptx32.contains("mov.f32 %vf3, 0f00000000;"),
+            "expected +0.0 f32 literal materialised for canonicalisation, got:\n{ptx32}"
+        );
+        // ±0.0-only test (false for NaN) then selp folds -0.0 -> +0.0 for both
+        // the candidate (%vf0) and the resident slot value (%vf1).
+        assert!(
+            ptx32.contains("setp.eq.f32 %p8, %vf0, %vf3;")
+                && ptx32.contains("selp.f32 %vf0, %vf3, %vf0, %p8;"),
+            "expected candidate -0.0 canonicalisation for f32, got:\n{ptx32}"
+        );
+        assert!(
+            ptx32.contains("setp.eq.f32 %p8, %vf1, %vf3;")
+                && ptx32.contains("selp.f32 %vf1, %vf3, %vf1, %p8;"),
+            "expected slot -0.0 canonicalisation for f32, got:\n{ptx32}"
+        );
+
+        // f64: +0.0 literal is 0d0000000000000000.
+        let ptx64 = compile_groupby_float_atomic_kernel(ReduceOp::Max, DataType::Float64).unwrap();
+        assert!(
+            ptx64.contains("mov.f64 %vfd3, 0d0000000000000000;"),
+            "expected +0.0 f64 literal materialised for canonicalisation, got:\n{ptx64}"
+        );
+        assert!(
+            ptx64.contains("setp.eq.f64 %p8, %vfd0, %vfd3;")
+                && ptx64.contains("selp.f64 %vfd0, %vfd3, %vfd0, %p8;"),
+            "expected candidate -0.0 canonicalisation for f64, got:\n{ptx64}"
+        );
+        assert!(
+            ptx64.contains("setp.eq.f64 %p8, %vfd1, %vfd3;")
+                && ptx64.contains("selp.f64 %vfd1, %vfd3, %vfd1, %p8;"),
+            "expected slot -0.0 canonicalisation for f64, got:\n{ptx64}"
+        );
+
+        // NaN handling must remain intact alongside the new canonicalisation.
+        assert!(
+            ptx32.contains("testp.notanumber.f32 %p3, %vf0;")
+                && ptx32.contains("testp.notanumber.f32 %p4, %vf1;"),
+            "NaN total-order tests should be preserved, got:\n{ptx32}"
         );
     }
 }
