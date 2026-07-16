@@ -123,29 +123,6 @@ const SPIN_BACKOFF_NS: u32 = 32;
 /// is sufficient and keeps the bound cheap to evaluate.
 const MAX_PROBE_FACTOR: u32 = 2;
 
-/// Overflow-counter contract shared with `hash_kernels.rs`.
-///
-/// The kernel ABI is fixed at six parameters (see the module-level "ABI"
-/// note), so there is no dedicated `.param` for an overflow counter. By
-/// convention the host over-allocates the accumulator table
-/// (`acc_table_ptr`, ABI `param_3`) by one extra 32-bit slot *past* the `k`
-/// accumulator entries and zero-initialises it. This kernel bumps that slot
-/// with `atom.global.add.u32` whenever a row is dropped (probe exhaustion or
-/// an EMPTY-sentinel miss). The host reads the slot after the launch to detect
-/// dropped rows.
-///
-/// The counter slot byte offset is `k * elem_bytes` (immediately after the
-/// last accumulator element). This keeps the counter co-allocated with the
-/// table it guards and avoids touching the otherwise-full six-parameter ABI.
-///
-/// NOTE (cross-branch contract): `hash_kernels.rs` is out of this worktree's
-/// edit/read set, so the *exact* slot location it uses could differ (it may,
-/// for example, carry a seventh parameter of its own). The convention encoded
-/// here — trailing u32 slot in the accumulator allocation — is the
-/// ABI-preserving choice for this module; the host launcher and any sibling
-/// kernel must agree on it.
-const OVERFLOW_COUNTER_TRAILING_SLOT: bool = true;
-
 /// Generate a PTX kernel for `GROUP BY MIN(float)` / `MAX(float)`.
 ///
 /// Performs the same hash + linear probe against `keys_table_ptr` as the
@@ -339,33 +316,18 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     writeln!(ptx, "\tmov.s64 %rl4, {};", EMPTY_KEY_LITERAL).map_err(write_err)?;
 
     // Probe bound: allow at most `k * MAX_PROBE_FACTOR` steps before declaring
-    // the row's key absent and recording an overflow. `%r9` is the live probe
-    // budget, decremented each iteration and tested against zero in the loop.
-    // Mirrors the MAX_PROBE_FACTOR bail convention in `hash_kernels.rs` so both
-    // kernels give up under the same conditions instead of spinning forever on
-    // a corrupt / under-populated keys table.
+    // the row's key absent and dropping its contribution. `%r9` is the live
+    // probe budget, decremented each iteration and tested against zero in the
+    // loop. Mirrors the MAX_PROBE_FACTOR bail convention in `hash_kernels.rs`
+    // so both kernels give up under the same conditions instead of spinning
+    // forever on a corrupt / under-populated keys table.
+    //
+    // LIMITATION: probe exhaustion (or hitting an EMPTY sentinel) silently
+    // drops the row's contribution by branching to DONE — the documented,
+    // pre-existing behaviour. There is no overflow counter, so this kernel
+    // requires no host-side over-allocation beyond the `k`-element accumulator
+    // table described in the module-level ABI note.
     writeln!(ptx, "\tmul.lo.u32 %r9, %r5, {f};", f = MAX_PROBE_FACTOR).map_err(write_err)?;
-
-    // Pre-compute the host-checkable overflow-counter address: the u32 slot
-    // immediately past the `k` accumulator entries in `acc_table_ptr`
-    // (ABI param_3). See `OVERFLOW_COUNTER_TRAILING_SLOT` for the cross-branch
-    // contract. `%rd20` ends up pointing at `acc_base + k * elem_bytes`.
-    writeln!(
-        ptx,
-        "\tld.param.u64 %rd18, [{}_param_3];",
-        FLOAT_ATOMIC_AGG_ENTRY
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tcvta.to.global.u64 %rd18, %rd18;").map_err(write_err)?;
-    writeln!(
-        ptx,
-        "\tmul.wide.u32 %rd19, %r5, {bytes};",
-        bytes = elem_bytes
-    )
-    .map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd20, %rd18, %rd19;").map_err(write_err)?;
-    // Constant +1 used for the overflow `atom.global.add.u32` bumps below.
-    writeln!(ptx, "\tmov.u32 %r11, 1;").map_err(write_err)?;
 
     // Probe loop. Non-mutating: keys kernel already populated the table; we
     // just walk slots until we find the one whose key matches ours, bounded by
@@ -377,31 +339,28 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     writeln!(ptx, "\tsetp.eq.s64 %p1, %rl5, %rl0;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra FOUND;").map_err(write_err)?;
     // Defensive: if we hit an EMPTY sentinel during the probe the keys kernel
-    // didn't populate this row's slot — shouldn't happen in practice. Record
-    // the dropped row on the host-checkable overflow counter before bailing,
-    // so the drop is observable rather than silent (matching the
-    // `atom.global.add.u32` overflow accounting in `hash_kernels.rs`).
+    // didn't populate this row's slot — shouldn't happen in practice. Drop the
+    // row's contribution by bailing to DONE. This is a silent drop (a
+    // documented limitation, unchanged from before this branch); there is no
+    // overflow counter and therefore no host-side over-allocation to keep the
+    // write in bounds.
     writeln!(ptx, "\tsetp.eq.s64 %p2, %rl5, %rl4;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
-    // Exhausted the probe budget without finding our key: also an overflow.
+    writeln!(ptx, "\t@%p2 bra DONE;").map_err(write_err)?;
+    // Exhausted the probe budget without finding our key: also drop the row's
+    // contribution (silent, same as the sentinel-miss case above).
     writeln!(ptx, "\tsetp.eq.u32 %p3, %r9, 0;").map_err(write_err)?;
-    writeln!(ptx, "\t@%p3 bra OVERFLOW;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p3 bra DONE;").map_err(write_err)?;
     writeln!(ptx, "\tsub.u32 %r9, %r9, 1;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s32 %r8, %r8, 1;").map_err(write_err)?;
     writeln!(ptx, "\tand.b32 %r8, %r8, %r6;").map_err(write_err)?;
     // Occupancy-friendly back-off on the probe-advance path. Reached only
     // when the probed slot held the wrong key (collision) — yielding SM
     // cycles here frees the warp scheduler to run peer warps that may be
-    // populating slots ahead of us. The FOUND and OVERFLOW paths
+    // populating slots ahead of us. The FOUND and bail paths
     // skip this via early branches above.
     writeln!(ptx, "\tmov.u32 %nstime, {ns};", ns = SPIN_BACKOFF_NS).map_err(write_err)?;
     writeln!(ptx, "\tnanosleep.u32 %nstime;").map_err(write_err)?;
     writeln!(ptx, "\tbra PROBE_LOOP;").map_err(write_err)?;
-    // Overflow sink: bump the host-checkable counter and drop this row. Shared
-    // by the EMPTY-sentinel miss and probe-budget exhaustion above.
-    writeln!(ptx, "OVERFLOW:").map_err(write_err)?;
-    writeln!(ptx, "\tatom.global.add.u32 %r12, [%rd20], %r11;").map_err(write_err)?;
-    writeln!(ptx, "\tbra DONE;").map_err(write_err)?;
     writeln!(ptx, "FOUND:").map_err(write_err)?;
 
     // Compute the accumulator slot address (acc_table + slot * elem_bytes).
@@ -706,11 +665,14 @@ mod tests {
         );
     }
 
-    /// Finding (a): the probe walk must be bounded and must bump a
-    /// host-checkable overflow counter on probe exhaustion / sentinel miss,
-    /// instead of spinning forever or dropping the row silently.
+    /// Finding (a): the probe walk must be bounded so a corrupt /
+    /// under-populated keys table can never spin the kernel forever. On probe
+    /// exhaustion or an EMPTY-sentinel miss the kernel bails to DONE, silently
+    /// dropping the row's contribution (a documented limitation unchanged from
+    /// before this branch). There is NO overflow counter, so the kernel needs
+    /// no host-side over-allocation past the `k`-element accumulator table.
     #[test]
-    fn probe_loop_is_bounded_and_counts_overflow() {
+    fn probe_loop_is_bounded_and_bails_without_overflow_counter() {
         for (op, dt) in [
             (ReduceOp::Min, DataType::Float32),
             (ReduceOp::Max, DataType::Float32),
@@ -735,31 +697,29 @@ mod tests {
                 ptx.contains("sub.u32 %r9, %r9, 1;"),
                 "expected probe-budget decrement in PTX for {op:?}/{dt:?}, got:\n{ptx}"
             );
-            // Both the exhaustion and the EMPTY-sentinel-miss paths branch to a
-            // shared OVERFLOW sink rather than silently dropping the row.
+            // Both the exhaustion and the EMPTY-sentinel-miss paths bail to DONE,
+            // dropping the row's contribution.
             assert!(
-                ptx.contains("OVERFLOW:"),
-                "expected OVERFLOW sink label in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+                ptx.contains("@%p3 bra DONE;"),
+                "probe-budget exhaustion should bail to DONE for {op:?}/{dt:?}, got:\n{ptx}"
             );
-            // The overflow sink bumps a host-checkable counter via atomic add.
             assert!(
-                ptx.contains("atom.global.add.u32 %r12, [%rd20], %r11;"),
-                "expected overflow-counter atomic bump in PTX for {op:?}/{dt:?}, got:\n{ptx}"
+                ptx.contains("@%p2 bra DONE;"),
+                "EMPTY-sentinel miss should bail to DONE for {op:?}/{dt:?}, got:\n{ptx}"
             );
-            // The old silent `@%p2 bra DONE` sentinel drop must be gone: the
-            // sentinel-miss path now routes through OVERFLOW.
+            // There must be NO overflow counter: no OVERFLOW sink, no trailing
+            // u32 atomic-add into an over-allocated accumulator slot. This is
+            // what keeps the kernel from writing out of bounds when the host
+            // allocates exactly `k` accumulator entries.
             assert!(
-                ptx.contains("@%p2 bra OVERFLOW;"),
-                "EMPTY-sentinel miss should route to OVERFLOW for {op:?}/{dt:?}, got:\n{ptx}"
+                !ptx.contains("OVERFLOW"),
+                "no OVERFLOW sink should remain for {op:?}/{dt:?}, got:\n{ptx}"
+            );
+            assert!(
+                !ptx.contains("atom.global.add.u32"),
+                "no overflow-counter atomic add should remain for {op:?}/{dt:?}, got:\n{ptx}"
             );
         }
-
-        // Document the assumed cross-branch counter convention at test time so
-        // a change to the contract surfaces here.
-        assert!(
-            OVERFLOW_COUNTER_TRAILING_SLOT,
-            "overflow counter is expected to live in a trailing u32 slot of acc_table"
-        );
     }
 
     /// Finding (b): -0.0 must be canonicalised to +0.0 before the compare/CAS
