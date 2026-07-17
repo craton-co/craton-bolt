@@ -413,8 +413,14 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     // +0.0 and -0.0 and false for NaN, so the `selp` rewrites only signed zero
     // and leaves every other value — including all NaN bit patterns — untouched,
     // preserving the NaN handling documented above.
-    writeln!(ptx, "\tmov.{fty} %{fr}3, {z};", fty = float_ty, fr = float_reg, z = pos_zero)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmov.{fty} %{fr}3, {z};",
+        fty = float_ty,
+        fr = float_reg,
+        z = pos_zero
+    )
+    .map_err(write_err)?;
     writeln!(
         ptx,
         "\tsetp.eq.{fty} %p8, %{fr}0, %{fr}3;",
@@ -459,8 +465,14 @@ pub fn compile_groupby_float_atomic_kernel(op: ReduceOp, dtype: DataType) -> Bol
     // is true only for ±0.0 and false for NaN, so NaN slot bits are preserved.
     // %{fr}3 holds +0.0 (re-materialised here so the canonicalisation does not
     // depend on register liveness across the CAS back-edge).
-    writeln!(ptx, "\tmov.{fty} %{fr}3, {z};", fty = float_ty, fr = float_reg, z = pos_zero)
-        .map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmov.{fty} %{fr}3, {z};",
+        fty = float_ty,
+        fr = float_reg,
+        z = pos_zero
+    )
+    .map_err(write_err)?;
     writeln!(
         ptx,
         "\tsetp.eq.{fty} %p8, %{fr}1, %{fr}3;",
