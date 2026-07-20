@@ -10,20 +10,51 @@
 //! hash-partition + per-partition Tier-1 reduction is profitable, route
 //! the query through the Tier-2 kernel.
 //!
-//! Above the Tier-2 cardinality cap, both fast paths' assumptions break
-//! down (per-partition tables would themselves overflow shared memory)
-//! and we fall back to the always-correct global-atomic path.
-//!
-//! This module is **additive**: it does NOT modify the existing Tier-1
-//! dispatcher in [`crate::exec::groupby_shmem_dispatch`]. The two
-//! dispatchers will be merged by a follow-up consolidation; for now,
-//! call-sites that want the three-way decision should call
-//! [`dispatch_v2`].
+//! Above the Tier-2 cardinality cap ([`TIER2_MAX_GROUPS`], the physical
+//! `NUM_PARTITIONS * BLOCK_GROUPS` output-slot capacity) spill is
+//! guaranteed by pigeonhole, so we route straight to the always-correct
+//! global-atomic path instead of running the full pipeline to a
+//! guaranteed spill + soft-fallback.
 //!
 //! Like the Tier-1 dispatcher, this is **pure selection logic** — no GPU
 //! calls, no I/O. Threshold values are exposed as `pub const` so an
 //! auto-tuner (or `grep`) can find and adjust them without spelunking
 //! through the function body.
+//!
+//! # Source-of-truth map for GROUP BY dispatch (read before editing)
+//!
+//! There is no single dispatcher; selection logic lives in three layers,
+//! each with a distinct, current responsibility. None is dead code (every
+//! function below has a live production caller — verified by `git grep`):
+//!
+//! 1. **Macro fall-through order** in
+//!    [`crate::exec::groupby::execute_groupby`] (`try_fast_path!`) is the
+//!    OUTERMOST source of truth: it fixes the *order* in which the ~20
+//!    `try_execute` fast-path executors are offered the query. The first
+//!    one whose preconditions match wins; the rest never see the query.
+//! 2. **`dispatch_v2`** (this module) is the SUM/Float64/Int32 single-key
+//!    cardinality dispatcher. Live callers: the single-SUM Tier-2 executor
+//!    [`crate::exec::groupby_tier2_exec`] and the multi-SUM Tier-2 executor
+//!    [`crate::exec::groupby_tier2_multi_exec`]. It models only SUM/F64
+//!    because those are the only ops whose Tier-1-vs-Tier-2-vs-global
+//!    decision is shared; it is NOT a stale stub.
+//! 3. **`dispatch`** (the Tier-1 dispatcher in
+//!    [`crate::exec::groupby_shmem_dispatch`]) is the analogous Tier-1
+//!    SUM/F64 cardinality gate. Live callers: the single-SUM
+//!    [`crate::exec::groupby_shmem_exec`] and multi-SUM
+//!    [`crate::exec::groupby_shmem_multi_exec`] shmem executors.
+//!
+//! The non-SUM shmem/Tier-2 executors (COUNT / MIN/MAX / AVG, single- and
+//! two-key) deliberately do NOT route through `dispatch` / `dispatch_v2`:
+//! their eligibility tails diverge (an `n_vals` range, a value-dtype branch,
+//! `n_key_cols == 2`, etc. — see the dedup note below) and each gates its
+//! own cardinality floor inline against the same `pub const` thresholds
+//! ([`TIER1_MAX_GROUPS`] / [`TIER1_MIN_ROWS`] / [`TIER2_MIN_ROWS`] and the
+//! Tier-1 module's `SHARED_MEM_*`). Those constants are the shared knobs;
+//! the per-op gates are intentionally local. An earlier note here claimed
+//! the two dispatchers "will be merged by a follow-up" — that merge never
+//! landed and would change executor selection (and touch files outside this
+//! module), so it is NOT pursued here; this map is the reconciliation.
 //!
 //! # Policy (v0)
 //!
@@ -140,10 +171,47 @@ pub struct DispatchInputsV2 {
 pub const TIER1_MAX_GROUPS: u32 = 1024;
 
 /// Maximum distinct group count the Tier-2 (hash-partitioned two-pass)
-/// kernel will accept.  Above this, the per-partition hashtables
-/// themselves would exceed shared memory even after partitioning, and
-/// we route through the always-correct global-atomic path.
-pub const TIER2_MAX_GROUPS: u32 = 100_000_000;
+/// kernel can ever resolve correctly — the *physical* slot capacity of
+/// the reduce output, `NUM_PARTITIONS * BLOCK_GROUPS`.
+///
+/// The Tier-2 pipeline scatters rows into `NUM_PARTITIONS` partitions and
+/// then reduces each partition into a fixed `BLOCK_GROUPS`-slot shared-mem
+/// hash table (see [`crate::exec::groupby_tier2_orchestrator`] and
+/// [`crate::jit::partition_reduce_kernel`]). Distinct keys therefore land
+/// in exactly `NUM_PARTITIONS * BLOCK_GROUPS = 4096 * 1024 = 4_194_304`
+/// output slots in total. Those two constants live in
+/// [`crate::jit::partition_kernel::NUM_PARTITIONS`] /
+/// [`crate::jit::partition_reduce_kernel::BLOCK_GROUPS`] (NOT in this
+/// file's editable set), so the value is spelled out here as `4096 *
+/// 1024` with this reference comment.
+///
+/// Above this many distinct keys, spill is *guaranteed* by the pigeonhole
+/// principle: there are strictly more distinct keys than total slots, so
+/// at least one per-partition table overflows `MAX_PROBES`, the reduce
+/// kernel raises the `partition_reduce spill` sentinel, and
+/// `groupby::execute_groupby`'s GB-S2 soft-fallback recomputes on the
+/// always-correct global-atomic path. Routing those queries straight to
+/// `GlobalAtomic` here (instead of running the full partition + scatter +
+/// reduce pipeline only to spill and fall back) is pure wasted-work
+/// elimination — the final executor and result are identical either way.
+///
+/// The previous value (`100_000_000`) vastly overshot this physical
+/// capacity: every query with `4_194_304 < n_groups <= 100_000_000`
+/// distinct keys ran the entire pipeline to a guaranteed spill before
+/// falling back, and the doc comment ("per-partition hashtables would
+/// exceed shared memory") was wrong — the limit is total output slots,
+/// not per-block smem.
+///
+/// NOTE on load factor: this is the *hard* ceiling. Real workloads can
+/// spill below it when hash skew packs more than `BLOCK_GROUPS` distinct
+/// keys into one partition (the orchestrator docs note correctness holds
+/// "precisely when total distinct keys are <= K * BLOCK_GROUPS"). We do
+/// NOT bake a load-factor margin into the cap: below the physical ceiling
+/// many queries still succeed on Tier-2 today, and lowering the gate
+/// would change which executor produces their result. A margin belongs in
+/// an auto-tuner with hardware coverage, not in this behaviour-preserving
+/// constant.
+pub const TIER2_MAX_GROUPS: u32 = 4096 * 1024;
 
 /// Minimum input-row count to consider the Tier-1 path.  Below this,
 /// the extra kernel launch + per-block reduction overhead is not
@@ -257,6 +325,50 @@ mod tests {
         // Above the Tier-2 cap → neither fast path is safe.
         let inputs = DispatchInputsV2 {
             n_groups: 200_000_000,
+            ..eligible_baseline()
+        };
+        assert_eq!(dispatch_v2(inputs), GroupByStrategyV2::GlobalAtomic);
+    }
+
+    /// The Tier-2 cap must equal the physical reduce-output slot capacity
+    /// `NUM_PARTITIONS * BLOCK_GROUPS = 4096 * 1024`. Those constants live
+    /// outside this file's editable set
+    /// (`partition_kernel::NUM_PARTITIONS` /
+    /// `partition_reduce_kernel::BLOCK_GROUPS`), so this test pins the
+    /// derivation locally; if either kernel constant ever changes, this
+    /// assertion documents the value that must move in lock-step.
+    #[test]
+    fn tier2_cap_equals_physical_slot_capacity() {
+        assert_eq!(TIER2_MAX_GROUPS, 4096 * 1024);
+        assert_eq!(TIER2_MAX_GROUPS, 4_194_304);
+        // Cross-check against the kernel constants this value is derived
+        // from (read-only here — they are authored in `src/jit/`).
+        assert_eq!(
+            TIER2_MAX_GROUPS,
+            crate::jit::partition_kernel::NUM_PARTITIONS
+                * crate::jit::partition_reduce_kernel::BLOCK_GROUPS
+        );
+    }
+
+    /// Exactly at the new cap → still Tier-2 (the bound is inclusive:
+    /// `n_groups <= TIER2_MAX_GROUPS`), so a query that *just* fits the
+    /// physical slot capacity is not forced off the fast path.
+    #[test]
+    fn tier2_boundary_at_cap_is_eligible() {
+        let inputs = DispatchInputsV2 {
+            n_groups: TIER2_MAX_GROUPS,
+            ..eligible_baseline()
+        };
+        assert_eq!(dispatch_v2(inputs), GroupByStrategyV2::Tier2Partitioned);
+    }
+
+    /// One distinct key over the physical capacity → spill is guaranteed
+    /// by pigeonhole, so dispatch must route straight to GlobalAtomic
+    /// rather than running the pipeline to a guaranteed spill + fallback.
+    #[test]
+    fn tier2_boundary_one_over_cap_falls_back() {
+        let inputs = DispatchInputsV2 {
+            n_groups: TIER2_MAX_GROUPS + 1,
             ..eligible_baseline()
         };
         assert_eq!(dispatch_v2(inputs), GroupByStrategyV2::GlobalAtomic);

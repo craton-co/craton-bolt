@@ -21,10 +21,21 @@
 //! 1. `n_groups <= SHARED_MEM_MAX_GROUPS` — table fits in per-block smem.
 //! 2. `n_rows  >= SHARED_MEM_MIN_ROWS`    — amortise launch overhead.
 //! 3. `n_key_cols == 1`                   — multi-key is Tier-2 work.
-//! 4. `op == Sum && value_dtype == Float64` — first cut targets `SUM`/F64.
-//! 5. `key_dtype == Int32`                — first cut targets Int32 keys.
+//! 4. `op == Sum && value_dtype == Float64` — this gate models `SUM`/F64.
+//! 5. `key_dtype == Int32`                — this gate models Int32 keys.
 //!
 //! Otherwise fall back to `GlobalAtomic`, which is always correct.
+//!
+//! This [`dispatch`] is the Tier-1 SUM/Float64 cardinality gate; its live
+//! callers are the single-SUM [`crate::exec::groupby_shmem_exec`] and
+//! multi-SUM [`crate::exec::groupby_shmem_multi_exec`] executors. The
+//! non-SUM shmem executors (COUNT / MIN/MAX / AVG) gate their own
+//! cardinality floors inline against [`SHARED_MEM_MIN_ROWS`] /
+//! [`SHARED_MEM_MAX_GROUPS`] rather than routing through here, because
+//! their eligibility tails diverge. See the full source-of-truth map in
+//! [`crate::exec::groupby_tier2_dispatch`]'s module docs for how this gate,
+//! the Tier-2 `dispatch_v2`, and the `execute_groupby` fall-through order
+//! fit together (none is dead code).
 //!
 //! # dedup (tier2/shmem): shared vs intentionally-specialized boilerplate
 //!
