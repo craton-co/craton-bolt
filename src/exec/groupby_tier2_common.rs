@@ -71,6 +71,117 @@ pub(crate) fn scan_max_nonneg_key(keys: &[i32]) -> Option<i32> {
     Some(max_key)
 }
 
+/// Result of [`scan_key_range`]: the observed `[min, max]` Int32 key range for
+/// a non-empty single-key column, or `None` for empty input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyRange {
+    /// Smallest key seen (may be negative).
+    pub min: i32,
+    /// Largest key seen.
+    pub max: i32,
+}
+
+/// Scan a single-Int32-key column for its `[min, max]` range WITHOUT
+/// rejecting negative keys — the relaxed companion to
+/// [`scan_max_nonneg_key`] for the Tier-2 **hashed** path.
+///
+/// ## Why a separate helper (Tier-1 vs Tier-2 key handling)
+///
+/// [`scan_max_nonneg_key`] declines (`None`) on the first negative key
+/// because the **Tier-1** per-block shared-memory kernels use a *dense*
+/// `slot == key` table indexed directly by the key value: a negative key has
+/// no valid dense slot, so Tier-1 must fall back. That gate is correct for
+/// Tier-1 and is deliberately left untouched — every Tier-1 (`groupby_shmem_*`)
+/// executor keeps calling `scan_max_nonneg_key`.
+///
+/// The **Tier-2** pipeline is different: it does NOT index by the raw key.
+/// It hashes the key (`(uint32_t)key * HASH_MULTIPLIER`, see
+/// [`crate::jit::partition_kernel`]) to pick a partition and then slots within
+/// the partition by `key & (BLOCK_GROUPS - 1)` on the key's *bit pattern*
+/// ([`crate::jit::partition_reduce_kernel`]). Both operate on the two's
+/// complement `u32` reinterpretation, so a negative i32 key hashes and slots
+/// exactly as well as a non-negative one — negative and sparse keys are
+/// first-class on the hashed path. The over-conservative `None`-on-negative
+/// gate therefore declines Tier-2-eligible queries that the kernel would
+/// handle correctly.
+///
+/// Returns:
+/// * `None` — empty input (no keys). Callers decide what empty means, exactly
+///   as with `scan_max_nonneg_key`'s `Some(-1)` empty sentinel.
+/// * `Some(KeyRange { min, max })` — the observed inclusive key range. `min`
+///   may be negative; the range spans the full `i32` domain.
+///
+/// ## Estimating `n_groups` from the range
+///
+/// Callers must NOT reuse the Tier-1 `max + 1` dense-cardinality proxy with
+/// this helper: for negative or sparse keys `max + 1` is not a meaningful
+/// distinct-count estimate (e.g. keys `{-100, -50}` give `max = -50`, and
+/// `{-5, 1_000_000}` would over-estimate `1_000_001` groups for only two
+/// distinct keys). Use [`dense_n_groups_from_range`], which returns a valid
+/// distinct-key UPPER BOUND only when the keys are provably dense and
+/// non-negative (i.e. `min >= 0`, where the span `max - min + 1` bounds the
+/// count), and `None` otherwise so the caller can fall back to an exact
+/// `HashSet` count or decline.
+///
+/// ## Status: capability only — NOT yet wired into live dispatch
+///
+/// This helper (and [`dense_n_groups_from_range`]) provide the relaxed
+/// key-range logic, but the Tier-2 executors are intentionally left calling
+/// `scan_max_nonneg_key` for now. Switching a live executor onto this path
+/// would make Tier-2 fire on negative/sparse-key queries that currently fall
+/// through to the global-atomic path — a query-observable executor-selection
+/// change that cannot be validated without GPU hardware in this worktree.
+/// The unit tests below pin the relaxed semantics so the follow-up that flips
+/// the gate (with hardware coverage) can do so with confidence.
+///
+/// Pure host-side computation: no GPU calls, no I/O, no launch parameters.
+#[inline]
+pub(crate) fn scan_key_range(keys: &[i32]) -> Option<KeyRange> {
+    let mut iter = keys.iter().copied();
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for k in iter {
+        if k < min {
+            min = k;
+        }
+        if k > max {
+            max = k;
+        }
+    }
+    Some(KeyRange { min, max })
+}
+
+/// Derive a distinct-key UPPER BOUND from a [`KeyRange`] for the Tier-2
+/// hashed path, returning `None` when no cheap valid bound exists.
+///
+/// * `min >= 0`: the keys lie in `[min, max]` within the non-negative domain,
+///   so the number of distinct keys is at most the span `max - min + 1`.
+///   Returned as `Some(span)` (saturating into `u32`). This is the
+///   negative-key-safe generalisation of the old `max + 1` proxy — when
+///   `min == 0` it reduces to exactly `max + 1`, matching the dense-from-zero
+///   estimate the executors use today.
+/// * `min < 0`: the range straddles negative values, where the dense-span
+///   bound is unreliable (a negative `min` with a large positive `max` can
+///   imply a huge span for only a few distinct keys). Returns `None` so the
+///   caller falls back to an exact `HashSet` distinct count (or declines),
+///   rather than over- or under-estimating cardinality.
+///
+/// Pure host arithmetic; produces an estimate only — never a launch parameter.
+#[inline]
+pub(crate) fn dense_n_groups_from_range(range: KeyRange) -> Option<u32> {
+    if range.min < 0 {
+        return None;
+    }
+    // min >= 0 and max >= min >= 0, so both fit in u32 and the span is
+    // non-negative. `+1` is saturating for the (max == i32::MAX, min == 0)
+    // corner so we never overflow.
+    let span = (range.max as u32)
+        .saturating_sub(range.min as u32)
+        .saturating_add(1);
+    Some(span)
+}
+
 use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
@@ -629,6 +740,142 @@ mod tests {
             }
             let expected = if declined { None } else { Some(max_key) };
             assert_eq!(scan_max_nonneg_key(case), expected, "case={case:?}");
+        }
+    }
+
+    // -- Relaxed Tier-2 hashed-path key-range helpers --------------------
+
+    #[test]
+    fn scan_key_range_empty_is_none() {
+        // Mirrors `scan_max_nonneg_key`'s empty handling: the caller decides
+        // what empty means; the scan reports "no keys".
+        assert_eq!(scan_key_range(&[]), None);
+    }
+
+    #[test]
+    fn scan_key_range_accepts_negative_and_sparse_keys() {
+        // The whole point of the relaxed scan: negatives do NOT decline.
+        assert_eq!(
+            scan_key_range(&[-5, 3]),
+            Some(KeyRange { min: -5, max: 3 })
+        );
+        assert_eq!(
+            scan_key_range(&[0, 1, -1, 2]),
+            Some(KeyRange { min: -1, max: 2 })
+        );
+        // All-negative range.
+        assert_eq!(
+            scan_key_range(&[-100, -50, -75]),
+            Some(KeyRange { min: -100, max: -50 })
+        );
+        // Sparse but non-negative.
+        assert_eq!(
+            scan_key_range(&[5, 1_000_000]),
+            Some(KeyRange {
+                min: 5,
+                max: 1_000_000
+            })
+        );
+        // Full-domain extremes.
+        assert_eq!(
+            scan_key_range(&[i32::MIN, 0, i32::MAX]),
+            Some(KeyRange {
+                min: i32::MIN,
+                max: i32::MAX
+            })
+        );
+        // Single element.
+        assert_eq!(
+            scan_key_range(&[7]),
+            Some(KeyRange { min: 7, max: 7 })
+        );
+    }
+
+    #[test]
+    fn dense_n_groups_from_range_matches_old_proxy_when_dense_from_zero() {
+        // When min == 0 the relaxed estimate must equal the historical
+        // `max + 1` dense-from-zero proxy the executors use today.
+        for &max in &[0i32, 1, 7, 1023, 1024, 1_000_000, i32::MAX] {
+            let got = dense_n_groups_from_range(KeyRange { min: 0, max }).unwrap();
+            let old_proxy = (max as u32).saturating_add(1);
+            assert_eq!(got, old_proxy, "max={max}");
+        }
+    }
+
+    #[test]
+    fn dense_n_groups_from_range_uses_span_for_nonneg_offset_keys() {
+        // Non-negative but not starting at zero: the bound is the span
+        // `max - min + 1`, NOT `max + 1` (which would over-count).
+        assert_eq!(
+            dense_n_groups_from_range(KeyRange { min: 100, max: 109 }),
+            Some(10)
+        );
+        // Single distinct key.
+        assert_eq!(
+            dense_n_groups_from_range(KeyRange { min: 42, max: 42 }),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn dense_n_groups_from_range_declines_negative_min() {
+        // A negative min means the dense-span bound is unreliable, so the
+        // helper returns None to push the caller to an exact count / decline
+        // rather than emitting a bogus cardinality.
+        assert_eq!(dense_n_groups_from_range(KeyRange { min: -1, max: 5 }), None);
+        assert_eq!(
+            dense_n_groups_from_range(KeyRange {
+                min: -100,
+                max: -50
+            }),
+            None
+        );
+        assert_eq!(
+            dense_n_groups_from_range(KeyRange {
+                min: i32::MIN,
+                max: i32::MAX
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn dense_n_groups_from_range_saturates_at_full_nonneg_span() {
+        // min == 0, max == i32::MAX: span is i32::MAX as u32 + 1, which fits
+        // in u32 (== 2_147_483_648) without overflow thanks to saturating_add.
+        assert_eq!(
+            dense_n_groups_from_range(KeyRange {
+                min: 0,
+                max: i32::MAX
+            }),
+            Some(2_147_483_648)
+        );
+    }
+
+    /// The relaxed scan must agree with `scan_max_nonneg_key` on the
+    /// non-negative inputs where both apply: when every key is `>= 0`,
+    /// `scan_key_range(..).max` equals `scan_max_nonneg_key(..)` and the
+    /// derived dense estimate equals the old `max + 1` proxy iff min == 0.
+    #[test]
+    fn relaxed_scan_agrees_with_dense_scan_on_nonneg_inputs() {
+        let cases: &[&[i32]] = &[&[0], &[0, 7, 3, 7, 1], &[5, 5, 5], &[0, 1023, 1024]];
+        for case in cases {
+            let dense_max = scan_max_nonneg_key(case).unwrap();
+            let range = scan_key_range(case).unwrap();
+            assert_eq!(range.max, dense_max, "max mismatch case={case:?}");
+            // These cases all include 0 or start higher; verify the dense
+            // estimate is the span and is a valid upper bound on distinct keys.
+            let est = dense_n_groups_from_range(range).unwrap();
+            let exact_distinct = {
+                let mut v = case.to_vec();
+                v.sort_unstable();
+                v.dedup();
+                v.len() as u32
+            };
+            assert!(
+                est >= exact_distinct,
+                "estimate {est} must upper-bound distinct {exact_distinct} (case={case:?})"
+            );
         }
     }
 
