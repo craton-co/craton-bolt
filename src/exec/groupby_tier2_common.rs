@@ -74,6 +74,7 @@ pub(crate) fn scan_max_nonneg_key(keys: &[i32]) -> Option<i32> {
 /// Result of [`scan_key_range`]: the observed `[min, max]` Int32 key range for
 /// a non-empty single-key column, or `None` for empty input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // staged for a hardware-verified follow-up that flips the Tier-2 gate; exercised by unit tests below
 pub(crate) struct KeyRange {
     /// Smallest key seen (may be negative).
     pub min: i32,
@@ -136,6 +137,7 @@ pub(crate) struct KeyRange {
 ///
 /// Pure host-side computation: no GPU calls, no I/O, no launch parameters.
 #[inline]
+#[allow(dead_code)] // staged for a hardware-verified follow-up that flips the Tier-2 gate; exercised by unit tests below
 pub(crate) fn scan_key_range(keys: &[i32]) -> Option<KeyRange> {
     let mut iter = keys.iter().copied();
     let first = iter.next()?;
@@ -169,6 +171,7 @@ pub(crate) fn scan_key_range(keys: &[i32]) -> Option<KeyRange> {
 ///
 /// Pure host arithmetic; produces an estimate only — never a launch parameter.
 #[inline]
+#[allow(dead_code)] // staged for a hardware-verified follow-up that flips the Tier-2 gate; exercised by unit tests below
 pub(crate) fn dense_n_groups_from_range(range: KeyRange) -> Option<u32> {
     if range.min < 0 {
         return None;
