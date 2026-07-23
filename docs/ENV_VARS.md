@@ -25,6 +25,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `CRATON_BOLT_PTX_CACHE_MAX_ENTRIES`| 4096               | integer / `0` | Disk PTX-cache entry-count cap (`0` disables)  |
 | `CRATON_DISTINCT_HOST_MAX_ROWS`  | 10_000_000           | integer > 0 | Host-side DISTINCT input row cap                |
 | `CRATON_SETOP_HOST_MAX_ROWS`     | 10_000_000           | integer > 0 | Host-side `UNION`/`EXCEPT`/`INTERSECT` row cap  |
+| `CRATON_IN_SET_MAX_ROWS`         | 10_000_000           | integer > 0 | `IN`/`NOT IN` subquery distinct-value row cap   |
 | `CRATON_PLAN_CACHE_SIZE`         | 64                   | integer > 0 | SQL→LogicalPlan parse-cache capacity (FIFO)     |
 | `CRATON_MAX_SQL_BYTES`           | 1 MiB                | integer > 0 | Pre-parse cap on SQL input length (bytes)       |
 | `CRATON_MAX_SQL_TOKENS`          | 100_000              | integer > 0 | Pre-parse cap on SQL token count                |
@@ -482,6 +483,25 @@ path in every case.
 - **Source**: `src/exec/setops.rs::parse_setop_host_max_rows_env` (env var
   name constant `SETOP_HOST_MAX_ROWS_ENV`, line 77; default constant
   `SETOP_HOST_MAX_ROWS`, line 70).
+
+### `CRATON_IN_SET_MAX_ROWS`
+- **Default**: `10_000_000` (ten million rows)
+- **Type**: positive integer, parsed as `usize`; `0` is rejected
+- **What**: Upper bound on the number of **distinct** values an `IN` /
+  `NOT IN` subquery may materialise into a host-side membership set during
+  pre-lowering resolution (`src/exec/subquery_resolve.rs`). Without a cap,
+  `x IN (SELECT high_cardinality_col …)` can grow an unbounded literal list
+  and a deep boolean fold that later passes walk recursively; exceeding the
+  cap is a clean [`BoltError::Other`].
+- **When**: Raise on trusted workloads with legitimately large `IN`-subquery
+  result sets; lower to bound host memory on shared / hostile inputs.
+- **Notes**: Latched once per process (`OnceLock`). A value of `0` would
+  disable the cap and is rejected with a one-time `log::warn!`; empty /
+  unparseable values fall back to the default with a warning. Default
+  matches `CRATON_SETOP_HOST_MAX_ROWS` / `CRATON_DISTINCT_HOST_MAX_ROWS`.
+- **Source**: `src/exec/subquery_resolve.rs::parse_in_set_max_rows_env` (env
+  var name constant `IN_SET_MAX_ROWS_ENV`, line 70; default constant
+  `IN_SET_MAX_ROWS`, line 64).
 
 ### `CRATON_MAX_SQL_BYTES`
 - **Default**: `1_048_576` (1 MiB)
