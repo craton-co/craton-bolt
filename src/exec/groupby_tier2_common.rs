@@ -758,10 +758,7 @@ mod tests {
     #[test]
     fn scan_key_range_accepts_negative_and_sparse_keys() {
         // The whole point of the relaxed scan: negatives do NOT decline.
-        assert_eq!(
-            scan_key_range(&[-5, 3]),
-            Some(KeyRange { min: -5, max: 3 })
-        );
+        assert_eq!(scan_key_range(&[-5, 3]), Some(KeyRange { min: -5, max: 3 }));
         assert_eq!(
             scan_key_range(&[0, 1, -1, 2]),
             Some(KeyRange { min: -1, max: 2 })
@@ -769,7 +766,10 @@ mod tests {
         // All-negative range.
         assert_eq!(
             scan_key_range(&[-100, -50, -75]),
-            Some(KeyRange { min: -100, max: -50 })
+            Some(KeyRange {
+                min: -100,
+                max: -50
+            })
         );
         // Sparse but non-negative.
         assert_eq!(
@@ -788,10 +788,7 @@ mod tests {
             })
         );
         // Single element.
-        assert_eq!(
-            scan_key_range(&[7]),
-            Some(KeyRange { min: 7, max: 7 })
-        );
+        assert_eq!(scan_key_range(&[7]), Some(KeyRange { min: 7, max: 7 }));
     }
 
     #[test]
@@ -825,7 +822,10 @@ mod tests {
         // A negative min means the dense-span bound is unreliable, so the
         // helper returns None to push the caller to an exact count / decline
         // rather than emitting a bogus cardinality.
-        assert_eq!(dense_n_groups_from_range(KeyRange { min: -1, max: 5 }), None);
+        assert_eq!(
+            dense_n_groups_from_range(KeyRange { min: -1, max: 5 }),
+            None
+        );
         assert_eq!(
             dense_n_groups_from_range(KeyRange {
                 min: -100,
