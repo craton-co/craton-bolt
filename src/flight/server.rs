@@ -5,13 +5,22 @@
 //! This is the gRPC surface of the Flight SQL endpoint. The implementation is
 //! intentionally thin:
 //!
-//! - `handshake` trivially accepts (no auth in the skeleton).
+//! - `handshake` accepts the connection; if the service was built with
+//!   [`FlightSqlServer::with_bearer_token`] it additionally validates the
+//!   client's `authorization: Bearer <token>` metadata.
 //! - `get_flight_info` / `get_schema` / `do_get` decode the command via the
 //!   sibling [`crate::flight::sql`] module and stream the result via the
 //!   sibling [`crate::flight::encode`] module.
 //! - every other method returns [`tonic::Status::unimplemented`] for now
 //!   (TODO: prepared statements via `do_put` / `do_action`, bidirectional
 //!   `do_exchange`, catalog enumeration via `list_flights` / `list_actions`).
+//!
+//! # Security
+//!
+//! gRPC does not carry handshake state forward onto subsequent calls, so a
+//! bearer token (when configured) is re-checked on **every** RPC, not just in
+//! `handshake`. When no token is configured the server accepts all clients —
+//! see the [module-level warning](crate::flight). There is no TLS here.
 
 #![cfg(feature = "flight")]
 
@@ -42,15 +51,24 @@ impl FlightService for FlightSqlServer {
     type ListActionsStream = RpcStream<ActionType>;
     type DoExchangeStream = RpcStream<FlightData>;
 
-    /// Trivial handshake: echo back an empty response and accept the
-    /// connection. No authentication is performed in the skeleton.
+    /// Handshake: validate the bearer token (when one is configured) and echo
+    /// back an empty response.
     ///
-    /// TODO: support bearer-token / basic auth handshake payloads and emit a
-    /// session token in `HandshakeResponse::payload`.
+    /// When the service was built with
+    /// [`FlightSqlServer::with_bearer_token`], the client must present a
+    /// matching `authorization: Bearer <token>` metadata header here (and on
+    /// every later RPC — gRPC does not carry handshake state forward). When no
+    /// token is configured the handshake accepts unconditionally; see the
+    /// module-level security warning.
+    ///
+    /// TODO: emit a per-session token in `HandshakeResponse::payload` once
+    /// real session management lands (the current model is a single shared
+    /// secret, re-validated per call).
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
+        self.check_auth(&request)?;
         let resp = HandshakeResponse {
             protocol_version: 0,
             payload: Default::default(),
@@ -97,12 +115,21 @@ impl FlightService for FlightSqlServer {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.check_auth(&request)?;
         let descriptor = request.into_inner();
         let cmd = command_bytes(&descriptor)?;
 
-        // Decode + execute via the SQL command layer to learn the schema.
-        let result = sql::execute_flight_command(self.engine(), &cmd)?;
-        let schema = result.schema.clone();
+        // Learn the schema only — do NOT fully materialise the result here.
+        //
+        // The previous implementation ran `execute_flight_command` (a full
+        // query execution) just to populate the schema and the row count, then
+        // `do_get` ran the *same* query a second time. That doubled (and with
+        // a `get_schema` round-trip, tripled) the GPU work per logical query
+        // and let a client amplify load cheaply. We now decode + plan the
+        // schema only and report the row/byte totals as "unknown" (-1), which
+        // is valid Flight SQL. The single materialisation happens once, in
+        // `do_get`.
+        let schema = sql::schema_for_command(self.engine(), &cmd)?;
 
         // The ticket carries the command bytes verbatim so `do_get` can map it
         // back to the same result set.
@@ -116,13 +143,17 @@ impl FlightService for FlightSqlServer {
         };
 
         // IPC-encode the schema into the FlightInfo. `try_with_schema` does the
-        // IPC serialisation for us (arrow-flight helper).
+        // IPC serialisation for us (arrow-flight helper). Totals are unknown
+        // until `do_get` materialises the result.
         let info = FlightInfo::new()
             .try_with_schema(schema.as_ref())
-            .map_err(|e| Status::internal(format!("failed to encode schema: {e}")))?
+            .map_err(|e| {
+                log::warn!("craton-bolt flight: schema IPC encode failed: {e}");
+                Status::internal("failed to encode result schema")
+            })?
             .with_descriptor(descriptor)
             .with_endpoint(endpoint)
-            .with_total_records(result.batches.iter().map(|b| b.num_rows() as i64).sum())
+            .with_total_records(-1)
             .with_total_bytes(-1);
 
         Ok(Response::new(info))
@@ -134,6 +165,7 @@ impl FlightService for FlightSqlServer {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
+        self.check_auth(&request)?;
         let descriptor = request.into_inner();
         let cmd = command_bytes(&descriptor)?;
 
@@ -150,10 +182,11 @@ impl FlightService for FlightSqlServer {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        self.check_auth(&request)?;
         let ticket = request.into_inner();
         let cmd = ticket.ticket;
 
-        let result = sql::execute_flight_command(self.engine(), &cmd)?;
+        let result = sql::execute_flight_command(self.engine(), &cmd, self.config())?;
         let flight_stream: BoxStream<'static, Result<FlightData, Status>> =
             encode::batches_to_flight_stream(result);
 
@@ -186,8 +219,9 @@ impl FlightService for FlightSqlServer {
     /// Advertise the supported actions. Empty in the skeleton (no actions yet).
     async fn list_actions(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
+        self.check_auth(&request)?;
         let output = stream::empty::<Result<ActionType, Status>>();
         Ok(Response::new(Box::pin(output) as Self::ListActionsStream))
     }

@@ -5,21 +5,23 @@
 //!
 //! This module is the **command layer** that the Flight server (sibling
 //! [`crate::flight::server`]) calls into. It owns the translation between
-//! Flight SQL protobuf commands / tickets and the craton-bolt [`Engine`]
-//! public query API, plus the [`BoltError`] → [`tonic::Status`] mapping.
+//! Flight SQL protobuf commands / tickets and the craton-bolt
+//! [`Engine`](crate::exec::Engine) public query API, plus the [`BoltError`] →
+//! [`tonic::Status`] mapping.
 //!
 //! ## Unified server ↔ sql ABI
 //!
-//! The server calls exactly two entry points, both taking the shared,
-//! mutex-guarded engine handle ([`Arc<Mutex<Engine>>`]) and the raw command
-//! bytes (a prost-encoded `google.protobuf.Any`):
+//! The server calls exactly two entry points, both taking the shared engine
+//! handle ([`SharedEngine`](crate::flight::SharedEngine), i.e.
+//! `Arc<parking_lot::Mutex<Engine>>`) and the raw command bytes (a
+//! prost-encoded `google.protobuf.Any`):
 //!
 //! * [`execute_flight_command`] — decode + execute a command, returning a
 //!   materialised [`SqlCommandResult`] (schema + batches + echoed command
-//!   bytes for the ticket round-trip). Used by both `get_flight_info` (to
-//!   learn the schema / row count) and `do_get` (to fetch the data).
+//!   bytes for the ticket round-trip). Used by `do_get` to fetch the data;
+//!   bounded by the [`FlightSqlConfig`](crate::flight::FlightSqlConfig) caps.
 //! * [`schema_for_command`] — decode the command and recover just its result
-//!   [`SchemaRef`] (for `get_schema`).
+//!   [`SchemaRef`] (for `get_flight_info` and `get_schema`).
 //!
 //! Everything else — the typed command enum, the `Any` matching, the ticket
 //! codec, the [`BoltError`] mapper — is internal to this module.
@@ -34,8 +36,6 @@
 //! [`FlightSqlCommand::Unsupported`] / their typed variants and currently
 //! return `UNIMPLEMENTED`.
 
-use std::sync::{Arc, Mutex};
-
 use arrow_schema::SchemaRef;
 
 use arrow_flight::sql::{
@@ -47,8 +47,7 @@ use prost::Message;
 use tonic::Status;
 
 use crate::error::BoltError;
-use crate::exec::Engine;
-use crate::flight::SqlCommandResult;
+use crate::flight::{FlightSqlConfig, SharedEngine, SqlCommandResult};
 
 /// A decoded Flight SQL command extracted from a [`FlightDescriptor`]'s `cmd`
 /// (a `prost` [`Any`]).
@@ -84,6 +83,15 @@ pub(crate) enum FlightSqlCommand {
 /// * Parse / plan / type errors → `INVALID_ARGUMENT` (the client's SQL).
 /// * `Unsupported` → `UNIMPLEMENTED`.
 /// * Everything else (CUDA, memory, IO, capacity, other) → `INTERNAL`.
+///
+/// # Security
+///
+/// Parse/plan/type errors describe the *client's own SQL*, so their text is
+/// safe (and useful) to return. But CUDA driver codes, IO paths, memory
+/// figures, and other internal failure text can leak server-side
+/// implementation detail (filesystem layout, driver versions, capacity), so
+/// for the `INTERNAL` bucket we return a **generic** client-facing message and
+/// log the real error server-side (at `warn`) for operators.
 fn bolt_err_to_status(err: BoltError) -> Status {
     match err {
         BoltError::Sql(msg) | BoltError::Plan(msg) | BoltError::Type(msg) => {
@@ -94,8 +102,13 @@ fn bolt_err_to_status(err: BoltError) -> Status {
         }
         BoltError::Unsupported(msg) => Status::unimplemented(msg),
         // CUDA / memory / IO / GPU-capacity / freeform are server-side
-        // failures from the client's point of view.
-        other => Status::internal(other.to_string()),
+        // failures from the client's point of view. Do NOT forward the verbose
+        // internal text to the (possibly untrusted) client — log it here and
+        // return a generic message.
+        other => {
+            log::warn!("craton-bolt flight: query failed (internal): {other}");
+            Status::internal("internal error executing query")
+        }
     }
 }
 
@@ -169,12 +182,46 @@ fn statement_sql(command: FlightSqlCommand) -> Result<String, Status> {
     }
 }
 
-/// Lock the shared engine, mapping a poisoned mutex to an `INTERNAL`
-/// [`Status`] instead of panicking inside a gRPC handler.
-fn lock_engine(engine: &Arc<Mutex<Engine>>) -> Result<std::sync::MutexGuard<'_, Engine>, Status> {
-    engine
-        .lock()
-        .map_err(|_| Status::internal("query engine mutex poisoned"))
+/// Enforce the configured result-size caps on a materialised batch, returning
+/// `RESOURCE_EXHAUSTED` (a clean, retry-discouraging gRPC status) when a cap is
+/// exceeded.
+///
+/// # Security
+///
+/// This is the availability guard: it stops a single (possibly hostile) query
+/// from forcing the server to hand back an unbounded result over the wire. The
+/// check is *post-materialisation* — the engine has already built the batch in
+/// host memory — so it bounds egress / IPC-encode work, not the query's own
+/// peak memory. Pair with a sane `max_result_*` and a trusted network.
+fn enforce_result_caps(
+    batch: &arrow_array::RecordBatch,
+    config: &FlightSqlConfig,
+) -> Result<(), Status> {
+    if let Some(max_rows) = config.max_result_rows {
+        let rows = batch.num_rows();
+        if rows > max_rows {
+            return Err(Status::resource_exhausted(format!(
+                "result of {rows} rows exceeds the configured limit of {max_rows} rows"
+            )));
+        }
+    }
+    if let Some(max_bytes) = config.max_result_bytes {
+        // `get_array_memory_size` lives on the `Array` trait.
+        use arrow_array::Array as _;
+        // Sum the per-column Arrow in-memory footprint (matches the engine's
+        // own `estimate_batch_bytes`). Saturating so the sum cannot wrap.
+        let bytes = batch
+            .columns()
+            .iter()
+            .map(|c| c.get_array_memory_size())
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        if bytes > max_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "result of {bytes} bytes exceeds the configured limit of {max_bytes} bytes"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Decode + execute a Flight SQL command against the shared engine and return
@@ -189,20 +236,37 @@ fn lock_engine(engine: &Arc<Mutex<Engine>>) -> Result<std::sync::MutexGuard<'_, 
 ///
 /// [`RecordBatch`]: arrow_array::RecordBatch
 ///
+/// The result is bounded by `config`'s caps (see [`enforce_result_caps`]).
+///
 /// Returns `INVALID_ARGUMENT` for client SQL errors, `UNIMPLEMENTED` for
-/// command types we do not execute, and `INTERNAL` for engine failures (via
-/// the [`BoltError`] mapper).
+/// command types we do not execute, `RESOURCE_EXHAUSTED` for over-cap results,
+/// and `INTERNAL` for engine failures (via the [`BoltError`] mapper).
+///
+/// # Concurrency
+///
+/// The shared engine is not `Sync`, so execution is serialised behind a
+/// [`parking_lot::Mutex`]. The lock is held only for the duration of
+/// [`Engine::sql`](crate::exec::Engine::sql) and released immediately after the
+/// batch is materialised;
+/// encoding happens lock-free in the caller. `parking_lot` does not poison, so
+/// a panicking query frees the lock cleanly for the next client.
 pub fn execute_flight_command(
-    engine: &Arc<Mutex<Engine>>,
+    engine: &SharedEngine,
     cmd: &[u8],
+    config: &FlightSqlConfig,
 ) -> Result<SqlCommandResult, Status> {
     let command = decode_command(cmd)?;
     let sql = statement_sql(command)?;
 
-    let guard = lock_engine(engine)?;
-    let handle = guard.sql(&sql).map_err(bolt_err_to_status)?;
-    let batch = handle.into_record_batch();
-    drop(guard);
+    let batch = {
+        // Scope the guard tightly: hold the engine lock only across execution,
+        // not across cap-checking or result construction.
+        let guard = engine.lock();
+        let handle = guard.sql(&sql).map_err(bolt_err_to_status)?;
+        handle.into_record_batch()
+    };
+
+    enforce_result_caps(&batch, config)?;
 
     let schema = batch.schema();
     Ok(SqlCommandResult {
@@ -216,13 +280,18 @@ pub fn execute_flight_command(
 ///
 /// There is no cheap "plan-only, get schema" entry point on the engine today,
 /// so we execute the query once to recover the result Arrow schema. (TODO: a
-/// plan-only schema path to avoid executing twice across
-/// `get_schema` + `do_get`.)
-pub fn schema_for_command(engine: &Arc<Mutex<Engine>>, cmd: &[u8]) -> Result<SchemaRef, Status> {
+/// plan-only schema path to avoid executing the query merely to learn its
+/// schema.)
+///
+/// Note: this path does **not** apply the result-size caps — it discards the
+/// data and keeps only the schema. Callers that go on to fetch the data
+/// (`do_get`) re-run via [`execute_flight_command`], which *does* enforce the
+/// caps.
+pub fn schema_for_command(engine: &SharedEngine, cmd: &[u8]) -> Result<SchemaRef, Status> {
     let command = decode_command(cmd)?;
     let sql = statement_sql(command)?;
 
-    let guard = lock_engine(engine)?;
+    let guard = engine.lock();
     let handle = guard.sql(&sql).map_err(bolt_err_to_status)?;
     Ok(handle.record_batch().schema())
 }
@@ -283,6 +352,71 @@ mod tests {
             statement_sql(command).unwrap_err().code(),
             tonic::Code::Unimplemented
         );
+    }
+
+    fn sample_batch(rows: usize) -> arrow_array::RecordBatch {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let data: Vec<i32> = (0..rows as i32).collect();
+        arrow_array::RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(data))]).unwrap()
+    }
+
+    #[test]
+    fn caps_allow_within_limit() {
+        let batch = sample_batch(10);
+        let config = FlightSqlConfig {
+            max_result_rows: Some(100),
+            max_result_bytes: Some(1 << 30),
+        };
+        assert!(enforce_result_caps(&batch, &config).is_ok());
+    }
+
+    #[test]
+    fn caps_reject_too_many_rows() {
+        let batch = sample_batch(10);
+        let config = FlightSqlConfig {
+            max_result_rows: Some(5),
+            max_result_bytes: None,
+        };
+        let err = enforce_result_caps(&batch, &config).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn caps_reject_too_many_bytes() {
+        let batch = sample_batch(100);
+        let config = FlightSqlConfig {
+            max_result_rows: None,
+            max_result_bytes: Some(1), // 100 i32s far exceed 1 byte
+        };
+        let err = enforce_result_caps(&batch, &config).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn caps_disabled_when_none() {
+        let batch = sample_batch(1_000);
+        let config = FlightSqlConfig {
+            max_result_rows: None,
+            max_result_bytes: None,
+        };
+        assert!(enforce_result_caps(&batch, &config).is_ok());
+    }
+
+    #[test]
+    fn internal_errors_are_redacted() {
+        // The verbose internal text must NOT reach the client.
+        let secret = "C:/secret/path/driver.so CUDA_ERROR_OUT_OF_MEMORY (700)";
+        let status = bolt_err_to_status(BoltError::Memory(secret.into()));
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            !status.message().contains("secret"),
+            "internal error text leaked to client: {}",
+            status.message()
+        );
+        assert_eq!(status.message(), "internal error executing query");
     }
 
     #[test]
