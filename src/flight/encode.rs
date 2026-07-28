@@ -59,7 +59,10 @@ pub fn batches_to_flight_stream(
     match arrow_flight::utils::batches_to_flight_data(schema.as_ref(), batches) {
         Ok(msgs) => stream::iter(msgs.into_iter().map(Ok)).boxed(),
         Err(e) => {
-            let err = Status::internal(format!("flight IPC encode failed: {e}"));
+            // Log the detailed encoder error server-side; return a generic
+            // message to the (possibly untrusted) client.
+            log::warn!("craton-bolt flight: IPC encode of result stream failed: {e}");
+            let err = Status::internal("failed to encode result");
             stream::once(async move { Err(err) }).boxed()
         }
     }
@@ -76,9 +79,10 @@ pub fn schema_to_ipc_bytes(schema: &Schema) -> Result<Bytes, Status> {
     // Flight `SchemaResult.schema` field expects.
     let options = arrow::ipc::writer::IpcWriteOptions::default();
     let schema_as_ipc = arrow_flight::SchemaAsIpc::new(schema, &options);
-    let schema_result: arrow_flight::SchemaResult = schema_as_ipc
-        .try_into()
-        .map_err(|e| Status::internal(format!("flight schema IPC encode failed: {e}")))?;
+    let schema_result: arrow_flight::SchemaResult = schema_as_ipc.try_into().map_err(|e| {
+        log::warn!("craton-bolt flight: schema IPC encode failed: {e}");
+        Status::internal("failed to encode result schema")
+    })?;
     Ok(schema_result.schema)
 }
 
