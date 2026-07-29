@@ -49,6 +49,7 @@
 //!   path also makes no a priori cap.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::cuda::dictionary::DictionaryColumn;
 use crate::cuda::GpuVec;
@@ -314,6 +315,77 @@ pub fn right_str(s: &str, n: i64) -> String {
     s.chars().skip(skip as usize).collect()
 }
 
+// ---------------------------------------------------------------------------
+// LPAD / RPAD target-length cap (unbounded-allocation DoS guard).
+// ---------------------------------------------------------------------------
+
+/// Upper bound on the *target character length* accepted by `LPAD` / `RPAD`.
+///
+/// Without this cap, `LPAD(s, len, pad)` with a large attacker-controlled
+/// `len` builds a fill string of `len - chars(s)` characters PER ROW via
+/// `pad.chars().cycle().take(gap)` — `LPAD(s, 4000000000, 'x')` allocates a
+/// multi-GB string for every row with no upper limit, a memory-DoS surface on
+/// SQL-controlled inputs. (Unlike `SUBSTRING` / `LEFT` / `RIGHT`, which all
+/// saturate against the source length, pad's target is the *output* size and
+/// is otherwise unbounded.) `1 << 20` characters (1,048,576) is far larger
+/// than any legitimate fixed-width pad and bounds a single padded value to at
+/// most a few MiB even for 4-byte codepoints, while [`pad_str_checked`] turns
+/// an over-cap request into a clean [`BoltError::Other`] long before the OOM
+/// killer is involved.
+///
+/// Overridable at runtime via the [`MAX_PAD_LEN_ENV`] env var (parsed once on
+/// first use; see [`max_pad_len`]).
+pub const MAX_PAD_LEN: usize = 1 << 20;
+
+/// Environment variable that overrides [`MAX_PAD_LEN`] at runtime. Parsed as a
+/// base-10 `usize`; a value of `0` is rejected (it would forbid all padding)
+/// and any unset / empty / unparseable / zero value falls back to the
+/// compile-time default. Mirrors the `CRATON_DISTINCT_HOST_MAX_ROWS` knob in
+/// [`crate::exec::distinct`].
+const MAX_PAD_LEN_ENV: &str = "CRATON_MAX_PAD_LEN";
+
+/// Latch for the per-process pad-length cap. First call resolves the env var;
+/// subsequent calls hit the cached `usize`. Mirrors `distinct.rs`'s
+/// `DISTINCT_HOST_MAX_ROWS_CACHE`.
+static MAX_PAD_LEN_CACHE: OnceLock<usize> = OnceLock::new();
+
+/// Resolve the per-process pad-length cap, performing the env lookup once.
+fn max_pad_len() -> usize {
+    *MAX_PAD_LEN_CACHE.get_or_init(parse_max_pad_len_env)
+}
+
+/// Pure parser for [`MAX_PAD_LEN_ENV`]. Extracted from the latch so the rules
+/// can be unit-tested without touching the `OnceLock`. Returns the compile-time
+/// default on unset / empty / unparseable / zero values, logging a warning in
+/// the unparseable / zero cases.
+fn parse_max_pad_len_env() -> usize {
+    let raw = match std::env::var(MAX_PAD_LEN_ENV) {
+        Ok(v) => v,
+        Err(_) => return MAX_PAD_LEN,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return MAX_PAD_LEN;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) => {
+            log::warn!(
+                "pad: {MAX_PAD_LEN_ENV}='0' would forbid all padding; \
+                 using default of {MAX_PAD_LEN}"
+            );
+            MAX_PAD_LEN
+        }
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "pad: {MAX_PAD_LEN_ENV}='{trimmed}' is not a valid usize ({e}); \
+                 using default of {MAX_PAD_LEN}"
+            );
+            MAX_PAD_LEN
+        }
+    }
+}
+
 /// Which side [`pad_str`] pads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PadSide {
@@ -335,13 +407,57 @@ pub enum PadSide {
 /// * An empty `pad` cannot fill, so `s` is only ever truncated, never padded
 ///   (PostgreSQL returns the truncated/verbatim string in that case).
 ///
-/// `len` is taken as `i64` and saturated into the character domain; absurd
-/// values just clamp to the string length.
+/// `len` is taken as `i64` and saturated into the character domain. A target
+/// larger than the string only ever pads up to the [`MAX_PAD_LEN`] cap (see
+/// below); a target smaller than the string truncates to it.
+///
+/// ## DoS guard
+///
+/// The requested target length is clamped to [`MAX_PAD_LEN`] before any fill
+/// is allocated, so a SQL-controlled `LPAD(s, 4000000000, 'x')` can never
+/// materialise a multi-GB string per row. This infallible entry point (used by
+/// the host expression evaluator, which produces `Option<String>` cells)
+/// *clamps* an over-cap target; [`pad_str_checked`] is the variant that instead
+/// surfaces a clean [`BoltError`] for an over-cap request. Normal/in-range
+/// lengths are unaffected by either path.
 pub fn pad_str(s: &str, len: i64, pad: &str, side: PadSide) -> String {
     if len <= 0 {
         return String::new();
     }
+    // Clamp the target to the cap so the fill allocation below is bounded even
+    // on the infallible path; `pad_str_checked` errors instead of clamping.
+    let target = (len as usize).min(max_pad_len());
+    pad_to_target(s, target, pad, side)
+}
+
+/// Fallible `LPAD` / `RPAD` that rejects an over-cap target length with a clean
+/// [`BoltError::Other`] instead of allocating (or silently clamping, as
+/// [`pad_str`] does). Behaviour for in-range `len` is identical to [`pad_str`].
+///
+/// This is the preferred entry point for any call site that can propagate a
+/// `BoltResult`; it converts the unbounded-allocation DoS into a surfaced error
+/// at the SQL boundary. The cap is [`MAX_PAD_LEN`] (overridable via
+/// [`MAX_PAD_LEN_ENV`]).
+pub fn pad_str_checked(s: &str, len: i64, pad: &str, side: PadSide) -> BoltResult<String> {
+    if len <= 0 {
+        return Ok(String::new());
+    }
     let target = len as usize;
+    let cap = max_pad_len();
+    if target > cap {
+        return Err(BoltError::Other(format!(
+            "LPAD/RPAD: requested length {} exceeds the maximum of {} characters \
+             (set {} to override)",
+            len, cap, MAX_PAD_LEN_ENV
+        )));
+    }
+    Ok(pad_to_target(s, target, pad, side))
+}
+
+/// Shared LPAD/RPAD core: pad or truncate `s` to exactly `target` CHARACTERS.
+/// `target` is assumed already bounded by the caller (clamped by [`pad_str`],
+/// rejected-if-over-cap by [`pad_str_checked`]).
+fn pad_to_target(s: &str, target: usize, pad: &str, side: PadSide) -> String {
     let src: Vec<char> = s.chars().collect();
     if src.len() >= target {
         // Truncate to the first `target` characters (prefix kept on both sides).
@@ -1342,6 +1458,103 @@ mod tests {
         // Multibyte pad and source count by characters, not bytes.
         assert_eq!(pad_str("x", 3, "→", PadSide::Left), "→→x");
         assert_eq!(pad_str("héllo", 7, "*", PadSide::Right), "héllo**");
+    }
+
+    // ----- LPAD / RPAD target-length cap (DoS guard) ---------------------
+
+    #[test]
+    fn pad_checked_normal_length_matches_pad_str() {
+        // In-range lengths behave exactly like the infallible `pad_str`; the
+        // cap is invisible for any legitimate pad.
+        for &(s, len, pad, side) in &[
+            ("5", 3i64, "0", PadSide::Left),
+            ("abc", 6, "xy", PadSide::Right),
+            ("abcdef", 3, "x", PadSide::Left), // truncation path
+            ("ab", 5, "", PadSide::Left),      // empty-pad path
+            ("abc", 0, "x", PadSide::Right),   // zero length
+            ("abc", -3, "x", PadSide::Right),  // negative length
+        ] {
+            assert_eq!(
+                pad_str_checked(s, len, pad, side).unwrap(),
+                pad_str(s, len, pad, side),
+                "checked/infallible divergence for ({s:?}, {len}, {pad:?}, {side:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn pad_checked_rejects_oversized_length() {
+        // The reachable-from-SQL DoS: an absurd target length must produce a
+        // clean BoltError instead of allocating a multi-GB fill per row.
+        let huge = (MAX_PAD_LEN as i64) + 1;
+        let err = pad_str_checked("x", huge, "y", PadSide::Left).unwrap_err();
+        match err {
+            BoltError::Other(msg) => {
+                assert!(msg.contains("exceeds the maximum"), "unexpected msg: {msg}");
+                assert!(msg.contains(MAX_PAD_LEN_ENV), "msg should name the env knob: {msg}");
+            }
+            other => panic!("expected Other(exceeds the maximum), got {other:?}"),
+        }
+
+        // A truly pathological value (the original report's 4e9) is likewise
+        // rejected, not allocated.
+        assert!(pad_str_checked("x", 4_000_000_000, "y", PadSide::Right).is_err());
+    }
+
+    #[test]
+    fn pad_checked_exactly_at_cap_is_accepted() {
+        // The cap is inclusive: a request of exactly MAX_PAD_LEN succeeds and
+        // produces a string of exactly that many characters.
+        let at_cap = MAX_PAD_LEN as i64;
+        let out = pad_str_checked("x", at_cap, "y", PadSide::Left).unwrap();
+        assert_eq!(out.chars().count(), MAX_PAD_LEN);
+        // One above the cap is rejected — confirms the boundary.
+        assert!(pad_str_checked("x", at_cap + 1, "y", PadSide::Left).is_err());
+    }
+
+    #[test]
+    fn pad_str_clamps_oversized_length_instead_of_allocating() {
+        // The infallible path (used where no BoltResult can be propagated)
+        // must NOT allocate an unbounded fill: it clamps the target to the cap.
+        let out = pad_str("x", 4_000_000_000, "y", PadSide::Left);
+        assert_eq!(out.chars().count(), MAX_PAD_LEN);
+        // The source character is preserved at the right edge (LPAD keeps the
+        // value on the right, fill on the left).
+        assert!(out.ends_with('x'));
+    }
+
+    #[test]
+    fn parse_max_pad_len_env_rules() {
+        // Pure parser: exercised directly so we don't perturb the process-wide
+        // OnceLock latch. (Mirrors distinct.rs's env-parser test posture.)
+        // Unset behaviour is environment-dependent, so only assert the
+        // explicit-input rules here.
+        //
+        // We cannot portably "unset" within a pure call, so drive the cases we
+        // control by temporarily setting the var. Serialise via a single test
+        // and restore afterwards.
+        let prev = std::env::var(MAX_PAD_LEN_ENV).ok();
+
+        std::env::set_var(MAX_PAD_LEN_ENV, "4096");
+        assert_eq!(parse_max_pad_len_env(), 4096);
+
+        std::env::set_var(MAX_PAD_LEN_ENV, "  8192  ");
+        assert_eq!(parse_max_pad_len_env(), 8192, "value should be trimmed");
+
+        std::env::set_var(MAX_PAD_LEN_ENV, "0");
+        assert_eq!(parse_max_pad_len_env(), MAX_PAD_LEN, "0 rejected → default");
+
+        std::env::set_var(MAX_PAD_LEN_ENV, "not-a-number");
+        assert_eq!(parse_max_pad_len_env(), MAX_PAD_LEN, "garbage → default");
+
+        std::env::set_var(MAX_PAD_LEN_ENV, "");
+        assert_eq!(parse_max_pad_len_env(), MAX_PAD_LEN, "empty → default");
+
+        // Restore the prior environment so we don't leak into other tests.
+        match prev {
+            Some(v) => std::env::set_var(MAX_PAD_LEN_ENV, v),
+            None => std::env::remove_var(MAX_PAD_LEN_ENV),
+        }
     }
 
     // ----- REVERSE -------------------------------------------------------
