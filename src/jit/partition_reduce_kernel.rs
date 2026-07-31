@@ -268,9 +268,10 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 //     and the addr-compute scratch-register order,
 //   * the publish/probe `PublishRegs` + key-type token,
 //   * the CLAIM key store width,
-//   * the export key load/store width + scratch-register order, and the
-//     export-loop predicate numbers (the spill variant's null-check predicate
-//     shifts the i64 export predicates by one).
+//   * the export key load/store width + scratch-register order. (The
+//     export-loop predicate numbers shift by one for BOTH spill variants now —
+//     each one's `SPILL_BUMP` null-check predicate `%p5` pushes the export
+//     predicates to `%p6`/`%p7`.)
 //
 // Every other byte is identical across all four (key_width × spill) variants.
 // The 4 golden snapshots (`partition_reduce{,_spill}`, `partition_reduce_i64{,_spill}`)
@@ -280,9 +281,10 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 /// Emit the full per-partition SUM kernel for the given `key_width`/`spill`/`entry`.
 ///
 /// `spill == true` appends the trailing `spill_counter` `.u64` param + the
-/// `SPILL_BUMP` overflow handler and drops the collision-advance back-off; the
-/// i64 spill variant null-checks the counter pointer (the i32 spill variant,
-/// older, bumps unconditionally — preserved for byte-stable golden parity).
+/// `SPILL_BUMP` overflow handler and drops the collision-advance back-off. Both
+/// key widths null-check the counter pointer (`setp.eq.u64 %p5`) before the
+/// `atom.global.add.u32`, honouring the null-counter contract in the module
+/// docs so a caller passing 0 does not fault on `atom.global.add.u32 [0], 1`.
 pub(crate) fn emit_sum_kernel(key_width: KeyWidth, spill: bool, entry: &str) -> BoltResult<String> {
     let mut ptx = String::new();
     let block_groups = BLOCK_GROUPS;
@@ -412,22 +414,15 @@ pub(crate) fn emit_sum_kernel(key_width: KeyWidth, spill: bool, entry: &str) -> 
     if spill {
         writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
-        // SPILL_BUMP: bump the spill counter, then fall to the epilogue. The
-        // i32 variant (older) bumps unconditionally; the i64 variant null-checks
-        // the pointer so callers can opt out with 0. Both shapes are byte-stable
-        // against their golden snapshots.
-        match key_width {
-            KeyWidth::I32 => {
-                super::partition_reduce_kernel_spill_common::emit_spill_bump_unchecked(
-                    &mut ptx, 9,
-                )?;
-            }
-            KeyWidth::I64 => {
-                super::partition_reduce_kernel_spill_common::emit_spill_bump_with_null_check(
-                    &mut ptx, 9,
-                )?;
-            }
-        }
+        // SPILL_BUMP: null-check the spill-counter pointer, then bump it (when
+        // non-null) before falling to the epilogue. BOTH key widths now gate the
+        // `atom.global.add.u32` on `setp.eq.u64 %p5` so callers can opt out with
+        // 0 — honouring the null-counter contract documented above (~:91-96).
+        // (The i32 variant previously bumped UNCONDITIONALLY via
+        // `emit_spill_bump_unchecked`, which faulted with an illegal device
+        // address — `atom.global.add.u32 [0], 1` — for the documented
+        // null-counter caller. Golden snapshots regenerate downstream.)
+        super::partition_reduce_kernel_spill_common::emit_spill_bump_with_null_check(&mut ptx, 9)?;
 
         super::partition_reduce_kernel_spill_common::emit_loop_next_done(&mut ptx)?;
     } else {
@@ -440,12 +435,14 @@ pub(crate) fn emit_sum_kernel(key_width: KeyWidth, spill: bool, entry: &str) -> 
     }
 
     // ---- Phase 3: per-slot export to global memory ------------------------
-    // The export loop/set predicates are normally `%p5`/`%p6`. ONLY the i64
-    // spill variant shifts them to `%p6`/`%p7`: its `SPILL_BUMP` handler emits a
-    // `setp.eq.u64 %p5` null-check that consumes `%p5`. The i32 spill variant
-    // (older, unchecked `SPILL_BUMP`) emits NO such predicate, so it keeps the
-    // base `%p5`/`%p6` — matching its golden snapshot exactly.
-    let shift_export_preds = spill && key_width == KeyWidth::I64;
+    // The export loop/set predicates are normally `%p5`/`%p6`. BOTH spill
+    // variants shift them to `%p6`/`%p7`: their `SPILL_BUMP` handler now emits a
+    // `setp.eq.u64 %p5` null-check (via `emit_spill_bump_with_null_check`) that
+    // consumes `%p5`, so the export loop must avoid reusing it. (Previously only
+    // the i64 spill variant shifted, because the i32 spill variant emitted an
+    // UNGUARDED bump with no `%p5` predicate; that unguarded path was the
+    // illegal-address fault this fix removes.)
+    let shift_export_preds = spill;
     let (loop_pred, set_pred) = if shift_export_preds {
         ("%p6", "%p7")
     } else {
@@ -998,6 +995,42 @@ mod tests {
         assert!(
             ptx.contains("SPILL_BUMP:"),
             "spill variant must label its overflow path:\n{ptx}"
+        );
+    }
+
+    /// SPILL_BUMP must GATE the global atomic on a null-pointer check so a
+    /// caller honouring the documented null-counter contract (passing 0 for the
+    /// spill-counter pointer) does not fault on `atom.global.add.u32 [0], 1`.
+    /// The i32-key SUM spill path previously emitted the bump UNGUARDED (an
+    /// illegal-address device fault); this test pins the guard in place.
+    #[test]
+    fn with_spill_gates_counter_bump_on_null_check() {
+        let ptx = compile_partition_reduce_kernel_with_spill().expect("kernel compiles");
+        let bump_pos = ptx
+            .find("SPILL_BUMP:")
+            .expect("spill variant must label its overflow path");
+        let after_bump = &ptx[bump_pos..];
+
+        // The null-gate predicate + skip-branch must precede the atomic bump.
+        let setp = after_bump
+            .find("setp.eq.u64 %p5,")
+            .expect("SPILL_BUMP must null-check the counter pointer with setp.eq.u64 %p5");
+        let skip = after_bump
+            .find("@%p5 bra LOOP_NEXT;")
+            .expect("SPILL_BUMP must @%p5-skip the bump when the pointer is null");
+        let bump = after_bump
+            .find("atom.global.add.u32 %r36,")
+            .expect("SPILL_BUMP must bump the counter when non-null");
+        assert!(
+            setp < skip && skip < bump,
+            "SPILL_BUMP order must be setp.eq.u64 -> @%p5 skip -> atom.global.add.u32:\n{ptx}"
+        );
+
+        // The export loop must NOT reuse %p5 (consumed by the null-check); it
+        // shifts to %p6/%p7 like the i64 spill variant.
+        assert!(
+            ptx.contains("setp.ge.u32 %p6, %r41,"),
+            "export loop predicate must shift to %p6 after the %p5 null-check:\n{ptx}"
         );
     }
 

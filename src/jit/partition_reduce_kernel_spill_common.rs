@@ -16,7 +16,8 @@
 //!    `.address_size 64` + blank line).
 //! 2. The block/thread-id register setup (`mov.u32 %r0,%ctaid.x` etc.).
 //! 3. The `SPILL_BUMP:` label + null-check + `atom.global.add.u32`
-//!    sequence (the 8 kernels that null-check; 2 omit the check).
+//!    sequence (9 of the 10 kernels null-check; only the i32-key COUNT
+//!    spill path still omits the check — see `emit_spill_bump_unchecked`).
 //! 4. The `LOOP_NEXT:` / `LOOP_DONE:` epilogue.
 //!
 //! This module factors those exact byte sequences into helpers so the
@@ -124,9 +125,9 @@ pub(crate) fn emit_spin_backoff(ptx: &mut String, ns: u32) -> BoltResult<()> {
 /// \tatom.global.add.u32 %r36, [%rd9], 1;
 /// ```
 ///
-/// Used by 8 of 10 spill kernels (all except the i32-key SUM and the
-/// i32-key COUNT, which were written before the null-check was added
-/// and remain that way to keep their golden PTX byte-stable).
+/// Used by 9 of 10 spill kernels (all except the i32-key COUNT spill path,
+/// which still bumps unconditionally via [`emit_spill_bump_unchecked`] and
+/// remains to be migrated — see that helper's WARNING).
 pub(crate) fn emit_spill_bump_with_null_check(
     ptx: &mut String,
     rd_spill_idx: u32,
@@ -139,9 +140,7 @@ pub(crate) fn emit_spill_bump_with_null_check(
 }
 
 /// Emit the `SPILL_BUMP:` label followed by an unconditional
-/// `atom.global.add.u32` bump (no null check). Two of the older spill
-/// emitters (i32-key SUM, i32-key COUNT) ship this shape; the helper
-/// preserves their exact bytes.
+/// `atom.global.add.u32` bump (no null check).
 ///
 /// Emitted bytes (with `rd_spill_idx = 9`):
 ///
@@ -149,6 +148,15 @@ pub(crate) fn emit_spill_bump_with_null_check(
 /// SPILL_BUMP:
 /// \tatom.global.add.u32 %r36, [%rd9], 1;
 /// ```
+///
+/// WARNING — this VIOLATES the null-counter contract documented in
+/// `partition_reduce_kernel.rs` (~:91-96): a caller that passes 0 for the
+/// spill-counter pointer gets `atom.global.add.u32 [0], 1`, an illegal-address
+/// device fault. The i32-key SUM emitter was migrated off this helper to
+/// [`emit_spill_bump_with_null_check`]; the only remaining caller is the
+/// i32-key COUNT spill path in `partition_reduce_kernel_count.rs`, which still
+/// needs migrating (its export-predicate allocation in that file must shift to
+/// `%p6`/`%p7` in the same change, so it is out of scope for this fix).
 pub(crate) fn emit_spill_bump_unchecked(ptx: &mut String, rd_spill_idx: u32) -> BoltResult<()> {
     writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd{rd_spill_idx}], 1;").map_err(write_err)?;
