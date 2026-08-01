@@ -14,9 +14,7 @@
 # full test suite links cleanly. This only changes the *link* step; compiled
 # rlibs are unaffected and reused.
 #
-# Requires LLVM's lld-link on PATH (e.g. `scoop install llvm`, or any LLVM
-# toolchain). The toolchain also ships a copy at
-#   <sysroot>/lib/rustlib/x86_64-pc-windows-msvc/bin/gcc-ld/lld-link.exe
-# if a system LLVM is not desired.
+# Uses Rust's bundled `rust-lld` linker directly, avoiding external LLVM
+# installation requirements on PATH while preventing MSVC link.exe PDB limits.
 [target.x86_64-pc-windows-msvc]
-linker = "lld-link"
+rustflags = ["-C", "linker=rust-lld"]
