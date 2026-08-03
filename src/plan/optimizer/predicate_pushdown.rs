@@ -451,6 +451,21 @@ fn remap_to_branch(
         return None;
     }
 
+    // Duplicate output names make the positional remap ambiguous: the
+    // `out_name -> branch_name` map below is keyed by output name, so two
+    // output columns sharing a name (e.g. `SELECT a, a ... UNION ...`) would
+    // collide last-wins and a conjunct referencing that name could be rewritten
+    // to the WRONG branch column at a different position. We cannot tell which
+    // position the predicate meant, so bail and leave the filter above the node
+    // — mirroring the other defensive guards in this file. (The leading branch's
+    // names ARE the output names, so this also covers a duplicate-named union.)
+    let mut seen = std::collections::HashSet::with_capacity(out_schema.fields.len());
+    for out_field in &out_schema.fields {
+        if !seen.insert(out_field.name.as_str()) {
+            return None;
+        }
+    }
+
     // Output-name -> branch-name, position by position. When the names already
     // match (the common case, and always so for the leading branch) the entry
     // is an identity and `rename_columns` leaves the reference untouched.
@@ -936,6 +951,84 @@ mod tests {
                 assert!(found_x, "expected a remapped Filter in branch 1");
             }
             other => panic!("expected Union on top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_push_into_union_with_duplicate_output_names() {
+        // A union whose output schema has two columns named `a` (e.g.
+        // `SELECT a, a ... UNION ...`). The positional output-name -> branch-
+        // name remap would be ambiguous — the two `a` positions could map to
+        // different branch columns and last-wins would silently misroute a
+        // pushed predicate. The pass must BAIL and leave the filter above the
+        // union, exactly preserving semantics.
+        let dup = |name: &str| {
+            scan(
+                name,
+                vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("a", DataType::Int64, false),
+                ],
+            )
+        };
+        let union = LogicalPlan::Union {
+            inputs: vec![dup("t0"), dup("t1")],
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(union),
+            predicate: col("a").gt(lit(0_i64)),
+        };
+        // Sanity: the union output schema really does carry a duplicate name.
+        let s = plan.schema().expect("typecheck");
+        assert_eq!(s.fields.len(), 2);
+        assert_eq!(s.fields[0].name, "a");
+        assert_eq!(s.fields[1].name, "a");
+
+        let out = PredicatePushdown.rewrite(plan).expect("push");
+        // The filter must remain ABOVE the union (no push into either branch).
+        match out {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(
+                    matches!(*input, LogicalPlan::Union { .. }),
+                    "duplicate-named union must keep the filter above it"
+                );
+            }
+            other => panic!("expected Filter to stay above the union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_push_into_setop_with_duplicate_output_names() {
+        // Same hazard for EXCEPT/INTERSECT: a duplicate-named left (output)
+        // schema makes the positional remap ambiguous, so the filter stays put.
+        let dup = |name: &str| {
+            scan(
+                name,
+                vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("a", DataType::Int64, false),
+                ],
+            )
+        };
+        let set_op = LogicalPlan::SetOp {
+            left: Box::new(dup("l")),
+            right: Box::new(dup("r")),
+            op: SetOpKind::Intersect,
+            all: false,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(set_op),
+            predicate: col("a").gt(lit(0_i64)),
+        };
+        let out = PredicatePushdown.rewrite(plan).expect("push");
+        match out {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(
+                    matches!(*input, LogicalPlan::SetOp { .. }),
+                    "duplicate-named set-op must keep the filter above it"
+                );
+            }
+            other => panic!("expected Filter to stay above the set-op, got {other:?}"),
         }
     }
 
