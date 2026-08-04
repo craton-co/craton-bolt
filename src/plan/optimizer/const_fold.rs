@@ -7,9 +7,13 @@
 //! * folds binary arithmetic / comparison / logical operators over two
 //!   literal operands into a single literal (`2 + 3` -> `5`, `1 < 2` ->
 //!   `true`);
-//! * applies boolean identities that hold for *any* operand without changing
-//!   semantics: `x AND true` -> `x`, `x AND false` -> `false`,
-//!   `x OR false` -> `x`, `x OR true` -> `true`;
+//! * applies boolean identities that preserve semantics: the operand-keeping
+//!   `x AND true` -> `x` and `x OR false` -> `x` hold for *any* operand; the
+//!   absorbing `x AND false` -> `false` and `x OR true` -> `true` discard `x`,
+//!   so they fire only when the discarded operand is provably error-free (a
+//!   column ref or literal) — otherwise eliding a possibly-trapping subexpr
+//!   could suppress a runtime error this pass must not change (mirroring
+//!   `fold_int`'s div-by-zero / overflow guards);
 //! * collapses double negation `NOT (NOT x)` -> `x`;
 //! * folds `NOT true` / `NOT false`.
 //!
@@ -118,10 +122,13 @@ pub fn fold_expr(expr: Expr) -> Expr {
 
 /// Fold a binary node whose children are already folded.
 fn fold_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
-    // Boolean identities that hold for any (non-NULL-sensitive) operand.
-    // `x AND true` => x, `x AND false` => false, etc. We only apply these
-    // when exactly one side is a bool literal; folding two bool literals
-    // falls through to the literal-pair arithmetic below.
+    // Boolean simplifications. The operand-keeping identities (`x AND true` =>
+    // x, `x OR false` => x) hold for any operand; the absorbing ones
+    // (`x AND false` => false, `x OR true` => true) discard their other operand
+    // and so only fire when it is provably error-free (see `simplify_and` /
+    // `simplify_or`). We only apply these when at least one side is a bool
+    // literal; folding two bool literals falls through to the literal-pair
+    // arithmetic below.
     if op == BinaryOp::And {
         if let Some(simplified) = simplify_and(&left, &right) {
             return simplified;
@@ -150,6 +157,16 @@ fn fold_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
 /// when neither side is a bool literal (let the literal-pair path handle
 /// `true AND false`). Cloning the surviving operand is unavoidable because we
 /// borrow both sides to inspect them.
+///
+/// The absorbing `x AND false -> false` rule *discards* `x` unevaluated. Under
+/// this engine's eager/vectorised evaluation `x` would otherwise be computed
+/// for every row, so eliding it would suppress any runtime error/overflow it
+/// raises — changing the observable result, which this pass must never do (the
+/// same invariant `fold_int` upholds by refusing to fold div-by-zero /
+/// overflow). We therefore only absorb when the discarded operand is provably
+/// error-free (a column ref or literal — see [`is_error_free`]); otherwise the
+/// expression is left for the runtime. The `x AND true -> x` identity *keeps*
+/// `x`, so it needs no such guard.
 fn simplify_and(left: &Expr, right: &Expr) -> Option<Expr> {
     if super::expr_util::is_bool_literal(left, true) {
         return Some(right.clone());
@@ -157,15 +174,22 @@ fn simplify_and(left: &Expr, right: &Expr) -> Option<Expr> {
     if super::expr_util::is_bool_literal(right, true) {
         return Some(left.clone());
     }
-    if super::expr_util::is_bool_literal(left, false)
-        || super::expr_util::is_bool_literal(right, false)
-    {
+    // `lit(false) AND x` / `x AND lit(false)` -> `false`, but only when the
+    // *other* (discarded) operand can never raise at runtime.
+    if super::expr_util::is_bool_literal(left, false) && is_error_free(right) {
+        return Some(Expr::Literal(Literal::Bool(false)));
+    }
+    if super::expr_util::is_bool_literal(right, false) && is_error_free(left) {
         return Some(Expr::Literal(Literal::Bool(false)));
     }
     None
 }
 
 /// `x OR false` -> `x`; `x OR true` -> `true`; symmetric.
+///
+/// As in [`simplify_and`], the absorbing `x OR true -> true` rule discards `x`
+/// and is only applied when `x` is provably error-free; the `x OR false -> x`
+/// identity keeps `x` and is always safe.
 fn simplify_or(left: &Expr, right: &Expr) -> Option<Expr> {
     if super::expr_util::is_bool_literal(left, false) {
         return Some(right.clone());
@@ -173,12 +197,32 @@ fn simplify_or(left: &Expr, right: &Expr) -> Option<Expr> {
     if super::expr_util::is_bool_literal(right, false) {
         return Some(left.clone());
     }
-    if super::expr_util::is_bool_literal(left, true)
-        || super::expr_util::is_bool_literal(right, true)
-    {
+    if super::expr_util::is_bool_literal(left, true) && is_error_free(right) {
+        return Some(Expr::Literal(Literal::Bool(true)));
+    }
+    if super::expr_util::is_bool_literal(right, true) && is_error_free(left) {
         return Some(Expr::Literal(Literal::Bool(true)));
     }
     None
+}
+
+/// True when evaluating `expr` can never raise a runtime error/trap, so it is
+/// safe to discard unevaluated in an absorbing boolean fold.
+///
+/// Deliberately minimal and conservative: only a bare column reference or a
+/// literal (transparently through `Alias`) qualifies. A column read returns
+/// data and a literal is a constant, so neither can overflow, divide by zero,
+/// fail a checked cast, or trap in a scalar function. Anything richer
+/// (arithmetic, casts, `CASE`, `LIKE`, scalar functions, sub-queries) *might*
+/// raise, so it is treated as unsafe-to-discard and the fold is skipped — the
+/// expression is then evaluated at runtime exactly as the unoptimised plan
+/// would, preserving the observable result.
+fn is_error_free(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) | Expr::Literal(_) => true,
+        Expr::Alias(inner, _) => is_error_free(inner),
+        _ => false,
+    }
 }
 
 /// Fold a unary node whose child is already folded.
@@ -500,6 +544,67 @@ mod tests {
     fn simplifies_and_false() {
         let e = b(BinaryOp::And, col("a"), lit(false));
         assert!(matches!(fold_expr(e), Expr::Literal(Literal::Bool(false))));
+    }
+
+    #[test]
+    fn does_not_absorb_and_false_with_erroring_operand() {
+        // (a / b) AND false: under eager evaluation `a / b` could trap (div by
+        // zero), so absorbing to `false` would suppress that error. Must stay a
+        // Binary (the whole `AND`), not fold to `false`.
+        let div = b(BinaryOp::Div, col("a"), col("b"));
+        let e = b(BinaryOp::And, div, lit(false));
+        assert!(
+            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::And, .. }),
+            "x AND false must NOT fold when x can raise at runtime"
+        );
+    }
+
+    #[test]
+    fn does_not_absorb_and_false_with_erroring_operand_on_left() {
+        // Symmetric: false AND (a / b) must also stay unfolded.
+        let div = b(BinaryOp::Div, col("a"), col("b"));
+        let e = b(BinaryOp::And, lit(false), div);
+        assert!(
+            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::And, .. }),
+            "false AND x must NOT fold when x can raise at runtime"
+        );
+    }
+
+    #[test]
+    fn does_not_absorb_or_true_with_erroring_operand() {
+        // (a / b) OR true must stay a Binary, not fold to `true`.
+        let div = b(BinaryOp::Div, col("a"), col("b"));
+        let e = b(BinaryOp::Or, div, lit(true));
+        assert!(
+            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::Or, .. }),
+            "x OR true must NOT fold when x can raise at runtime"
+        );
+    }
+
+    #[test]
+    fn still_absorbs_and_false_with_literal_operand() {
+        // A literal operand can never raise, so absorbing still fires.
+        let e = b(BinaryOp::And, lit(7_i64), lit(false));
+        assert!(matches!(fold_expr(e), Expr::Literal(Literal::Bool(false))));
+    }
+
+    #[test]
+    fn still_absorbs_two_bool_literals_and() {
+        // false AND false: the discarded side is itself a literal → still folds.
+        let e = b(BinaryOp::And, lit(false), lit(false));
+        assert!(matches!(fold_expr(e), Expr::Literal(Literal::Bool(false))));
+    }
+
+    #[test]
+    fn still_keeps_and_true_with_erroring_operand() {
+        // `x AND true` keeps x — no discard, so it folds away the `true`
+        // regardless of whether x could raise.
+        let div = b(BinaryOp::Div, col("a"), col("b"));
+        let e = b(BinaryOp::And, div, lit(true));
+        assert!(
+            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::Div, .. }),
+            "x AND true should simplify to x even when x can raise"
+        );
     }
 
     #[test]
