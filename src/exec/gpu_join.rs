@@ -29,7 +29,7 @@
 //!     │
 //!     ├─ out_probe_idx_dev   (GpuVec<u32>, out_capacity)
 //!     ├─ out_build_idx_dev   (GpuVec<u32>, out_capacity)
-//!     └─ out_counter_dev     (GpuVec<u32>, length 1, init=0)
+//!     └─ out_counter_dev     (GpuVec<u64>, length 1, init=0)
 //!     │
 //!     ▼ launch PROBE kernel (1 thread / probe row)
 //!  out buffers populated up to *counter[0]* entries (arbitrary order)
@@ -1011,10 +1011,17 @@ fn probe_tiled_enabled() -> bool {
 /// `(probe_idx, build_idx)` into the output buffers via an atomic counter.
 ///
 /// Returns the number of matches actually claimed (the post-launch value of
-/// the GPU-side counter), capped at `out_capacity`. If the kernel claimed
-/// more than `out_capacity` slots the counter will still hold the true count
-/// (the kernel only skips the *writes* on overflow), so callers can detect
-/// the overflow and re-run with a bigger output buffer.
+/// the GPU-side counter) as a **u64**. If the kernel claimed more than
+/// `out_capacity` slots the counter will still hold the true count (the kernel
+/// only skips the *writes* on overflow), so callers can detect the overflow
+/// and re-run with a bigger output buffer.
+///
+/// The counter is u64 because a single high-skew launch can claim more than
+/// `u32::MAX` matches; a u32 counter would wrap mid-overflow and the host
+/// would read a small, plausible count → silent truncation of the join
+/// output. The output index buffers are still u32-addressed (`out_capacity`
+/// fits u32), so any in-range claimed index is `< 2^32`; only the *counter*
+/// itself needs the wider type.
 ///
 /// **Batch 6** — when [`PROBE_TILED_ENV_VAR`] is opted in, the launcher
 /// resolves [`PROBE_KERNEL_TILED_ENTRY`] instead of [`PROBE_KERNEL_ENTRY`]
@@ -1026,12 +1033,12 @@ fn launch_probe_kernel(
     row_idx_table_dev: &GpuVec<u32>,
     out_probe_idx_dev: &mut GpuVec<u32>,
     out_build_idx_dev: &mut GpuVec<u32>,
-    out_counter_dev: &mut GpuVec<u32>,
+    out_counter_dev: &mut GpuVec<u64>,
     n_probe_rows: u32,
     cap: u32,
     out_capacity: u32,
     stream: &CudaStream,
-) -> BoltResult<u32> {
+) -> BoltResult<u64> {
     if n_probe_rows == 0 {
         // No probe rows -> no matches; counter stays at 0.
         return Ok(0);
@@ -1104,8 +1111,9 @@ fn launch_probe_kernel(
     }
     stream.synchronize()?;
 
-    // Read back the actual number of matches.
-    let counter_host: Vec<u32> = out_counter_dev.to_vec()?;
+    // Read back the actual number of matches (u64 — see fn doc; a u32 readback
+    // would alias an overflowed counter back into the in-range space).
+    let counter_host: Vec<u64> = out_counter_dev.to_vec()?;
     let n_matches_raw = counter_host[0];
     Ok(n_matches_raw)
 }
@@ -1213,12 +1221,12 @@ fn launch_probe_aos_kernel(
     slots_dev: &GpuVec<u8>,
     out_probe_idx_dev: &mut GpuVec<u32>,
     out_build_idx_dev: &mut GpuVec<u32>,
-    out_counter_dev: &mut GpuVec<u32>,
+    out_counter_dev: &mut GpuVec<u64>,
     n_probe_rows: u32,
     cap: u32,
     out_capacity: u32,
     stream: &CudaStream,
-) -> BoltResult<u32> {
+) -> BoltResult<u64> {
     if n_probe_rows == 0 {
         return Ok(0);
     }
@@ -1273,7 +1281,7 @@ fn launch_probe_aos_kernel(
         ))?;
     }
     stream.synchronize()?;
-    let counter_host: Vec<u32> = out_counter_dev.to_vec()?;
+    let counter_host: Vec<u64> = out_counter_dev.to_vec()?;
     Ok(counter_host[0])
 }
 
@@ -1332,7 +1340,9 @@ pub fn hash_join_indices_on_gpu_aos(
     })?;
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    // u64 counter: the kernel keeps climbing past out_capacity on overflow and
+    // can exceed u32::MAX under skew; a u32 buffer would wrap and mask it.
+    let mut out_counter_dev = GpuVec::<u64>::zeros(1)?;
 
     launch_build_aos_kernel(
         &build_keys_dev,
@@ -1352,13 +1362,15 @@ pub fn hash_join_indices_on_gpu_aos(
         out_capacity_u32,
         &stream,
     )?;
-    if n_matches_raw > out_capacity_u32 {
+    if n_matches_raw > out_capacity_u32 as u64 {
         // Probe overflow: kernel wrote more matches than out_capacity.
         // The host join handles this input fine — return the fallback
         // signal so the executor retries there. The caller
         // (`try_gpu_inner_join`) treats any `Err(_)` as "GPU declined"
         // and falls back; we use the typed `GpuCapacity` variant so the
         // pattern-match is recognisable rather than string-parsed.
+        // The u64 counter vs u32 capacity comparison is done at 64-bit width
+        // so a counter past 2^32 can never look in-range.
         log::warn!(
             "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
              falling back to host hash join"
@@ -1367,6 +1379,7 @@ pub fn hash_join_indices_on_gpu_aos(
             "gpu_join: AoS probe claimed {n_matches_raw} matches > capacity {out_capacity_u32}"
         )));
     }
+    // Safe narrow: n_matches_raw <= out_capacity_u32 < 2^32 past the gate above.
     let n_matches = n_matches_raw as usize;
     // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the SoA
     // INNER path. `download_to_host_pinned` falls back to `to_vec()` under
@@ -1617,7 +1630,9 @@ pub fn hash_join_indices_on_gpu_resident(
 
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    // u64 counter: the probe kernel keeps climbing past out_capacity on
+    // overflow and can exceed u32::MAX under skew; a u32 buffer would wrap.
+    let mut out_counter_dev = GpuVec::<u64>::zeros(1)?;
 
     // Build phase — populate the device hash table from the build side.
     launch_build_kernel(
@@ -1643,10 +1658,12 @@ pub fn hash_join_indices_on_gpu_resident(
         &stream,
     )?;
 
-    if n_matches_raw > out_capacity_u32 {
+    if n_matches_raw > out_capacity_u32 as u64 {
         // Same overflow contract as the host path: typed GpuCapacity error so
         // the caller routes to the host hash-join. Under the INNER + unique-
-        // build invariant the gate enforces, this never fires.
+        // build invariant the gate enforces, this never fires. The u64 counter
+        // vs u32 capacity comparison runs at 64-bit width so a >2^32 count can
+        // never alias an in-range value.
         log::warn!(
             "gpu join (resident) probe overflow ({n_matches_raw} > {out_capacity_u32}); \
              falling back to host hash join"
@@ -1667,6 +1684,7 @@ pub fn hash_join_indices_on_gpu_resident(
     Ok(GpuJoinIndicesResident {
         build_idx: out_build_idx_dev,
         probe_idx: out_probe_idx_dev,
+        // Safe narrow: n_matches_raw <= out_capacity_u32 < 2^32 past the gate.
         n_matches: n_matches_raw as usize,
     })
 }
@@ -1798,7 +1816,10 @@ pub fn hash_join_indices_on_gpu_with_shape(
 
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    // u64 counter: duplicate-key fan-out can claim > u32::MAX indices in one
+    // launch; the kernel keeps climbing past out_capacity so a u32 buffer
+    // would wrap and the host would read a small plausible count.
+    let mut out_counter_dev = GpuVec::<u64>::zeros(1)?;
 
     launch_build_collision_kernel(
         &build_keys_dev,
@@ -1827,12 +1848,13 @@ pub fn hash_join_indices_on_gpu_with_shape(
         &stream,
     )?;
 
-    if n_matches_raw > out_capacity_u32 {
+    if n_matches_raw > out_capacity_u32 as u64 {
         // Probe overflow: kernel wrote more matches than out_capacity. The
         // host join handles this input fine — return the fallback signal so
         // the executor retries there. `try_gpu_inner_join` catches any
         // `Err(_)` and falls back to the host hash-join; `GpuCapacity` is
-        // the typed marker for that path.
+        // the typed marker for that path. 64-bit comparison so a >2^32
+        // duplicate-fan-out count can never look in-range.
         log::warn!(
             "gpu join probe overflow ({n_matches_raw} > {out_capacity_u32}); \
              falling back to host hash join"
@@ -1961,7 +1983,10 @@ pub fn execute_outer_join_indices_on_gpu(
 
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    // u64 counter: cartesian-explosion outer joins can claim > u32::MAX indices
+    // in one launch; the kernel keeps climbing past out_capacity so a u32
+    // buffer would wrap and mask the overflow.
+    let mut out_counter_dev = GpuVec::<u64>::zeros(1)?;
 
     launch_build_collision_kernel(
         &build_keys_dev,
@@ -1990,7 +2015,7 @@ pub fn execute_outer_join_indices_on_gpu(
         &stream,
     )?;
 
-    if n_matches_raw > out_capacity_u32 {
+    if n_matches_raw > out_capacity_u32 as u64 {
         // Probe overflow: kernel wrote more matches than out_capacity. The
         // host join handles this input fine — return the fallback signal so
         // the executor retries there. Cartesian-explosion outer joins land
@@ -2103,7 +2128,11 @@ pub fn execute_outer_join_indices_on_gpu(
             }
         } else {
             let mut out_unmatched_dev = GpuVec::<u32>::zeros(n_build)?;
-            let mut out_unmatched_counter_dev = GpuVec::<u32>::zeros(1)?;
+            // u64 counter for ABI symmetry with the shared counter buffer; the
+            // unmatched-build kernel's count is bounded by n_build (one claim
+            // per build row) so it cannot actually overflow, but the device
+            // buffer is 8 bytes wide.
+            let mut out_unmatched_counter_dev = GpuVec::<u64>::zeros(1)?;
             let n_unmatched = launch_unmatched_build_kernel(
                 &matched_dev,
                 &mut out_unmatched_dev,
@@ -2112,7 +2141,7 @@ pub fn execute_outer_join_indices_on_gpu(
                 n_build_u32,
                 &stream,
             )?;
-            if n_unmatched > n_build_u32 {
+            if n_unmatched > n_build_u32 as u64 {
                 // Probe overflow (second-pass): the unmatched-build kernel's
                 // counter exceeded the n_build upper bound, meaning the
                 // bitmap-walk wrote outside the sized buffer. The host
@@ -2222,14 +2251,14 @@ fn launch_probe_collision_kernel(
     next_idx_dev: &GpuVec<u32>,
     out_probe_idx_dev: &mut GpuVec<u32>,
     out_build_idx_dev: &mut GpuVec<u32>,
-    out_counter_dev: &mut GpuVec<u32>,
+    out_counter_dev: &mut GpuVec<u64>,
     matched_dev: Option<&GpuVec<u32>>,
     n_probe_rows: u32,
     n_build_rows: u32,
     cap: u32,
     out_capacity: u32,
     stream: &CudaStream,
-) -> BoltResult<u32> {
+) -> BoltResult<u64> {
     if n_probe_rows == 0 {
         return Ok(0);
     }
@@ -2310,7 +2339,7 @@ fn launch_probe_collision_kernel(
         ))?;
     }
     stream.synchronize()?;
-    let counter_host: Vec<u32> = out_counter_dev.to_vec()?;
+    let counter_host: Vec<u64> = out_counter_dev.to_vec()?;
     Ok(counter_host[0])
 }
 
@@ -2318,11 +2347,11 @@ fn launch_probe_collision_kernel(
 fn launch_unmatched_build_kernel(
     matched_dev: &GpuVec<u32>,
     out_build_idx_dev: &mut GpuVec<u32>,
-    out_counter_dev: &mut GpuVec<u32>,
+    out_counter_dev: &mut GpuVec<u64>,
     n_build_rows: u32,
     out_capacity: u32,
     stream: &CudaStream,
-) -> BoltResult<u32> {
+) -> BoltResult<u64> {
     if n_build_rows == 0 {
         return Ok(0);
     }
@@ -2379,7 +2408,7 @@ fn launch_unmatched_build_kernel(
         ))?;
     }
     stream.synchronize()?;
-    let counter_host: Vec<u32> = out_counter_dev.to_vec()?;
+    let counter_host: Vec<u64> = out_counter_dev.to_vec()?;
     Ok(counter_host[0])
 }
 
@@ -3530,7 +3559,10 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
 
     let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
     let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
-    let mut out_counter_dev = GpuVec::<u32>::zeros(1)?;
+    // u64 counter: lossy-fold false-positive blow-ups can claim > u32::MAX
+    // candidate indices in one launch; the kernel keeps climbing past
+    // out_capacity so a u32 buffer would wrap and mask the overflow.
+    let mut out_counter_dev = GpuVec::<u64>::zeros(1)?;
 
     launch_build_collision_kernel(
         &build_keys_dev,
@@ -3557,7 +3589,7 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
         out_capacity_u32,
         &stream,
     )?;
-    if n_matches_raw > out_capacity_u32 {
+    if n_matches_raw > out_capacity_u32 as u64 {
         // Probe overflow: kernel wrote more candidate matches than
         // out_capacity. The host join handles this input fine — return the
         // fallback signal so the executor retries there. Lossy-fold
@@ -5053,5 +5085,39 @@ mod tests {
             "under cuda-stub, hash_join_indices_on_gpu_with_shape must \
              return Err so the host fallback engages"
         );
+    }
+
+    /// W16 — the per-launch output match counter is a **u64** on both sides of
+    /// the host/device ABI. A u32 counter wraps when a single high-skew launch
+    /// claims > 2^32 matches; the kernel keeps the counter climbing past
+    /// `out_capacity` to signal overflow, so on wrap the host would read a
+    /// small, plausible count and silently truncate the join output.
+    ///
+    /// This is a pure-host, build-independent guard: it pins the element width
+    /// of the counter buffer (`GpuVec<u64>` ⇒ 8 bytes/elem) so a future
+    /// refactor that narrows the counter back to `GpuVec<u32>` (4 bytes)
+    /// fails here, in lockstep with the kernel-side `all_output_counters_are_u64`
+    /// test in `crate::jit::hash_join_kernel`. `empty()` allocates no device
+    /// memory, so the test runs without a CUDA context.
+    #[test]
+    fn output_counter_buffer_is_u64_eight_bytes() {
+        // The counter element type must be 8 bytes wide.
+        assert_eq!(std::mem::size_of::<u64>(), 8);
+
+        // A length-1 counter buffer must be 8 bytes — the size the device-side
+        // `atom.global.add.u64` and the host `to_vec::<u64>()` readback agree
+        // on. `byte_len() == len() * size_of::<u64>()` is the GpuVec invariant;
+        // pin it at the width the join counter relies on.
+        let counter = GpuVec::<u64>::empty();
+        let view = counter.view();
+        assert_eq!(
+            view.byte_len(),
+            view.len() * 8,
+            "u64 counter buffer must be 8 bytes per element (W16 overflow fix)"
+        );
+        // And a single-element counter would therefore be exactly 8 bytes, vs
+        // the 4 bytes a wrap-prone u32 counter would occupy.
+        assert_eq!(1 * std::mem::size_of::<u64>(), 8);
+        assert_ne!(std::mem::size_of::<u64>(), std::mem::size_of::<u32>());
     }
 }
