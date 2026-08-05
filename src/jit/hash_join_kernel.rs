@@ -63,7 +63,7 @@
 //! 2. Hashes + probes through `keys_table` (same hash + mask as build):
 //!    * Slot is empty (`keys_table[slot] == EMPTY_KEY`) ⇒ no match; return.
 //!    * Slot key matches ⇒ atomically claim an output index via
-//!      `atom.global.add.u32 idx, [out_counter], 1`, then write
+//!      `atom.global.add.u64 idx, [out_counter], 1`, then write
 //!      `(out_probe_idx[idx], out_build_idx[idx]) = (tid, row_idx_table[slot])`.
 //!      Bounded by the host-provided `out_capacity`; on overflow the kernel
 //!      bails silently and the host re-launches with a larger output buffer
@@ -667,7 +667,7 @@ pub fn compile_build_kernel() -> BoltResult<String> {
 ///     .param .u64 row_idx_table_ptr, // u32, length cap (populated)
 ///     .param .u64 out_probe_idx_ptr, // u32, length out_capacity
 ///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
-///     .param .u64 out_counter_ptr,   // u32, single counter (init=0)
+///     .param .u64 out_counter_ptr,   // u64, single counter (init=0)
 ///     .param .u32 n_probe,
 ///     .param .u32 cap,               // power-of-two
 ///     .param .u32 out_capacity       // guard against output buffer overflow
@@ -681,6 +681,16 @@ pub fn compile_build_kernel() -> BoltResult<String> {
 /// resized output buffer. For Stage 1 the host pre-sizes the output to
 /// `build_n_rows + probe_n_rows` which is loose enough to never overflow
 /// in the INNER-equi-join-with-unique-build case.
+///
+/// The counter is a **u64**: under extreme skew a single launch can claim
+/// more than `u32::MAX` output indices (the counter keeps climbing past
+/// `out_capacity` so the host can size the next buffer). A u32 counter would
+/// wrap mid-overflow and hand the host a small, plausible count → silent
+/// truncation of the join output. `out_capacity` itself stays u32 (output
+/// index buffers are u32-addressed), so all counter-vs-capacity comparisons
+/// widen the capacity to 64-bit; the claimed index is only narrowed back to
+/// u32 on the store path, which is reached solely when the index is already
+/// `< out_capacity < 2^32`.
 ///
 /// TODO(perf): SoA probe could fuse adjacent slot loads via `ld.global.nc.v2.u64`
 /// with a 2-way-unrolled probe — the key array is 8-byte aligned and two
@@ -809,24 +819,32 @@ pub fn compile_probe_kernel() -> BoltResult<String> {
     writeln!(p, "\tadd.s64 %rd7, %rd4, %rd5;").map_err(write_err)?;
     writeln!(p, "\tld.global.nc.u32 %r9, [%rd7];").map_err(write_err)?;
 
-    // atom.add on counter: claim slot.
+    // atom.add on counter: claim slot. The counter is a u64 (see kernel doc):
+    // a single launch can legitimately claim > u32::MAX indices under skew,
+    // and the counter must keep climbing past out_capacity without wrapping so
+    // the host reads the true overflow magnitude. out_capacity (%r22) is a u32
+    // param; widen it to %rl8 so the counter comparisons run at 64-bit width.
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_5];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u64.u32 %rl8, %r22;").map_err(write_err)?;
     // Speculative ld.acquire pre-check: if the counter is already at or past
     // out_capacity, every subsequent atom.add is wasted work that serializes
     // matching threads on the counter cacheline. Skip the atomic and bail.
     // Correctness: the atomic still bounds-checks below, so a thread that
     // races past this pre-check (seeing a stale-but-low counter) is still
-    // guarded by the post-atomic setp.ge.u32 against the returned index.
-    writeln!(p, "\tld.acquire.gpu.u32 %r12, [%rd8];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p5, %r12, %r22;").map_err(write_err)?;
+    // guarded by the post-atomic setp.ge.u64 against the returned index.
+    writeln!(p, "\tld.acquire.gpu.u64 %rl9, [%rd8];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u64 %p5, %rl9, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p5 bra DONE;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r10, 1;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r11, [%rd8], %r10;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rl10, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u64 %rl11, [%rd8], %rl10;").map_err(write_err)?;
 
-    // If r11 (claimed slot) >= out_capacity, skip the writes.
-    writeln!(p, "\tsetp.ge.u32 %p4, %r11, %r22;").map_err(write_err)?;
+    // If rl11 (claimed slot) >= out_capacity, skip the writes (64-bit compare so
+    // an overflowed counter never aliases a small in-range index). Below the
+    // gate the index is < out_capacity < 2^32, so narrowing to %r11 is exact.
+    writeln!(p, "\tsetp.ge.u64 %p4, %rl11, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r11, %rl11;").map_err(write_err)?;
 
     // out_probe_idx[claimed] = tid (== %r3)
     writeln!(p, "\tld.param.u64 %rd9, [{entry}_param_3];").map_err(write_err)?;
@@ -1087,17 +1105,23 @@ pub fn compile_probe_kernel_tiled() -> BoltResult<String> {
     writeln!(p, "\tadd.s64 %rd10, %rd4, %rd9;").map_err(write_err)?;
     writeln!(p, "\tld.global.u32 %r9, [%rd10];").map_err(write_err)?;
 
-    // atom.add on counter: claim slot.
+    // atom.add on counter: claim slot. u64 counter (see kernel doc) — must not
+    // wrap under > u32::MAX matches in one launch. Widen out_capacity (%r22) to
+    // %rl8 for 64-bit counter comparisons.
     writeln!(p, "\tld.param.u64 %rd11, [{entry}_param_5];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd11, %rd11;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r10, 1;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r11, [%rd11], %r10;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u64.u32 %rl8, %r22;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rl10, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u64 %rl11, [%rd11], %rl10;").map_err(write_err)?;
 
-    // If r11 (claimed slot) >= out_capacity, skip the writes — same overflow
+    // If rl11 (claimed slot) >= out_capacity, skip the writes — same overflow
     // semantics as the single-load probe (counter keeps climbing so host can
-    // detect overflow and re-launch with a bigger output buffer).
-    writeln!(p, "\tsetp.ge.u32 %p4, %r11, %r22;").map_err(write_err)?;
+    // detect overflow and re-launch with a bigger output buffer). 64-bit
+    // compare; below the gate the index is < out_capacity < 2^32 so the
+    // narrow to %r11 is exact.
+    writeln!(p, "\tsetp.ge.u64 %p4, %rl11, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r11, %rl11;").map_err(write_err)?;
 
     // out_probe_idx[claimed] = tid.
     writeln!(p, "\tld.param.u64 %rd12, [{entry}_param_3];").map_err(write_err)?;
@@ -1316,7 +1340,7 @@ pub fn compile_build_collision_kernel() -> BoltResult<String> {
 ///     .param .u64 next_idx_ptr,      // u32, length build_n_rows
 ///     .param .u64 out_probe_idx_ptr, // u32, length out_capacity
 ///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
-///     .param .u64 out_counter_ptr,   // u32, single counter (init=0)
+///     .param .u64 out_counter_ptr,   // u64, single counter (init=0)
 ///     .param .u64 matched_ptr,       // u32, ceil(build_n_rows/32) words (= ceil(build_n_rows/8) bytes) — may be 0
 ///     .param .u32 n_probe,
 ///     .param .u32 cap,
@@ -1451,24 +1475,33 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
     writeln!(p, "\tsetp.ge.u32 %p4, %r25, %r24;").map_err(write_err)?;
     writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
 
-    // Atomic claim an output index. Speculative ld.acquire pre-check first:
-    // if the counter is already at or past out_capacity, skip the atom.add
-    // entirely so contending threads don't all serialize on the counter
-    // cacheline. We bail to DONE on a confirmed overflow — the host will
-    // re-launch with a larger output buffer (counter > out_capacity is the
-    // only signal it needs; the exact overflow magnitude isn't required).
-    // Correctness: a thread that races past this pre-check (e.g. sees a
-    // stale low counter) still bounds-checks the atom.add's pre-increment
-    // return against out_capacity below, so we still never write past the
-    // end of the output buffers.
-    writeln!(p, "\tld.acquire.gpu.u32 %r33, [%rd18];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p7, %r33, %r23;").map_err(write_err)?;
+    // Atomic claim an output index. The counter is a u64 (see kernel doc):
+    // a duplicate-key fan-out can claim > u32::MAX indices in one launch, so a
+    // u32 counter would wrap and hand the host a small, plausible count →
+    // silent truncation. out_capacity (%r23) is u32; widen it to %rl8 for the
+    // 64-bit counter comparisons.
+    //
+    // Speculative ld.acquire pre-check first: if the counter is already at or
+    // past out_capacity, skip the atom.add entirely so contending threads
+    // don't all serialize on the counter cacheline. We bail to DONE on a
+    // confirmed overflow — the host will re-launch with a larger output buffer
+    // (counter > out_capacity is the only signal it needs; the exact overflow
+    // magnitude isn't required). Correctness: a thread that races past this
+    // pre-check (e.g. sees a stale low counter) still bounds-checks the
+    // atom.add's pre-increment return against out_capacity below, so we still
+    // never write past the end of the output buffers.
+    writeln!(p, "\tcvt.u64.u32 %rl8, %r23;").map_err(write_err)?;
+    writeln!(p, "\tld.acquire.gpu.u64 %rl9, [%rd18];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u64 %p7, %rl9, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p7 bra DONE;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r26, 1;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r27, [%rd18], %r26;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rl10, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u64 %rl11, [%rd18], %rl10;").map_err(write_err)?;
     // Skip stores on overflow but keep counter climbing so host can detect.
-    writeln!(p, "\tsetp.ge.u32 %p5, %r27, %r23;").map_err(write_err)?;
+    // 64-bit compare; below the gate the index is < out_capacity < 2^32 so the
+    // narrow to %r27 is exact.
+    writeln!(p, "\tsetp.ge.u64 %p5, %rl11, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p5 bra ADVANCE;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r27, %rl11;").map_err(write_err)?;
 
     // out_probe_idx[claimed] = tid (%r3).
     writeln!(p, "\tmul.wide.u32 %rd22, %r27, 4;").map_err(write_err)?;
@@ -1523,11 +1556,18 @@ pub fn compile_probe_collision_kernel() -> BoltResult<String> {
 /// .visible .entry bolt_hash_join_emit_unmatched_build(
 ///     .param .u64 matched_ptr,       // u32, ceil(build_n_rows/32) words (= ceil(build_n_rows/8) bytes)
 ///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
-///     .param .u64 out_counter_ptr,   // u32, single counter (init=0)
+///     .param .u64 out_counter_ptr,   // u64, single counter (init=0)
 ///     .param .u32 build_n_rows,
 ///     .param .u32 out_capacity
 /// )
 /// ```
+///
+/// The counter is a **u64** for ABI symmetry with the probe kernels' shared
+/// `out_counter_dev: GpuVec<u64>` buffer. This kernel's counter can never
+/// actually exceed `out_capacity == build_n_rows` (one thread per build row,
+/// each claiming at most one slot), but the device buffer is 8 bytes wide, so
+/// the atomic and readback must be 64-bit or the host would read a u64 whose
+/// upper word is uninitialised garbage.
 pub fn compile_unmatched_build_kernel() -> BoltResult<String> {
     let mut p = String::new();
     writeln!(p, "{PTX_VERSION}").map_err(write_err)?;
@@ -1574,22 +1614,28 @@ pub fn compile_unmatched_build_kernel() -> BoltResult<String> {
     writeln!(p, "\tsetp.ne.u32 %p1, %r9, 0;").map_err(write_err)?;
     writeln!(p, "\t@%p1 bra DONE;").map_err(write_err)?;
 
-    // Claim a slot. Speculative ld.acquire pre-check: if the counter is
-    // already past out_capacity, skip the atom.add entirely so contending
-    // threads don't all serialize on the counter cacheline. Correctness:
-    // the post-atomic setp.ge.u32 below still bounds-checks the returned
-    // (pre-increment) index, so a thread that races past the pre-check is
-    // still safe.
+    // Claim a slot. The counter is a u64 (see kernel doc) for ABI symmetry
+    // with the probe kernels' shared 8-byte counter buffer; widen out_capacity
+    // (%r12) to %rd9 so the comparisons run at 64-bit width. Speculative
+    // ld.acquire pre-check: if the counter is already past out_capacity, skip
+    // the atom.add entirely so contending threads don't all serialize on the
+    // counter cacheline. Correctness: the post-atomic setp.ge.u64 below still
+    // bounds-checks the returned (pre-increment) index, so a thread that races
+    // past the pre-check is still safe.
     writeln!(p, "\tld.param.u64 %rd3, [{entry}_param_2];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd3, %rd3;").map_err(write_err)?;
     writeln!(p, "\tld.param.u32 %r12, [{entry}_param_4];").map_err(write_err)?;
-    writeln!(p, "\tld.acquire.gpu.u32 %r13, [%rd3];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p3, %r13, %r12;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u64.u32 %rd9, %r12;").map_err(write_err)?;
+    writeln!(p, "\tld.acquire.gpu.u64 %rd10, [%rd3];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u64 %p3, %rd10, %rd9;").map_err(write_err)?;
     writeln!(p, "\t@%p3 bra DONE;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r10, 1;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r11, [%rd3], %r10;").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p2, %r11, %r12;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rd11, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u64 %rd12, [%rd3], %rd11;").map_err(write_err)?;
+    // 64-bit bounds check; below the gate the index is < out_capacity < 2^32
+    // so narrowing to %r11 is exact.
+    writeln!(p, "\tsetp.ge.u64 %p2, %rd12, %rd9;").map_err(write_err)?;
     writeln!(p, "\t@%p2 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r11, %rd12;").map_err(write_err)?;
 
     writeln!(p, "\tld.param.u64 %rd4, [{entry}_param_1];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd4, %rd4;").map_err(write_err)?;
@@ -1692,7 +1738,7 @@ pub fn compile_cross_kernel() -> BoltResult<String> {
 ///     .param .u64 slots_ptr,         // [u8; cap * 16] AoS slots
 ///     .param .u64 out_probe_idx_ptr, // u32, length out_capacity
 ///     .param .u64 out_build_idx_ptr, // u32, length out_capacity
-///     .param .u64 out_counter_ptr,   // u32, single counter
+///     .param .u64 out_counter_ptr,   // u64, single counter
 ///     .param .u32 n_probe,
 ///     .param .u32 cap,
 ///     .param .u32 out_capacity
@@ -1801,20 +1847,28 @@ pub fn compile_probe_aos_kernel() -> BoltResult<String> {
     writeln!(p, "\tbra PROBE_LOOP;").map_err(write_err)?;
 
     writeln!(p, "MATCH:").map_err(write_err)?;
-    // atom.add on counter. Speculative ld.acquire pre-check: if the counter
-    // is already past out_capacity, skip the atom.add to avoid serializing
-    // matching threads on a hot cacheline. The post-atomic setp.ge.u32
-    // below still bounds-checks the returned (pre-increment) index, so the
-    // pre-check is purely additive and overflow can never bypass the guard.
+    // atom.add on counter. u64 counter (see kernel doc): a single launch can
+    // claim > u32::MAX indices under skew, so a u32 counter would wrap mid-
+    // overflow and silently truncate the join output. out_capacity (%r22) is a
+    // u32 param; widen it to %rl8 for the 64-bit counter comparisons.
+    // Speculative ld.acquire pre-check: if the counter is already past
+    // out_capacity, skip the atom.add to avoid serializing matching threads on
+    // a hot cacheline. The post-atomic setp.ge.u64 below still bounds-checks
+    // the returned (pre-increment) index, so the pre-check is purely additive
+    // and overflow can never bypass the guard.
     writeln!(p, "\tld.param.u64 %rd8, [{entry}_param_4];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd8, %rd8;").map_err(write_err)?;
-    writeln!(p, "\tld.acquire.gpu.u32 %r13, [%rd8];").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p5, %r13, %r22;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u64.u32 %rl8, %r22;").map_err(write_err)?;
+    writeln!(p, "\tld.acquire.gpu.u64 %rl9, [%rd8];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u64 %p5, %rl9, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p5 bra DONE;").map_err(write_err)?;
-    writeln!(p, "\tmov.u32 %r11, 1;").map_err(write_err)?;
-    writeln!(p, "\tatom.global.add.u32 %r12, [%rd8], %r11;").map_err(write_err)?;
-    writeln!(p, "\tsetp.ge.u32 %p4, %r12, %r22;").map_err(write_err)?;
+    writeln!(p, "\tmov.u64 %rl10, 1;").map_err(write_err)?;
+    writeln!(p, "\tatom.global.add.u64 %rl11, [%rd8], %rl10;").map_err(write_err)?;
+    // 64-bit bounds check; below the gate the index is < out_capacity < 2^32
+    // so the narrow to %r12 is exact.
+    writeln!(p, "\tsetp.ge.u64 %p4, %rl11, %rl8;").map_err(write_err)?;
     writeln!(p, "\t@%p4 bra DONE;").map_err(write_err)?;
+    writeln!(p, "\tcvt.u32.u64 %r12, %rl11;").map_err(write_err)?;
 
     // out_probe_idx[claimed] = tid (%r3)
     writeln!(p, "\tld.param.u64 %rd9, [{entry}_param_2];").map_err(write_err)?;
@@ -2436,26 +2490,36 @@ mod tests {
     #[test]
     fn probe_ptx_uses_atom_add_for_output_counter() {
         let ptx = compile_probe_kernel().unwrap();
+        // The output match counter is a u64 (W16: a single high-skew launch can
+        // claim > u32::MAX indices; a u32 atomic would wrap and silently
+        // truncate the join). The counter atomic MUST be 64-bit, and the
+        // narrower u32 atomic MUST NOT appear (the only atomic in this kernel
+        // is the counter).
         assert!(
-            ptx.contains("atom.global.add.u32"),
-            "probe kernel must use atom.global.add.u32 for output counter; got:\n{ptx}"
+            ptx.contains("atom.global.add.u64"),
+            "probe kernel must use atom.global.add.u64 for output counter; got:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("atom.global.add.u32"),
+            "probe kernel must NOT use a u32 counter atomic (overflow wrap); got:\n{ptx}"
         );
     }
 
     /// Probe kernel must guard against output-buffer overflow before storing.
-    /// The guard is `setp.ge.u32 ..., claimed, out_capacity` — if the
+    /// The guard is `setp.ge.u64 ..., claimed, out_capacity` — if the
     /// returned counter value is >= out_capacity, the writes must be
-    /// skipped.
+    /// skipped. W16: the comparison is 64-bit (the counter is u64 and
+    /// out_capacity is widened to 64-bit) so an overflowed counter past 2^32
+    /// can never alias a small in-range claimed index.
     #[test]
     fn probe_ptx_guards_against_output_overflow() {
         let ptx = compile_probe_kernel().unwrap();
-        // The kernel must compare the claimed slot against out_capacity. The
-        // exact register pairing comes out as `setp.ge.u32 %p4, %r11, %r22;`
-        // in the current emit; we test the shape, not the register pairing,
-        // so allocator tweaks don't break the test.
+        // The kernel must compare the claimed slot against out_capacity at
+        // 64-bit width. We test the shape, not the register pairing, so
+        // allocator tweaks don't break the test.
         assert!(
-            ptx.contains("setp.ge.u32"),
-            "probe kernel must guard claimed >= out_capacity; got:\n{ptx}"
+            ptx.contains("setp.ge.u64"),
+            "probe kernel must guard claimed >= out_capacity at 64-bit width; got:\n{ptx}"
         );
     }
 
@@ -2608,8 +2672,12 @@ mod tests {
         assert!(ptx.contains("and.b32"));
         // Branches around the store when matched != 0.
         assert!(ptx.contains("setp.ne.u32"));
-        // Atomic counter for output slot claim.
-        assert!(ptx.contains("atom.global.add.u32"));
+        // Atomic counter for output slot claim — u64 for ABI symmetry with the
+        // probe kernels' shared 8-byte counter buffer (W16). The u32 atomic
+        // must be gone so the host never reads an 8-byte counter whose upper
+        // word the kernel left uninitialised.
+        assert!(ptx.contains("atom.global.add.u64"));
+        assert!(!ptx.contains("atom.global.add.u32"));
         // Emits exactly one u32 store (the build row index).
         let n_st = ptx.matches("st.global.u32").count();
         assert_eq!(
@@ -2757,9 +2825,14 @@ mod tests {
     #[test]
     fn probe_aos_ptx_uses_atom_add_for_counter() {
         let ptx = compile_probe_aos_kernel().unwrap();
+        // u64 counter (W16) — same overflow-safety contract as the SoA probe.
         assert!(
-            ptx.contains("atom.global.add.u32"),
-            "AoS probe must use atom.global.add.u32 for the output counter\n{ptx}"
+            ptx.contains("atom.global.add.u64"),
+            "AoS probe must use atom.global.add.u64 for the output counter\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("atom.global.add.u32"),
+            "AoS probe must NOT use a u32 counter atomic (overflow wrap)\n{ptx}"
         );
     }
 
@@ -2984,9 +3057,15 @@ mod tests {
     #[test]
     fn probe_tiled_ptx_uses_atom_add_for_output_counter() {
         let ptx = compile_probe_kernel_tiled().unwrap();
+        // u64 counter (W16) — same overflow-safety contract as the single-load
+        // probe (whose ABI the tiled probe shares byte-for-byte).
         assert!(
-            ptx.contains("atom.global.add.u32"),
-            "tiled probe must use atom.global.add.u32 for output counter; got:\n{ptx}"
+            ptx.contains("atom.global.add.u64"),
+            "tiled probe must use atom.global.add.u64 for output counter; got:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("atom.global.add.u32"),
+            "tiled probe must NOT use a u32 counter atomic (overflow wrap); got:\n{ptx}"
         );
     }
 
@@ -3175,5 +3254,50 @@ mod tests {
             !probe_aos.contains("ld.acquire.gpu.s64"),
             "AoS probe kernel must not emit slot-claim speculative pre-check\n{probe_aos}"
         );
+    }
+
+    /// W16 — every kernel that increments the per-launch output match counter
+    /// MUST do so with a 64-bit atomic. A u32 counter wraps when one launch
+    /// produces > 2^32 matches (extreme join skew), handing the host a small
+    /// plausible count and silently truncating the join output. This test pins
+    /// the widened atomic across all five counter-bearing emitters and asserts
+    /// the narrow u32 counter atomic is gone from every one.
+    ///
+    /// Note: `compile_probe_collision_kernel` legitimately keeps an
+    /// `atom.global.or.b32` for the per-build-row *matched bitmap* — that is a
+    /// different atomic and is intentionally NOT widened (it ORs a 1-bit flag
+    /// into a 32-bit word). We assert only that the `add.u32` *counter* variant
+    /// is absent, which leaves the `or.b32` bitmap atomic untouched.
+    #[test]
+    fn all_output_counters_are_u64() {
+        let counter_kernels: [(&str, String); 5] = [
+            ("probe", compile_probe_kernel().unwrap()),
+            ("probe_tiled", compile_probe_kernel_tiled().unwrap()),
+            ("probe_collision", compile_probe_collision_kernel().unwrap()),
+            ("probe_aos", compile_probe_aos_kernel().unwrap()),
+            ("unmatched_build", compile_unmatched_build_kernel().unwrap()),
+        ];
+        for (name, ptx) in &counter_kernels {
+            assert!(
+                ptx.contains("atom.global.add.u64"),
+                "{name}: output match counter must use atom.global.add.u64; got:\n{ptx}"
+            );
+            assert!(
+                !ptx.contains("atom.global.add.u32"),
+                "{name}: u32 counter atomic must be gone (overflow wrap); got:\n{ptx}"
+            );
+            // The speculative counter pre-check load must also be 64-bit so a
+            // counter already past 2^32 isn't read as a small u32.
+            assert!(
+                ptx.contains("ld.acquire.gpu.u64"),
+                "{name}: speculative counter pre-check must be a 64-bit load; got:\n{ptx}"
+            );
+            // The counter-vs-capacity comparisons must be 64-bit so an
+            // overflowed counter never aliases a small in-range index.
+            assert!(
+                ptx.contains("setp.ge.u64"),
+                "{name}: counter bounds-check must compare at 64-bit width; got:\n{ptx}"
+            );
+        }
     }
 }
