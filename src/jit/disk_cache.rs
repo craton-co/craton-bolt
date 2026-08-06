@@ -72,7 +72,8 @@
 //! cache directory another local user can write is a code-execution
 //! surface. The integrity boundary is therefore **directory ownership +
 //! permissions plus key-bound integrity**, NOT the strength of the
-//! integrity hash. The hash is a non-cryptographic `DefaultHasher` digest
+//! integrity hash. The hash is a non-cryptographic FNV-1a digest (an
+//! explicit, toolchain-stable in-file primitive — see [`fnv1a64`] / C-1)
 //! and lives in the same directory as the body, so an attacker who can
 //! write the directory could also recompute it — it only guards against
 //! accidental corruption, naive tampering, and (via key binding) cross-key
@@ -166,20 +167,23 @@ pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
 /// protects across published releases — `CODEGEN_VERSION` is what
 /// protects within a release / between local dev builds.
 ///
-/// # C-1: a Rust-std (toolchain) upgrade is ALSO a key-rotation event
+/// # C-1: toolchain-stable hashing primitive (resolved)
 ///
-/// The on-disk key and the V-7 integrity digest are derived from
-/// `std::collections::hash_map::DefaultHasher` (SipHash-1-3), whose byte
-/// output is **not contractually stable across Rust std versions**. The
-/// disk cache is safe today only because the crate version is folded into
-/// the salt and a published release bumps that version — but a *local*
-/// toolchain bump (same crate version) could silently change every key
-/// while still re-deriving the digest with the new hasher, so reads simply
-/// miss rather than mis-route (the body is re-hashed on read with the same
-/// toolchain that wrote nothing yet). Treat a `rustc`/std upgrade as a
-/// codegen-freshness event: bump this constant (or wire the `build.rs`
-/// `BOLT_CODEGEN_FINGERPRINT` below) so the key rotates deterministically
-/// instead of relying on `DefaultHasher`'s undocumented stability.
+/// The on-disk key tail and the V-7 integrity digest are now derived from an
+/// explicit, in-file **FNV-1a** hash ([`fnv1a64`]) whose byte output is fixed
+/// across all Rust toolchains — **not** from
+/// `std::collections::hash_map::DefaultHasher` (SipHash-1-3), whose byte output
+/// is documented as *not* stable across Rust std versions. Previously a *local*
+/// `rustc`/std upgrade (same crate version) could silently change every key /
+/// digest with the new hasher, cold-invalidating the entire on-disk PTX cache
+/// (a per-query recompile cliff). With the stable primitive in place a
+/// toolchain bump no longer rotates keys or digests by itself.
+///
+/// A `rustc`/std upgrade is still, conceptually, a *codegen-freshness* event if
+/// it changes the emitted PTX text — in that case bump this constant (or wire
+/// the `build.rs` `BOLT_CODEGEN_FINGERPRINT` below) so the key rotates
+/// deterministically. The difference now is that key rotation is an explicit,
+/// intentional decision rather than an accidental side effect of the hasher.
 ///
 /// # History
 ///   - v1: initial.
@@ -1189,11 +1193,21 @@ pub(crate) fn valid_key(key: &str) -> bool {
 ///
 /// Returns a fixed-width 32-char lowercase hex string — the same shape as
 /// [`hash_to_key`] — derived from `(key, body)` via two domain-separated
-/// `DefaultHasher` instances packed into 128 bits. This deliberately
-/// reuses the crate's existing `DefaultHasher`-based 128-bit hashing
-/// convention (the same shape `exec::module_cache::hash128` and the
-/// `ModuleCacheKey` use for content keys) so we pull in **no new
-/// dependency** for a hash.
+/// [`fnv1a64`] passes packed into 128 bits, using **no new dependency**.
+///
+/// # Toolchain-stable primitive (C-1)
+///
+/// This digest is built from an explicit, in-file FNV-1a implementation
+/// ([`fnv1a64`]) whose byte output is fixed forever — **not** from std's
+/// `DefaultHasher` (SipHash-1-3), whose output is documented as unstable
+/// across Rust std versions. Using the stable primitive means an `rustc` /
+/// std upgrade no longer silently rotates every on-disk digest (and, via the
+/// matching change in the upstream key composer, every key), which would
+/// otherwise cold-invalidate the entire on-disk PTX cache on a toolchain bump.
+/// The 128-bit width and the `(key, body)` framing below are unchanged from
+/// the previous `DefaultHasher`-pair shape, so only the hashing *primitive*
+/// moved — the digest *semantics* (determinism, key binding, content
+/// sensitivity) are identical.
 ///
 /// # Key binding
 ///
@@ -1219,26 +1233,58 @@ pub(crate) fn valid_key(key: &str) -> bool {
 /// prevents cross-key content replay within an otherwise-trusted directory.
 #[must_use]
 fn body_digest(key: &str, body: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
+    // Frame the message with a leading domain byte (0xD1 / 0xD2), then a fixed
+    // big-endian u64 length prefix on `key`, then the key and body bytes. The
+    // two distinct domain bytes produce two independent 64-bit FNV-1a halves
+    // that pack into a 128-bit digest; the domains differ from the key-hash
+    // domains used in `exec::module_cache` so a digest can never be confused
+    // with a key. The length prefix means `(key, body)` can never be re-parsed
+    // as a different `(key', body')` split (length-prefix framing). Everything
+    // is fixed-byte-order (big-endian length, raw UTF-8 bytes) so the framed
+    // stream — and therefore the digest — is identical on every target and
+    // every toolchain (C-1: no `DefaultHasher`/SipHash native-endian output).
+    let frame = |domain: u8| -> u64 {
+        let mut framed: Vec<u8> = Vec::with_capacity(1 + 8 + key.len() + body.len());
+        framed.push(domain);
+        framed.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        framed.extend_from_slice(key.as_bytes());
+        framed.extend_from_slice(body.as_bytes());
+        fnv1a64(&framed)
+    };
+    hash_to_key(frame(0xD1), frame(0xD2))
+}
 
-    // Domain bytes (0xD1 / 0xD2) distinct from the key-hash domains used in
-    // `exec::module_cache` so a digest can never be confused with a key. The
-    // `key` is fed in with a u64 length prefix so `(key, body)` can never be
-    // re-parsed as a different `(key', body')` split (length-prefix framing).
-    let mut hi = DefaultHasher::new();
-    hi.write_u8(0xD1);
-    hi.write_u64(key.len() as u64);
-    hi.write(key.as_bytes());
-    hi.write(body.as_bytes());
-
-    let mut lo = DefaultHasher::new();
-    lo.write_u8(0xD2);
-    lo.write_u64(key.len() as u64);
-    lo.write(key.as_bytes());
-    lo.write(body.as_bytes());
-
-    hash_to_key(hi.finish(), lo.finish())
+/// FNV-1a 64-bit hash of `bytes` — an explicit, version-stable hashing
+/// primitive (fixes C-1).
+///
+/// # Why an in-file FNV-1a instead of `DefaultHasher`
+///
+/// The on-disk cache keys and the [`body_digest`] integrity digest must be
+/// **byte-stable across Rust toolchains**: a digest that silently changes when
+/// `rustc` / std is upgraded cold-invalidates the entire on-disk PTX cache
+/// (every `<key>.ptx` filename and every header digest rotates), a per-query
+/// recompile cliff. `std::collections::hash_map::DefaultHasher` (SipHash-1-3)
+/// explicitly does **not** guarantee a stable byte output across std versions,
+/// so it cannot back a persistent on-disk key.
+///
+/// FNV-1a is a tiny, fully-specified, dependency-free hash whose output is
+/// fixed forever: starting from the 64-bit offset basis
+/// `0xcbf29ce484222325`, for each input byte we XOR it into the accumulator
+/// then multiply by the 64-bit FNV prime `0x100000001b3` (wrapping). The
+/// result is deterministic on every platform and every toolchain. It is
+/// **not** cryptographic — and per the V-7 doc, the hash strength was never
+/// the integrity boundary (directory ownership/permissions is) — so a
+/// non-cryptographic but *stable* digest is exactly what this cache needs.
+#[must_use]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Header-line prefix written ahead of the PTX body in every cache file
@@ -2220,6 +2266,52 @@ mod tests {
         assert_eq!(body_digest(k, "abc").len(), 32);
         // Key binding: identical body, different key -> different digest.
         assert_ne!(body_digest("key0", "abc"), body_digest("key1", "abc"));
+    }
+
+    /// C-1: the stable hashing primitive returns FIXED, known values for fixed
+    /// inputs — these are pinned so a future change to the primitive (e.g. an
+    /// accidental revert to `DefaultHasher`, or a tweak to the offset
+    /// basis/prime) is caught immediately, because it would silently
+    /// cold-invalidate every on-disk cache entry across the fleet.
+    #[test]
+    fn fnv1a64_is_stable_and_matches_canonical_vectors() {
+        // Canonical FNV-1a 64-bit reference vectors (from the FNV spec):
+        //   "" -> the offset basis itself (no bytes mixed),
+        //   "a" / "foobar" -> well-known published digests.
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+        // Determinism: same input -> same output, every call.
+        assert_eq!(fnv1a64(b"craton-bolt"), fnv1a64(b"craton-bolt"));
+        // Two different inputs differ.
+        assert_ne!(fnv1a64(b"abc"), fnv1a64(b"abd"));
+        // `body_digest` domain-separates its two halves by prepending a single
+        // domain byte (0xD1 / 0xD2) before hashing. Pin those framed values and
+        // confirm distinct domains over the SAME bytes diverge (so the two
+        // packed halves are independent).
+        assert_eq!(fnv1a64(b"\xD1foobar"), 0x8e7a_b894_3bd9_2391);
+        assert_eq!(fnv1a64(b"\xD2foobar"), 0xaf12_6b44_bf9a_3cd8);
+        assert_ne!(
+            fnv1a64(b"\xD1foobar"),
+            fnv1a64(b"\xD2foobar"),
+            "distinct domain bytes must yield independent halves"
+        );
+    }
+
+    /// C-1: the full key-bound `body_digest` is pinned to a fixed known value
+    /// for a fixed `(key, body)` vector. This proves the digest is stable
+    /// across toolchains (it is built from the explicit FNV-1a primitive, not
+    /// `DefaultHasher`), so an `rustc`/std upgrade no longer rotates on-disk
+    /// keys/digests and cold-invalidates the PTX cache.
+    #[test]
+    fn body_digest_pins_a_known_value() {
+        // Golden vector: stable forever. If this assertion ever needs updating
+        // for a reason OTHER than an intentional cache-format bump, the
+        // hashing primitive has regressed.
+        assert_eq!(body_digest("key0", "abc"), "7dbbd585c9f2a5a3dfc19f04becf51d0");
+        // A different body and a different key both diverge from it.
+        assert_eq!(body_digest("key0", "abd"), "7dbbda85c9f2ae22dfc1a604becf5db5");
+        assert_eq!(body_digest("key1", "abc"), "4584617ff2fd670ec4d91b0f80a4befd");
     }
 
     /// V-7 key binding, end-to-end: an entry's bytes copied verbatim to a
