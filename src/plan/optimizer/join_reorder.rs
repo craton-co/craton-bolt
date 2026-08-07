@@ -254,6 +254,19 @@ impl JoinReorder {
     /// `plan`. Returns `None` (caller keeps the original) when the chain isn't
     /// reorderable or any leaf lacks an estimate.
     fn try_reorder_chain(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        // Snapshot the ORIGINAL chain's combined-output field-NAME sequence
+        // before we touch anything. `join_combined_schema` renames a right-
+        // side column whose name collides with a left-side name (`right.x`,
+        // then `__2`, `__3`, ...), and *which* column gets renamed depends on
+        // the join shape/order — exactly what this pass changes. A parent
+        // `Project` (or any expr) that references such a renamed column would,
+        // after reorder, bind to a different leaf's column or dangle. So we
+        // require the rebuilt plan to reproduce this exact name sequence
+        // positionally (see the guard at the end of the function); if it
+        // can't, we abort the reorder for this subtree. A type-check failure
+        // here yields `None` and stays a no-op.
+        let original_names = field_name_sequence(plan)?;
+
         let mut leaves: Vec<LogicalPlan> = Vec::new();
         let mut equi_pairs: Vec<(Expr, Expr)> = Vec::new();
         if !flatten_chain(plan, &mut leaves, &mut equi_pairs) {
@@ -292,10 +305,37 @@ impl JoinReorder {
 
         // Cost-based enumeration: pick the cheapest (possibly bushy) join shape.
         let model = CardModel::new(leaf_rows, &edges);
-        let plan = optimize(&model)?;
+        let optimized = optimize(&model)?;
 
-        rebuild_from_shape(&plan.shape, &leaves, &equi_pairs)
+        let rebuilt = rebuild_from_shape(&optimized.shape, &leaves, &equi_pairs)?;
+
+        // Combined-schema name guard. The reorder preserves the leaf *set*, so
+        // the multiset of underlying columns is unchanged — but the renaming
+        // `join_combined_schema` applies to duplicate non-key column names is
+        // shape-dependent, so the rebuilt top join may expose a DIFFERENT
+        // field-name sequence than the original (a renamed column landing in a
+        // different position, or a previously-bare name now suffixed). Any
+        // parent expr binding by name would then silently bind to the wrong
+        // leaf's column or dangle. A *set* comparison is insufficient here:
+        // renames must line up positionally. If the rebuilt sequence does not
+        // match the original positionally, abort and keep the original plan.
+        let rebuilt_names = field_name_sequence(&rebuilt)?;
+        if rebuilt_names != original_names {
+            return None;
+        }
+
+        Some(rebuilt)
     }
+}
+
+/// The combined-output field-NAME sequence of `plan` (positional, including the
+/// shape-dependent collision renames `join_combined_schema` applies). Returns
+/// `None` on a type-check failure, which the caller treats as a reason to stay
+/// a conservative no-op.
+fn field_name_sequence(plan: &LogicalPlan) -> Option<Vec<String>> {
+    plan.schema()
+        .ok()
+        .map(|s| s.fields.into_iter().map(|f| f.name).collect())
 }
 
 /// Resolve the single leaf index whose output columns contain *every* column
