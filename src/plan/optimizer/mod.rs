@@ -131,7 +131,10 @@ pub fn default_passes_with_estimator(
 ///
 /// "Changed" is detected with the plan's `{:?}` rendering — a cheap structural
 /// signal that needs no extra machinery on [`PlanRewrite`] and exactly tracks
-/// the only thing that matters here (did any node change?). The hard iteration
+/// the only thing that matters here (did any node change?). To avoid rendering
+/// the plan twice per sweep, each sweep's "after" rendering is carried forward
+/// as the next sweep's "before", so the loop renders the plan only once per
+/// sweep (plus one initial render). The hard iteration
 /// cap guarantees termination even if some pass were to oscillate. The set and
 /// order of `passes` is never altered — only the iteration is added — and every
 /// pass is individually semantics-preserving, so this can only ever fold/push
@@ -144,15 +147,26 @@ pub fn run_to_fixpoint(
     plan: LogicalPlan,
 ) -> BoltResult<LogicalPlan> {
     let mut plan = plan;
+    // The change signal is still the plan's `{:?}` rendering, but we render the
+    // plan at most ONCE per sweep instead of twice: this sweep's "after" string
+    // becomes the next sweep's "before", so an N-sweep run does N+1 renders
+    // rather than 2N. (A per-pass `changed: bool` would be cheaper still, but
+    // `PlanRewrite::rewrite` — defined in the public `rewrite.rs`, which this
+    // change must not touch — returns only the rewritten plan with no way to
+    // report whether it modified anything, so the whole-plan comparison is the
+    // only signal available from here. Behaviour is identical: same fixpoint,
+    // same iteration count, just fewer allocations.)
+    let mut before = format!("{plan:?}");
     for _ in 0..MAX_FIXPOINT_ITERS {
-        let before = format!("{plan:?}");
         for pass in passes {
             plan = pass.rewrite(plan)?;
         }
+        let after = format!("{plan:?}");
         // Fixpoint reached: a full sweep left the plan structurally identical.
-        if format!("{plan:?}") == before {
+        if after == before {
             break;
         }
+        before = after;
     }
     Ok(plan)
 }
