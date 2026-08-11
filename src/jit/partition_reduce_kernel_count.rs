@@ -253,9 +253,7 @@ pub(crate) fn emit_count_kernel(
         // param (index 5) lands one register lower than the SUM kernel's `%rd9`.
         // Golden snapshots regenerate downstream to absorb the new null-check
         // bytes (`setp.eq.u64 %p5` / `@%p5 bra LOOP_NEXT`).
-        super::partition_reduce_kernel_spill_common::emit_spill_bump_with_null_check(
-            &mut ptx, 8,
-        )?;
+        super::partition_reduce_kernel_spill_common::emit_spill_bump_with_null_check(&mut ptx, 8)?;
         super::partition_reduce_kernel_spill_common::emit_loop_next_done(&mut ptx)?;
     } else {
         writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;

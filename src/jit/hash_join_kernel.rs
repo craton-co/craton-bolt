@@ -1111,6 +1111,15 @@ pub fn compile_probe_kernel_tiled() -> BoltResult<String> {
     writeln!(p, "\tld.param.u64 %rd11, [{entry}_param_5];").map_err(write_err)?;
     writeln!(p, "\tcvta.to.global.u64 %rd11, %rd11;").map_err(write_err)?;
     writeln!(p, "\tcvt.u64.u32 %rl8, %r22;").map_err(write_err)?;
+    // Speculative ld.acquire pre-check: if the counter is already at or past
+    // out_capacity, skip the atom.add entirely so contending threads don't all
+    // serialize on the counter cacheline. Correctness: the post-atomic
+    // setp.ge.u64 below still bounds-checks the returned index, so a thread
+    // that races past this pre-check (seeing a stale low counter) is still
+    // guarded against writing past the end of the output buffers.
+    writeln!(p, "\tld.acquire.gpu.u64 %rl9, [%rd11];").map_err(write_err)?;
+    writeln!(p, "\tsetp.ge.u64 %p7, %rl9, %rl8;").map_err(write_err)?;
+    writeln!(p, "\t@%p7 bra DONE;").map_err(write_err)?;
     writeln!(p, "\tmov.u64 %rl10, 1;").map_err(write_err)?;
     writeln!(p, "\tatom.global.add.u64 %rl11, [%rd11], %rl10;").map_err(write_err)?;
 

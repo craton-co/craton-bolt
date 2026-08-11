@@ -1,5 +1,6 @@
 ---
 source: tests/ptx_golden_partition_snapshots.rs
+assertion_line: 224
 expression: normalize_ptx(&ptx)
 ---
 .version 7.5
@@ -111,6 +112,8 @@ MATCH:
 	atom.shared.add.u64 %rd{25}, [%rd{23}], 1;
 	bra LOOP_NEXT;
 SPILL_BUMP:
+	setp.eq.u64 %p{6}, %rd{8}, 0;
+	@%p{6} bra LOOP_NEXT;
 	atom.global.add.u32 %r{11}, [%rd{8}], 1;
 LOOP_NEXT:
 	add.u32 %r{6}, %r{6}, %r{1};
@@ -121,8 +124,8 @@ LOOP_DONE:
 	mul.lo.u32 %r{13}, %r{0}, 1024;
 	mov.u32 %r{14}, %r{2};
 EXPORT_TOP:
-	setp.ge.u32 %p{6}, %r{14}, 1024;
-	@%p{6} bra EXPORT_DONE;
+	setp.ge.u32 %p{7}, %r{14}, 1024;
+	@%p{7} bra EXPORT_DONE;
 	add.u32 %r{15}, %r{13}, %r{14};
 	mul.wide.u32 %rd{26}, %r{14}, 4;
 	add.s64 %rd{27}, %rd{0}, %rd{26};
@@ -132,8 +135,8 @@ EXPORT_TOP:
 	ld.shared.u64 %rd{30}, [%rd{29}];
 	add.s64 %rd{31}, %rd{2}, %rd{26};
 	ld.shared.u32 %r{17}, [%rd{31}];
-	setp.ne.s32 %p{7}, %r{17}, 0;
-	selp.u32 %r{18}, 1, 0, %p{7};
+	setp.ne.s32 %p{4}, %r{17}, 0;
+	selp.u32 %r{18}, 1, 0, %p{4};
 	mul.wide.u32 %rd{32}, %r{15}, 4;
 	add.s64 %rd{33}, %rd{5}, %rd{32};
 	st.global.s32 [%rd{33}], %r{16};

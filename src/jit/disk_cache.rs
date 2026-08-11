@@ -2308,10 +2308,19 @@ mod tests {
         // Golden vector: stable forever. If this assertion ever needs updating
         // for a reason OTHER than an intentional cache-format bump, the
         // hashing primitive has regressed.
-        assert_eq!(body_digest("key0", "abc"), "7dbbd585c9f2a5a3dfc19f04becf51d0");
+        assert_eq!(
+            body_digest("key0", "abc"),
+            "7dbbd585c9f2a5a3dfc19f04becf51d0"
+        );
         // A different body and a different key both diverge from it.
-        assert_eq!(body_digest("key0", "abd"), "7dbbda85c9f2ae22dfc1a604becf5db5");
-        assert_eq!(body_digest("key1", "abc"), "4584617ff2fd670ec4d91b0f80a4befd");
+        assert_eq!(
+            body_digest("key0", "abd"),
+            "7dbbda85c9f2ae22dfc1a604becf5db5"
+        );
+        assert_eq!(
+            body_digest("key1", "abc"),
+            "4584617ff2fd670ec4d91b0f80a4befd"
+        );
     }
 
     /// V-7 key binding, end-to-end: an entry's bytes copied verbatim to a

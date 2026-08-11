@@ -55,10 +55,12 @@ fi
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
     # Use native Windows path (e.g., C:/craton/bolt)
     HOST_DIR="$(pwd -W)"
+    HOST_TMP_DIR="$(cd "$TMP_DIR" && pwd -W)"
     # Prevent Git Bash from changing /workspace to C:\Program Files\Git\workspace
     export MSYS_NO_PATHCONV=1
 else
     HOST_DIR="$PWD"
+    HOST_TMP_DIR="$TMP_DIR"
 fi
 
 # Common volume mounts (shared source + cargo registry).
@@ -82,15 +84,19 @@ echo "========================================"
     docker run --rm --cpus 2 \
         "${CACHE_COMMON[@]}" \
         -v "local-ci-target-tests:/target" \
+        -v "$HOST_TMP_DIR:/ci_tmp" \
         -e CARGO_TARGET_DIR=/target \
         local-ci-tests bash -c "
   set -ex
+  _step() { echo \"\$1\" > /ci_tmp/tests_failed_step; echo \">>> Running \$1\"; }
 
-  echo '>>> Running cargo test (lib + integration)'
+  _step 'cargo test (lib + integration)'
   cargo test --lib --tests --features cuda-stub --no-default-features
 
-  echo '>>> Running cargo test (doctests)'
+  _step 'cargo test (doctests)'
   cargo test --doc --features cuda-stub --no-default-features
+
+  rm -f /ci_tmp/tests_failed_step
 " 2>&1 | sed 's/^/[TESTS] /'
     echo "${PIPESTATUS[0]}" > "$TMP_DIR/tests.exit"
 ) &
@@ -102,44 +108,50 @@ TESTS_PID=$!
     docker run --rm --cpus 2 \
         "${CACHE_COMMON[@]}" \
         -v "local-ci-target-others:/target" \
+        -v "$HOST_TMP_DIR:/ci_tmp" \
         -e CARGO_TARGET_DIR=/target \
         local-ci-others bash -c "
   set -ex
+  _step() { echo \"\$1\" > /ci_tmp/others_failed_step; echo \">>> Running \$1\"; }
 
-  echo '>>> Running rustfmt check'
+  _step 'rustfmt check'
   cargo fmt --all -- --check
 
-  echo '>>> Running clippy (advisory, non-blocking)'
+  _step 'clippy (advisory)'
   cargo clippy --lib --tests --features cuda-stub --no-default-features || echo '⚠️ Clippy failed but is non-blocking'
 
-  echo '>>> Running cargo check (lib, strict)'
+  _step 'cargo check (lib, strict)'
   RUSTFLAGS='-D warnings' cargo check --lib --features cuda-stub --no-default-features
 
-  echo '>>> Running cargo check --features cudarc'
+  _step 'cargo check --features cudarc'
   cargo check --lib --features cudarc --no-default-features
 
-  echo '>>> Running feature build (flight + substrait)'
+  _step 'feature build (cuda-stub,flight)'
   cargo check --lib --tests --no-default-features --features cuda-stub,flight
+
+  _step 'feature build (cuda-stub,substrait)'
   cargo check --lib --tests --no-default-features --features cuda-stub,substrait
 
-  echo '>>> Running doc (docs.rs parity)'
+  _step 'cargo doc'
   cargo doc --no-default-features --features cuda-stub --no-deps
 
-  echo '>>> Running package (cargo publish --dry-run)'
+  _step 'cargo publish --dry-run'
   cargo publish --dry-run --allow-dirty --no-default-features --features cuda-stub
 
-  echo '>>> Running coverage (host, informational)'
+  _step 'cargo llvm-cov'
   cargo llvm-cov --no-default-features --features cuda-stub --lib --lcov --output-path lcov.info || echo '⚠️ Coverage failed but is non-blocking'
   cargo llvm-cov --no-default-features --features cuda-stub --lib --summary-only || true
 
-  echo '>>> Running cargo deny (licenses + bans, blocking)'
+  _step 'cargo deny (licenses + bans)'
   cargo deny check licenses bans
 
-  echo '>>> Running cargo deny (advisories, non-blocking)'
+  _step 'cargo deny (advisories)'
   cargo deny check advisories || echo '⚠️ cargo-deny advisories failed but is non-blocking'
 
-  echo '>>> Running cargo deny (all-features, informational)'
+  _step 'cargo deny (all-features)'
   cargo deny --all-features check advisories licenses bans || echo '⚠️ cargo-deny all-features failed but is non-blocking'
+
+  rm -f /ci_tmp/others_failed_step
 " 2>&1 | sed 's/^/[OTHERS] /'
     echo "${PIPESTATUS[0]}" > "$TMP_DIR/others.exit"
 ) &
@@ -161,12 +173,14 @@ echo "========================================"
 if [[ $TESTS_EXIT -eq 0 ]]; then
     echo " CONTAINER 1 (TESTS):  PASSED"
 else
-    echo " CONTAINER 1 (TESTS):  FAILED (exit $TESTS_EXIT)"
+    TESTS_FAILED_STEP=$(cat "$TMP_DIR/tests_failed_step" 2>/dev/null || echo "unknown step")
+    echo " CONTAINER 1 (TESTS):  FAILED (exit $TESTS_EXIT) — step: $TESTS_FAILED_STEP"
 fi
 if [[ $OTHERS_EXIT -eq 0 ]]; then
     echo " CONTAINER 2 (OTHERS): PASSED"
 else
-    echo " CONTAINER 2 (OTHERS): FAILED (exit $OTHERS_EXIT)"
+    OTHERS_FAILED_STEP=$(cat "$TMP_DIR/others_failed_step" 2>/dev/null || echo "unknown step")
+    echo " CONTAINER 2 (OTHERS): FAILED (exit $OTHERS_EXIT) — step: $OTHERS_FAILED_STEP"
 fi
 
 if [[ $TESTS_EXIT -ne 0 || $OTHERS_EXIT -ne 0 ]]; then

@@ -554,7 +554,13 @@ mod tests {
         let div = b(BinaryOp::Div, col("a"), col("b"));
         let e = b(BinaryOp::And, div, lit(false));
         assert!(
-            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::And, .. }),
+            matches!(
+                fold_expr(e),
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    ..
+                }
+            ),
             "x AND false must NOT fold when x can raise at runtime"
         );
     }
@@ -565,7 +571,13 @@ mod tests {
         let div = b(BinaryOp::Div, col("a"), col("b"));
         let e = b(BinaryOp::And, lit(false), div);
         assert!(
-            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::And, .. }),
+            matches!(
+                fold_expr(e),
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    ..
+                }
+            ),
             "false AND x must NOT fold when x can raise at runtime"
         );
     }
@@ -576,7 +588,13 @@ mod tests {
         let div = b(BinaryOp::Div, col("a"), col("b"));
         let e = b(BinaryOp::Or, div, lit(true));
         assert!(
-            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::Or, .. }),
+            matches!(
+                fold_expr(e),
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    ..
+                }
+            ),
             "x OR true must NOT fold when x can raise at runtime"
         );
     }
@@ -602,7 +620,13 @@ mod tests {
         let div = b(BinaryOp::Div, col("a"), col("b"));
         let e = b(BinaryOp::And, div, lit(true));
         assert!(
-            matches!(fold_expr(e), Expr::Binary { op: BinaryOp::Div, .. }),
+            matches!(
+                fold_expr(e),
+                Expr::Binary {
+                    op: BinaryOp::Div,
+                    ..
+                }
+            ),
             "x AND true should simplify to x even when x can raise"
         );
     }

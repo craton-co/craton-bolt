@@ -157,6 +157,10 @@ pub(crate) fn emit_spill_bump_with_null_check(
 /// i32-key COUNT spill path in `partition_reduce_kernel_count.rs`, which still
 /// needs migrating (its export-predicate allocation in that file must shift to
 /// `%p6`/`%p7` in the same change, so it is out of scope for this fix).
+#[expect(
+    dead_code,
+    reason = "i32-key COUNT spill path still needs migrating off this helper; see module-level doc"
+)]
 pub(crate) fn emit_spill_bump_unchecked(ptx: &mut String, rd_spill_idx: u32) -> BoltResult<()> {
     writeln!(ptx, "SPILL_BUMP:").map_err(write_err)?;
     writeln!(ptx, "\tatom.global.add.u32 %r36, [%rd{rd_spill_idx}], 1;").map_err(write_err)?;

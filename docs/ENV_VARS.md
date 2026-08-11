@@ -33,6 +33,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `CRATON_MAX_APPLY_ROWS`          | 100_000              | integer > 0 | LATERAL/correlated-apply left-row cap           |
 | `CRATON_VALUES_MAX_ROWS`         | 1_000_000            | integer > 0 | `VALUES` literal row cap                         |
 | `CRATON_GENERATE_SERIES_MAX_ROWS`| 10_000_000           | integer > 0 | `generate_series` output row cap                |
+| `CRATON_MAX_PAD_LEN`             | 1_048_576 (1 MiB)    | integer > 0 | Max output length for string-padding operations  |
 | `BOLT_POOL_STATS_INTERVAL_SECS`  | 60                   | seconds / 0 | Pool-stats log emit cadence (`0` disables)      |
 | `BOLT_POOL_WATCH_INTERVAL_SECS`  | 5                    | seconds     | Background watcher poll cadence                 |
 | `BOLT_POOL_WATCH_LOW_WATER_FRAC` | 0.10                 | `(0, 1)`    | Watcher proactive-evict threshold (free/total)  |
@@ -592,3 +593,21 @@ path in every case.
 - **Source**: `src/plan/sql_frontend.rs::generate_series_max_rows` (env var
   name constant `GENERATE_SERIES_MAX_ROWS_ENV`, line 2057; default constant
   `GENERATE_SERIES_MAX_ROWS`, line 2053).
+
+### `CRATON_MAX_PAD_LEN`
+- **Default**: `1_048_576` (1 MiB — i.e. 1 << 20 characters)
+- **Type**: positive integer, parsed as `usize`; `0` is rejected (would forbid
+  all padding); unset / empty / unparseable / zero values fall back to the
+  default with a `log::warn!`
+- **What**: Per-process cap on the maximum output length produced by
+  string-padding operations (`LPAD` / `RPAD` and related) in
+  `src/exec/string_ops_extended.rs`. Without a cap, `LPAD(col, 10^9, ' ')` on
+  even a single row would allocate without bound. Exceeding the cap is a
+  clean `BoltError`.
+- **When**: Raise for legitimately large padding targets (e.g. generating wide
+  fixed-format text); lower to tighten the guard on shared / hostile inputs.
+- **Notes**: Resolved once on first use via a `OnceLock` and frozen for the
+  process lifetime. Mirrors the `CRATON_DISTINCT_HOST_MAX_ROWS` latching
+  convention.
+- **Source**: `src/exec/string_ops_extended.rs` (env var name constant
+  `MAX_PAD_LEN_ENV`, line 345; default constant `MAX_PAD_LEN`, line 338).
