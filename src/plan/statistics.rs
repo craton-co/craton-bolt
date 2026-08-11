@@ -398,12 +398,19 @@ fn join_key_cardinality(ndv_l: Option<usize>, ndv_r: Option<usize>, l: f64, r: f
 /// Rules:
 /// * Equality `col = const` → `1 / ndv` when the column NDV is known,
 ///   otherwise [`DEFAULT_EQ_SELECTIVITY`].
-/// * Range comparison (`<`, `<=`, `>`, `>=`) and `LIKE` →
-///   [`DEFAULT_RANGE_SELECTIVITY`].
+/// * Range comparison (`<`, `<=`, `>`, `>=`) → the fraction of `[min, max]`
+///   that satisfies the bound when the column's min/max statistics are known
+///   (see [`range_selectivity`]); otherwise [`DEFAULT_RANGE_SELECTIVITY`].
+///   `BETWEEN lo AND hi` desugars to `col >= lo AND col <= hi` upstream, so it
+///   is refined automatically via the `AND` path.
+/// * `LIKE` → [`DEFAULT_RANGE_SELECTIVITY`] (no histogram model for patterns).
 /// * `a AND b` → `sel(a) · sel(b)` (independence assumption).
 /// * `a OR b` → `sel(a) + sel(b) − sel(a)·sel(b)`, capped at 1.0
 ///   (inclusion–exclusion under independence).
 /// * `NOT a` → `1 − sel(a)`.
+/// * `col IS NULL` → `null_count / row_count` when the column has recorded
+///   stats; `col IS NOT NULL` → its complement. Falls back to
+///   [`DEFAULT_OTHER_SELECTIVITY`] when no stats are available.
 /// * Anything else → [`DEFAULT_OTHER_SELECTIVITY`].
 pub fn estimate_selectivity(
     predicate: &Expr,
@@ -429,7 +436,7 @@ pub fn estimate_selectivity(
                 1.0 - eq_selectivity(left, right, input, stats)
             }
             BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
-                DEFAULT_RANGE_SELECTIVITY
+                range_selectivity(*op, left, right, input, stats)
             }
             // Arithmetic / string-concat operators are not boolean predicates;
             // a malformed plan that uses one here gets the generic fallback.
@@ -437,8 +444,11 @@ pub fn estimate_selectivity(
         },
         Expr::Unary { op, operand } => match op {
             UnaryOp::Not => 1.0 - estimate_selectivity(operand, input, stats),
-            // IS NULL / IS NOT NULL: no histogram, use the generic default.
-            UnaryOp::IsNull | UnaryOp::IsNotNull => DEFAULT_OTHER_SELECTIVITY,
+            // IS NULL → null_count / row_count when the column's stats are
+            // recorded; IS NOT NULL is its complement. Without stats, both fall
+            // back to the generic default.
+            UnaryOp::IsNull => null_selectivity(operand, input, stats),
+            UnaryOp::IsNotNull => 1.0 - null_selectivity(operand, input, stats),
         },
         // `col LIKE 'pattern'` behaves like a range scan for estimation.
         Expr::Like { .. } => DEFAULT_RANGE_SELECTIVITY,
@@ -496,6 +506,123 @@ fn col_eq_col_selectivity(
     }
 }
 
+/// Selectivity of a range comparison `col OP const` (or `const OP col`).
+///
+/// When the column's `min`/`max` statistics are known *and* both the bound and
+/// the column's range are numeric, returns the fraction of the `[min, max]`
+/// interval that satisfies the comparison (the textbook uniform-distribution
+/// estimate). Operands in either order are handled by normalising to
+/// `col OP const`. Falls back to [`DEFAULT_RANGE_SELECTIVITY`] whenever the
+/// column, its bounds, or the literal cannot be resolved to a numeric range —
+/// preserving the previous constant exactly when no histogram is available.
+fn range_selectivity(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    input: &LogicalPlan,
+    stats: &dyn StatsProvider,
+) -> f64 {
+    // Normalise to `col OP const`. If the constant is on the left we mirror the
+    // operator so `5 < col` is treated as `col > 5`.
+    let (col_expr, lit_val, op) = if is_constant(right) {
+        (left, literal_f64(right), op)
+    } else if is_constant(left) {
+        (right, literal_f64(left), mirror_op(op))
+    } else {
+        // Neither side a constant (e.g. `a < b`): no min/max model applies.
+        return DEFAULT_RANGE_SELECTIVITY;
+    };
+
+    let value = match lit_val {
+        Some(v) => v,
+        None => return DEFAULT_RANGE_SELECTIVITY,
+    };
+    let (cs, _) = match scan_column_stats(col_expr, input, stats) {
+        Some(cs) => cs,
+        None => return DEFAULT_RANGE_SELECTIVITY,
+    };
+    let (min, max) = match (
+        cs.min.as_ref().and_then(scalar_f64),
+        cs.max.as_ref().and_then(scalar_f64),
+    ) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => return DEFAULT_RANGE_SELECTIVITY,
+    };
+    let span = max - min;
+    if !(span > 0.0) {
+        // Degenerate / inverted range (single-valued column or bad stats):
+        // a uniform fraction is undefined, so keep the conservative default.
+        return DEFAULT_RANGE_SELECTIVITY;
+    }
+
+    // Fraction of [min, max] satisfying the bound (uniform assumption). `<` and
+    // `<=` share the same continuous estimate, as do `>` and `>=`; the discrete
+    // boundary correction is below this model's granularity.
+    let frac = match op {
+        BinaryOp::Lt | BinaryOp::LtEq => (value - min) / span,
+        BinaryOp::Gt | BinaryOp::GtEq => (max - value) / span,
+        // Only the four range ops reach here.
+        _ => return DEFAULT_RANGE_SELECTIVITY,
+    };
+    frac.clamp(0.0, 1.0)
+}
+
+/// Mirror a comparison operator for swapped operands: `a < b` ⇔ `b > a`, etc.
+fn mirror_op(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Selectivity of `col IS NULL`: `null_count / row_count` when the column has
+/// a recorded stats entry and the owning table has a positive row count.
+/// Returns [`DEFAULT_OTHER_SELECTIVITY`] when no stats are available so an
+/// untracked column keeps its previous mid-range estimate. (`IS NOT NULL`
+/// callers take `1 - this`.)
+fn null_selectivity(expr: &Expr, input: &LogicalPlan, stats: &dyn StatsProvider) -> f64 {
+    match scan_column_stats(expr, input, stats) {
+        Some((cs, row_count)) if row_count > 0 => {
+            (cs.null_count as f64 / row_count as f64).clamp(0.0, 1.0)
+        }
+        // No stats entry, or a zero-row table: keep the generic default rather
+        // than reading 0 nulls out of an absent/empty record.
+        _ => DEFAULT_OTHER_SELECTIVITY,
+    }
+}
+
+/// Convert a stats [`ScalarValue`] bound to an `f64` for range arithmetic.
+/// Only the numeric variants participate; `Bool` / `Str` bounds have no
+/// uniform-range interpretation and yield `None`.
+fn scalar_f64(v: &ScalarValue) -> Option<f64> {
+    match v {
+        ScalarValue::Int(i) => Some(*i as f64),
+        ScalarValue::Float(f) => Some(*f),
+        ScalarValue::Bool(_) | ScalarValue::Str(_) => None,
+    }
+}
+
+/// Convert a constant scalar expression (a literal, possibly aliased) to an
+/// `f64` for range arithmetic, mirroring the numeric variants of
+/// [`scalar_f64`]. Returns `None` for NULL, non-numeric, and non-literal
+/// expressions so the caller falls back to the default range selectivity.
+fn literal_f64(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Alias(inner, _) => literal_f64(inner),
+        Expr::Literal(lit) => match lit {
+            crate::plan::logical_plan::Literal::Int32(v) => Some(*v as f64),
+            crate::plan::logical_plan::Literal::Int64(v) => Some(*v as f64),
+            crate::plan::logical_plan::Literal::Float32(v) => Some(*v as f64),
+            crate::plan::logical_plan::Literal::Float64(v) => Some(*v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Resolve the NDV for an expression that is (or wraps) a bare column
 /// reference, by locating the base [`LogicalPlan::Scan`] that supplies the
 /// column and looking the column up in its table stats.
@@ -505,6 +632,55 @@ fn col_eq_col_selectivity(
 fn column_ndv(expr: &Expr, input: &LogicalPlan, stats: &dyn StatsProvider) -> Option<usize> {
     let name = column_name(expr)?;
     scan_ndv_for_column(input, name, stats)
+}
+
+/// Resolve the full [`ColumnStats`] (and the owning table's row count) for an
+/// expression that is (or wraps) a bare column reference, by locating the base
+/// [`LogicalPlan::Scan`] that supplies the column.
+///
+/// Returns `None` for non-column expressions, for columns whose source table
+/// has no stats, or for columns with no recorded per-column stats entry — so a
+/// caller can distinguish "stats absent" from "stats present recording zero".
+/// Mirrors [`scan_ndv_for_column`]'s deliberately simple resolution (no rename
+/// tracking): good enough for the common filter-directly-over-scan shape.
+fn scan_column_stats(
+    expr: &Expr,
+    input: &LogicalPlan,
+    stats: &dyn StatsProvider,
+) -> Option<(ColumnStats, usize)> {
+    let name = column_name(expr)?;
+    scan_column_stats_for_column(input, name, stats)
+}
+
+/// Walk `plan` for the base `Scan` whose table stats record a per-column entry
+/// for `column`, returning the column's stats plus that table's row count.
+/// Same pre-order strategy as [`scan_ndv_for_column`].
+fn scan_column_stats_for_column(
+    plan: &LogicalPlan,
+    column: &str,
+    stats: &dyn StatsProvider,
+) -> Option<(ColumnStats, usize)> {
+    match plan {
+        LogicalPlan::Window { input, .. } => scan_column_stats_for_column(input, column, stats),
+        LogicalPlan::Scan { table, .. } => {
+            let ts = stats.table_stats(table)?;
+            let cs = ts.per_column.get(column)?.clone();
+            Some((cs, ts.row_count))
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. } => scan_column_stats_for_column(input, column, stats),
+        LogicalPlan::Union { inputs } => inputs
+            .iter()
+            .find_map(|b| scan_column_stats_for_column(b, column, stats)),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            scan_column_stats_for_column(left, column, stats)
+                .or_else(|| scan_column_stats_for_column(right, column, stats))
+        }
+    }
 }
 
 /// Search the plan subtree `plan` for a base `Scan` whose table stats record
@@ -725,6 +901,199 @@ mod tests {
             predicate: pred,
         };
         assert_eq!(estimate_rows(&plan, &stats), Some(190));
+    }
+
+    #[test]
+    fn filter_range_uses_min_max_when_available() {
+        // a in [0, 100]; WHERE a < 25  →  (25 - 0) / 100 = 0.25  →  250.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 0,
+                    ndv: None,
+                    min: Some(ScalarValue::Int(0)),
+                    max: Some(ScalarValue::Int(100)),
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: col("a").lt(lit(25i64)),
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(250));
+    }
+
+    #[test]
+    fn filter_range_gt_uses_min_max() {
+        // a in [0, 100]; WHERE a > 75  →  (100 - 75) / 100 = 0.25  →  250.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 0,
+                    ndv: None,
+                    min: Some(ScalarValue::Int(0)),
+                    max: Some(ScalarValue::Int(100)),
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: col("a").gt(lit(75i64)),
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(250));
+    }
+
+    #[test]
+    fn filter_range_constant_on_left_mirrors_operator() {
+        // `25 > a`  is  `a < 25`  →  (25 - 0) / 100 = 0.25  →  250.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 0,
+                    ndv: None,
+                    min: Some(ScalarValue::Int(0)),
+                    max: Some(ScalarValue::Int(100)),
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            // 25 > a  (literal on the left)
+            predicate: Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(lit(25i64)),
+                right: Box::new(col("a")),
+            },
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(250));
+    }
+
+    #[test]
+    fn filter_range_clamps_value_beyond_max() {
+        // a in [0, 100]; WHERE a < 500  →  fraction clamps to 1.0  →  1000.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 0,
+                    ndv: None,
+                    min: Some(ScalarValue::Int(0)),
+                    max: Some(ScalarValue::Int(100)),
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: col("a").lt(lit(500i64)),
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(1_000));
+    }
+
+    #[test]
+    fn filter_range_falls_back_without_min_max() {
+        // ndv recorded but no min/max → keep the 0.3 default → 1000 * 0.3 = 300.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column("a", ColumnStats::with_ndv(50)),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: col("a").gt(lit(5i64)),
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(300));
+    }
+
+    #[test]
+    fn filter_range_degenerate_when_min_equals_max() {
+        // min == max: span is zero, uniform fraction undefined → 0.3 default.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 0,
+                    ndv: None,
+                    min: Some(ScalarValue::Int(42)),
+                    max: Some(ScalarValue::Int(42)),
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: col("a").lt(lit(50i64)),
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(300));
+    }
+
+    #[test]
+    fn filter_is_null_uses_null_count() {
+        // null_count = 200 of 1000 rows → IS NULL selectivity 0.2 → 200.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 200,
+                    ndv: None,
+                    min: None,
+                    max: None,
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(col("a")),
+            },
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(200));
+    }
+
+    #[test]
+    fn filter_is_not_null_complements_null_count() {
+        // null_count = 200 of 1000 → IS NOT NULL selectivity 0.8 → 800.
+        let stats = MockStats::default().with(
+            "t",
+            TableStats::new(1_000).with_column(
+                "a",
+                ColumnStats {
+                    null_count: 200,
+                    ndv: None,
+                    min: None,
+                    max: None,
+                },
+            ),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: Expr::Unary {
+                op: UnaryOp::IsNotNull,
+                operand: Box::new(col("a")),
+            },
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(800));
+    }
+
+    #[test]
+    fn filter_is_null_falls_back_without_column_stats() {
+        // No per-column entry for `a` → generic 0.25 default → 250.
+        let stats = MockStats::default().with("t", TableStats::new(1_000));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan("t", "a", DataType::Int64)),
+            predicate: Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(col("a")),
+            },
+        };
+        assert_eq!(estimate_rows(&plan, &stats), Some(250));
     }
 
     #[test]
