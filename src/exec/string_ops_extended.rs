@@ -1491,7 +1491,10 @@ mod tests {
         match err {
             BoltError::Other(msg) => {
                 assert!(msg.contains("exceeds the maximum"), "unexpected msg: {msg}");
-                assert!(msg.contains(MAX_PAD_LEN_ENV), "msg should name the env knob: {msg}");
+                assert!(
+                    msg.contains(MAX_PAD_LEN_ENV),
+                    "msg should name the env knob: {msg}"
+                );
             }
             other => panic!("expected Other(exceeds the maximum), got {other:?}"),
         }

@@ -218,7 +218,10 @@ impl FlightSqlServer {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
+            .and_then(|s| {
+                s.strip_prefix("Bearer ")
+                    .or_else(|| s.strip_prefix("bearer "))
+            });
         match presented {
             Some(tok) if tok == expected => Ok(()),
             _ => Err(tonic::Status::unauthenticated(

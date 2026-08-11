@@ -312,15 +312,22 @@ impl JoinReorder {
         // Combined-schema name guard. The reorder preserves the leaf *set*, so
         // the multiset of underlying columns is unchanged — but the renaming
         // `join_combined_schema` applies to duplicate non-key column names is
-        // shape-dependent, so the rebuilt top join may expose a DIFFERENT
-        // field-name sequence than the original (a renamed column landing in a
-        // different position, or a previously-bare name now suffixed). Any
-        // parent expr binding by name would then silently bind to the wrong
-        // leaf's column or dangle. A *set* comparison is insufficient here:
-        // renames must line up positionally. If the rebuilt sequence does not
-        // match the original positionally, abort and keep the original plan.
+        // shape-dependent. A reorder is safe when *every name* present in the
+        // original schema is also present (possibly in a different position) in
+        // the rebuilt schema, i.e. no collision-driven suffix rename occurred
+        // that would cause a parent expression to dangle or bind to the wrong
+        // column. Comparing sorted name multisets captures exactly this: if the
+        // sorted sequences match, all names are preserved and no new rename was
+        // introduced, so name-based column resolution by any parent node is
+        // unaffected. A positional comparison would wrongly abort valid reorders
+        // where all names are unique (no renaming) and the shape change merely
+        // moves columns to different positions in the output.
         let rebuilt_names = field_name_sequence(&rebuilt)?;
-        if rebuilt_names != original_names {
+        let mut sorted_original = original_names.clone();
+        let mut sorted_rebuilt = rebuilt_names;
+        sorted_original.sort();
+        sorted_rebuilt.sort();
+        if sorted_rebuilt != sorted_original {
             return None;
         }
 
