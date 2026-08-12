@@ -84,6 +84,29 @@ impl RegAlloc {
         Ok((lo_name, hi_name))
     }
 
+    /// Assign the single logical `reg` to a fresh `rl` (b64) register holding
+    /// the LOW half of a 128-bit (Decimal128 / i128) value, and additionally
+    /// allocate an anonymous sibling `rl` for the HIGH half. Returns
+    /// `(lo_name, hi_name)`.
+    ///
+    /// This is the single-`Reg` analogue of [`RegAlloc::assign_pair`], used by
+    /// the scalar `Op::Const` / `Op::Cast` paths (`emit_const` / `emit_cast`),
+    /// which carry only ONE destination `Reg`. The mapped `reg` resolves to
+    /// the low half — matching the codebase-wide convention that a
+    /// `Value::pair`'s `reg` field is the low half and `hi_reg` the high half
+    /// (see `physical_plan::Value`). The high register is materialised (so the
+    /// full 16-byte value is well-defined in PTX) but is NOT inserted into the
+    /// mapping: a single-register op has no logical `Reg` to expose it through.
+    /// `class_for(Decimal128)` deliberately errors, so 128-bit values never go
+    /// through the dtype-dispatched `assign`; they always ride the `rl` class
+    /// directly here and in `assign_pair`.
+    fn assign_decimal_lo(&mut self, reg: Reg) -> (String, String) {
+        let lo_name = self.alloc("rl");
+        let hi_name = self.alloc("rl");
+        self.mapping.insert(reg, lo_name.clone());
+        (lo_name, hi_name)
+    }
+
     /// Look up the physical register name previously assigned to `reg`.
     fn get(&self, reg: Reg) -> BoltResult<&str> {
         self.mapping
@@ -1820,15 +1843,50 @@ fn emit_store(
 /// lets attacker-controlled SQL values reach this function.
 fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
     match lit {
-        Literal::Null => Err(BoltError::Other(
-            "ptx_gen: NULL literal not supported".into(),
-        )),
+        // SQL NULL placeholder. A bare `Op::Const { Literal::Null }` carries
+        // NO static dtype — the planner attaches the peer dtype to the
+        // surrounding `Value` (see `physical_plan::Codegen::emit_null_as`) but
+        // never threads it into this op. The NULL row's *value* is a
+        // don't-care: the actual NULL signal rides the per-row VALIDITY bitmap
+        // (`emit_is_null_check` / the AND-of-inputs fold in `emit_kernel`),
+        // and the executor masks the result before any consumer observes it.
+        // We therefore materialise a fully-defined ZERO placeholder, matching
+        // the convention `emit_null_as` already uses for a Decimal128-typed
+        // NULL ("zero is as good a placeholder as any"). It lands in the b64
+        // (`rl`) class — the widest general register — emitted via the same
+        // hex-bit-pattern `mov.u64` form as the `Int64` path (no codegen-
+        // injection surface; the operand is the literal `0`).
+        Literal::Null => {
+            let dst_name = b.alloc.alloc("rl");
+            b.alloc.mapping.insert(dst, dst_name.clone());
+            emit_fmt!(b, "mov.u64 {}, 0x{:016X};", dst_name, 0u64)
+        }
         Literal::Utf8(_) => Err(BoltError::Other(
             "ptx_gen: Utf8 literal not supported".into(),
         )),
-        Literal::Decimal128(..) => Err(BoltError::Plan(
-            "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-        )),
+        // Decimal128 literal. The PTX side has no native 128-bit register
+        // class, so an i128 value is represented as a `(lo, hi)` pair of u64
+        // (`rl`-class) registers — exactly the shape consumed by every i128
+        // arithmetic emitter (`emit_add_128`, `emit_mul_128`, …) and produced
+        // by `emit_const_128` for the dual-register `Op::Const128`. A
+        // single-register `Op::Const` only carries ONE destination `Reg`, so
+        // `dst` becomes the LOW half (matching the codebase convention that a
+        // `Value::pair`'s `reg` field is the low half) and the high half is
+        // materialised into an anonymous sibling `rl`. The i128 is split
+        // little-endian via a wrapping `u128` cast — identical to the
+        // planner's `emit_literal` lowering to `Op::Const128`.
+        //
+        // SECURITY: both halves are emitted as `0x{:016X}` hex (`[0-9A-F]`
+        // only), the same codegen-injection-hardening convention used by the
+        // `Int64` / `Float64` / `Const128` paths.
+        Literal::Decimal128(value, _, _) => {
+            let bits = *value as u128;
+            let lo = bits as u64;
+            let hi = (bits >> 64) as u64;
+            let (lo_name, hi_name) = b.alloc.assign_decimal_lo(dst);
+            emit_fmt!(b, "mov.u64 {}, 0x{:016X};", lo_name, lo)?;
+            emit_fmt!(b, "mov.u64 {}, 0x{:016X};", hi_name, hi)
+        }
         // v0.7: Date32 / Timestamp literals lower to integer constants.
         // Date32 is i32 days-since-epoch; Timestamp is i64 ticks-since-epoch
         // in the source unit. Same hex-bit-pattern emission convention as
@@ -1890,9 +1948,77 @@ fn emit_cast(
     // temporaries are removed by routing the predicate emits through
     // `emit_fmt!` and the final instruction through `emit_fmt!` as well.
     let src_name = b.alloc.get(src)?.to_string();
-    let dst_name = b.alloc.assign(dst, to)?;
 
     use DataType::*;
+
+    // ---- Decimal128 casts (handled BEFORE the unconditional `assign(dst,
+    // to)` below, because `RegAlloc::class_for(Decimal128)` deliberately
+    // errors — a 128-bit value has no single register class). ----
+    //
+    // A Decimal128 value is a `(lo, hi)` pair of u64 registers (see
+    // `RegAlloc::assign_pair` / `Op::LoadColumn128`). The single-register
+    // `Op::Cast` carries only ONE `src` / `dst` register apiece, so the only
+    // direction it can realise FAITHFULLY is the one the i128 narrow path
+    // (`emit_narrow_i128_to_int`) already implements using just the LOW half:
+    // a SCALE-0 Decimal128 -> integer truncation. There `dst = (i128) src`
+    // with no `10^s` divide, so the low half alone carries every value bit
+    // (`Int64`: a `mov.u64`; `Int32`: a `cvt.s32.s64` truncation) — byte-for-
+    // byte the `emit_narrow_i128_to_int` shape, just sourced from the single
+    // `src` low-half register.
+    //
+    // EVERY OTHER Decimal128 direction genuinely needs the dual-register i128
+    // ops the planner emits separately (`Op::WidenToI128`, `Op::Mul128` /
+    // `Op::Div128` for the `10^scale` rescale, `Op::F64ToI128` /
+    // `Op::I128ToF64`, `Op::NarrowI128ToInt`) — they require a high half and/or
+    // a scale constant that a single-register `Op::Cast` cannot carry. Those
+    // are rejected HERE, per-direction, with a precise message naming the op
+    // to lower through (NOT a blanket "not yet lowered" — the machinery exists
+    // and `physical_plan::Codegen::emit_decimal_cast` already routes through
+    // it).
+    match (from, to) {
+        // Faithful single-register direction: scale-0 Decimal128 -> integer.
+        (Decimal128(_, 0), Int64) => {
+            let dst_name = b.alloc.assign(dst, to)?;
+            return emit_fmt!(b, "mov.u64 {}, {};", dst_name, src_name);
+        }
+        (Decimal128(_, 0), Int32) => {
+            let dst_name = b.alloc.assign(dst, to)?;
+            return emit_fmt!(b, "cvt.s32.s64 {}, {};", dst_name, src_name);
+        }
+        // Nonzero-scale Decimal -> integer needs a `10^s` divide first.
+        (Decimal128(_, s), Int32 | Int64) => {
+            return Err(BoltError::Plan(format!(
+                "ptx_gen: CAST Decimal128(_, {s}) -> {to:?} with nonzero scale must lower \
+                 through Op::Div128 (divide out 10^{s}) then Op::NarrowI128ToInt, not the \
+                 single-register Op::Cast"
+            )));
+        }
+        // Integer / Decimal / Float -> Decimal128: needs the dual-register
+        // widen + `10^s` scale (Mul128 / Div128) or float<->i128 conversion.
+        (_, Decimal128(_, _)) => {
+            return Err(BoltError::Plan(format!(
+                "ptx_gen: CAST {from:?} -> {to:?} must lower through the dual-register i128 \
+                 ops (Op::WidenToI128 / Op::F64ToI128 then Op::Mul128 / Op::Div128 for the \
+                 10^scale rescale), not the single-register Op::Cast"
+            )));
+        }
+        // Decimal128 -> Float: needs Op::I128ToF64 (hi half) then a `10^s` divide.
+        (Decimal128(_, _), Float32 | Float64) => {
+            return Err(BoltError::Plan(format!(
+                "ptx_gen: CAST {from:?} -> {to:?} must lower through Op::I128ToF64 (reads the \
+                 hi half) then a float divide by 10^scale, not the single-register Op::Cast"
+            )));
+        }
+        // Decimal128 -> Bool: not a supported conversion in this engine.
+        (Decimal128(_, _), Bool) | (Decimal128(_, _), Date32) | (Decimal128(_, _), Timestamp(_, _)) => {
+            return Err(BoltError::Plan(format!(
+                "ptx_gen: CAST {from:?} -> {to:?} is not a supported Decimal128 conversion"
+            )));
+        }
+        _ => {}
+    }
+
+    let dst_name = b.alloc.assign(dst, to)?;
     let instr = match (from, to) {
         // Same type -> typed mov of the appropriate width.
         (a, c) if a == c => {
@@ -1908,9 +2034,17 @@ fn emit_cast(
                 Date32 => "s32",
                 Timestamp(_, _) => "s64",
                 Utf8 => return Err(BoltError::Other("ptx_gen: cannot cast Utf8".into())),
+                // Decimal128 identity cast cannot ride a single register (it
+                // would silently drop the hi half); the planner special-cases
+                // it to a pair-preserving no-op upstream
+                // (`emit_cast_expr`). Handled in the Decimal128 pre-match
+                // above for the non-identity directions; an identity Decimal128
+                // cast is rejected there via the `(_, Decimal128(_, _))` arm.
                 Decimal128(_, _) => {
                     return Err(BoltError::Plan(
-                        "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
+                        "ptx_gen: identity CAST on Decimal128 must stay a dual-register \
+                         (lo, hi) no-op (see physical_plan::emit_cast_expr); the \
+                         single-register Op::Cast would drop the high half".into(),
                     ))
                 }
             };
@@ -1970,10 +2104,17 @@ fn emit_cast(
             return Err(BoltError::Other("ptx_gen: Utf8 casts not supported".into()))
         }
 
+        // Every Decimal128 source/target combination is fully resolved (and
+        // either emitted or precisely rejected) by the Decimal128 pre-match
+        // above, which `return`s before reaching this point. This arm is a
+        // defensive internal-error guard for a future regression that adds a
+        // new Decimal128 shape to the pre-match without an early return.
         (Decimal128(_, _), _) | (_, Decimal128(_, _)) => {
-            return Err(BoltError::Plan(
-                "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
-            ))
+            return Err(BoltError::Other(format!(
+                "ptx_gen: internal — Decimal128 cast {from:?} -> {to:?} reached the \
+                 single-register cast match (should have been handled by the Decimal128 \
+                 pre-match)"
+            )))
         }
 
         // Unreachable: the `a == c` guard above already covers every
