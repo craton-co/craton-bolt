@@ -998,4 +998,103 @@ mod tests {
             "a disconnected (cross-product) chain must not be reordered"
         );
     }
+
+    /// Three leaves that each carry a duplicate **non-key** column `x` alongside
+    /// distinct join keys. `join_combined_schema` renames the colliding right-
+    /// side `x` columns (`right.x`, then `__2`, ...), and the rename outcome
+    /// depends on join order — exactly what this pass changes. Without the
+    /// combined-schema name guard a reorder could expose a different field-name
+    /// sequence, silently rebinding a parent's column reference. With the guard
+    /// the pass must EITHER preserve the original name sequence positionally OR
+    /// bail to the original plan. Either way the output schema's field-NAME
+    /// sequence (positional, renames included) is identical to the input's.
+    fn three_way_dup_nonkey() -> LogicalPlan {
+        // a(ka, x), b(kb, x), c(kc, x) joined ka=kb, kb=kc. `x` is non-key and
+        // shared by every leaf, so the combined schema disambiguates it.
+        let a = LogicalPlan::Scan {
+            table: "a".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("ka", DataType::Int64, false),
+                Field::new("x", DataType::Int64, false),
+            ]),
+        };
+        let b = LogicalPlan::Scan {
+            table: "b".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("kb", DataType::Int64, false),
+                Field::new("x", DataType::Int64, false),
+            ]),
+        };
+        let c = LogicalPlan::Scan {
+            table: "c".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("kc", DataType::Int64, false),
+                Field::new("x", DataType::Int64, false),
+            ]),
+        };
+        let ab = LogicalPlan::Join {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: JoinType::Inner,
+            on: vec![(col("ka"), col("kb"))],
+            filter: None,
+        };
+        LogicalPlan::Join {
+            left: Box::new(ab),
+            right: Box::new(c),
+            join_type: JoinType::Inner,
+            on: vec![(col("kb"), col("kc"))],
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn dup_nonkey_column_preserves_name_sequence_or_bails() {
+        // Stats that would otherwise drive a reorder smallest-first.
+        let stats = MockStats::default()
+            .with("a", 1000)
+            .with("b", 10)
+            .with("c", 5);
+        let est = Arc::new(StatsEstimator::new(stats));
+        let pass = JoinReorder::with_estimator(est);
+
+        let plan = three_way_dup_nonkey();
+        let before: Vec<String> = plan
+            .schema()
+            .expect("typecheck")
+            .fields
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        // Sanity: the duplicate non-key `x` really did get disambiguated, so
+        // this fixture genuinely exercises the shape-dependent rename path.
+        assert!(
+            before.iter().any(|n| n != "x" && n.contains('x') && n.contains('.'))
+                || before.iter().filter(|n| n.as_str() == "x").count() == 1,
+            "fixture must trigger combined-schema renaming, got {before:?}"
+        );
+
+        let out = pass.rewrite(plan).expect("rewrite");
+        let after: Vec<String> = out
+            .schema()
+            .expect("typecheck after")
+            .fields
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+
+        // The guard's contract: the positional field-NAME sequence (renames
+        // included) is preserved. If the cheapest shape would have changed it,
+        // the pass must have bailed to the original plan instead — either way
+        // the sequences are equal here. A set comparison would NOT catch a
+        // positional rename swap; we deliberately compare the ordered Vecs.
+        assert_eq!(
+            before, after,
+            "reorder must preserve the combined-schema name sequence \
+             positionally or bail to the original plan"
+        );
+    }
 }
