@@ -4834,6 +4834,255 @@ mod decimal128_ir_tests {
             "expected the 2^64 constant\n{ptx}"
         );
     }
+
+    // ---- W15: scalar `Op::Const` / `Op::Cast` paths for Decimal128 / Null.
+    //
+    // These exercise the SINGLE-register `emit_const` / `emit_cast` arms
+    // (distinct from the dual-register `Op::Const128` / i128 ops above). A
+    // single-register const for a 128-bit value maps `dst` to the LOW half
+    // and materialises the HIGH half into an anonymous sibling `rl`; the only
+    // faithful single-register cast direction is a scale-0 Decimal128 ->
+    // integer (low-half truncation). Every other Decimal128 cast direction is
+    // rejected with a precise per-direction message.
+
+    /// (a) A `Decimal128` LITERAL via single-register `Op::Const` must emit
+    /// BOTH 64-bit halves as `mov.u64 ..., 0x<hex>;` — the same hex-bit-pattern
+    /// representation `emit_const_128` produces for the dual-register
+    /// `Op::Const128`. The raw `i128` is split little-endian (lo = low 64
+    /// bits, hi = next 64 bits).
+    #[test]
+    fn const_decimal128_literal_emits_two_u64_movs() {
+        // Raw i128 with distinguishable, non-equal halves. value =
+        //   hi=0x0000_0000_0000_002A , lo=0x1122_3344_5566_7788
+        let value: i128 = (0x0000_0000_0000_002A_i128 << 64) | 0x1122_3344_5566_7788_i128;
+        let lo: u64 = value as u128 as u64;
+        let hi: u64 = ((value as u128) >> 64) as u64;
+        let spec = KernelSpec {
+            inputs: vec![],
+            outputs: vec![ColumnIO {
+                name: "k".into(),
+                // Store the low half through an Int64 output so the kernel is
+                // well-formed without needing a Store128 hi register (the
+                // single-register const only exposes the low half).
+                dtype: DataType::Int64,
+            }],
+            ops: vec![
+                Op::Const {
+                    dst: Reg(0),
+                    lit: Literal::Decimal128(value, 38, 0),
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_const_dec128_lit").expect("compile");
+        let expected_lo = format!("0x{:016X}", lo);
+        let expected_hi = format!("0x{:016X}", hi);
+        assert!(
+            ptx.contains(&expected_lo),
+            "expected lo half hex constant {expected_lo} in PTX\n{ptx}"
+        );
+        assert!(
+            ptx.contains(&expected_hi),
+            "expected hi half hex constant {expected_hi} in PTX\n{ptx}"
+        );
+        // Two `mov.u64`s for the const's two halves (the Store adds none).
+        let n_mov_u64 = ptx.matches("mov.u64").count();
+        assert!(
+            n_mov_u64 >= 2,
+            "expected >=2 mov.u64 for the Decimal128 literal halves, got {n_mov_u64}\n{ptx}"
+        );
+    }
+
+    /// (b) A `Decimal128(_, 0)` -> `Int64` CAST via single-register `Op::Cast`
+    /// is the one faithful direction: a low-half `mov.u64` bit-copy (scale 0 =>
+    /// no `10^s` divide => the low half carries every value bit). Mirrors the
+    /// `Int64` arm of `emit_narrow_i128_to_int`.
+    #[test]
+    fn cast_decimal128_scale0_to_int64_emits_mov_u64() {
+        let spec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "d".into(),
+                dtype: dec(20, 0),
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Int64,
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::Cast {
+                    dst: Reg(2),
+                    src: Reg(0),
+                    from: dec(20, 0),
+                    to: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_cast_dec128_scale0_i64").expect("compile");
+        // The cast itself is a `mov.u64` of the low-half register (no cvt).
+        assert!(
+            ptx.contains("mov.u64"),
+            "expected `mov.u64` for the scale-0 Decimal128 -> Int64 low-half copy\n{ptx}"
+        );
+        // It must NOT spuriously emit a float/scale conversion.
+        assert!(
+            !ptx.contains("cvt.rn.f64") && !ptx.contains("fma.rn.f64"),
+            "scale-0 Decimal128 -> Int64 must not emit any float conversion\n{ptx}"
+        );
+    }
+
+    /// (b') A NONZERO-scale `Decimal128 -> Int` CAST and any `_ -> Decimal128`
+    /// CAST must be rejected on the single-register path with a PRECISE message
+    /// naming the dual-register i128 op to lower through — never a blanket
+    /// "not yet lowered to GPU".
+    #[test]
+    fn cast_decimal128_unsupported_directions_reject_precisely() {
+        // Nonzero scale Decimal -> Int needs Div128 then NarrowI128ToInt.
+        let nonzero_scale = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "d".into(),
+                dtype: dec(20, 2),
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: DataType::Int64,
+            }],
+            ops: vec![
+                Op::LoadColumn128 {
+                    dst_lo: Reg(0),
+                    dst_hi: Reg(1),
+                    col_idx: 0,
+                },
+                Op::Cast {
+                    dst: Reg(2),
+                    src: Reg(0),
+                    from: dec(20, 2),
+                    to: DataType::Int64,
+                },
+                Op::Store {
+                    src: Reg(2),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+            predicate: None,
+            register_count: 3,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let err = compile(&nonzero_scale, "bolt_cast_dec128_scale2_i64")
+            .expect_err("nonzero-scale Decimal -> Int must reject on the scalar cast path");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Op::Div128") && msg.contains("Op::NarrowI128ToInt"),
+            "rejection must name the dual-register ops to lower through, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not yet lowered"),
+            "rejection must NOT be the stale blanket message, got: {msg}"
+        );
+
+        // Int -> Decimal128 needs WidenToI128 + Mul128 for the 10^s scale.
+        let int_to_dec = KernelSpec {
+            inputs: vec![ColumnIO {
+                name: "i".into(),
+                dtype: DataType::Int64,
+            }],
+            outputs: vec![ColumnIO {
+                name: "out".into(),
+                dtype: dec(20, 2),
+            }],
+            ops: vec![
+                Op::LoadColumn {
+                    dst: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+                Op::Cast {
+                    dst: Reg(1),
+                    src: Reg(0),
+                    from: DataType::Int64,
+                    to: dec(20, 2),
+                },
+                Op::Store128 {
+                    src_lo: Reg(1),
+                    src_hi: Reg(1),
+                    col_idx: 0,
+                },
+            ],
+            predicate: None,
+            register_count: 2,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let err2 = compile(&int_to_dec, "bolt_cast_i64_dec128")
+            .expect_err("Int -> Decimal128 must reject on the scalar cast path");
+        let msg2 = format!("{err2}");
+        assert!(
+            msg2.contains("Op::WidenToI128"),
+            "Int -> Decimal128 rejection must name Op::WidenToI128, got: {msg2}"
+        );
+        assert!(
+            !msg2.contains("not yet lowered"),
+            "rejection must NOT be the stale blanket message, got: {msg2}"
+        );
+    }
+
+    /// (c) A `Literal::Null` via single-register `Op::Const` materialises a
+    /// fully-defined ZERO placeholder (`mov.u64 ..., 0x0000000000000000;`) —
+    /// the NULL signal itself rides the validity bitmap, so the value register
+    /// is a masked don't-care.
+    #[test]
+    fn const_null_literal_emits_zero_placeholder() {
+        let spec = KernelSpec {
+            inputs: vec![],
+            outputs: vec![ColumnIO {
+                name: "n".into(),
+                dtype: DataType::Int64,
+            }],
+            ops: vec![
+                Op::Const {
+                    dst: Reg(0),
+                    lit: Literal::Null,
+                },
+                Op::Store {
+                    src: Reg(0),
+                    col_idx: 0,
+                    dtype: DataType::Int64,
+                },
+            ],
+            predicate: None,
+            register_count: 1,
+            input_has_validity: vec![],
+            output_has_validity: vec![],
+        };
+        let ptx = compile(&spec, "bolt_const_null").expect("compile");
+        assert!(
+            ptx.contains("mov.u64") && ptx.contains("0x0000000000000000"),
+            "expected `mov.u64 ..., 0x0000000000000000;` zero placeholder for NULL\n{ptx}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
