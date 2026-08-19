@@ -277,3 +277,107 @@ fn changelog_has_section_for_current_version() {
          release has a changelog entry."
     );
 }
+
+/// Scan `text` (Markdown) for backtick-delimited `CRATON_*` / `BOLT_*` tokens
+/// that look like environment-variable names, returning each distinct name.
+///
+/// `docs/ENV_VARS.md` always wraps env-var names in backticks — both in the
+/// quick-start matrix (`| \`CRATON_FOO\` | ... |`) and in the per-var section
+/// headings (`### \`CRATON_FOO\``). We deliberately only consider backtick runs
+/// (not bare prose) and apply the same uppercase/digit/underscore shape filter
+/// as [`scan_env_var_literals`], so incidental prose can't produce a false
+/// "documented" hit.
+fn scan_env_var_doc_names(text: &str) -> BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut found = BTreeSet::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'`' && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'`' {
+                let content = &text[start..j];
+                if (content.starts_with("CRATON_") || content.starts_with("BOLT_"))
+                    && content
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    found.insert(content.to_string());
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// (4) Reverse-direction parity, **non-failing by design** (diagnostic only).
+///
+/// [`env_var_doc_parity`] enforces `src/` → `docs/ENV_VARS.md` (every var read
+/// in code is documented). This complementary check looks the *other* way —
+/// `docs/ENV_VARS.md` → `src/` — to surface vars that are documented but no
+/// longer referenced as a string literal in `src/` (stale docs, renamed vars,
+/// or — legitimately — a var documented ahead of a sibling code change that
+/// hasn't landed on this branch yet).
+///
+/// It deliberately **never asserts**: a documented-but-not-yet-in-`src/` var is
+/// a valid transient state (docs can lead code across a multi-PR campaign), so
+/// failing CI on it would be wrong. We only `eprintln!` a diagnostic. Promote a
+/// finding to a hard failure only once the var set has been reconciled and you
+/// want to lock it down.
+#[test]
+fn env_var_reverse_parity_diagnostic() {
+    let root = repo_root();
+    let src_dir = root.join("src");
+
+    let mut rs_files = Vec::new();
+    collect_rs_files(&src_dir, &mut rs_files);
+
+    let mut in_src: BTreeSet<String> = BTreeSet::new();
+    for file in &rs_files {
+        let text = read_to_string(file);
+        in_src.extend(scan_env_var_literals(&text));
+    }
+
+    let docs = read_to_string(&root.join("docs").join("ENV_VARS.md"));
+    let documented = scan_env_var_doc_names(&docs);
+
+    // Vars documented ahead of (or independently from) their `src/` call site.
+    // Listing one here silences its diagnostic line; it is NOT an assertion —
+    // an unlisted var still only warns, never fails. Curated so the test stays
+    // green for any not-yet-reconciled var.
+    const DOC_LEADS_SRC: &[&str] = &[
+        // Read in `src/exec/string_ops_extended.rs` by a sibling LPAD/RPAD
+        // length-cap change; documented here ahead of that code landing on
+        // this branch.
+        "CRATON_MAX_PAD_LEN",
+    ];
+    let lead: BTreeSet<&str> = DOC_LEADS_SRC.iter().copied().collect();
+
+    let mut documented_only: Vec<String> = Vec::new();
+    for var in &documented {
+        if in_src.contains(var) || lead.contains(var.as_str()) {
+            continue;
+        }
+        documented_only.push(var.clone());
+    }
+
+    // Diagnostic only — never `assert!`. Keep this test green by construction.
+    if !documented_only.is_empty() {
+        eprintln!(
+            "[doc-consistency] note: {} env var(s) are documented in \
+             docs/ENV_VARS.md but not found as a `CRATON_*`/`BOLT_*` string \
+             literal in src/: {documented_only:?}. This is informational only \
+             (the var may be read via build.rs, a benches/ gate, or a sibling \
+             code change not yet on this branch). Reconcile docs/src or add the \
+             name to DOC_LEADS_SRC in tests/doc_consistency_test.rs if the lead \
+             is intentional.",
+            documented_only.len()
+        );
+    }
+}
