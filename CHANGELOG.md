@@ -18,7 +18,57 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
   same stable sort), proven by a 1M-slot parity test; the collector's generic bound
   widened to `T: Copy + Send + Sync`.
 
+### Security
+- **Substrait ingestion now honours-or-rejects dropped plan fields** instead of
+  silently ignoring them — an unrecognised / unsupported field in a
+  `substrait::proto::Plan` is now an explicit error rather than being dropped,
+  so a converted plan can never silently diverge from the caller's intent.
+- **Flight SQL frontend hardened** (`--features flight`): the server now binds
+  to **loopback by default**, requires **bearer-token auth**, enforces
+  **result-size caps**, uses a **non-poisoning lock** so one failed query can't
+  wedge the service, and **redacts error detail** returned to clients so
+  internal messages don't leak over the wire.
+- **`LPAD` / `RPAD` output length is now capped** (default 1,048,576 chars,
+  overridable via `CRATON_MAX_PAD_LEN`) so an adversarial `len` can't drive an
+  unbounded host allocation; an over-cap request is a clean error. See
+  `docs/ENV_VARS.md`.
+
 ### Fixed
+- **Shared-memory GROUP BY negative-key out-of-bounds guard** — the Tier-1
+  shmem group-by path now bounds-checks negative / out-of-range keys before
+  indexing the slot buffer, closing an OOB access.
+- **Context-epoch the stream / graph / PTX caches** — the per-context stream
+  pool, CUDA-graph cache, and PTX module cache are now invalidated by a
+  `CONTEXT_EPOCH` bump on `CudaContext` drop, fixing a multi-engine teardown
+  use-after-free where a second engine reused handles minted in a
+  torn-down context.
+- **`GpuView` / `GpuViewMut` `Send` soundness** — the cross-thread handle types
+  now carry a `Mutex` so the `Send` impl is sound rather than relying on an
+  unsynchronised raw pointer.
+- **`IN (subquery)` stack overflow + three-valued-logic fold** — deeply nested
+  / large `IN (SELECT ...)` lists no longer overflow the stack during folding,
+  and the fold now follows SQL three-valued logic (NULL handling) correctly.
+- **Float-atomics bounded probe + signed-zero determinism** — the float
+  MIN/MAX CAS loop now uses a bounded probe (no unbounded spin) and canonicalises
+  `-0.0` / `+0.0` so results are deterministic across runs.
+- **Spill-counter null-gate** — the GROUP BY spill counter is no longer bumped
+  on a null/empty path, fixing a spurious spill-metric increment.
+- **Join-reorder schema-rename guard** — the join reorder optimization now
+  guards against the collision-safe right-side column renames so a reorder can't
+  resolve a column against the wrong (pre-rename) schema.
+- **Transactional `replace_table`** — replacing a registered table is now
+  atomic: a failure mid-replace leaves the previously-registered table intact
+  rather than dropping it.
+- **Disk PTX-cache stable hashing** — the on-disk cache key now uses a stable
+  (process-independent) hash so cache entries are reusable across processes as
+  intended.
+- **PTX decimal / null literals** — codegen now emits `Decimal128` and NULL
+  literals correctly in the PTX literal path.
+- **Join match-counter `u64` widening** — the join match counter is widened to
+  `u64`, preventing overflow on very large match cardinalities.
+- **Optimizer union-duplicate-name guard** — the optimizer now guards against
+  duplicate output column names produced by a `UNION`, and uses stats-driven
+  selectivity where available (see Changed).
 - **`Dictionary(Utf8)` `ORDER BY` now sorts by string value** (lexicographic)
   instead of by the raw dictionary index — fixes wrong ordering for unordered
   dictionaries on the GPU sort path.
@@ -47,6 +97,11 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
   source changes.
 - **Hardened the module-cache key** with a `Debug`-injectivity guard test;
   disk-cache write-through failures are now logged.
+- **Optimizer uses stats-driven selectivity** for filter / join cardinality
+  estimates where column statistics are available, falling back to the previous
+  heuristic constants otherwise.
+- **CI GPU lane exercises the real `cudarc` path** rather than the `cuda-stub`
+  shim, so the cudarc-backed driver calls get build/link coverage in CI.
 
 ### Docs
 - Corrected `docs/JIT_PIPELINE.md` (LRU + 128-bit key, disk cache documented)
