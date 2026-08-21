@@ -29,6 +29,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `CRATON_PLAN_CACHE_SIZE`         | 64                   | integer > 0 | SQL→LogicalPlan parse-cache capacity (FIFO)     |
 | `CRATON_MAX_SQL_BYTES`           | 1 MiB                | integer > 0 | Pre-parse cap on SQL input length (bytes)       |
 | `CRATON_MAX_SQL_TOKENS`          | 100_000              | integer > 0 | Pre-parse cap on SQL token count                |
+| `CRATON_MAX_PAD_LEN`             | 1_048_576 chars      | integer > 0 | `LPAD` / `RPAD` max output length (chars)       |
 | `CRATON_MAX_RECURSIVE_ITERATIONS`| 1000                 | integer > 0 | `WITH RECURSIVE` fixpoint iteration cap         |
 | `CRATON_MAX_APPLY_ROWS`          | 100_000              | integer > 0 | LATERAL/correlated-apply left-row cap           |
 | `CRATON_VALUES_MAX_ROWS`         | 1_000_000            | integer > 0 | `VALUES` literal row cap                         |
@@ -535,6 +536,26 @@ path in every case.
 - **Source**: `src/plan/sql_frontend.rs::max_sql_tokens` (env var name
   constant `MAX_SQL_TOKENS_ENV`, line 83; default constant
   `MAX_SQL_TOKENS_DEFAULT`, line 74).
+
+### `CRATON_MAX_PAD_LEN`
+- **Default**: `1_048_576` (1 << 20 characters)
+- **Type**: positive integer (characters), parsed as `usize`; `0` / empty /
+  unparseable fall back to the default
+- **What**: Upper bound on the requested output length of `LPAD(s, len, pad)` /
+  `RPAD(s, len, pad)`. Because the pad fill is materialized to `len` characters,
+  an adversarially large `len` (e.g. `LPAD('x', 2000000000, 'y')`) would
+  allocate gigabytes of host string before any cap. The string-ops executor
+  rejects any `len` above this cap with a clean `BoltError::Other(...)` instead
+  of attempting a runaway allocation; values at or below the cap pad / truncate
+  exactly as documented for `LPAD` / `RPAD`. (`len <= 0` still yields the empty
+  string and never consults this cap.)
+- **When**: Raise on trusted workloads that legitimately pad to more than ~1M
+  characters; lower to tighten the guard on shared / hostile inputs.
+- **Notes**: Cheap env lookup; invalid (non-integer / zero / empty) values fall
+  back to the default of 1,048,576. Mirrors the conservative
+  fall-back-to-default posture of the other `CRATON_MAX_*` guards.
+- **Source**: `src/exec/string_ops_extended.rs` (`pad_str` length guard;
+  env var name constant `MAX_PAD_LEN_ENV`).
 
 ### `CRATON_MAX_RECURSIVE_ITERATIONS`
 - **Default**: `1000`
