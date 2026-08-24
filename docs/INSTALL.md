@@ -16,6 +16,7 @@ For day-to-day build / test / bench commands once you're set up, see
 | CUDA Toolkit 12.x                         | Provides `cuda.lib` (Windows) / `libcuda.so` (Linux) for the linker.         |
 | NVIDIA driver matching the toolkit        | Required only to *run* kernels on a real GPU (tests / benches).              |
 | NVIDIA GPU with compute capability ≥ 7.0  | Required only for live-GPU tests and `cargo bench` with `BOLT_BENCH_GPU=1`.  |
+| **`lld-link` (LLVM) — Windows only**      | `.cargo/config.toml` hard-sets `linker = "lld-link"` for the `x86_64-pc-windows-msvc` target, so it must be on `PATH` for every Windows build (see [Windows linker: lld-link](#windows-linker-lld-link)). A fallback to MSVC `link.exe` is documented below for hosts without LLVM. |
 
 You do **not** need a GPU or the CUDA toolkit to build, type-check, or run the
 offline test suite — see [Building without CUDA](#building-without-cuda)
@@ -69,6 +70,57 @@ This requires `cuda.lib` / `libcuda.so` on the linker path (see
 toolkit automatically from `CUDA_PATH` or the platform-default install
 locations; set `CUDA_PATH` explicitly to pin a specific install (see
 [`ENV_VARS.md`](./ENV_VARS.md)).
+
+### Windows linker: lld-link
+
+On Windows, `.cargo/config.toml` hard-sets the linker for the
+`x86_64-pc-windows-msvc` target:
+
+```toml
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+```
+
+This applies to **every** Windows build (`cargo build`, `cargo test`,
+`cargo bench`), so **`lld-link` must be on `PATH`**. It comes with LLVM —
+install it with `scoop install llvm`, `choco install llvm`, or any LLVM
+toolchain (it ships as `lld-link.exe`). The Rust toolchain also bundles a copy
+at `<sysroot>/lib/rustlib/x86_64-pc-windows-msvc/bin/gcc-ld/lld-link.exe` if a
+system LLVM is not desired.
+
+Why `lld-link` rather than MSVC's `link.exe`: the integration-test suite links
+~39 binaries that each embed the bundled `duckdb` dev-dependency. MSVC's
+`link.exe` spawns `mspdbsrv.exe` for PDB debug info, and `mspdbsrv` enforces a
+hard concurrent-session limit that linking that many DuckDB-embedding binaries
+blows past (`LNK1318: Unexpected PDB error; LIMIT (12)`). `lld-link` generates
+PDBs in-process with no `mspdbsrv` and no such limit. It only changes the
+*link* step; compiled rlibs are unaffected. See the comments in
+`.cargo/config.toml` for the full rationale.
+
+**Fallback — no LLVM installed?** If you don't have (and don't want) LLVM, you
+can override the linker back to MSVC `link.exe`. Open an **MSVC developer
+shell** (run `vcvars64.bat`, or use the "x64 Native Tools Command Prompt") so
+`link.exe` is on `PATH`, then set the per-target linker env var, which
+overrides the `.cargo/config.toml` setting:
+
+```powershell
+# In an MSVC dev shell (vcvars64) so link.exe is on PATH:
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "link.exe"
+cargo build --release
+```
+
+```cmd
+:: cmd.exe equivalent:
+set CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe
+cargo build --release
+```
+
+This works fine for the library and a single binary; the `mspdbsrv` session
+limit only bites when linking the full ~39-binary integration-test suite in one
+go (`cargo test`), so prefer `lld-link` if you intend to run the integration
+tests. Do **not** edit `.cargo/config.toml` to make this change — the env-var
+override keeps the committed config (which the CI/maintainer flow depends on)
+intact.
 
 ### Cargo features
 
