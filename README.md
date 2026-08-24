@@ -65,6 +65,14 @@ cargo build --release
 
 Hosts without a CUDA toolkit can type-check the crate with `cargo build --no-default-features --features cuda-stub` — useful for CI and `docs.rs` builds.
 
+> **Windows note:** `.cargo/config.toml` sets `linker = "lld-link"` for the
+> `x86_64-pc-windows-msvc` target, so **LLVM's `lld-link` must be on `PATH`**
+> for any Windows build (install LLVM, e.g. `scoop install llvm`). Without LLVM,
+> open an MSVC dev shell (`vcvars64`) and override the linker back to MSVC with
+> `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe`. See
+> [`docs/INSTALL.md`](docs/INSTALL.md#windows-linker-lld-link) for details and
+> why `lld-link` is the default.
+
 ### Run a query
 
 ```rust
