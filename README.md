@@ -81,24 +81,31 @@ use arrow_array::{Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use craton_bolt::Engine;
 
-let mut engine = Engine::new()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = Engine::new()?;
 
-// Register a table.
-let region: Int32Array = (0..1_000_000_i32).map(|i| i % 4).collect();
-let price:  Float64Array = (0..1_000_000_u64).map(|i| i as f64).collect();
-let tax:    Float64Array = (0..1_000_000_u64).map(|_| 0.0825_f64).collect();
-let schema = Arc::new(Schema::new(vec![
-    Field::new("region_id", DataType::Int32,   false),
-    Field::new("price",     DataType::Float64, false),
-    Field::new("tax",       DataType::Float64, false),
-]));
-let batch = RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(price), Arc::new(tax)])?;
-engine.register_table("sales", batch)?;
+    // Register a table.
+    let region: Int32Array = (0..1_000_000_i32).map(|i| i % 4).collect();
+    let price:  Float64Array = (0..1_000_000_u64).map(|i| i as f64).collect();
+    let tax:    Float64Array = (0..1_000_000_u64).map(|_| 0.0825_f64).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region_id", DataType::Int32,   false),
+        Field::new("price",     DataType::Float64, false),
+        Field::new("tax",       DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(region), Arc::new(price), Arc::new(tax)])?;
+    engine.register_table("sales", batch)?;
 
-// Execute.
-let handle = engine.sql("SELECT price * tax FROM sales WHERE region_id = 1")?;
-println!("got {} rows", handle.num_rows());
+    // Execute.
+    let handle = engine.sql("SELECT price * tax FROM sales WHERE region_id = 1")?;
+    println!("got {} rows", handle.num_rows());
+    Ok(())
+}
 ```
+
+> `Engine::new()` requires a CUDA-capable GPU; build/run this on a host with
+> the toolkit, or see [`examples/quickstart.rs`](examples/quickstart.rs) for a
+> variant that degrades gracefully when no GPU is present.
 
 Behind the scenes for that single line: the SQL is parsed; column references and string literals are rewritten as needed; the logical plan is lowered to a `KernelSpec` of SSA-shaped ops; the codegen emits a fresh PTX module; the CUDA driver assembles it to SASS; the kernel launches one thread per row with predicate gating; a GPU-side prefix-scan + gather compacts the output; the surviving rows download into an Arrow `RecordBatch`.
 
