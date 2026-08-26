@@ -3,7 +3,9 @@
 //! Craton Bolt — JIT-compiled GPU SQL engine.
 //!
 //! Pipeline: SQL string → Logical Plan → Physical Plan → IR → PTX string →
-//! NVRTC-compiled cubin → CUDA launch → result Arrow array.
+//! driver-JIT cubin (the CUDA driver assembles the PTX to SASS in-process via
+//! `cuModuleLoadData` — the NVRTC-equivalent path, with **no NVRTC dependency
+//! at runtime**) → CUDA launch → result Arrow array.
 //!
 //! Memory safety: GPU allocations are owned by `GpuVec<T>` and borrowed as
 //! `GpuView<T>`. Kernel launches that need write access require
