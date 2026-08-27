@@ -1072,7 +1072,9 @@ mod tests {
         // Sanity: the duplicate non-key `x` really did get disambiguated, so
         // this fixture genuinely exercises the shape-dependent rename path.
         assert!(
-            before.iter().any(|n| n != "x" && n.contains('x') && n.contains('.'))
+            before
+                .iter()
+                .any(|n| n != "x" && n.contains('x') && n.contains('.'))
                 || before.iter().filter(|n| n.as_str() == "x").count() == 1,
             "fixture must trigger combined-schema renaming, got {before:?}"
         );
