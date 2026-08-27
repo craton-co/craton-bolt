@@ -2010,7 +2010,9 @@ fn emit_cast(
             )));
         }
         // Decimal128 -> Bool: not a supported conversion in this engine.
-        (Decimal128(_, _), Bool) | (Decimal128(_, _), Date32) | (Decimal128(_, _), Timestamp(_, _)) => {
+        (Decimal128(_, _), Bool)
+        | (Decimal128(_, _), Date32)
+        | (Decimal128(_, _), Timestamp(_, _)) => {
             return Err(BoltError::Plan(format!(
                 "ptx_gen: CAST {from:?} -> {to:?} is not a supported Decimal128 conversion"
             )));
@@ -2044,7 +2046,8 @@ fn emit_cast(
                     return Err(BoltError::Plan(
                         "ptx_gen: identity CAST on Decimal128 must stay a dual-register \
                          (lo, hi) no-op (see physical_plan::emit_cast_expr); the \
-                         single-register Op::Cast would drop the high half".into(),
+                         single-register Op::Cast would drop the high half"
+                            .into(),
                     ))
                 }
             };
