@@ -1085,7 +1085,8 @@ fn golden_hash_join_probe_kernel_smoke() {
         ptx.contains(".visible .entry bolt_hash_join_probe"),
         "{ptx}"
     );
-    // Probe is non-mutating; it only does atomic-add on the output counter.
+    // Probe is non-mutating; it only does atomic-add on the output counter
+    // (widened to u64 to avoid >2^32-match wraparound).
     assert!(
         ptx.contains("atom.global.add.u64"),
         "missing output-claim atomic\n{ptx}"
@@ -1112,7 +1113,7 @@ fn golden_hash_join_probe_tiled_kernel_smoke() {
         ptx.contains(".visible .entry bolt_hash_join_probe_tiled"),
         "{ptx}"
     );
-    // Same output-claim atomic as the single-load probe.
+    // Same output-claim atomic as the single-load probe (u64-wide counter).
     assert!(
         ptx.contains("atom.global.add.u64"),
         "missing output-claim atomic\n{ptx}"
@@ -1215,8 +1216,8 @@ fn golden_hash_join_unmatched_build_kernel_smoke() {
 // ---- Tests: speculative ld.acquire pre-check before output-counter atom.add
 //
 // All probe (and unmatched-build) kernels that claim output slots via
-// `atom.global.add.u32` on a shared counter must first emit a speculative
-// `ld.acquire.gpu.u32` of the counter and a `setp.ge.u32` against the
+// `atom.global.add.u64` on a shared counter must first emit a speculative
+// `ld.acquire.gpu.u64` of the counter and a `setp.ge.u64` against the
 // out_capacity register, branching to the bail label. Without this, under
 // capacity overflow EVERY matching thread issues an atomic increment on the
 // hot counter cacheline, serializing all warps even when no writes will
@@ -1225,7 +1226,7 @@ fn golden_hash_join_unmatched_build_kernel_smoke() {
 // pre-check is still safe.
 //
 // Each test asserts the literal speculative-load shape and verifies it
-// appears textually BEFORE the atom.global.add.u32 site in the emitted PTX.
+// appears textually BEFORE the atom.global.add.u64 site in the emitted PTX.
 
 /// Helper: assert that `needle_pre` appears at a lower byte offset than
 /// `needle_post` in `ptx`. Reports both offsets on failure.
