@@ -309,26 +309,33 @@ impl JoinReorder {
 
         let rebuilt = rebuild_from_shape(&optimized.shape, &leaves, &equi_pairs)?;
 
-        // Combined-schema name guard. The reorder preserves the leaf *set*, so
-        // the multiset of underlying columns is unchanged — but the renaming
-        // `join_combined_schema` applies to duplicate non-key column names is
-        // shape-dependent. A reorder is safe when *every name* present in the
-        // original schema is also present (possibly in a different position) in
-        // the rebuilt schema, i.e. no collision-driven suffix rename occurred
-        // that would cause a parent expression to dangle or bind to the wrong
-        // column. Comparing sorted name multisets captures exactly this: if the
-        // sorted sequences match, all names are preserved and no new rename was
-        // introduced, so name-based column resolution by any parent node is
-        // unaffected. A positional comparison would wrongly abort valid reorders
-        // where all names are unique (no renaming) and the shape change merely
-        // moves columns to different positions in the output.
-        let rebuilt_names = field_name_sequence(&rebuilt)?;
-        let mut sorted_original = original_names.clone();
-        let mut sorted_rebuilt = rebuilt_names;
-        sorted_original.sort();
-        sorted_rebuilt.sort();
-        if sorted_rebuilt != sorted_original {
-            return None;
+        // Combined-schema name guard — enforced ONLY when a shape-dependent
+        // collision-rename can actually occur. `join_combined_schema` renames a
+        // column (`right.x`, then `__2`, ...) solely when two leaves share a
+        // base column name, and *which* column gets the suffix depends on the
+        // join shape/order — so for COLLIDING names a reorder could rebind a
+        // name-referencing parent to the wrong leaf's column or dangle, and the
+        // rebuilt field-name sequence must match the original positionally (a
+        // *set* comparison is insufficient — the renames must line up).
+        //
+        // When every leaf column name is globally UNIQUE, no rename ever
+        // happens: reordering merely permutes column order, and a name-based
+        // binding still resolves to the same column, so the reorder is safe even
+        // though the field-name sequence changes. Enforcing the positional match
+        // there would (wrongly) veto every legitimate reorder. So we gate the
+        // guard on the presence of cross-leaf name collisions.
+        let total_cols: usize = leaf_cols.iter().map(|s| s.len()).sum();
+        let distinct_cols = leaf_cols
+            .iter()
+            .flatten()
+            .collect::<HashSet<&String>>()
+            .len();
+        let has_name_collision = total_cols != distinct_cols;
+        if has_name_collision {
+            let rebuilt_names = field_name_sequence(&rebuilt)?;
+            if rebuilt_names != original_names {
+                return None;
+            }
         }
 
         Some(rebuilt)
