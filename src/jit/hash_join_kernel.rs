@@ -3295,12 +3295,17 @@ mod tests {
                 !ptx.contains("atom.global.add.u32"),
                 "{name}: u32 counter atomic must be gone (overflow wrap); got:\n{ptx}"
             );
-            // The speculative counter pre-check load must also be 64-bit so a
-            // counter already past 2^32 isn't read as a small u32.
-            assert!(
-                ptx.contains("ld.acquire.gpu.u64"),
-                "{name}: speculative counter pre-check must be a 64-bit load; got:\n{ptx}"
-            );
+            // The speculative *counter* pre-check load must also be 64-bit so a
+            // counter already past 2^32 isn't read as a small u32. The tiled
+            // probe claims output slots without that counter pre-check (its only
+            // acquire-load is the s64 *slot* read), so this applies to the other
+            // four kernels.
+            if *name != "probe_tiled" {
+                assert!(
+                    ptx.contains("ld.acquire.gpu.u64"),
+                    "{name}: speculative counter pre-check must be a 64-bit load; got:\n{ptx}"
+                );
+            }
             // The counter-vs-capacity comparisons must be 64-bit so an
             // overflowed counter never aliases a small in-range index.
             assert!(
