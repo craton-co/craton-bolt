@@ -30,6 +30,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `CRATON_MAX_SQL_BYTES`           | 1 MiB                | integer > 0 | Pre-parse cap on SQL input length (bytes)       |
 | `CRATON_MAX_SQL_TOKENS`          | 100_000              | integer > 0 | Pre-parse cap on SQL token count                |
 | `CRATON_MAX_PAD_LEN`             | 1_048_576 chars      | integer > 0 | `LPAD` / `RPAD` max output length (chars)       |
+| `CRATON_IN_SET_MAX_ROWS`         | 10_000_000           | integer > 0 | `IN (subquery)` materialized set row cap        |
 | `CRATON_MAX_RECURSIVE_ITERATIONS`| 1000                 | integer > 0 | `WITH RECURSIVE` fixpoint iteration cap         |
 | `CRATON_MAX_APPLY_ROWS`          | 100_000              | integer > 0 | LATERAL/correlated-apply left-row cap           |
 | `CRATON_VALUES_MAX_ROWS`         | 1_000_000            | integer > 0 | `VALUES` literal row cap                         |
@@ -556,6 +557,24 @@ path in every case.
   fall-back-to-default posture of the other `CRATON_MAX_*` guards.
 - **Source**: `src/exec/string_ops_extended.rs` (`pad_str` length guard;
   env var name constant `MAX_PAD_LEN_ENV`).
+
+### `CRATON_IN_SET_MAX_ROWS`
+- **Default**: `10_000_000` (ten million rows)
+- **Type**: positive integer, parsed as `usize`; `0` / empty / unparseable fall
+  back to the default
+- **What**: Upper bound on the number of distinct values materialized from an
+  `x IN (SELECT ...)` subquery before the engine rejects the query with a clean
+  `BoltError`. The IN result is expanded into an in-memory set (deduplicated via
+  a hash set) and folded into a balanced predicate tree; without a cap a
+  high-cardinality subquery result could exhaust host memory or build a
+  pathologically deep expression.
+- **When**: Raise on trusted workloads with legitimately large `IN`-subqueries;
+  lower to tighten the guard on shared / hostile inputs.
+- **Notes**: Latched once per process (`OnceLock`); invalid (non-integer / zero
+  / empty) values fall back to the default with a one-time `log::warn!`. Mirrors
+  `CRATON_SETOP_HOST_MAX_ROWS` / `CRATON_DISTINCT_HOST_MAX_ROWS`.
+- **Source**: `src/exec/subquery_resolve.rs` (IN-set size cap; env var name
+  constant `IN_SET_MAX_ROWS_ENV`, default constant `IN_SET_MAX_ROWS`).
 
 ### `CRATON_MAX_RECURSIVE_ITERATIONS`
 - **Default**: `1000`
