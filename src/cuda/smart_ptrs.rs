@@ -331,11 +331,9 @@ impl<'a, T: Pod> GpuView<'a, T> {
         // SAFETY: `self.streams` was minted by `GpuVec::view` from the live
         // parent buffer, whose lifetime is `>= 'a` (the view borrows it), so
         // the cell is valid for the whole life of `self`. `tag_stream_set`
-        // null-checks before dereferencing. NOTE: it then `borrow_mut`s a
-        // non-atomic `RefCell`; this is only race-free because Craton Bolt
-        // serializes all tagging/`Drop` of a given buffer onto one thread (see
-        // the `Send` impl below) — `Send` lets the view move threads, but the
-        // launch discipline must ensure no concurrent tag of the same cell.
+        // null-checks before dereferencing, then `lock()`s the parent buffer's
+        // `parking_lot::Mutex<StreamSet>` (see the `Send` impl below), so a tag
+        // from another thread synchronizes on the mutex rather than racing.
         unsafe { tag_stream_set(self.streams, stream) }
     }
 
@@ -360,33 +358,24 @@ impl<'a, T: Pod> GpuView<'a, T> {
 // the view. The added raw pointer makes the auto-derived `Send` go away,
 // hence this explicit impl.
 //
-// HONEST SOUNDNESS BASIS — read before relying on this:
+// SOUNDNESS BASIS — read before relying on this:
 //
-// The pointee of `streams` is the parent buffer's `RefCell<StreamSet>`. Its
-// borrow flag is a NON-ATOMIC `Cell`, so `mark_launch_use` -> `tag_stream_set`
-// -> `borrow_mut()` mutating it from two threads at once — or one thread
-// tagging while another runs the buffer's `Drop` (which also borrows the
-// cell) — is a genuine DATA RACE = undefined behaviour. The often-quoted
-// "RefCell panics instead of UB" guarantee applies ONLY to single-threaded
-// re-entrant borrows; it does NOT make a cross-thread borrow-flag race safe.
+// The pointee of `streams` is the parent buffer's stream-set cell. As of the
+// companion `crate::cuda::buffer` change, that cell is a
+// `parking_lot::Mutex<StreamSet>` (the `StreamSetRef = *const Mutex<StreamSet>`
+// alias and `tag_stream_set` `lock()` it). So `mark_launch_use` ->
+// `tag_stream_set`, and the buffer's `Drop` (which also locks the cell),
+// SYNCHRONIZE on the mutex: a tag from one thread blocks against a tag or
+// `Drop` on another rather than corrupting shared state. That is what makes
+// moving a `GpuView` across threads memory-safe — i.e. what this `Send` claims.
 //
-// What actually makes this `Send` impl sound today is an OPERATIONAL
-// invariant, not a type-system one: Craton Bolt drives every GPU launch (and
-// therefore every `mark_launch_use`/`mark_stream_use` tag and every buffer
-// `Drop`) through a single serialized launch thread per context. No two
-// threads ever touch the same buffer's stream-set cell concurrently, so the
-// race above is never realized. Moving a `GpuView` to another thread is only
-// safe while that discipline holds; safe code that tags a sibling view on one
-// thread while this view is tagged on another (e.g. via `std::thread::scope`)
-// would reintroduce the race. See the module-level note below the impl.
-//
-// The STRUCTURALLY sound fix is to replace the parent buffer's
-// `RefCell<StreamSet>` (and the `StreamSetRef = *const RefCell<StreamSet>`
-// alias and `tag_stream_set`) with a thread-safe primitive — `parking_lot`
-// is already a dependency — so concurrent tags synchronize rather than race.
-// That state lives in `crate::cuda::buffer`, not here, so it cannot be done
-// from this module alone; this comment documents the real invariant until
-// that cross-module change lands.
+// (Historically this cell was a non-atomic `RefCell<StreamSet>`, and this
+// `Send` impl was sound only by an OPERATIONAL invariant: Craton Bolt drives
+// every launch/tag/`Drop` through a single serialized launch thread per
+// context. That serialization still governs launch *ordering* for correctness,
+// but it is no longer what keeps this `Send` memory-safe — the mutex is. The
+// "RefCell panics instead of UB" guarantee never applied across threads
+// anyway; the lock removes the question entirely.)
 unsafe impl<'a, T: Pod> Send for GpuView<'a, T> {}
 // Intentionally NOT `Sync`: under Craton Bolt's launch model a kernel can write
 // through the parent `GpuVec` while another thread reads through the view
@@ -443,10 +432,10 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
     pub fn mark_launch_use(&self, stream: CUstream) {
         // SAFETY: identical to `GpuView::mark_launch_use` — the parent
         // buffer outlives `'a`, so `self.streams` is valid for the view's
-        // life; `tag_stream_set` null-checks before dereferencing. The
-        // `borrow_mut` of the non-atomic `RefCell` it then performs is race-free
-        // only under Craton Bolt's single serialized-launch-thread discipline
-        // (see the `GpuView`/`GpuViewMut` `Send` impls), not by the type system.
+        // life; `tag_stream_set` null-checks before dereferencing, then `lock()`s
+        // the parent buffer's `parking_lot::Mutex<StreamSet>`, so a concurrent
+        // tag or `Drop` synchronizes on the mutex rather than racing (see the
+        // `GpuView`/`GpuViewMut` `Send` impls).
         unsafe { tag_stream_set(self.streams, stream) }
     }
 
@@ -477,13 +466,11 @@ impl<'a, T: Pod> GpuViewMut<'a, T> {
 // SAFETY: ownership of a `GpuViewMut` may move between threads; the underlying
 // device memory is reachable only via this single handle for its lifetime.
 // The `streams` raw back-pointer carries the SAME soundness basis as the
-// `GpuView` `Send` impl above — including the honest caveat: the parent
-// buffer's stream-set cell is a non-atomic `RefCell`, so the only thing that
-// keeps a cross-thread `mark_launch_use`/`Drop` borrow-flag race from being
-// UB is Craton Bolt's single serialized-launch-thread discipline, NOT any
-// `RefCell` panic guarantee. The structurally sound fix (move that cell behind
-// a `parking_lot` lock in `crate::cuda::buffer`) is cross-module and so cannot
-// be applied from this file. See the `GpuView` `Send` impl for the full note.
+// `GpuView` `Send` impl above: the parent buffer's stream-set cell is a
+// `parking_lot::Mutex<StreamSet>` (companion `crate::cuda::buffer` change), so a
+// cross-thread `mark_launch_use`/`Drop` synchronizes on the mutex rather than
+// racing a non-atomic borrow flag. See the `GpuView` `Send` impl for the full
+// note (and the historical RefCell-by-discipline caveat it supersedes).
 unsafe impl<'a, T: Pod> Send for GpuViewMut<'a, T> {}
 // Intentionally NOT `Sync`: concurrent mutation through shared references
 // would race on device memory just as `&mut [T]` would on host memory.
