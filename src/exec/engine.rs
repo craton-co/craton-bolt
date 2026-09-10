@@ -98,6 +98,31 @@ fn max_recursive_iterations() -> usize {
         .unwrap_or(MAX_RECURSIVE_ITERATIONS)
 }
 
+/// Hard safety cap on the number of rows a `WITH RECURSIVE` fixpoint may
+/// materialize (working set or accumulated result), INDEPENDENT of
+/// [`MAX_RECURSIVE_ITERATIONS`]. A non-linear recursive term (one that scans
+/// the CTE more than once, i.e. a self-join) multiplies its input super-
+/// linearly, so it can exhaust host memory in far fewer than
+/// [`MAX_RECURSIVE_ITERATIONS`] iterations — the iteration cap alone does not
+/// bound memory. Capping the row count lets the engine return a clean
+/// [`BoltError`] instead of aborting the process on a multi-GiB allocation.
+/// Override with [`MAX_RECURSIVE_ROWS_ENV`].
+pub(crate) const MAX_RECURSIVE_ROWS: usize = 10_000_000;
+
+/// Environment-variable override for [`MAX_RECURSIVE_ROWS`]. A positive integer
+/// raises (or lowers) the cap; a missing / non-integer / zero value falls back
+/// to the default. Mirrors the `CRATON_*` size-guard convention.
+pub(crate) const MAX_RECURSIVE_ROWS_ENV: &str = "CRATON_MAX_RECURSIVE_ROWS";
+
+/// Resolve the effective recursive-CTE row cap (env override or default).
+fn max_recursive_rows() -> usize {
+    std::env::var(MAX_RECURSIVE_ROWS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_RECURSIVE_ROWS)
+}
+
 /// Hard safety cap on the number of LEFT rows a LATERAL apply (feature F3) will
 /// drive (feature: LATERAL / correlated execution).
 ///
@@ -3181,6 +3206,22 @@ impl Engine {
                 )));
             }
 
+            // Row-count safety cap (independent of the iteration cap): a
+            // non-linear recursive term multiplies its input, so bound the
+            // working set BEFORE running the next term — otherwise an explosive
+            // cycle can request a multi-GiB allocation inside the recursive
+            // subplan and abort the process instead of erroring cleanly.
+            if working_set.num_rows() > max_recursive_rows() {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: working set reached {} rows, exceeding the \
+                     {}-row safety cap (set {MAX_RECURSIVE_ROWS_ENV} to \
+                     override) — a non-linear recursive term is multiplying rows \
+                     without reaching a fixpoint",
+                    working_set.num_rows(),
+                    max_recursive_rows()
+                )));
+            }
+
             let rec_out = relabel(run_with_cte(&working_set, &rec.recursive)?)?;
 
             if rec.all && rec.naive {
@@ -3233,6 +3274,19 @@ impl Engine {
                 }
                 working_set = deduped.clone();
                 result = deduped;
+            }
+
+            // Bound the accumulated result too: UNION ALL appends every row and
+            // cannot dedup, so a slowly-growing cycle accretes rows each step
+            // until the iteration cap — fail cleanly at the row cap first.
+            if result.num_rows() > max_recursive_rows() {
+                return Err(BoltError::Plan(format!(
+                    "WITH RECURSIVE: accumulated result reached {} rows, \
+                     exceeding the {}-row safety cap (set \
+                     {MAX_RECURSIVE_ROWS_ENV} to override)",
+                    result.num_rows(),
+                    max_recursive_rows()
+                )));
             }
         }
 

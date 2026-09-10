@@ -32,6 +32,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `CRATON_MAX_PAD_LEN`             | 1_048_576 chars      | integer > 0 | `LPAD` / `RPAD` max output length (chars)       |
 | `CRATON_IN_SET_MAX_ROWS`         | 10_000_000           | integer > 0 | `IN (subquery)` materialized set row cap        |
 | `CRATON_MAX_RECURSIVE_ITERATIONS`| 1000                 | integer > 0 | `WITH RECURSIVE` fixpoint iteration cap         |
+| `CRATON_MAX_RECURSIVE_ROWS`      | 10_000_000           | integer > 0 | `WITH RECURSIVE` working-set / result row cap   |
 | `CRATON_MAX_APPLY_ROWS`          | 100_000              | integer > 0 | LATERAL/correlated-apply left-row cap           |
 | `CRATON_VALUES_MAX_ROWS`         | 1_000_000            | integer > 0 | `VALUES` literal row cap                         |
 | `CRATON_GENERATE_SERIES_MAX_ROWS`| 10_000_000           | integer > 0 | `generate_series` output row cap                |
@@ -575,6 +576,26 @@ path in every case.
   `CRATON_SETOP_HOST_MAX_ROWS` / `CRATON_DISTINCT_HOST_MAX_ROWS`.
 - **Source**: `src/exec/subquery_resolve.rs` (IN-set size cap; env var name
   constant `IN_SET_MAX_ROWS_ENV`, default constant `IN_SET_MAX_ROWS`).
+
+### `CRATON_MAX_RECURSIVE_ROWS`
+- **Default**: `10_000_000` (ten million rows)
+- **Type**: positive integer, parsed as `usize`; missing / non-integer / `0`
+  fall back to the default
+- **What**: Hard cap on the number of rows a `WITH RECURSIVE` fixpoint may
+  materialize (the working set fed into each iteration and the accumulated
+  result). INDEPENDENT of `CRATON_MAX_RECURSIVE_ITERATIONS`: a non-linear
+  recursive term (one that scans the CTE more than once, i.e. a self-join)
+  multiplies its input super-linearly, so it can exhaust host memory in far
+  fewer than the iteration cap. When the working set or the accumulated result
+  exceeds this cap the engine returns a clean `BoltError` instead of aborting
+  the process on a multi-GiB allocation.
+- **When**: Raise on trusted workloads with legitimately large recursive
+  results; lower to tighten the guard on shared / hostile inputs.
+- **Notes**: Checked at the top of every fixpoint iteration (before the next
+  recursive term runs) and after the result grows. Mirrors the other `CRATON_*`
+  row caps.
+- **Source**: `src/exec/engine.rs` (`execute_recursive_cte`; env var name
+  constant `MAX_RECURSIVE_ROWS_ENV`, default constant `MAX_RECURSIVE_ROWS`).
 
 ### `CRATON_MAX_RECURSIVE_ITERATIONS`
 - **Default**: `1000`
