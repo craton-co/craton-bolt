@@ -3350,7 +3350,67 @@ impl Engine {
 
         let outer_arrow = plan_schema_to_arrow_schema(&la.outer_schema)?;
         let sub_arrow = plan_schema_to_arrow_schema(&la.subquery_schema)?;
-        let combined_arrow = plan_schema_to_arrow_schema(&la.combined_schema)?;
+        // Build the applied (combined) relation against the ACTUAL produced
+        // left schema, NOT the frontend-captured `la.left_schema`. As in
+        // `execute_correlated_where`, re-running `la.left` through `run_subplan`
+        // can produce a relation that differs column-for-column from the schema
+        // the frontend recorded (projection pruning dropping an unreferenced
+        // left column, or an equivalent column under a different Arrow
+        // encoding). Building the cross product against the stale
+        // `la.combined_schema` then trips `RecordBatch::try_new`'s
+        // column-count / type check (the "LATERAL cross-product row" error).
+        //
+        // Rebuild the combined schema as the ACTUAL left fields ++ the subquery
+        // tail. The subquery tail is taken from the ORIGINAL `la.combined_schema`
+        // (its trailing `la.subquery_schema.fields.len()` fields), which already
+        // carries the duplicate-name disambiguation the OUTER template
+        // (`la.post`) was lowered against — dropping left columns can only
+        // remove name collisions, never introduce them, so reusing those tail
+        // names stays consistent. `la.post` binds columns by NAME (the
+        // projection kernel resolves inputs via `schema.index_of`), so the
+        // surviving left field names line up with `post` exactly and any dropped
+        // (unreferenced) column is safely absent.
+        let n_sub = la.subquery_schema.fields.len();
+        let declared_combined = plan_schema_to_arrow_schema(&la.combined_schema)?;
+        let combined_arrow = {
+            let left_schema = left.schema();
+            let declared = declared_combined.fields();
+            // The subquery tail is the last `n_sub` fields of the declared
+            // combined schema (its head was `la.left_schema`, now superseded by
+            // the actual `left.schema()`). Build a `Vec<Field>` (mirroring the
+            // `Schema::new` call sites in `engine_support`) from the produced
+            // left fields ++ that tail.
+            let sub_tail = &declared[declared.len() - n_sub..];
+            let combined_fields: Vec<arrow_schema::Field> = left_schema
+                .fields()
+                .iter()
+                .chain(sub_tail.iter())
+                .map(|f| f.as_ref().clone())
+                .collect();
+            Arc::new(arrow_schema::Schema::new(combined_fields))
+        };
+
+        // `la.corr_left_indices` index into the FRONTEND `la.left_schema`, but
+        // the per-row gather below indexes into the ACTUAL produced `left`
+        // batch — whose columns may be a pruned subset (see the combined-schema
+        // note above), shifting positions. Remap each correlated index to the
+        // produced column with the SAME NAME (pruning never renames). This keeps
+        // the outer-value gather sound even when a left column ordered before a
+        // correlated one was pruned. A correlated column itself is never pruned
+        // (the per-row test references it), so the name is always present.
+        let actual_left_schema = left.schema();
+        let mut corr_actual_indices: Vec<usize> =
+            Vec::with_capacity(la.corr_left_indices.len());
+        for &li in &la.corr_left_indices {
+            let name = &la.left_schema.fields[li].name;
+            let pos = actual_left_schema.index_of(name).map_err(|_| {
+                BoltError::Plan(format!(
+                    "LATERAL apply: correlated left column '{name}' not present in \
+                     the produced left relation"
+                ))
+            })?;
+            corr_actual_indices.push(pos);
+        }
 
         // Run a lateral subplan with the single-row outer relation bound. The
         // overlay entry is always cleared afterwards (mirrors the recursive
@@ -3386,8 +3446,8 @@ impl Engine {
             // Build the single-row outer relation: gather `corr_left_indices`
             // from this row, renamed to the `__corr_<i>` schema.
             let one = UInt32Array::from(vec![row as u32]);
-            let mut outer_cols: Vec<ArrayRef> = Vec::with_capacity(la.corr_left_indices.len());
-            for &li in &la.corr_left_indices {
+            let mut outer_cols: Vec<ArrayRef> = Vec::with_capacity(corr_actual_indices.len());
+            for &li in &corr_actual_indices {
                 let g = arrow::compute::take(left.column(li).as_ref(), &one, None)
                     .map_err(|e| BoltError::Other(format!("LATERAL outer take: {e}")))?;
                 outer_cols.push(g);
@@ -3539,7 +3599,47 @@ impl Engine {
         let n_left = left.num_rows();
 
         let outer_arrow = plan_schema_to_arrow_schema(&cw.outer_schema)?;
-        let left_arrow = plan_schema_to_arrow_schema(&cw.left_schema)?;
+        // Build the surviving-rows result against the ACTUAL produced schema,
+        // NOT the frontend-captured `cw.left_schema`. `cw.left` is re-run through
+        // the full optimizer + executor by `run_subplan`, which can legitimately
+        // produce a relation that differs column-for-column from the schema the
+        // frontend recorded when it built the plan — e.g. projection pruning may
+        // drop a column nothing upstream references (a left column present in
+        // the FROM but never projected / correlated / ordered by), or the
+        // executor may hand back an equivalent column under a different Arrow
+        // encoding. Building against the stale declared schema then trips
+        // `RecordBatch::try_new`'s column-count / type check (the
+        // "correlated-WHERE result build" error). Using `left.schema()` makes
+        // the result build trivially consistent with the data it holds.
+        //
+        // This stays correct for the OUTER template (`cw.post`): although `post`
+        // was lowered over `cw.left_schema`, it binds columns by NAME (the
+        // projection kernel resolves inputs via `schema.index_of`), so any
+        // column that survives in `left.schema()` lines up with `post` by name,
+        // and any dropped column is — by construction of the pruning that
+        // dropped it — unreferenced by `post`.
+        let left_arrow = left.schema();
+
+        // `cw.corr_left_indices` index into the FRONTEND `cw.left_schema`, but
+        // the per-row gather below indexes into the ACTUAL produced `left`
+        // batch — whose columns may be a pruned subset (see the `left_arrow`
+        // note above), shifting positions. Remap each correlated index to the
+        // produced column with the SAME NAME (pruning never renames), so the
+        // outer-value gather stays sound even when a column ordered before a
+        // correlated one was pruned. A correlated column itself is never pruned
+        // (the per-row test references it), so the name is always present.
+        let mut corr_actual_indices: Vec<usize> =
+            Vec::with_capacity(cw.corr_left_indices.len());
+        for &li in &cw.corr_left_indices {
+            let name = &cw.left_schema.fields[li].name;
+            let pos = left_arrow.index_of(name).map_err(|_| {
+                BoltError::Plan(format!(
+                    "correlated WHERE: correlated outer column '{name}' not present \
+                     in the produced outer relation"
+                ))
+            })?;
+            corr_actual_indices.push(pos);
+        }
 
         // Mandatory per-outer-row cap — the test subplan runs once per outer
         // row (identical guard to the LATERAL apply path).
@@ -3574,8 +3674,8 @@ impl Engine {
         let mut keep: Vec<u32> = Vec::new();
         for row in 0..n_left {
             let one = UInt32Array::from(vec![row as u32]);
-            let mut outer_cols: Vec<ArrayRef> = Vec::with_capacity(cw.corr_left_indices.len());
-            for &li in &cw.corr_left_indices {
+            let mut outer_cols: Vec<ArrayRef> = Vec::with_capacity(corr_actual_indices.len());
+            for &li in &corr_actual_indices {
                 let g = arrow::compute::take(left.column(li).as_ref(), &one, None)
                     .map_err(|e| BoltError::Other(format!("correlated-WHERE outer take: {e}")))?;
                 outer_cols.push(g);
@@ -8231,6 +8331,87 @@ mod tests {
         let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let got: Vec<i64> = (0..b.num_rows()).map(|i| k.value(i)).collect();
         assert_eq!(got, vec![1, 2], "k=3 dropped (scalar subquery is NULL)");
+    }
+
+    /// Regression fixture for the schema-reconciliation fix: `wide_lft` has an
+    /// UNUSED leading column (`pad`) and an UNUSED trailing column (`lbl`)
+    /// around the correlated/projected `k` — so the correlated column is NOT at
+    /// index 0. This exercises the by-NAME remap of `corr_left_indices` (a
+    /// positional gather would read `pad`/`lbl` instead of `k`) and the
+    /// combined/result build against the produced left schema. If a future
+    /// optimizer change prunes `pad`/`lbl` from the standalone left subplan, the
+    /// same fixture additionally covers the column-count reconciliation.
+    fn register_wide_lateral_fixtures(engine: &mut Engine) {
+        use arrow_array::StringArray;
+        let pad: ArrayRef = Arc::new(Int64Array::from(vec![100_i64, 200, 300]));
+        let wk: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+        let lbl: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("pad", ArrowDataType::Int64, false),
+            ArrowField::new("k", ArrowDataType::Int64, false),
+            ArrowField::new("lbl", ArrowDataType::Utf8, false),
+        ]));
+        let wide = RecordBatch::try_new(schema, vec![pad, wk, lbl]).expect("wide_lft batch");
+        engine.register_table("wide_lft", wide).expect("register wide_lft");
+
+        let vk: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 1, 2]));
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 11, 20]));
+        let vschema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("vk", ArrowDataType::Int64, false),
+            ArrowField::new("n", ArrowDataType::Int64, false),
+        ]));
+        let vals = RecordBatch::try_new(vschema, vec![vk, n]).expect("vals batch");
+        engine.register_table("vals", vals).expect("register vals");
+    }
+
+    /// End-to-end regression for the projection-pruning schema drift: a
+    /// correlated LATERAL where the left table's correlated column (`k`) is NOT
+    /// the first column and the surrounding columns get pruned. The fix must
+    /// build the combined relation against the produced left schema and remap
+    /// the correlation by name; the result is the same `(k, n)` cross product as
+    /// the narrow fixture. GPU-gated.
+    #[test]
+    #[ignore = "gpu:e2e — LATERAL apply subplans run through the GPU execute path"]
+    fn lateral_apply_prunes_unused_left_columns() {
+        let mut engine = Engine::new().expect("ctx");
+        register_wide_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT wide_lft.k, d.n FROM wide_lft, \
+                 LATERAL (SELECT n FROM vals WHERE vk = wide_lft.k) AS d \
+                 ORDER BY wide_lft.k, d.n",
+            )
+            .expect("lateral apply over pruned-left must execute");
+        let b = h.record_batch();
+        assert_eq!(b.num_rows(), 3, "k=1 (2 rows) + k=2 (1 row); k=3 dropped");
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let n = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<(i64, i64)> = (0..b.num_rows())
+            .map(|i| (k.value(i), n.value(i)))
+            .collect();
+        assert_eq!(got, vec![(1, 10), (1, 11), (2, 20)]);
+    }
+
+    /// End-to-end regression for the projection-pruning schema drift on the
+    /// correlated-WHERE path: the outer table's correlated column (`k`) is not
+    /// first and the surrounding columns get pruned. The semi-join must still
+    /// keep the matching outer rows (k=1, k=2). GPU-gated.
+    #[test]
+    #[ignore = "gpu:e2e — correlated WHERE subplans run through the GPU execute path"]
+    fn corr_where_exists_prunes_unused_outer_columns() {
+        let mut engine = Engine::new().expect("ctx");
+        register_wide_lateral_fixtures(&mut engine);
+        let h = engine
+            .sql(
+                "SELECT wide_lft.k FROM wide_lft \
+                 WHERE EXISTS (SELECT 1 FROM vals WHERE vk = wide_lft.k) \
+                 ORDER BY wide_lft.k",
+            )
+            .expect("correlated EXISTS over pruned-outer must execute");
+        let b = h.record_batch();
+        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<i64> = (0..b.num_rows()).map(|i| k.value(i)).collect();
+        assert_eq!(got, vec![1, 2], "semi-join keeps matching outer rows");
     }
 
     /// The mandatory per-outer-row safety cap fires with a clean error when the
