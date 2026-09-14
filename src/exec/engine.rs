@@ -3399,8 +3399,7 @@ impl Engine {
         // correlated one was pruned. A correlated column itself is never pruned
         // (the per-row test references it), so the name is always present.
         let actual_left_schema = left.schema();
-        let mut corr_actual_indices: Vec<usize> =
-            Vec::with_capacity(la.corr_left_indices.len());
+        let mut corr_actual_indices: Vec<usize> = Vec::with_capacity(la.corr_left_indices.len());
         for &li in &la.corr_left_indices {
             let name = &la.left_schema.fields[li].name;
             let pos = actual_left_schema.index_of(name).map_err(|_| {
@@ -3628,8 +3627,7 @@ impl Engine {
         // outer-value gather stays sound even when a column ordered before a
         // correlated one was pruned. A correlated column itself is never pruned
         // (the per-row test references it), so the name is always present.
-        let mut corr_actual_indices: Vec<usize> =
-            Vec::with_capacity(cw.corr_left_indices.len());
+        let mut corr_actual_indices: Vec<usize> = Vec::with_capacity(cw.corr_left_indices.len());
         for &li in &cw.corr_left_indices {
             let name = &cw.left_schema.fields[li].name;
             let pos = left_arrow.index_of(name).map_err(|_| {
@@ -8352,7 +8350,9 @@ mod tests {
             ArrowField::new("lbl", ArrowDataType::Utf8, false),
         ]));
         let wide = RecordBatch::try_new(schema, vec![pad, wk, lbl]).expect("wide_lft batch");
-        engine.register_table("wide_lft", wide).expect("register wide_lft");
+        engine
+            .register_table("wide_lft", wide)
+            .expect("register wide_lft");
 
         let vk: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 1, 2]));
         let n: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 11, 20]));
