@@ -1274,12 +1274,16 @@ impl EngineBuilder {
         // into the process-wide disk PTX cache so the JIT compile path
         // (`get_or_build_module` → `disk_cache::disk_cache()`) reads and
         // writes cubins at the configured directory — not only when the
-        // `BOLT_PTX_CACHE_DIR` env var is set. Opt-in: a `None` path
-        // clears any prior builder override and re-falls-back to the env
-        // var, preserving the historical "no path → no disk cache"
-        // behaviour. See `install_persistent_cache_override` for the
-        // precedence contract.
-        install_persistent_cache_override(self.persistent_cache_path.as_deref());
+        // `BOLT_PTX_CACHE_DIR` env var is set. Opt-in: when NO path was
+        // supplied we leave the process-wide override slot UNTOUCHED, so a
+        // previously-installed override (or the `BOLT_PTX_CACHE_DIR` env-var
+        // fallback) keeps taking effect. Building an engine without
+        // `persistent_cache` must not clobber disk-cache configuration that
+        // other code (or the env var) installed. See
+        // `install_persistent_cache_override` for the precedence contract.
+        if self.persistent_cache_path.is_some() {
+            install_persistent_cache_override(self.persistent_cache_path.as_deref());
+        }
 
         if self.enable_tracing {
             // Best-effort subscriber init. `log::set_max_level` is
