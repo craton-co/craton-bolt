@@ -8,6 +8,8 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-15
+
 ### Performance
 - **Tier-2 group-by host slot-walk** (`exec::groupby_tier2_common::collect_populated_slots_sorted`):
   the post-reduce collection over the fixed `NUM_PARTITIONS × BLOCK_GROUPS`
@@ -720,6 +722,8 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
+[Unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/craton-co/craton-bolt/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/craton-co/craton-bolt/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/craton-co/craton-bolt/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/craton-co/craton-bolt/compare/v0.3.0...v0.5.0

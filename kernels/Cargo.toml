@@ -17,7 +17,7 @@
 
 [package]
 name        = "craton-bolt-kernels"
-version     = "0.0.1"
+version     = "0.8.0"
 edition     = "2021"
 publish     = false
 description = "Craton Bolt GPU kernels compiled via rust-cuda (Wave A spike)."

@@ -257,12 +257,14 @@ const SENTINEL_I64_MIN: i64 = i64::MIN;
 /// Sentinel value for empty row-index slots and unused collision-list
 /// `head` / `next_idx` entries. Must match `u32::MAX` everywhere it
 /// appears in the kernels.
+#[allow(dead_code)]
 const SENTINEL_U32_MAX: u32 = u32::MAX;
 
 /// Process-wide pool of `i64::MIN`-filled host storage. Grown on demand.
 static SENTINEL_I64_MIN_POOL: Mutex<&'static [i64]> = Mutex::new(&[]);
 
 /// Process-wide pool of `u32::MAX`-filled host storage. Grown on demand.
+#[allow(dead_code)]
 static SENTINEL_U32_MAX_POOL: Mutex<&'static [u32]> = Mutex::new(&[]);
 
 /// Return a `&'static [i64]` of length `cap` whose every element is
@@ -290,6 +292,7 @@ pub fn get_sentinel_i64_min_vec(cap: usize) -> &'static [i64] {
 /// Return a `&'static [u32]` of length `cap` whose every element is
 /// `u32::MAX`. Reuses a process-wide buffer; only allocates when `cap`
 /// exceeds the largest previous request.
+#[allow(dead_code)]
 pub fn get_sentinel_u32_max_vec(cap: usize) -> &'static [u32] {
     let storage: &'static [u32] = {
         let mut guard = SENTINEL_U32_MAX_POOL.lock();
