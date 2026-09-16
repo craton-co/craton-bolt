@@ -2979,8 +2979,18 @@ mod tests {
             Err(_) => return,
         };
         let out = h.record_batch();
-        // (k=0, v=10), (k=1, v=20+40=60), (k=2, v=50). NULL key + NULL
-        // value rows drop.
+        // Non-NULL groups: (k=0, v=10), (k=1, v=20+40=60), (k=2, v=50).
+        // The value-NULL row (row 3, k=0) is dropped from k=0's SUM, so
+        // k=0 sums to 10 (row 0 only) and NOT 30.
+        //
+        // The NULL-KEY row (row 2, v=30) is NOT folded into any non-NULL
+        // group: SQL groups all NULL-keyed rows into a single group whose
+        // key is NULL. Whichever executor services the query, that NULL
+        // group's value (30) must never leak into group k=0. We therefore
+        // validate the NULL group SEPARATELY and skip it in the per-key
+        // table check below — reading `ks.value(i)` on a NULL key slot
+        // returns the buffer's default (0), which would otherwise be
+        // misread as "k=0 sum=30" (the original failure mode).
         let mut expected: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
         expected.insert(0, 10);
         expected.insert(1, 60);
@@ -2988,6 +2998,15 @@ mod tests {
         let ks = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let ss = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..out.num_rows() {
+            if ks.is_null(i) {
+                // The single NULL-key group. Its SUM is the lone NULL-keyed
+                // row's value (30); the NULL-VALUE row (row 3) belongs to
+                // k=0, not here. Assert it is exactly the NULL-key row's
+                // value so a regression that mis-buckets it into k=0 (the
+                // original "k=0 sum=30" bug) still fails loudly.
+                assert_eq!(ss.value(i), 30, "NULL-key group sum");
+                continue;
+            }
             let k = ks.value(i);
             let s = ss.value(i);
             assert_eq!(Some(&s), expected.get(&k), "k={k} sum={s}");
