@@ -2,7 +2,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA_STUB");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RUST_CUDA");
 
     // --- Auto-rotating codegen fingerprint ------------------------------
     //
@@ -25,21 +24,6 @@ fn main() {
     // (never weaker).
     emit_codegen_fingerprint();
 
-    // --- Wave A: rust-cuda PTX generation -------------------------------
-    //
-    // When `--features rust-cuda` is on, compile the kernels/ crate to
-    // PTX via cuda_builder (the rustc_codegen_nvvm front-end). The
-    // resulting PTX is dropped at $OUT_DIR/partition.ptx and consumed
-    // by src/jit/partition_kernel.rs via `include_str!`.
-    //
-    // When the feature is off, write an empty stub so the
-    // `include_str!` site in partition_kernel.rs (also feature-gated)
-    // doesn't fail to find the file. The host code under
-    // `#[cfg(not(feature = "rust-cuda"))]` never reads it.
-    //
-    // See docs/JIT_PIPELINE.md for the rust-cuda build hook and stub pattern.
-    compile_rust_cuda_kernels();
-
     // --- GRACEFUL DEGRADATION CONTRACT (GPU-less hosts) -----------------
     //
     // This build script NEVER hard-fails (panics / nonzero exit) because a
@@ -57,9 +41,7 @@ fn main() {
     //      reach) would later fail, with the warning already pointing at the
     //      cuda-stub escape hatch.
     //
-    // The only `expect()`/panic paths in this file are gated behind
-    // `--features rust-cuda` (cuda_builder) or read OUT_DIR (always set by
-    // Cargo); none are reachable on a default/cuda-stub GPU-less build.
+    // No build-time code generator or network fetch is invoked here.
     //
     // Skip CUDA discovery when building with the `cuda-stub` feature
     // (e.g. on docs.rs or CUDA-less hosts).
@@ -299,72 +281,4 @@ fn emit_codegen_fingerprint() {
         "cargo:rustc-env=BOLT_CODEGEN_FINGERPRINT={:016x}{:016x}",
         hi, lo
     );
-}
-
-// ---------------------------------------------------------------------------
-// rust-cuda (Wave A) PTX build hook.
-// ---------------------------------------------------------------------------
-//
-// Gated on `cfg(feature = "rust-cuda")`. When ON, invokes cuda_builder
-// against the sibling `kernels/` crate and writes the PTX to
-// $OUT_DIR/partition.ptx. When OFF, writes an empty file at the same path
-// so the `include_str!` in the feature-gated host code still resolves
-// (the host code under `#[cfg(not(feature = "rust-cuda"))]` never reads it
-// — see src/jit/partition_kernel.rs).
-
-// ===========================================================================
-// V-4 (HIGH) — SECURITY NOTE: build-time network fetch + external toolchain.
-// ===========================================================================
-//
-// Enabling `--features rust-cuda` makes cuda_builder / rustc_codegen_nvvm
-// DOWNLOAD and UNPACK an LLVM/libNVVM toolchain at build time and then RUN it
-// as a codegen plugin during this build. There is currently NO in-repo
-// integrity verification (no pinned checksum / signature) of the fetched
-// toolchain — trusting it is equivalent to trusting whatever the upstream
-// crate's downloader pulls onto the build host.
-//
-// This feature is intentionally OFF BY DEFAULT. Build it only on:
-//   * network-isolated / egress-controlled CI runners, AND
-//   * runners where the NVVM/LLVM toolchain artifacts are pre-pinned (vendored
-//     or fetched from a checksum-verified internal mirror).
-//
-// Do NOT enable rust-cuda on developer laptops or shared CI without the above.
-// Re-architecting the download to add integrity checks is tracked separately;
-// this comment is the documented hardening guidance (see ci.yml V-4 note).
-#[cfg(feature = "rust-cuda")]
-fn compile_rust_cuda_kernels() {
-    use cuda_builder::{CudaBuilder, NvvmArch};
-    use std::path::PathBuf;
-
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let kernels_dir = manifest.join("kernels");
-    let ptx_out = out_dir.join("partition.ptx");
-
-    println!("cargo:rerun-if-changed=kernels/src");
-    println!("cargo:rerun-if-changed=kernels/Cargo.toml");
-    println!("cargo:rerun-if-changed=kernels/rust-toolchain.toml");
-
-    // sm_70 matches Craton Bolt's hand-emit `.target sm_70` line so the PTX is
-    // co-loadable with the other kernels (see docs/JIT_PIPELINE.md).
-    CudaBuilder::new(&kernels_dir)
-        .copy_to(&ptx_out)
-        .arch(NvvmArch::Compute70)
-        .build()
-        .expect("cuda_builder failed to compile kernels/ to PTX");
-}
-
-#[cfg(not(feature = "rust-cuda"))]
-fn compile_rust_cuda_kernels() {
-    use std::path::PathBuf;
-
-    // Write an empty PTX placeholder so the `include_str!` site in
-    // src/jit/partition_kernel.rs has a file to point at when the host
-    // crate is compiled. The macro must resolve at parse time even though
-    // the body of the cfg-gated function never runs.
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let ptx_out = out_dir.join("partition.ptx");
-    if !ptx_out.exists() {
-        std::fs::write(&ptx_out, "").expect("failed to write empty partition.ptx stub");
-    }
 }

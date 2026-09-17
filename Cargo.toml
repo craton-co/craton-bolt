@@ -16,8 +16,8 @@ exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kerne
 
 # --- Workspace shim ---------------------------------------------------------
 #
-# Craton Bolt is a single-crate project, but the rust-cuda spike adds a sibling
-# `kernels/` directory that:
+# Craton Bolt is a single-crate project. The retired rust-cuda research source
+# remains in the sibling `kernels/` directory, which:
 #   - must NOT be built by the host's `cargo build` (it targets nvptx64 and
 #     needs a separate nightly toolchain — see kernels/rust-toolchain.toml),
 #   - must NOT be implicitly auto-detected as a workspace member, because
@@ -25,9 +25,7 @@ exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kerne
 #
 # Declaring an explicit `[workspace]` block with empty `members` and
 # `kernels/` in `exclude` keeps cargo from descending into it on
-# `cargo build` / `cargo test`. The `kernels/` crate is invoked exclusively
-# via `cuda_builder` from this crate's `build.rs` when the `rust-cuda`
-# feature is enabled.
+# `cargo build` / `cargo test`. It is archived research, not build input.
 #
 # The rationale for the empty-members / kernels-in-exclude setup is the
 # workspace-shim explanation above.
@@ -62,10 +60,10 @@ log = "0.4"
 # installing a subscriber (`tracing_subscriber::fmt().init()` is the simplest
 # choice). See `src/observability.rs` for the span-name catalogue.
 tracing = "0.1"
-# cudarc: optional pure-Rust CUDA Driver API binding. Gated on the
-# `cudarc` feature. v0.13 supports CUDA 12.x with stable Rust. Default
-# features off — we
-# only need `driver` for Stage 1.
+# cudarc is the default pure-Rust CUDA Driver API/context adapter. The
+# dependency's own optional features stay narrow: Bolt needs only its driver
+# surface and routes remaining unsupported calls through raw FFI on the same
+# cudarc-owned primary context.
 cudarc = { version = "0.13", optional = true, default-features = false, features = ["driver", "cuda-12060"] }
 
 # --- Optional subsystem deps (off by default) -------------------------------
@@ -80,14 +78,13 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros
 # Substrait plan ingestion (feature `substrait`, src/plan/substrait/). Ships the
 # generated prost protos under `substrait::proto`.
 substrait = { version = "0.55", optional = true }
+# Heavy reference engines are isolated behind test/benchmark-only features so
+# the normal library and integration-test lanes do not compile DuckDB/Polars.
+duckdb = { version = "1.2", optional = true, features = ["bundled"] }
+polars = { version = "0.42", optional = true, default-features = false, features = ["lazy"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-polars = { version = "0.42", default-features = false, features = ["lazy"] }
-# DuckDB is the canonical embedded-OLAP reference (see docs/COMPETITIVE_BENCHMARKING.md).
-# Bundled feature compiles DuckDB in-tree so the bench is reproducible without an
-# external install; build is slow (~5–10 min first time) but cached thereafter.
-duckdb = { version = "1.2", features = ["bundled"] }
 # proptest drives the property-test harness in tests/sql_proptest.rs: random
 # SQL queries from a constrained grammar are fed through parser+lowerer and
 # we assert no panics + type-consistent plans on success.
@@ -105,25 +102,25 @@ insta = "1"
 tracing-subscriber = "0.3"
 
 [features]
-default = []
+default = ["cudarc"]
 # Stub-mode lets non-CUDA hosts at least compile; real builds use the linked CUDA path.
 cuda-stub = []
 # Arrow Flight SQL server frontend (src/flight/). EXPERIMENTAL but compiles +
-# unit-tests pass: a tonic FlightService skeleton that decodes Flight SQL
+# executed smoke tests pass: a tonic FlightService skeleton that decodes Flight SQL
 # CommandStatementQuery, runs it through Engine::sql, and streams the Arrow
 # result as FlightData. Off by default (pulls the tonic/arrow-flight gRPC
-# stack); not built by CI's default lane. Build: `--features flight`.
+# stack); tested in its dedicated CI lane. Build: `--features flight`.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:futures", "dep:bytes", "dep:tokio"]
 # Substrait plan ingestion (src/plan/substrait/). EXPERIMENTAL but compiles +
-# unit-tests pass: converts a substrait::proto::Plan into the engine
+# executed unit/smoke tests pass: converts a substrait::proto::Plan into the engine
 # LogicalPlan (Read/Filter/Project/Aggregate/Sort/Join/Fetch + expressions).
 # Off by default. NOTE: the `substrait` crate's build script needs `protoc`
 # (set the PROTOC env var or put protoc on PATH). Build: `--features substrait`.
 substrait = ["dep:substrait"]
-# `cudarc` backend (Stage 1, spike): routes a handful of low-level CUDA
-# driver calls through the `cudarc` crate instead of our hand-rolled
-# `extern "C"` FFI. Not the default yet — turn on with
-# `cargo build --features cudarc` to opt in.
+reference-tests = ["dep:duckdb"]
+reference-benches = ["dep:duckdb", "dep:polars"]
+# Supported CUDA context/driver backend. Enabled by default; remaining raw
+# bindings are limited to driver calls not yet exposed through the adapter.
 #
 # When `cudarc` is enabled, the engine uses cudarc's primary context
 # (`CudaDevice::new`) as the ONLY CUDA context — the hand-rolled
@@ -132,18 +129,6 @@ substrait = ["dep:substrait"]
 # context were freed against the other at teardown. See
 # `CudaContext::new` in `src/cuda/cuda_sys.rs`.
 cudarc = ["dep:cudarc"]
-# `rust-cuda` (EXPERIMENTAL — DOES NOT BUILD YET): would switch
-# `partition_kernel.rs`'s PTX source from the hand-rolled string emitter to a
-# Rust-source kernel compiled at build time via `cuda_builder`
-# (rustc_codegen_nvvm). This feature CANNOT currently be built: the crates.io
-# `cuda_builder = "0.3"` build-dep resolves to the stale Feb-2022 0.3.0 release,
-# which is incompatible with the nightly + cuda_std git-rev toolchain the
-# `kernels/` crate targets (see `kernels/rust-toolchain.toml`). It is OFF by
-# default and left wired only as a spike placeholder — enabling it
-# (`--features rust-cuda`) will fail to compile until the build-dep is realigned
-# with the kernels toolchain. Default build remains hand-emit. See
-# `docs/JIT_PIPELINE.md` and `kernels/rust-toolchain.toml` for background.
-rust-cuda = ["dep:cuda_builder"]
 # `pool-sharded` (Stage-3 escape hatch): swaps the `DeviceMemPool::buckets`
 # field from a `DashMap<usize, Mutex<BucketEntry>>` to a fixed-size
 # `[Mutex<HashMap<usize, BucketEntry>>; 32]` array keyed by
@@ -165,27 +150,15 @@ pool-sharded = []
 # `proactive_eviction_count()` for telemetry. See `mem_pool.rs`.
 pool-watcher = []
 
-[build-dependencies]
-# `cuda_builder` is the build-time entry point to rust-cuda's NVVM codegen
-# backend. Optional + feature-gated so default builds (which do NOT have
-# the rust-cuda toolchain) ignore the dep entirely. Pulled in only when
-# `--features rust-cuda` is on.
-#
-# WARNING: this pin is EXPERIMENTAL and DOES NOT BUILD. `version = "0.3"`
-# resolves to the stale Feb-2022 `cuda_builder` 0.3.0 on crates.io, which is
-# incompatible with the nightly + cuda_std git-rev toolchain the `kernels/`
-# crate targets (see `kernels/rust-toolchain.toml`). The `rust-cuda` feature is
-# OFF by default for this reason; realigning this dep with the kernels toolchain
-# is tracked work. See `docs/JIT_PIPELINE.md` and `kernels/rust-toolchain.toml`.
-cuda_builder = { version = "0.3", optional = true }
-
 [[bench]]
 name = "query_benchmarks"
 harness = false
+required-features = ["reference-benches"]
 
 [[bench]]
 name = "olap_benchmarks"
 harness = false
+required-features = ["reference-benches"]
 
 # GPU-favorable companion to olap_benchmarks: compute-bound scalar aggregates
 # and compound-predicate filters (no GROUP BY → no hash contention). Gated on
@@ -193,6 +166,19 @@ harness = false
 [[bench]]
 name = "compute_benchmarks"
 harness = false
+required-features = ["reference-benches"]
+
+[[test]]
+name = "diff_duckdb"
+required-features = ["reference-tests"]
+
+[[test]]
+name = "diff_duckdb_semantics"
+required-features = ["reference-tests"]
+
+[[test]]
+name = "sql_proptest"
+required-features = ["reference-tests"]
 
 # Stage-6 microbench: throughput of `ORDER BY <utf8>` across a sweep of
 # cardinality ratios, used to calibrate `HIGH_CARDINALITY_THRESHOLD`.
@@ -211,6 +197,10 @@ harness = false
 # gating wiring itself is a follow-up. See `benches/regression.rs`.
 [[bench]]
 name = "regression"
+harness = false
+
+[[bench]]
+name = "scaling_benchmarks"
 harness = false
 
 [[example]]
@@ -245,5 +235,6 @@ codegen-units = 1
 debug = "line-tables-only"
 
 [package.metadata.docs.rs]
+default-features = false
 features = ["cuda-stub"]
 rustdoc-args = ["--cfg", "docsrs"]
