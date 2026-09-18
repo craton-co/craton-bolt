@@ -5,19 +5,15 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
-  # Weekly scheduled trigger — drives the allow-failure GPU lane below (the
-  # CPU lanes also run, which is harmless). Adjust/remove once a dedicated
-  # GPU runner is wired up. Cron is UTC.
+  # Weekly scheduled trigger exercises every blocking gate, including the
+  # canonical self-hosted GPU lane. Cron is UTC.
   schedule:
     - cron: "0 6 * * 1"
   # Allow maintainers to kick the GPU lane on demand.
   workflow_dispatch: {}
 
-# TODO(ci): SHA-pin all third-party action refs (actions/checkout,
-# dtolnay/rust-toolchain, actions/cache, taiki-e/install-action,
-# actions/upload-artifact, codecov/codecov-action) to immutable commit
-# SHAs once we can verify the hashes from a trusted source. Tag/branch
-# refs are kept as-is for now for readability.
+# Third-party actions are pinned to immutable commits. The trailing comments
+# retain the human-readable upstream major/ref for scheduled update audits.
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,16 +36,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (${{ matrix.toolchain }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -63,19 +59,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo fmt --all -- --check
 
-      # Clippy is ADVISORY and NON-BLOCKING: it surfaces style/correctness
-      # lints in the logs but does not gate merges. The codebase is being
-      # brought to clippy-clean incrementally — there are still pedantic
-      # warnings (e.g. the intentional IntArith::{div,shl,shr} method names
-      # trip `should_implement_trait`) and a few deny-by-default lints in test
-      # fixtures (`erasing_op` on intentional `n * 0` degenerate cases). The
-      # real production gate is `cargo check (lib, strict)` below (rustc
-      # warnings as errors on the shipped library). `continue-on-error` lets
-      # clippy report without blocking; tighten to a hard gate once clean.
-      - name: clippy (advisory, non-blocking)
+      - name: clippy (blocking)
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
-        continue-on-error: true
-        run: cargo clippy --lib --tests --features cuda-stub --no-default-features
+        run: cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings
 
       # Production-library compile gate: rustc warnings are errors here so the
       # shipped crate stays warning-clean. (Test code is compiled without
@@ -91,15 +77,6 @@ jobs:
         env:
           RUSTFLAGS: ""
 
-      # TODO(ci): --features rust-cuda requires nightly + libNVVM + LLVM
-      # toolchain — not feasible on github-hosted runners without a custom
-      # container. Track in https://github.com/craton-co/craton-bolt/issues/?
-      #
-      # V-4: enabling rust-cuda makes rustc_codegen_nvvm download & execute an
-      # external LLVM/libNVVM toolchain at build time (network fetch + plugin
-      # execution, no in-repo integrity check). Off by default; build it only
-      # on network-isolated, artifact-pinned runners. See build.rs.
-
       - name: cargo test (lib + integration)
         run: cargo test --lib --tests --features cuda-stub --no-default-features
 
@@ -107,12 +84,8 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
 
-  # Compile-check the optional EXPERIMENTAL subsystems (Arrow Flight SQL and
-  # Substrait ingestion) so they don't bit-rot. They are off by default and not
-  # exercised by the main `build` lane, so without this job an unrelated change
-  # to Engine / LogicalPlan could silently break them. We `cargo check --lib
-  # --tests` (compile, no link/run) which is enough to catch API drift in both
-  # the module code and its unit tests.
+  # Build and run the optional subsystem tests rather than merely type-checking
+  # them, so decode/encode and plan-conversion behavior cannot silently rot.
   #
   # RUSTFLAGS is cleared because these skeletons carry intentional dead-code
   # (unused Flight SQL command variants, substrait helpers reachable only from
@@ -124,13 +97,13 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -145,11 +118,31 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: cargo check --features flight
-        run: cargo check --lib --tests --no-default-features --features cuda-stub,flight
+      - name: cargo test --features flight
+        run: cargo test --lib --tests --no-default-features --features cuda-stub,flight
 
-      - name: cargo check --features substrait
-        run: cargo check --lib --tests --no-default-features --features cuda-stub,substrait
+      - name: cargo test --features substrait
+        run: cargo test --lib --tests --no-default-features --features cuda-stub,substrait
+
+  public-api:
+    name: public API snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned rustdoc JSON nightly
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: nightly-2026-04-03
+
+      - name: Install cargo-public-api
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
+        with:
+          tool: cargo-public-api@0.52.0
+
+      - name: Compare rustdoc public API with committed snapshot
+        run: bash scripts/check_public_api.sh
 
   # Documentation build under the HOST config. This mirrors what docs.rs
   # builds (docs.rs cannot link CUDA), so a green run here gives us
@@ -177,13 +170,13 @@ jobs:
       RUSTDOCFLAGS: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -214,13 +207,13 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -236,36 +229,29 @@ jobs:
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --no-default-features --features cuda-stub
 
-  # Host-side coverage (informational, non-blocking for tooling hiccups).
+  # Host-side coverage is a blocking regression gate. GPU-only FFI is excluded
+  # because hosted runners cannot execute it; the remaining line floor is an
+  # honest lower bound over code the host suite can exercise.
   # Measures HOST coverage under the same --no-default-features --features
-  # cuda-stub config the test job uses. We MEASURE and REPORT only: there is
-  # intentionally NO minimum-threshold gate — GPU code paths are dark on
-  # github-hosted runners (no CUDA device), so a blanket coverage floor would
-  # be unrealistic. The lcov report is uploaded as an artifact for inspection.
+  # cuda-stub config the test job uses. The committed floor is 50% lines.
   #
-  # NOTE: `continue-on-error: true` keeps coverage-tooling failures from
-  # blocking the pipeline, but the underlying `cargo llvm-cov` run executes
-  # the test suite, so a genuine TEST failure still surfaces (red job).
-  #
-  # FUTURE(ci): a dedicated GPU-runner lane could run
-  #   cargo test --features cudarc --no-default-features -- --ignored
-  # to exercise the `#[ignore]`-gated GPU tests. No GPU runner exists yet, so
-  # this remains a comment rather than a job.
+  # Real-device coverage is provided separately by the blocking
+  # `gpu-integration` job below; it is intentionally excluded from this host
+  # line-rate metric.
   coverage:
-    name: coverage (host, informational)
+    name: coverage (host, >=50% lines)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: llvm-tools-preview
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -276,7 +262,7 @@ jobs:
             ${{ runner.os }}-cargo-coverage-
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
         with:
           tool: cargo-llvm-cov@0.6.16
 
@@ -290,11 +276,11 @@ jobs:
           # from the report: that code is dark on github-hosted runners (no
           # CUDA device, cuda-stub stubs the FFI), so including it would tank
           # the host coverage number for paths that physically cannot run here.
-          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info
-          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only
+          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
+          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
 
       - name: Upload coverage report (lcov)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-lcov
           path: lcov.info
@@ -304,7 +290,7 @@ jobs:
       # forks / when no CODECOV_TOKEN secret is configured, and never fails CI.
       - name: Upload to Codecov (optional, non-blocking)
         if: ${{ env.CODECOV_TOKEN != '' }}
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -319,13 +305,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -335,46 +321,30 @@ jobs:
             ${{ runner.os }}-cargo-deny-
 
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
 
       # LICENSES + BANS: the STRICT/BLOCKING supply-chain gate. Scans the
       # default host graph (deny.toml graph.all-features=false), which is clean.
       - name: cargo deny check (licenses + bans, blocking)
         run: cargo deny check licenses bans
 
-      # ADVISORIES: NON-BLOCKING. The advisories check loads the *entire* live
-      # RUSTSEC database, and current cargo-deny releases trip over it
-      # independently of our dependency graph: 0.19.x panics parsing a
-      # malformed legacy advisory file, and 0.18.x rejects newer CVSS-4.0
-      # advisories. Until cargo-deny / advisory-db parsing stabilises, we run
-      # the advisory scan for visibility but do not let an upstream
-      # tool/DB-parsing failure block merges. (License/ban policy above stays
-      # strict.) Re-make this blocking once the tooling reliably parses the DB.
-      - name: cargo deny check (advisories, non-blocking)
-        continue-on-error: true
+      - name: cargo deny check (advisories, blocking)
         run: cargo deny check advisories
 
-  # V-11: informational supply-chain scan of the FULL feature graph, including
-  # the `rust-cuda` / rustc_codegen_nvvm build-dependency tree (curl/tar/
-  # xz 0.1.0/nvvm/...) that the default graph (all-features=false) never sees.
-  # This tree contains the known-unmaintained `xz 0.1.0` crate, which would
-  # fail under advisories.unmaintained = "deny", so this job is intentionally
-  # NON-BLOCKING (continue-on-error: true). Treat its output as advisory: it
-  # surfaces NVVM-toolchain dep issues without gating merges. If we ever pin
-  # and ignore the specific advisory, this job can be made blocking.
+  # The retired rust-cuda downloader graph has been removed, so the complete
+  # feature graph is now held to the same blocking advisory/license/ban policy.
   cargo-deny-all-features:
-    name: cargo deny (all-features, informational)
+    name: cargo deny (all-features, blocking)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -384,15 +354,13 @@ jobs:
             ${{ runner.os }}-cargo-deny-all-
 
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
 
-      # `--all-features` overrides deny.toml graph.all-features=false so the
-      # rust-cuda / NVVM build-dep tree is included in the scan.
       - name: cargo deny check (all features)
         run: cargo deny --all-features check advisories licenses bans
 
   # ===========================================================================
-  # GPU integration lane (STUB / ALLOW-FAILURE — no GPU runner exists yet).
+  # GPU integration lane (blocking on the canonical self-hosted runner).
   # ===========================================================================
   #
   # All other jobs in this file run with `--features cuda-stub` and therefore
@@ -412,35 +380,24 @@ jobs:
   # runner is online, this job stays queued rather than failing — that is
   # expected. The `runs-on` labels below MUST match the registered runner.
   #
-  # NON-BLOCKING: `continue-on-error: true` is set so that even once a runner
-  # is registered (or while the job sits queued / a maintainer cancels it), a
-  # red/absent GPU lane NEVER blocks a PR. The CPU/host lanes above are the
-  # gating signal. Remove `continue-on-error` only once the GPU runner is
-  # stable and we want real-device regressions to gate merges.
-  #
   # The lane is guarded to run only on the canonical repo (NOT on PRs from
   # forks), so untrusted fork code never executes on the self-hosted hardware.
   gpu-integration:
     name: gpu integration (self-hosted NVIDIA GPU)
     # Only run on the main repo — never on fork PRs, so fork code cannot run on
     # the self-hosted GPU hardware. Still runs on push / schedule / dispatch.
-    # This also short-circuits the (currently nonexistent) self-hosted runner:
-    # while no runner with the `self-hosted, gpu` labels is registered, the job
-    # simply has nothing to dispatch to and stays queued rather than failing.
+    # If the self-hosted runner is offline, this required job remains queued
+    # and the workflow cannot become green.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    # Non-blocking: a missing/red GPU lane must never block a PR while no
-    # self-hosted GPU runner exists (see the comment block above).
-    continue-on-error: true
     # Self-hosted NVIDIA GPU runner. A maintainer must register a runner with
-    # these labels (see the comment block above). Placeholder labels — adjust
-    # to match the actual runner registration if different.
+    # these canonical labels (see the comment block above).
     runs-on: [self-hosted, gpu]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       # On the GPU runner the CUDA Toolkit (>= 12) and a matching driver must
       # already be installed so `cuda.lib` / `libcuda.so` is on the linker
@@ -463,8 +420,10 @@ jobs:
           # synthetic pointer pool only when it is set. Without it `--ignored`
           # would run but silently skip the real-device work.
           #
-          # RUSTFLAGS is cleared because the GPU tree can carry warnings we
-          # do not want to gate the GPU lane on.
-          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored
+          # The second command is the intentionally split DuckDB/proptest
+          # conformance shard; keeping its bundled C++ build out of the core
+          # command makes ordinary test iteration substantially cheaper.
+          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored --test-threads=1
+          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest -- --ignored --test-threads=1
         env:
           RUSTFLAGS: ""

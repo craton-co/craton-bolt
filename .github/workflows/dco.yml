@@ -4,9 +4,8 @@ on:
   pull_request:
     branches: [main, dev]
 
-# TODO(ci): SHA-pin actions/checkout@v4 to an immutable commit SHA once we
-# can verify the hash from a trusted source. The DCO verification step below
-# is deliberately inlined (no third-party action) for the same reason.
+# Actions are immutable-SHA pinned. The DCO verification step remains inlined
+# so the governance gate has no additional third-party execution dependency.
 
 jobs:
   dco-check:
@@ -14,20 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
       # Inline DCO verification: scan every commit in the PR range and
       # require a `Signed-off-by:` trailer in each commit message body.
-      #
-      # We deliberately avoid third-party actions here (e.g.
-      # tim-actions/dco@v1.1.0) because we cannot SHA-pin them with a
-      # verified-by-us hash from this environment. If a trusted SHA pin
-      # is added later, this step can be replaced with:
-      #
-      #   uses: tim-actions/dco@<verified-sha>  # v1.1.0
       #
       # Required by CONTRIBUTING.md + PULL_REQUEST_TEMPLATE.md (DCO 1.1).
       - name: Verify DCO sign-off on every commit
