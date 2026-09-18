@@ -222,14 +222,24 @@ disabled (the default).
   kernel-launch parameter assembly), where the raw driver ABI forces it;
   those blocks carry `// SAFETY:` justifications and the launch synchronises
   before borrowed device memory can be freed.
-- **GPU correctness is validated out-of-band, not in CI.** Per project
-  convention, CI exercises **0 GPU code paths** (`cuda-stub` only); end-to-end
-  GPU execution is validated on maintainer hardware via `#[ignore]`-gated
-  tests (see the "CI runs no GPU code" callout in
-  [`README.md`](README.md) and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)).
-  A green CI run attests host logic, planning, and codegen *shape* — not
-  device behavior. Treat device-side memory-safety claims as best-effort and
-  pre-1.0.
+- **GPU correctness has a blocking real-device gate.** Hosted jobs use
+  `cuda-stub`, while the canonical self-hosted NVIDIA runner executes every
+  `#[ignore = "gpu:…"]` test serially and runs the split reference-conformance
+  shard against `cudarc`. An offline or failing runner prevents a green
+  workflow. Device safety remains pre-1.0 and does not imply protection from
+  a malicious driver or firmware.
+
+### Build and dependency supply chain
+
+- Every third-party GitHub Action is pinned to an immutable commit SHA.
+- `cargo deny` advisories, licenses, bans, and the all-features graph are
+  blocking. The former `rust-cuda` build-time downloader and its unpinned
+  LLVM/libNVVM dependency graph were removed; `kernels/` is archived source
+  and excluded from the workspace/package.
+- Local CI installs audited tools with locked Cargo resolution; it does not
+  execute a network-fetched `curl | sh` bootstrap.
+- These controls reduce dependency drift but do not make upstream registries
+  or action source intrinsically trusted. Pin updates require normal review.
 
 ### Security properties / boundaries (summary)
 
@@ -243,7 +253,7 @@ disabled (the default).
 | PTX cache integrity vs. a writer of the cache dir | **Boundary is the dir permissions** (`0o700` / per-user ACL), not the header (no MAC) |
 | Cache path traversal | Enforced — strict key charset, fail-to-miss |
 | Host memory safety | Enforced at compile time (Rust + borrow-checked GPU handles) |
-| Device-side execution correctness | Best-effort, validated out-of-band (not in CI) |
+| Device-side execution correctness | Blocking real-GPU CI plus conformance tests; still pre-1.0 |
 
 ### Out of scope / non-goals
 

@@ -14,7 +14,10 @@
 # full test suite links cleanly. This only changes the *link* step; compiled
 # rlibs are unaffected and reused.
 #
-# Uses Rust's bundled `rust-lld` linker directly, avoiding external LLVM
-# installation requirements on PATH while preventing MSVC link.exe PDB limits.
+# `rust-lld` is the stable toolchain's generic driver. Unlike invoking the
+# flavour-specific `lld-link` binary directly, it accepts rustc's
+# `-flavor link` argument on current toolchains, and needs no system LLVM.
+# Using rustflags form (rather than `linker = "rust-lld"`) ensures compatibility
+# with `cargo publish --dry-run` which sandboxes the linker environment.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "linker=rust-lld"]
