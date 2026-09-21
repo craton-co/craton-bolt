@@ -7,10 +7,12 @@ is the v0.6 / M7 staging ground for the public-API freeze that ships with
 contract. At 1.0 each entry in the **stable** tier becomes binding under
 the semver rules listed below.
 
-> Crate version this document was enumerated against: `0.7.0` (from
-> `Cargo.toml`). Reconciled against `src/lib.rs` and the modules it
-> re-exports; re-run the enumeration whenever the public surface changes (and
-> before the 1.0 freeze).
+> Crate version: `0.7.0`. The exhaustive rustdoc-derived inventory is
+> committed in [`PUBLIC_API_SNAPSHOT.txt`](PUBLIC_API_SNAPSHOT.txt). CI
+> regenerates it with `cargo-public-api 0.52.0` and pinned
+> `nightly-2026-04-03`, then fails on additions, removals, signature/export
+> changes, or trait-implementation drift. A deliberate public change updates
+> both the snapshot and this human stability guide in the same review.
 
 ## Stability tiers and semver contract
 
@@ -89,9 +91,10 @@ forced by this document.
 | `DataFrame` | struct (`plan::dataframe`) | Builder-style DataFrame API. Fields are private. |
 | `LogicalPlan` | enum (`plan::logical_plan`) | Logical-plan IR root. Each variant carries planner-internal payloads. **Not** `#[non_exhaustive]` — adding variants is breaking until the attribute is added. |
 | `Expr` | enum (`plan::logical_plan`) | Logical scalar expression. Same caveat as `LogicalPlan` re: `#[non_exhaustive]`. |
-| `Engine` | struct (`exec::engine`) | Top-level query engine. Re-exported at the crate root via `pub use exec::{Engine, EngineBuilder}`. Fields are private; new fields are non-breaking. Stable inherent methods: `new() -> BoltResult<Self>`, `new_with_device(i32) -> BoltResult<Self>`, `builder() -> EngineBuilder`, `device(&self) -> i32`, `memory_budget_bytes(&self) -> Option<usize>`, `persistent_cache_path(&self) -> Option<&Path>`, `tracing_enabled(&self) -> bool`, `with_rewrite(self, Box<dyn PlanRewrite>) -> Self`, `rewrite_count(&self) -> usize`, `register_table(...)`, `register_table_stream(...)`, `register_table_stream_lazy(&mut self, name: impl Into<String>, schema: plan::Schema, producer: exec::streaming::BatchProducer) -> BoltResult<()>` (registers a replayable, lazily-materialised streaming source; errors if the table name is already registered), `replace_table(...)`, `register_batch(&mut self, name, RecordBatch) -> BoltResult<()>`, `sql(&str) -> BoltResult<QueryHandle>`, `run_logical_plan(&mut self, &LogicalPlan) -> BoltResult<QueryHandle>`, `execute(&PhysicalPlan) -> BoltResult<QueryHandle>`. Changing any of those signatures is breaking. |
+| `Engine` | struct (`exec::engine`) | Top-level query engine. Re-exported at the crate root via `pub use exec::{Engine, EngineBuilder, QueryHandle}`. Fields are private; new fields are non-breaking. Stable inherent methods: `new() -> BoltResult<Self>`, `new_with_device(i32) -> BoltResult<Self>`, `builder() -> EngineBuilder`, `device(&self) -> i32`, `memory_budget_bytes(&self) -> Option<usize>`, `persistent_cache_path(&self) -> Option<&Path>`, `tracing_enabled(&self) -> bool`, `with_rewrite(self, Box<dyn PlanRewrite>) -> Self`, `rewrite_count(&self) -> usize`, `register_table(...)`, `register_table_stream(...)`, `register_table_stream_lazy(&mut self, name: impl Into<String>, schema: plan::Schema, producer: exec::streaming::BatchProducer) -> BoltResult<()>` (registers a replayable, lazily-materialised streaming source; errors if the table name is already registered), `replace_table(...)`, `register_batch(&mut self, name, RecordBatch) -> BoltResult<()>`, `sql(&str) -> BoltResult<QueryHandle>`, `run_logical_plan(&mut self, &LogicalPlan) -> BoltResult<QueryHandle>`, `execute(&PhysicalPlan) -> BoltResult<QueryHandle>`. Changing any of those signatures is breaking. |
 | `EngineBuilder` | struct (`exec::engine`) | Builder for `Engine`, re-exported at the crate root alongside `Engine`. Stable inherent methods: `new()`, `device(self, i32)`, `memory_budget(self, usize)`, `persistent_cache(self, PathBuf)`, `enable_tracing(self)`, `build(self) -> BoltResult<Engine>`. Fields are private; new fields are non-breaking. |
-| `QueryHandle` | struct (`exec::engine`) | Query-result handle wrapping a `RecordBatch`. Reachable as `craton_bolt::exec::QueryHandle` (re-exported from `exec`, but not at the crate root). Stable inherent methods: `record_batch(&self)`, `into_record_batch(self)`, `num_rows(&self)`. |
+| `QueryHandle` | struct (`exec::engine`) | Query-result handle wrapping a `RecordBatch`, re-exported at the crate root. Stable inherent methods: `record_batch(&self)`, `into_record_batch(self)`, `planned_execution_tier(&self) -> ExecutionTier`, `num_rows(&self)`. |
+| `ExecutionTier` | enum (`plan::physical_plan`) | Stable planned-placement contract, re-exported at the crate root: `Gpu`, `Host`, or `Hybrid`. `PhysicalPlan::planned_execution_tier()` and `QueryHandle::planned_execution_tier()` expose the deterministic pre-execution selection. Adding a variant is breaking until this enum becomes non-exhaustive. |
 | `PlanRewrite` | trait (`plan::rewrite`) | Re-exported at `plan::PlanRewrite`. Supertrait-bounded `Send + Sync`; consumed by `Engine::with_rewrite`. Required method(s) define the logical-plan rewrite hook; changing any existing signature or tightening the supertrait bound is breaking. |
 | `plan::TableProvider` | trait (`plan::sql_frontend`) | Frontend trait for resolving table schemas and per-column null-bearing. Required method: `schema(&self, name: &str) -> BoltResult<Schema>`. Default-impl methods: `has_nulls`, `null_count`, `schema_version`. Adding a new method WITH a default is non-breaking; adding a required method is breaking. Changing any existing signature is breaking. |
 | `plan::MemTableProvider` | struct (`plan::sql_frontend`) | Default in-memory `TableProvider` impl. Inherent methods `new`, `with_table`, `register`, `unregister_table`, `set_column_nullability`, `has_nulls` are part of the surface. |
