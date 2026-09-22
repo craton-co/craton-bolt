@@ -12,6 +12,41 @@ use crate::plan::logical_plan::{
     JoinType, Literal, LogicalPlan, ScalarFnKind, Schema, SortExpr, UnaryOp,
 };
 
+/// Planned execution placement for a physical query.
+///
+/// This is deliberately a coarse, stable contract: `Gpu` means the plan has
+/// no planned host compute stage, `Host` means it has no planned device compute
+/// stage, and `Hybrid` means both participate or the selected executor has a
+/// documented runtime fallback boundary. Transfers and Arrow result packaging
+/// do not by themselves make a plan hybrid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionTier {
+    /// Device compute only (apart from transfers/result packaging).
+    Gpu,
+    /// Host compute only.
+    Host,
+    /// A planned mixture of host/device compute, or a runtime-dependent
+    /// supported device path with a host fallback.
+    Hybrid,
+}
+
+impl ExecutionTier {
+    fn with_host_stage(self) -> Self {
+        match self {
+            Self::Host => Self::Host,
+            Self::Gpu | Self::Hybrid => Self::Hybrid,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::Hybrid
+        }
+    }
+}
+
 /// SSA register handle. Just an index into the IR's value table.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1165,7 +1200,7 @@ pub enum PhysicalPlan {
         output_schema: Schema,
     },
     /// GPU per-row `LIKE` filter over a **variable-width (non-dictionary)
-    /// `Utf8`** column — UNVALIDATED device path.
+    /// `Utf8`** column.
     ///
     /// Produced by the Filter lowering ONLY for the conservatively-scoped shape
     /// `col LIKE 'pattern'` / `col NOT LIKE 'pattern'` where the pattern is a
@@ -1177,8 +1212,9 @@ pub enum PhysicalPlan {
     /// [`crate::jit::string_kernel::compile_like_match_kernel`], downloads the
     /// 0/1 mask, re-applies NULL 3VL, and materialises the surviving rows.
     ///
-    /// ⚠️ The device kernel has not run on GPU hardware. The executor is
-    /// host-fallback-safe: any unsupported layout at run time evaluates the
+    /// The EXACT/PREFIX/SUFFIX/CONTAINS shapes have direct real-GPU regression
+    /// coverage. The executor remains host-fallback-safe: any unsupported
+    /// layout at run time evaluates the
     /// identical predicate on the host via [`crate::exec::like::host_like`]
     /// (no panic). Dict-encoded `Utf8` keeps its separate, untouched GPU LIKE
     /// rewrite — this variant only ever targets non-dict `Utf8`.
@@ -1266,6 +1302,51 @@ pub enum PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    /// Return the deterministic, pre-execution placement tier for this plan.
+    ///
+    /// Runtime capacity declines may still move a `Gpu` plan to the documented
+    /// host fallback. Operators whose supported implementation is
+    /// data-dependent are classified as [`ExecutionTier::Hybrid`] up front, so
+    /// callers never have to infer placement from environment variables.
+    pub fn planned_execution_tier(&self) -> ExecutionTier {
+        match self {
+            // A fused primitive projection is the one fully device-compute
+            // physical shape. Capacity decline remains an exceptional fallback.
+            PhysicalPlan::Projection { .. } => ExecutionTier::Gpu,
+
+            // Aggregate finalisation/group reconstruction, and these
+            // runtime-shape-dependent accelerators, have explicit host/device
+            // boundaries.
+            PhysicalPlan::Aggregate { .. }
+            | PhysicalPlan::Distinct { .. }
+            | PhysicalPlan::Sort { .. }
+            | PhysicalPlan::StringLength { .. }
+            | PhysicalPlan::StringProject { .. }
+            | PhysicalPlan::StringLikeFilter { .. }
+            | PhysicalPlan::Join { .. } => ExecutionTier::Hybrid,
+
+            // Host wrappers retain a pure Host tier only when their child is
+            // also Host; wrapping device work yields Hybrid.
+            PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Window { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::CountRows { input, .. } => {
+                input.planned_execution_tier().with_host_stage()
+            }
+            PhysicalPlan::Union { inputs } => inputs
+                .iter()
+                .map(PhysicalPlan::planned_execution_tier)
+                .reduce(ExecutionTier::combine)
+                .unwrap_or(ExecutionTier::Host)
+                .with_host_stage(),
+            PhysicalPlan::SetOp { left, right, .. } => left
+                .planned_execution_tier()
+                .combine(right.planned_execution_tier())
+                .with_host_stage(),
+        }
+    }
+
     /// Output schema of the whole plan.
     ///
     /// For the row-shape-preserving wrappers (`Distinct`, `Limit`, `Sort`),
@@ -1787,11 +1868,8 @@ impl<'a> Codegen<'a> {
         // Peel through any `Alias` wrappers so `x AS y IS NULL` lowers the
         // same as `x IS NULL`.
         let mut bare = operand;
-        loop {
-            match bare {
-                Expr::Alias(inner, _) => bare = inner.as_ref(),
-                _ => break,
-            }
+        while let Expr::Alias(inner, _) = bare {
+            bare = inner.as_ref();
         }
         let col_name = match bare {
             Expr::Column(n) => n.as_str(),
@@ -3544,11 +3622,7 @@ fn build_projection_kernel(
                     continue;
                 }
                 let field = scan_schema.field(&src)?;
-                output_fields.push(Field::new(
-                    name.clone(),
-                    field.dtype.clone(),
-                    field.nullable,
-                ));
+                output_fields.push(Field::new(name.clone(), field.dtype, field.nullable));
                 outputs.push(StringProjectOutput::Passthrough { source: src });
             }
             return Ok(PhysicalPlan::StringProject {
@@ -3614,13 +3688,10 @@ fn lower_projection(
         .as_ref()
         .map(|named| named.iter().cloned().collect());
 
-    let extra_pred_lowered: Option<Expr> = match extra_predicate {
-        Some(p) => Some(match &chain_proj_map {
-            Some(m) => substitute_one(p, m),
-            None => p.clone(),
-        }),
-        None => None,
-    };
+    let extra_pred_lowered: Option<Expr> = extra_predicate.map(|p| match &chain_proj_map {
+        Some(m) => substitute_one(p, m),
+        None => p.clone(),
+    });
 
     // Combine chain predicate AND extra predicate.
     let predicate = match (chain_predicate, extra_pred_lowered) {
@@ -3754,6 +3825,37 @@ fn lower_aggregate(
             None => e.clone(),
         };
         feed.push(lowered);
+    }
+
+    // SQL arithmetic compatibility: aggregate feeds currently have only a
+    // GPU pre-projection representation.  Unlike `Project` / `Filter`, there
+    // is no host pre-stage capable of preserving a computed NULL per row.
+    // Refuse the known non-standard device convention by default rather than
+    // silently turning divide-by-zero into zero.  Applications that depended
+    // on the pre-fix convention can opt in explicitly.
+    if !legacy_arithmetic_enabled()
+        && feed
+            .iter()
+            .any(|expr| expr_contains_integer_division(expr, scan_schema))
+    {
+        return Err(BoltError::Plan(format!(
+            "integer division/remainder inside an aggregate is not yet available \
+             with SQL-compatible NULL semantics; rewrite it in a host projection \
+             or set {BOLT_LEGACY_ARITHMETIC_ENV}=1 to opt into the historical \
+             zero/wrapping GPU convention"
+        )));
+    }
+    if !legacy_arithmetic_enabled()
+        && feed
+            .iter()
+            .any(|expr| expr_contains_decimal_division(expr, scan_schema))
+    {
+        return Err(BoltError::Plan(format!(
+            "Decimal128 division is disabled by default because the device path \
+             cannot yet surface SQL-compatible divide-by-zero semantics; set \
+             {BOLT_LEGACY_ARITHMETIC_ENV}=1 to opt into the historical \
+             divide-by-zero-is-zero convention"
+        )));
     }
 
     // If there is no filter and every feed expression is a bare column ref, we can skip the
@@ -3942,11 +4044,8 @@ fn predicate_contains_unary(expr: &Expr) -> bool {
             // Peel through any Alias wrappers — `x AS y IS NULL` is
             // still a bare-column unary that the codegen can lower.
             let mut bare = operand.as_ref();
-            loop {
-                match bare {
-                    Expr::Alias(inner, _) => bare = inner.as_ref(),
-                    _ => break,
-                }
+            while let Expr::Alias(inner, _) = bare {
+                bare = inner.as_ref();
             }
             // Bare column → GPU path; anything else → host path.
             !matches!(bare, Expr::Column(_))
@@ -4411,6 +4510,76 @@ fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
         }
     }
     exprs.iter().all(walk)
+}
+
+/// Explicit opt-in for the historical, non-standard arithmetic convention.
+///
+/// The legacy GPU emitters define integer/decimal division by zero as `0`
+/// and wrap `INT_MIN / -1`.  Those results are deterministic, but they are
+/// not SQL-compatible.  The default planner therefore keeps integer
+/// division/remainder on the NULL-aware host evaluator and rejects
+/// Decimal128 division (the host column representation cannot carry
+/// Decimal128 yet).  Setting this variable to `1` restores the old device
+/// behavior for compatibility with pre-fix applications.
+pub const BOLT_LEGACY_ARITHMETIC_ENV: &str = "BOLT_LEGACY_ARITHMETIC";
+
+fn legacy_arithmetic_enabled() -> bool {
+    std::env::var(BOLT_LEGACY_ARITHMETIC_ENV)
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Recursively find division-class expressions and classify their operand
+/// dtype.  `Expr::dtype` already performs the frontend's numeric unification,
+/// so inspecting the left operand gives the effective arithmetic width.
+fn expr_contains_division_of(expr: &Expr, schema: &Schema, wanted: fn(DataType) -> bool) -> bool {
+    match expr {
+        Expr::Binary { op, left, right } => {
+            let this_is_wanted =
+                matches!(op, BinaryOp::Div | BinaryOp::Mod) && left.dtype(schema).is_ok_and(wanted);
+            this_is_wanted
+                || expr_contains_division_of(left, schema, wanted)
+                || expr_contains_division_of(right, schema, wanted)
+        }
+        Expr::Alias(inner, _) | Expr::Unary { operand: inner, .. } => {
+            expr_contains_division_of(inner, schema, wanted)
+        }
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches.iter().any(|(when, then)| {
+                expr_contains_division_of(when, schema, wanted)
+                    || expr_contains_division_of(then, schema, wanted)
+            }) || else_branch
+                .as_deref()
+                .is_some_and(|e| expr_contains_division_of(e, schema, wanted))
+        }
+        Expr::Like { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::CastFormat { expr, .. }
+        | Expr::InSubquery { expr, .. } => expr_contains_division_of(expr, schema, wanted),
+        Expr::ScalarFn { args, .. } => args
+            .iter()
+            .any(|arg| expr_contains_division_of(arg, schema, wanted)),
+        Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Extract { .. }
+        | Expr::DateTrunc { .. }
+        | Expr::ScalarSubquery(_) => false,
+    }
+}
+
+fn expr_contains_integer_division(expr: &Expr, schema: &Schema) -> bool {
+    expr_contains_division_of(expr, schema, |dtype| {
+        matches!(dtype, DataType::Int32 | DataType::Int64)
+    })
+}
+
+fn expr_contains_decimal_division(expr: &Expr, schema: &Schema) -> bool {
+    expr_contains_division_of(expr, schema, |dtype| {
+        matches!(dtype, DataType::Decimal128(_, _))
+    })
 }
 
 /// Return the [`ScalarFnKind`] of the first `Expr::ScalarFn` found (depth-first)
@@ -5741,6 +5910,36 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             if let Some(string_case) = try_lower_string_case(plan, input, exprs)? {
                 return Ok(string_case);
             }
+            let input_schema = input.schema()?;
+            if !legacy_arithmetic_enabled()
+                && exprs
+                    .iter()
+                    .any(|expr| expr_contains_decimal_division(expr, &input_schema))
+            {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 division is disabled by default because the device \
+                     path cannot yet surface SQL-compatible divide-by-zero semantics; \
+                     set {BOLT_LEGACY_ARITHMETIC_ENV}=1 to opt into the historical \
+                     divide-by-zero-is-zero convention"
+                )));
+            }
+            if !legacy_arithmetic_enabled()
+                && exprs
+                    .iter()
+                    .any(|expr| expr_contains_integer_division(expr, &input_schema))
+            {
+                log::debug!(
+                    "physical_plan: integer division/remainder in Project; \
+                     lowering to the NULL-aware host evaluator"
+                );
+                let inner = lower(input)?;
+                let output_schema = plan.schema()?;
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
+            }
             // Scan/Filter/Project chain → single fused kernel via `lower_projection`.
             // Otherwise (Project over Aggregate, Join, Distinct, etc.) we
             // can't fold into one kernel; emit a thin `Project` rename/reorder
@@ -6073,8 +6272,32 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
             }
         }
         LogicalPlan::Filter { input, predicate } => {
-            // GPU per-row LIKE over a non-dict Utf8 column (UNVALIDATED device
-            // path). Fires ONLY for a bare `col LIKE 'pattern'` /
+            let input_schema = input.schema()?;
+            if !legacy_arithmetic_enabled()
+                && expr_contains_decimal_division(predicate, &input_schema)
+            {
+                return Err(BoltError::Plan(format!(
+                    "Decimal128 division is disabled by default because the device \
+                     path cannot yet surface SQL-compatible divide-by-zero semantics; \
+                     set {BOLT_LEGACY_ARITHMETIC_ENV}=1 to opt into the historical \
+                     divide-by-zero-is-zero convention"
+                )));
+            }
+            if !legacy_arithmetic_enabled()
+                && expr_contains_integer_division(predicate, &input_schema)
+            {
+                log::debug!(
+                    "physical_plan: integer division/remainder in Filter; \
+                     lowering to the NULL-aware host evaluator"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
+            }
+            // GPU per-row LIKE over a non-dict Utf8 column. Fires ONLY for a
+            // bare `col LIKE 'pattern'` /
             // `col NOT LIKE 'pattern'` whose constant pattern reduces to a
             // single literal segment with optional leading/trailing `%` (no
             // `_`, no ESCAPE). Every other LIKE shape falls through to the
@@ -6330,6 +6553,44 @@ mod tests {
     use crate::plan::logical_plan::{
         AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
     };
+
+    fn tier_projection() -> PhysicalPlan {
+        PhysicalPlan::Projection {
+            table: "t".into(),
+            kernel: KernelSpec {
+                inputs: vec![],
+                outputs: vec![],
+                ops: vec![],
+                predicate: None,
+                register_count: 0,
+                input_has_validity: vec![],
+                output_has_validity: vec![],
+            },
+            output_schema: Schema::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn planned_execution_tier_is_recursive_and_deterministic() {
+        let gpu = tier_projection();
+        assert_eq!(gpu.planned_execution_tier(), ExecutionTier::Gpu);
+
+        let host_wrapper = PhysicalPlan::Limit {
+            input: Box::new(gpu.clone()),
+            limit: 1,
+            offset: 0,
+        };
+        assert_eq!(host_wrapper.planned_execution_tier(), ExecutionTier::Hybrid);
+
+        let runtime_dependent = PhysicalPlan::Sort {
+            input: Box::new(gpu),
+            sort_exprs: vec![],
+        };
+        assert_eq!(
+            runtime_dependent.planned_execution_tier(),
+            ExecutionTier::Hybrid
+        );
+    }
 
     /// Anti-drift guards: the physical-plane type-rule helpers
     /// (`unify_numeric`, `decimal128_arith_result_dtype`,
@@ -6991,7 +7252,7 @@ mod tests {
                     dtype,
                 );
                 // Cloning preserves the cache key.
-                let clone = spec.clone();
+                let clone = spec;
                 assert_eq!(
                     dbg_key(&spec),
                     dbg_key(&clone),
@@ -7098,7 +7359,7 @@ mod tests {
 
         // Clone roundtrip: cloning preserves the cache key.
         let s = specs[0];
-        let clone = s.clone();
+        let clone = s;
         assert_eq!(dbg_key(&s), dbg_key(&clone));
     }
 
@@ -7130,7 +7391,7 @@ mod tests {
                     pass,
                     dtype,
                 );
-                let clone = spec.clone();
+                let clone = spec;
                 assert_eq!(dbg_key(&spec), dbg_key(&clone));
             }
         }

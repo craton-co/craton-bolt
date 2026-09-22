@@ -1,4 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::too_many_arguments
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assertions_on_constants,
+        clippy::erasing_op,
+        clippy::needless_range_loop
+    )
+)]
+// The crate predates Clippy's Markdown list-indent lints, and low-level CUDA
+// launch/FFI functions intentionally mirror fixed driver/kernel signatures.
+// Test fixtures also retain index-shaped loops and literal digit-zero formulas
+// where those forms mirror kernel layouts. All other warnings remain errors
+// in the canonical strict Clippy gate.
 
 //! Craton Bolt — JIT-compiled GPU SQL engine.
 //!
@@ -48,8 +66,8 @@ pub use ::tracing;
 
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use exec::streaming::{BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource};
-pub use exec::{Engine, EngineBuilder};
-pub use plan::{DataFrame, Expr, LogicalPlan, PhysicalPlan};
+pub use exec::{Engine, EngineBuilder, QueryHandle};
+pub use plan::{DataFrame, ExecutionTier, Expr, LogicalPlan, PhysicalPlan};
 
 /// Stage 4 (pool telemetry): public re-exports for downstream
 /// observability. [`pool_stats`] returns a [`PoolStats`] snapshot of

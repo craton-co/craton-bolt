@@ -28,8 +28,8 @@ pub use logical_plan::{
 };
 pub use optimizer::{default_passes, default_passes_with_estimator, RowEstimator, StatsEstimator};
 pub use physical_plan::{
-    lower as lower_physical, ColumnIO, KernelSpec, Op, PhysicalPlan, Reg, StringLengthOutput,
-    StringProjectOutput, Value,
+    lower as lower_physical, ColumnIO, ExecutionTier, KernelSpec, Op, PhysicalPlan, Reg,
+    StringLengthOutput, StringProjectOutput, Value,
 };
 pub use rewrite::PlanRewrite;
 pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};
