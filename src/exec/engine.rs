@@ -413,7 +413,7 @@ enum AggNum {
 
 /// Per-group accumulator for one host plain aggregate (SUM / MIN / MAX / AVG /
 /// COUNT / COUNT(*)). One instance per (group, aggregate) cell.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct PlainAccum {
     /// Non-NULL value count (also the plain `COUNT(col)` result, and the AVG
     /// divisor); for `COUNT(*)` this counts every row regardless of nullness.
@@ -423,17 +423,6 @@ struct PlainAccum {
     /// Running min / max (None until the first non-NULL value).
     min: Option<AggNum>,
     max: Option<AggNum>,
-}
-
-impl Default for PlainAccum {
-    fn default() -> Self {
-        PlainAccum {
-            count: 0,
-            sum: None,
-            min: None,
-            max: None,
-        }
-    }
 }
 
 /// Host-side per-group multi/mixed aggregate for the generalized
@@ -919,11 +908,31 @@ pub(crate) const DEFAULT_POOL_STATS_INTERVAL_SECS: u64 = 60;
 /// toggle smoke).
 pub const POOL_STATS_ENV: &str = "BOLT_POOL_STATS_INTERVAL_SECS";
 
+/// Process-wide ownership gate for context-bound CUDA globals.
+///
+/// The memory pool still owns context-bound pointers process-wide. Stream,
+/// module, and graph caches are context-tagged, but admitting two live Engines
+/// would still let the memory pool's owning-context slot be overwritten. Until
+/// that final registry is made per-context, fail the second construction
+/// deterministically instead of allowing cross-context invalid handles.
+static ACTIVE_ENGINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_ENGINE_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct ActiveEnginePermit;
+
+impl Drop for ActiveEnginePermit {
+    fn drop(&mut self) {
+        ACTIVE_ENGINE.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Top-level query engine.
 ///
 /// Field-drop order matters: `dict_registry` owns `DictionaryColumn`s which own
 /// `GpuVec`s — those must be freed BEFORE `_ctx` tears down the CUDA context.
-/// Rust drops fields in declaration order, so `_ctx` sits last.
+/// Rust drops fields in declaration order, so `_ctx` sits after every
+/// context-bound resource. The active-engine permit follows it and is released
+/// only after context teardown completes.
 ///
 /// # Construction
 ///
@@ -1102,8 +1111,11 @@ pub struct Engine {
     /// construction leaves this `true`, so the gate at the
     /// `run_to_fixpoint` call sites is a no-op for all stable callers.
     optimize: bool,
-    /// Owned CUDA context — declared LAST so it drops AFTER dictionaries.
+    /// Owned CUDA context — declared after every context-bound resource so it
+    /// drops after dictionaries, tables, and module handles.
     _ctx: CudaContext,
+    /// Releases the process-wide active-engine gate after `_ctx` has dropped.
+    _active_engine_permit: ActiveEnginePermit,
 }
 
 /// v0.6 builder for [`Engine`]. Use [`Engine::builder`] to start one.
@@ -1257,6 +1269,28 @@ impl EngineBuilder {
     /// - Any underlying CUDA driver failure (no CUDA-capable device,
     ///   driver / runtime mismatch, OOM on context create).
     pub fn build(self) -> BoltResult<Engine> {
+        // Serialize construction so a failed first build releases its permit
+        // before a racing builder decides whether an Engine is active.
+        let build_guard = ACTIVE_ENGINE_BUILD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ACTIVE_ENGINE
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(BoltError::Other(
+                "only one active Engine is supported per process; drop the existing \
+                 Engine before constructing another"
+                    .into(),
+            ));
+        }
+        let active_engine_permit = ActiveEnginePermit;
+
         let device_idx = self.device.unwrap_or(0);
         // Initialize the driver up-front so device_count() is callable.
         cuda_sys::init()?;
@@ -1315,7 +1349,7 @@ impl EngineBuilder {
             crate::jit::set_disk_ptx_cache_dir(Some(p));
         }
 
-        Ok(Engine {
+        let engine = Engine {
             tables: HashMap::new(),
             streaming_sources: RefCell::new(HashMap::new()),
             provider: MemTableProvider::new(),
@@ -1338,7 +1372,10 @@ impl EngineBuilder {
             // false, so this is `true` for all stable callers.
             optimize: !self.disable_optimizer,
             _ctx: ctx,
-        })
+            _active_engine_permit: active_engine_permit,
+        };
+        drop(build_guard);
+        Ok(engine)
     }
 }
 
@@ -3968,6 +4005,7 @@ impl Engine {
 
     /// Execute a pre-built `PhysicalPlan`.
     pub fn execute(&self, phys: &PhysicalPlan) -> BoltResult<QueryHandle> {
+        let planned_tier = phys.planned_execution_tier();
         // Streaming / morsel opt-in. The whole-table path below is the default
         // and is byte-for-byte preserved: this hook fires ONLY when (a) a memory
         // budget is configured (default is `None` → uncapped → never fires),
@@ -3988,12 +4026,14 @@ impl Engine {
                 if is_overlay_only {
                     if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
                         let output_schema = phys.output_schema().clone();
-                        return self.execute_streaming_leaf(
-                            table,
-                            morsel_rows,
-                            || self.execute_leaf_whole(phys),
-                            &output_schema,
-                        );
+                        return self
+                            .execute_streaming_leaf(
+                                table,
+                                morsel_rows,
+                                || self.execute_leaf_whole(phys),
+                                &output_schema,
+                            )
+                            .map(|h| h.with_planned_execution_tier(planned_tier));
                     }
                 }
             }
@@ -4008,12 +4048,14 @@ impl Engine {
                 if is_overlay_only {
                     if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
                         if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
-                            return self.execute_streaming_scalar_aggregate(
-                                table,
-                                morsel_rows,
-                                || self.execute_leaf_whole(phys),
-                                aggregate,
-                            );
+                            return self
+                                .execute_streaming_scalar_aggregate(
+                                    table,
+                                    morsel_rows,
+                                    || self.execute_leaf_whole(phys),
+                                    aggregate,
+                                )
+                                .map(|h| h.with_planned_execution_tier(planned_tier));
                         }
                     }
                 }
@@ -4030,19 +4072,22 @@ impl Engine {
                 if is_overlay_only {
                     if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
                         if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
-                            return self.execute_streaming_grouped_aggregate(
-                                table,
-                                morsel_rows,
-                                || self.execute_leaf_whole(phys),
-                                aggregate,
-                                &folds,
-                            );
+                            return self
+                                .execute_streaming_grouped_aggregate(
+                                    table,
+                                    morsel_rows,
+                                    || self.execute_leaf_whole(phys),
+                                    aggregate,
+                                    &folds,
+                                )
+                                .map(|h| h.with_planned_execution_tier(planned_tier));
                         }
                     }
                 }
             }
         }
         self.execute_leaf_whole(phys)
+            .map(|h| h.with_planned_execution_tier(planned_tier))
     }
 
     /// The whole-table dispatch — the original body of [`Engine::execute`].
@@ -4161,7 +4206,7 @@ impl Engine {
                         crate::exec::aggregate::execute_aggregate(phys, &batch)?
                     }
                 };
-                Ok(QueryHandle { batch: out })
+                Ok(QueryHandle::from_record_batch(out))
             }
             // ----- wave-7 dispatch -----
             //
@@ -4194,7 +4239,7 @@ impl Engine {
                 let h = self.execute(input)?;
                 let n_rows = h.batch.num_rows();
                 let batch = build_count_rows_batch(n_rows, output_schema)?;
-                Ok(QueryHandle { batch })
+                Ok(QueryHandle::from_record_batch(batch))
             }
             PhysicalPlan::Limit {
                 input,
@@ -4250,7 +4295,7 @@ impl Engine {
                             batches.len()
                         ))
                     })?;
-                Ok(QueryHandle { batch: merged })
+                Ok(QueryHandle::from_record_batch(merged))
             }
             PhysicalPlan::SetOp {
                 left,
@@ -4384,7 +4429,7 @@ impl Engine {
                             Arc::new(arrow_array::Date32Array::from(v)) as ArrayRef
                         }
                         (PDT::Timestamp(unit, tz), HC::I64(v)) => {
-                            let tz_owned = tz.map(|s| std::sync::Arc::<str>::from(s));
+                            let tz_owned = tz.map(std::sync::Arc::<str>::from);
                             match unit {
                                 PTU::Second => Arc::new(
                                     arrow_array::TimestampSecondArray::from(v)
@@ -4414,7 +4459,7 @@ impl Engine {
                         "failed to build PhysicalPlan::Project RecordBatch: {e}"
                     ))
                 })?;
-                Ok(QueryHandle { batch: out })
+                Ok(QueryHandle::from_record_batch(out))
             }
         }
     }
@@ -4942,7 +4987,7 @@ impl Engine {
             crate::metrics::Phase::Materialize,
             materialize_start.elapsed(),
         );
-        Ok(QueryHandle { batch: batch_out })
+        Ok(QueryHandle::from_record_batch(batch_out))
     }
 
     /// Host re-run of a GPU projection the device *declined*
@@ -4990,7 +5035,7 @@ impl Engine {
         // column, the input column ordinal that feeds it. `None` => not a pure
         // passthrough (predicate present, or a compute/cast/select op), so we
         // re-raise the decline rather than risk a wrong host result.
-        let out_src = passthrough_output_sources(kernel).ok_or_else(|| reraise())?;
+        let out_src = passthrough_output_sources(kernel).ok_or_else(&reraise)?;
 
         // Pull the source rows from the host-materialised table and pick the
         // mapped input column for each output, casting to the declared output
@@ -5003,7 +5048,7 @@ impl Engine {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(kernel.outputs.len());
         for (out_idx, out_io) in kernel.outputs.iter().enumerate() {
             let in_idx = out_src[out_idx];
-            let in_io = kernel.inputs.get(in_idx).ok_or_else(|| reraise())?;
+            let in_io = kernel.inputs.get(in_idx).ok_or_else(&reraise)?;
             let col_pos = src_schema.index_of(&in_io.name).map_err(|_| {
                 BoltError::Plan(format!(
                     "host projection fallback: input column '{}' not found in \
@@ -5040,10 +5085,12 @@ impl Engine {
 pub struct QueryHandle {
     /// The materialised result.
     ///
-    /// `pub(crate)` (was module-private): the streaming / string method
-    /// clusters split into sibling modules construct `QueryHandle { batch }`
-    /// literals directly. Pure visibility widening — no behaviour change.
+    /// `pub(crate)` so executor helpers can consume and rewrap batches without
+    /// exposing mutable result storage to downstream callers.
     pub(crate) batch: RecordBatch,
+    /// Deterministic placement classification of the physical plan that
+    /// produced this result.
+    planned_execution_tier: crate::plan::ExecutionTier,
 }
 
 impl QueryHandle {
@@ -5055,6 +5102,15 @@ impl QueryHandle {
     /// Consume the handle and return the owned record batch.
     pub fn into_record_batch(self) -> RecordBatch {
         self.batch
+    }
+
+    /// Planned host/device placement for the query that produced this result.
+    ///
+    /// This is decided before execution. A capacity-triggered fallback may
+    /// still move work to the host; plans with a supported runtime-dependent
+    /// device boundary are classified as `Hybrid` up front.
+    pub fn planned_execution_tier(&self) -> crate::plan::ExecutionTier {
+        self.planned_execution_tier
     }
 
     /// Wrap a `RecordBatch` produced by an executor into a `QueryHandle`.
@@ -5069,7 +5125,15 @@ impl QueryHandle {
     /// `Engine::sql` / `Engine::execute`.
     #[doc(hidden)]
     pub(crate) fn from_record_batch(batch: RecordBatch) -> Self {
-        Self { batch }
+        Self {
+            batch,
+            planned_execution_tier: crate::plan::ExecutionTier::Host,
+        }
+    }
+
+    fn with_planned_execution_tier(mut self, tier: crate::plan::ExecutionTier) -> Self {
+        self.planned_execution_tier = tier;
+        self
     }
 
     /// Number of rows in the result.
@@ -6615,6 +6679,30 @@ mod tests {
         crate::jit::set_disk_ptx_cache_dir(prev);
     }
 
+    /// The process-global memory pool is still context-bound, so a second live
+    /// Engine must fail cleanly instead of overwriting the pool owner and
+    /// producing invalid CUDA handles. Dropping the first Engine releases the
+    /// permit and allows a new context to be constructed.
+    #[test]
+    #[ignore = "gpu:multi-engine isolation requires a live CUDA context"]
+    fn concurrent_engine_is_rejected_and_drop_releases_permit() {
+        let first = Engine::new().expect("first Engine");
+        let err = match Engine::new() {
+            Ok(second) => {
+                drop(second);
+                panic!("second live Engine must be rejected")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("only one active Engine"),
+            "unexpected second-Engine error: {err}"
+        );
+        drop(first);
+        let replacement = Engine::new().expect("permit released after first Engine drop");
+        drop(replacement);
+    }
+
     /// When `persistent_cache` is NOT called on the builder, `build`
     /// must NOT touch the disk-cache override slot — so a previously-
     /// installed override (or the `BOLT_PTX_CACHE_DIR` env-var path)
@@ -6880,7 +6968,7 @@ mod tests {
             .get();
 
         assert!(
-            after >= before + 1,
+            after > before,
             "run_logical_plan must bump QueriesTotal at least once \
              (before={before}, after={after})"
         );
@@ -6919,11 +7007,11 @@ mod tests {
 
         assert!(result.is_err(), "scan of an unregistered table must fail");
         assert!(
-            after_total >= before_total + 1,
+            after_total > before_total,
             "a failed query still counts toward QueriesTotal"
         );
         assert!(
-            after_failed >= before_failed + 1,
+            after_failed > before_failed,
             "a failed run_logical_plan must bump QueriesFailed \
              (before={before_failed}, after={after_failed})"
         );
@@ -6939,12 +7027,12 @@ mod tests {
         let t0 = m.counter(crate::metrics::Counter::QueriesTotal).get();
         m.inc(crate::metrics::Counter::QueriesTotal);
         let t1 = m.counter(crate::metrics::Counter::QueriesTotal).get();
-        assert!(t1 >= t0 + 1, "QueriesTotal must be monotone under inc()");
+        assert!(t1 > t0, "QueriesTotal must be monotone under inc()");
 
         let f0 = m.counter(crate::metrics::Counter::QueriesFailed).get();
         m.inc(crate::metrics::Counter::QueriesFailed);
         let f1 = m.counter(crate::metrics::Counter::QueriesFailed).get();
-        assert!(f1 >= f0 + 1, "QueriesFailed must be monotone under inc()");
+        assert!(f1 > f0, "QueriesFailed must be monotone under inc()");
     }
 
     /// F10a — `DeviceCol::mark_launch_stream` must tag the launch stream
@@ -6969,7 +7057,7 @@ mod tests {
             DataType::Bool,
             DataType::Utf8,
         ] {
-            let col = DeviceCol::alloc_zeros(dtype.clone(), 8).expect("alloc");
+            let col = DeviceCol::alloc_zeros(dtype, 8).expect("alloc");
             // Must not panic; idempotent tagging is fine (StreamSet dedups).
             col.mark_launch_stream(s);
             col.mark_launch_stream(s);
@@ -7311,14 +7399,16 @@ mod tests {
         let total = 1000usize;
 
         // Baseline: whole table materialised, no budget.
-        let mut whole = Engine::new().expect("ctx");
-        whole
-            .register_table("t", int64_batch(0, total))
-            .expect("register whole");
-        let h_whole = whole
-            .sql("SELECT x FROM t WHERE x >= 100")
-            .expect("whole query");
-        let want = h_whole.record_batch().clone();
+        let want = {
+            let mut whole = Engine::new().expect("ctx");
+            whole
+                .register_table("t", int64_batch(0, total))
+                .expect("register whole");
+            whole
+                .sql("SELECT x FROM t WHERE x >= 100")
+                .expect("whole query")
+                .into_record_batch()
+        };
 
         // Streaming source + a budget far below the table footprint, so
         // `morsel_plan_for_table` returns `Morsels` and the streaming hook
@@ -7530,8 +7620,8 @@ mod tests {
         let n_groups = 7i64;
 
         // Baseline: whole table materialised, no budget.
-        let mut whole = Engine::new().expect("ctx");
-        {
+        let want = {
+            let mut whole = Engine::new().expect("ctx");
             let g: Int64Array = (0..total as i64).map(|i| i % n_groups).collect();
             let x: Int64Array = (0..total as i64).collect();
             let schema = Arc::new(ArrowSchema::new(vec![
@@ -7540,12 +7630,12 @@ mod tests {
             ]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(g), Arc::new(x)]).unwrap();
             whole.register_table("t", batch).expect("register whole");
-        }
-        let want = whole
-            .sql("SELECT g, SUM(x) AS s, COUNT(x) AS c, MIN(x) AS mn, MAX(x) AS mx FROM t GROUP BY g")
-            .expect("whole grouped query")
-            .record_batch()
-            .clone();
+            whole
+                .sql("SELECT g, SUM(x) AS s, COUNT(x) AS c, MIN(x) AS mn, MAX(x) AS mx FROM t GROUP BY g")
+                .expect("whole grouped query")
+                .record_batch()
+                .clone()
+        };
 
         // Streaming source + a budget far below the table footprint, so the
         // grouped-aggregate streaming hook fires.
@@ -7584,6 +7674,48 @@ mod tests {
         assert_eq!(
             got_map, want_map,
             "streamed grouped aggregates equal whole-table"
+        );
+    }
+
+    /// Device end-to-end regression for the grouped streaming SUM boundary:
+    /// each one-row morsel has a valid `i64::MAX` partial, but merging the two
+    /// partials is outside Int64. The host merger must report overflow instead
+    /// of wrapping a device-produced partial.
+    #[test]
+    #[ignore = "gpu:aggregate — streaming grouped SUM overflow is a hard error"]
+    fn streaming_grouped_sum_overflow_errors_end_to_end() {
+        let producer: crate::exec::streaming::BatchProducer = Box::new(|| {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("g", ArrowDataType::Int64, false),
+                ArrowField::new("x", ArrowDataType::Int64, false),
+            ]));
+            let batch = || {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1])),
+                        Arc::new(Int64Array::from(vec![i64::MAX])),
+                    ],
+                )
+                .unwrap()
+            };
+            Box::new(vec![Ok(batch()), Ok(batch())].into_iter())
+        });
+
+        let mut engine = Engine::builder()
+            .memory_budget(1)
+            .build()
+            .expect("ctx with one-row morsel budget");
+        engine
+            .register_table_stream_lazy("t", gx_schema(), producer)
+            .expect("register stream");
+
+        let err = engine
+            .sql("SELECT g, SUM(x) FROM t GROUP BY g")
+            .expect_err("two i64::MAX partials must overflow Int64");
+        assert!(
+            err.to_string().contains("overflows Int64"),
+            "overflow must be explicit; got {err}"
         );
     }
 
