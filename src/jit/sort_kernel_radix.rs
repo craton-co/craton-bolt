@@ -10,8 +10,8 @@
 //! round-trip ORDER BY on very large single-key sorts, an `O(n · k/r)` radix
 //! sort (where `k` is the key bit-width and `r` the radix bit-width) wins.
 //!
-//! This kernel is **gated behind the `BOLT_GPU_SORT=1` environment variable**
-//! — see [`try_gpu_radix_sort`] for the hook point.
+//! The executor selects this kernel through its planner heuristic. The legacy
+//! `BOLT_GPU_SORT` value is only a force-on/force-off override.
 //!
 //! ## Two ABI flavours: keys-only vs keys+indices
 //!
@@ -159,9 +159,8 @@ pub const RADIX_BITS: u32 = 4;
 /// Number of buckets per radix step (`1 << RADIX_BITS`).
 pub const RADIX_BUCKETS: u32 = 1 << RADIX_BITS;
 
-/// Environment variable that gates the GPU radix-sort path. When set to `1`
-/// the executor *may* route ORDER BY through the radix kernel for supported
-/// dtypes; when unset (the default) the existing host / bitonic path runs.
+/// Legacy executor override: `1` forces a GPU attempt and `0` forces host.
+/// Unset delegates to the planner heuristic.
 pub const BOLT_GPU_SORT_ENV: &str = "BOLT_GPU_SORT";
 
 /// Per-dtype PTX details for radix-sort key handling.
@@ -276,8 +275,7 @@ impl RadixFlavour {
 
 /// Public: is this dtype handled by the radix kernel?
 ///
-/// The executor calls this before consulting [`BOLT_GPU_SORT_ENV`]; if the
-/// dtype isn't supported, we never need to touch the env var at all.
+/// The executor calls this before launching the radix driver.
 pub fn radix_supports_dtype(dtype: DataType) -> bool {
     RadixFlavour::for_dtype(dtype).is_ok()
 }
@@ -640,9 +638,7 @@ pub fn compile_radix_histogram(dtype: DataType) -> BoltResult<String> {
 /// invariant the multi-pass LSD radix requires to be correct, and it matches the
 /// host `lexsort_to_indices` fallback for `ORDER BY non_unique_key [LIMIT k]`.
 ///
-/// The radix path remains gated behind `BOLT_GPU_SORT=1` (default OFF) until the
-/// orchestrator validates it on hardware; correctness no longer depends on
-/// scheduling.
+/// The stable radix path is hardware-validated and planner-selected.
 pub fn compile_radix_scatter(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_entry(dtype)?;
@@ -879,9 +875,8 @@ fn emit_block_stable_scatter_prologue(
 /// and applies a deterministic per-block rank, so equal-key rows keep their
 /// input order both within and across blocks. There is no global atomic and no
 /// scheduling dependence — the previous per-element `atom.global.add` race and
-/// the interim cross-block ordering gap are both gone. The radix path stays
-/// gated behind `BOLT_GPU_SORT=1` (default OFF) until the orchestrator validates
-/// it on hardware. See [`compile_radix_scatter`] for the full discussion.
+/// the interim cross-block ordering gap are both gone. See
+/// [`compile_radix_scatter`] for the full discussion.
 pub fn compile_radix_scatter_with_indices(dtype: DataType) -> BoltResult<String> {
     let flavour = RadixFlavour::for_dtype(dtype)?;
     let entry = radix_scatter_with_indices_entry(dtype)?;
