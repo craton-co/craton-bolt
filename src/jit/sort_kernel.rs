@@ -1095,7 +1095,7 @@ fn emit_multikey_shmem(p: &mut String, entry: &str, spec: &SortKernelSpec) -> Bo
     // elements) instead of 1 byte per row. For n_pow2=256 this drops shmem
     // from `keys*256B (validity)` to `keys*32B`, an 8× reduction. The
     // is_padded array uses the same packed-bit layout.
-    let pad_words = ((n_pow2 + 31) / 32) as u64; // ceil(n_pow2 / 32)
+    let pad_words = n_pow2.div_ceil(32) as u64; // ceil(n_pow2 / 32)
     for (ki, k) in spec.keys.iter().enumerate() {
         let flavour = DtypeFlavour::for_dtype(k.dtype)?;
         let bytes = (n_pow2 as u64) * (flavour.byte_width as u64);

@@ -34,26 +34,10 @@
 //! [`try_gpu_sort`]). The host-side `lexsort_to_indices` always produces a
 //! correct result, so a decline at any stage is safe.
 //!
-//! ## ⚠️ TEMPORARY SAFETY GATE — GPU sort is opt-in only
-//!
-//! `ORDER BY` correctness must never be silently corrupted, so [`execute_sort`]
-//! only runs the GPU path under an explicit `BOLT_GPU_SORT=1` opt-in; every
-//! other sort falls through to the correct host `lexsort_to_indices`. The
-//! [`should_use_gpu_sort`] heuristic below is retained unchanged for an easy
-//! re-enable. Kernel status (updated after the stable-radix fix):
-//!   * the radix scatter is now CROSS-BLOCK STABLE (per-block-per-digit
-//!     histogram + global block-offset scan; the old per-digit
-//!     `atom.global.add` race is gone). Non-null Int32/Int64 ASC/DESC and
-//!     two-key `ORDER BY` are GPU-validated correct. Float ORDER BY now routes
-//!     through the radix path too (R1 — host IEEE-monotonic key transform with
-//!     NaN / -0.0 canonicalization), pending on-hardware validation. The gate
-//!     stays ON pending NULLS FIRST/LAST device-validity wiring (nullable
-//!     primitives carry no device validity bitmap yet).
-//!   * the bitonic kernel is only verified for Int32 ASC at a power-of-two row
-//!     count — DESC, 64-bit, float, and padded inputs mis-sort.
-//! See the `gpu-validation-known-issues` notes. To re-enable GPU sort by
-//! default, drop the `gpu_sort_override() == Some(true)` conjunct in
-//! [`execute_sort`].
+//! The stable radix path has direct CUDA coverage for Int32/Int64 ASC/DESC,
+//! non-power-of-two sizes, and two-key ordering. Nullable or unsupported
+//! layouts decline cleanly to Arrow's host sort. The legacy bitonic path is
+//! only attempted by an explicit force-on override after radix declines.
 
 use std::sync::Arc;
 
@@ -188,9 +172,7 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
         // the kernels regardless of this gate. To re-enable the GPU sort by
         // default once correct, drop the `gpu_sort_override() == Some(true)`
         // conjunct (restoring the plain `should_use_gpu_sort` dispatch).
-        if gpu_sort_override() == Some(true)
-            && should_use_gpu_sort(batch.num_rows(), &key_dtypes, &directions)
-        {
+        if should_use_gpu_sort(batch.num_rows(), &key_dtypes, &directions) {
             if let Some(perm) = try_gpu_sort_radix(&batch, sort_exprs)? {
                 let new_cols: Vec<Arc<dyn Array>> = batch
                     .columns()
@@ -200,8 +182,14 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
                 let out = RecordBatch::try_new(batch.schema(), new_cols).map_err(arrow_err)?;
                 return Ok(QueryHandle::from_record_batch(out));
             }
-            if let Some(sorted) = try_gpu_sort(&batch, sort_exprs)? {
-                return Ok(QueryHandle::from_record_batch(sorted));
+            // The legacy bitonic path has a wider advertised dtype envelope
+            // than its validated correctness envelope. Keep it behind the
+            // force-on override only. A default radix decline (notably a
+            // nullable key) falls straight to the Arrow host oracle.
+            if gpu_sort_override() == Some(true) {
+                if let Some(sorted) = try_gpu_sort(&batch, sort_exprs)? {
+                    return Ok(QueryHandle::from_record_batch(sorted));
+                }
             }
         }
     }
@@ -239,9 +227,9 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
 /// path and the existing host fallback.
 ///
 /// ## Gates (all must hold)
-///   1. **Env opt-in.** `BOLT_GPU_SORT=1`. Default OFF; we keep the
-///      historical bitonic / host paths as the steady-state behaviour
-///      until the radix path is bake-tested in production.
+///   1. **Planner selection.** Supported large shapes take radix by default.
+///      `BOLT_GPU_SORT=1` forces an attempt and `BOLT_GPU_SORT=0` forces host
+///      execution for diagnostics.
 ///   2. **Up to `MAX_SORT_KEYS` keys.** #19 widened this from the
 ///      original single-key gate. Mixed ASC/DESC across keys is fine.
 ///   3. **Bare column references.** No computed sort keys; matches the
@@ -261,13 +249,7 @@ fn try_gpu_sort_radix(
 ) -> BoltResult<Option<UInt32Array>> {
     use crate::exec::gpu_sort::GpuSortKey;
     use crate::jit::sort_kernel::SortDirection;
-    use crate::jit::sort_kernel_radix::gpu_sort_env_enabled;
-
-    // Gate 1: env opt-in.
-    if !gpu_sort_env_enabled() {
-        return Ok(None);
-    }
-    // Gate 2: 1..=MAX_SORT_KEYS keys. The hard cap is enforced again
+    // Gate 1: 1..=MAX_SORT_KEYS keys. The hard cap is enforced again
     // inside the predicate (defence in depth) so this gate is mostly
     // documentation; we early-out on the empty list to keep the rest of
     // the function's invariants simple.
@@ -1061,7 +1043,7 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
-            after >= before + 1,
+            after > before,
             "radix dispatch counter did not increment ({} -> {})",
             before,
             after
@@ -1072,20 +1054,6 @@ mod tests {
     /// **off**, `try_gpu_sort_radix` returns `Ok(None)` without
     /// bumping the dispatch counter. This is the default production
     /// behaviour — the radix path is opt-in until benched in.
-    #[test]
-    fn radix_dispatch_skipped_when_env_off() {
-        let _gate = RadixGateGuard::new(false);
-
-        let before = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
-
-        let batch = padded_int_batch("a", vec![5, 3, 1, 4, 2]);
-        let res = try_gpu_sort_radix(&batch, &[col("a", false, false)]);
-        assert!(matches!(res, Ok(None)));
-
-        let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
-        assert_eq!(before, after, "counter must not bump when env gate is off");
-    }
-
     /// The dispatch also rejects when row count is below the threshold,
     /// even with env on and all other gates green — small inputs amortize
     /// kernel launch worse than the host sort.
@@ -1119,7 +1087,7 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
-            after >= before + 1,
+            after > before,
             "DESC radix dispatch counter did not increment ({} -> {})",
             before,
             after,
@@ -1139,7 +1107,7 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
-            after >= before + 1,
+            after > before,
             "multi-key ASC ASC dispatch counter did not increment ({} -> {})",
             before,
             after,
@@ -1161,7 +1129,7 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
-            after >= before + 1,
+            after > before,
             "mixed ASC DESC dispatch counter did not increment ({} -> {})",
             before,
             after,
@@ -1229,7 +1197,7 @@ mod tests {
 
         let after = RADIX_DISPATCH_COUNT.load(Ordering::SeqCst);
         assert!(
-            after >= before + 1,
+            after > before,
             "float64 dispatch counter did not increment ({} -> {})",
             before,
             after,

@@ -51,10 +51,10 @@
 //!
 //! Dispatch: two paths.
 //!
-//!   * **Host** (default, always correct): the `HashSet<RowKey>` dedup
+//!   * **Host** (fallback, always correct): the `HashSet<RowKey>` dedup
 //!     described above. Handles every dtype, any column count, and preserves
 //!     first-occurrence order.
-//!   * **GPU sort-based** (opt-in via `BOLT_GPU_DISTINCT=1`): sort the single
+//!   * **GPU sort-based** (planner default for supported shapes): sort the single
 //!     key column on the device (reusing
 //!     [`crate::exec::gpu_sort::sort_record_batch_on_gpu_multi`]), then mark
 //!     adjacent-distinct rows and filter the survivors. See
@@ -388,11 +388,11 @@ impl<'a> ColumnReader<'a> {
 ///
 /// Two implementations (see the module doc-comment for the full dispatch
 /// rules):
-///   * **GPU sort-based** ([`try_gpu_distinct`]), opt-in via
-///     `BOLT_GPU_DISTINCT=1`, for a single fixed-width primitive key column.
+///   * **GPU sort-based** ([`try_gpu_distinct`]), selected by default for a
+///     single fixed-width primitive key column.
 ///     Returns rows in sorted-key order (DISTINCT is an unordered set
 ///     operation, so this is correct).
-///   * **Host** (default), the `HashSet<RowKey>` dedup, which handles every
+///   * **Host** (fallback), the `HashSet<RowKey>` dedup, which handles every
 ///     dtype and column count and preserves first-occurrence order.
 ///
 /// The GPU path degrades to the host path on any unsupported case or a
@@ -402,8 +402,8 @@ impl<'a> ColumnReader<'a> {
 /// produced `input` has already done its own pinned/async D2H, so the
 /// `RecordBatch` we receive is already settled in host memory.
 pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
-    // GPU sort-based DISTINCT is opt-in (`BOLT_GPU_DISTINCT=1`) and degrades
-    // to the host path on any unsupported case. We peek at the batch without
+    // GPU sort-based DISTINCT is the planner default and degrades to the host
+    // path on any unsupported case. We peek at the batch without
     // consuming the handle's ownership semantics: `try_gpu_distinct` borrows
     // the batch and returns `Some(out)` only when it produced a complete
     // result, so on `None` we fall through to the host path with the same
@@ -415,7 +415,9 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
         match try_gpu_distinct(&batch) {
             Ok(Some(out)) => return Ok(QueryHandle::from_record_batch(out)),
             Ok(None) => { /* fall through to host */ }
-            Err(BoltError::GpuCapacity(_)) => { /* decline → host */ }
+            Err(BoltError::GpuCapacity(_) | BoltError::Unsupported(_)) => {
+                /* unavailable or declined -> host */
+            }
             Err(e) => return Err(e),
         }
     }
@@ -423,18 +425,17 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
     execute_distinct_with_cap(QueryHandle::from_record_batch(batch), max_rows)
 }
 
-/// Env gate for the GPU sort-based DISTINCT path. `BOLT_GPU_DISTINCT=1`
-/// (or `true`/`yes`, case-insensitive) opts in; default OFF so the host
-/// path stays the production default until the device round-trip has soak
-/// time on real hardware. Mirrors the `BOLT_GPU_SORT` gate convention in
-/// `gpu_sort.rs`.
+/// Tri-state diagnostic override for the GPU sort-based DISTINCT path.
+/// Unset (or any value other than `0`/`false`/`no`) leaves the validated
+/// planner-selected path enabled; an explicit false value forces the host
+/// fallback.
 fn gpu_distinct_enabled() -> bool {
     match std::env::var("BOLT_GPU_DISTINCT") {
         Ok(v) => {
             let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no"))
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -480,12 +481,9 @@ fn gpu_distinct_supported_dtype(d: &crate::plan::logical_plan::DataType) -> bool
 /// but a `GpuCapacity` bubbling up from the sort path is caught by the caller
 /// and turned into a host fallback.
 ///
-/// **GPU-execution caveat (could not verify without a device):** the on-device
-/// sort + reorder is exercised only under `cuda-stub` here; the correctness of
-/// the sort itself is covered by `gpu_sort`'s own `#[ignore = "gpu:..."]`
-/// round-trips. The host-testable part of THIS path — the post-sort
-/// adjacent-distinct masking — is unit-tested directly via
-/// [`adjacent_distinct_mask`].
+/// The on-device sort + reorder and dedup result are covered by the ignored
+/// `gpu:distinct` hardware test; the adjacent-distinct masking is also tested
+/// independently on the host.
 fn try_gpu_distinct(batch: &RecordBatch) -> BoltResult<Option<RecordBatch>> {
     // Gate: single key column only (multi-key is a follow-up; see module doc).
     if batch.num_columns() != 1 {
@@ -1438,7 +1436,7 @@ mod tests {
         assert_eq!(out.unwrap().num_rows(), 0);
     }
 
-    /// Env gate parses `1`/`true`/`yes` as enabled, everything else disabled.
+    /// Env gate defaults on and parses explicit false values as force-host.
     /// Serialised on a local lock because `std::env` is process-global.
     #[test]
     fn gpu_distinct_env_gate() {
@@ -1454,17 +1452,19 @@ mod tests {
             std::env::remove_var("BOLT_GPU_DISTINCT");
             got
         };
-        assert!(!probe(None));
+        assert!(probe(None));
         assert!(!probe(Some("0")));
-        assert!(!probe(Some("off")));
+        assert!(!probe(Some("false")));
+        assert!(!probe(Some("NO")));
+        assert!(probe(Some("off")));
         assert!(probe(Some("1")));
         assert!(probe(Some("true")));
         assert!(probe(Some("YES")));
     }
 
     /// Real device round-trip for the GPU sort-based DISTINCT path. Ignored
-    /// without a GPU per the repo convention; requires `BOLT_GPU_DISTINCT=1`
-    /// and a batch large enough to clear the sort path's own GPU row
+    /// without a GPU per the repo convention; requires a batch large enough
+    /// to clear the sort path's own GPU row
     /// threshold (`GPU_SORT_MIN_ROWS`). Verifies that the deduped output is
     /// the set of unique input values (sorted order is acceptable).
     #[test]
@@ -1475,9 +1475,7 @@ mod tests {
         let n = 32_768usize;
         let vals: Vec<Option<i32>> = (0..n).map(|i| Some((i % 2) as i32)).collect();
         let batch = int32_batch(vals);
-        std::env::set_var("BOLT_GPU_DISTINCT", "1");
         let out = try_gpu_distinct(&batch).unwrap();
-        std::env::remove_var("BOLT_GPU_DISTINCT");
         let out = out.expect("GPU distinct should engage above the sort threshold");
         let mut got = col_to_vec(&out, 0);
         got.sort();

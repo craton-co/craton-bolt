@@ -244,7 +244,7 @@ pub fn arrow_dtype_to_internal(d: &arrow_schema::DataType) -> Option<DataType> {
 /// `is_padded`).
 fn build_validity_padded(arr: &dyn Array, n_pow2: usize) -> Vec<u8> {
     let n_rows = arr.len();
-    let bytes = (n_pow2 + 7) / 8;
+    let bytes = n_pow2.div_ceil(8);
     let mut out = vec![0u8; bytes];
     for i in 0..n_rows {
         if !arr.is_null(i) {
@@ -272,7 +272,7 @@ fn build_validity_padded(arr: &dyn Array, n_pow2: usize) -> Vec<u8> {
 /// the real row could end up at an index >= n_rows and get truncated. With
 /// the explicit padded-bit, padded rows always lose the tiebreak.
 fn build_is_padded(n_rows: usize, n_pow2: usize) -> Vec<u8> {
-    let bytes = (n_pow2 + 7) / 8;
+    let bytes = n_pow2.div_ceil(8);
     let mut out = vec![0u8; bytes];
     for i in n_rows..n_pow2 {
         out[i / 8] |= 1 << (i % 8);
@@ -328,9 +328,7 @@ fn sample_distinct_utf8(sa: &StringArray) -> (usize, usize) {
     if n == 0 {
         return (0, 0);
     }
-    let target = (n / HIGH_CARDINALITY_SAMPLE_STRIDE_DIV)
-        .max(1)
-        .min(HIGH_CARDINALITY_SAMPLE_MAX);
+    let target = (n / HIGH_CARDINALITY_SAMPLE_STRIDE_DIV).clamp(1, HIGH_CARDINALITY_SAMPLE_MAX);
     // Stride: distribute `target` samples across `n` rows. `step` is at least
     // 1 (target <= n implied by the .min(n) clamp in the caller — but be
     // defensive in case `target == 0`).
@@ -821,7 +819,8 @@ pub struct GpuSortKey<'a> {
 //   fall through. Mixed ASC/DESC per-key is supported.
 // - **No NULLs in any key column.** Radix sort has no validity-bitmap
 //   routing; we reject nullable columns up front.
-// - **Env-gated.** `BOLT_GPU_SORT=1` opts in; default OFF.
+// - **Planner-selected by default.** `BOLT_GPU_SORT=1` forces an attempt and
+//   `BOLT_GPU_SORT=0` forces host execution for diagnostics.
 //
 // The dispatch decision in [`try_gpu_sort_radix`] returns `Ok(None)` on
 // any precondition miss so the caller can fall through to the bitonic
@@ -1300,14 +1299,18 @@ fn run_radix_pipeline_i32(
     // overwrites every slot), but the populated len is what lets the
     // final `to_vec()` D2H read all n_rows entries after the last
     // ping↔pong swap.
-    let mut keys_ping: GpuVec<i32> = GpuVec::<i32>::from_slice(&gathered)?;
-    let mut keys_pong: GpuVec<i32> = GpuVec::<i32>::from_slice(&gathered)?;
+    let mut keys_ping: GpuVec<i32> = GpuVec::<i32>::from_slice(&gathered)
+        .map_err(|e| BoltError::Other(format!("radix i32 keys_ping allocation/upload: {e}")))?;
+    let mut keys_pong: GpuVec<i32> = GpuVec::<i32>::from_slice(&gathered)
+        .map_err(|e| BoltError::Other(format!("radix i32 keys_pong allocation/upload: {e}")))?;
     // Seed idx_ping with the running permutation (identity for the first
     // key in the LSD chain). The kernel reorders idx_ping in lock-step
     // with keys_ping, so after all radix passes idx_ping holds the
     // NEW running permutation.
-    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
-    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)?;
+    let mut idx_ping: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)
+        .map_err(|e| BoltError::Other(format!("radix i32 idx_ping allocation/upload: {e}")))?;
+    let mut idx_pong: GpuVec<u32> = GpuVec::<u32>::from_slice(running_perm)
+        .map_err(|e| BoltError::Other(format!("radix i32 idx_pong allocation/upload: {e}")))?;
 
     // Launch shape. `grid_x` (= num_blocks) sizes the per-block-per-digit
     // histogram / offsets buffers below, so we compute it before allocating.
@@ -1320,8 +1323,10 @@ fn run_radix_pipeline_i32(
     // block's 16 digit counts separate so the host can build deterministic,
     // blockIdx-ordered output offsets. `zeros(...)` populates the GpuVec's
     // bookkeeping len for the memset_d8 / memcpy paths below.
-    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
-    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)?;
+    let hist_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)
+        .map_err(|e| BoltError::Other(format!("radix i32 histogram allocation: {e}")))?;
+    let offsets_dev: GpuVec<u32> = GpuVec::<u32>::zeros(block_hist_len)
+        .map_err(|e| BoltError::Other(format!("radix i32 offsets allocation: {e}")))?;
 
     // ----- modules + entry points -------------------------------------
     //
@@ -1342,8 +1347,11 @@ fn run_radix_pipeline_i32(
         &hist_spec,
         RADIX_HISTOGRAM_I32_ENTRY,
         |spec| compile_radix_histogram(spec.dtype),
-    )?;
-    let hist_fn = hist_module.function(&radix_histogram_entry(dtype)?)?;
+    )
+    .map_err(|e| BoltError::Other(format!("radix i32 histogram module: {e}")))?;
+    let hist_fn = hist_module
+        .function(&radix_histogram_entry(dtype)?)
+        .map_err(|e| BoltError::Other(format!("radix i32 histogram function: {e}")))?;
 
     let scatter_spec = RadixSortKernelSpec {
         pass: RadixSortPass::ScatterWithIndices,
@@ -1353,8 +1361,11 @@ fn run_radix_pipeline_i32(
         &scatter_spec,
         RADIX_SCATTER_WI_I32_ENTRY,
         |spec| compile_radix_scatter_with_indices(spec.dtype),
-    )?;
-    let scatter_fn = scatter_module.function(&radix_scatter_with_indices_entry(dtype)?)?;
+    )
+    .map_err(|e| BoltError::Other(format!("radix i32 scatter module: {e}")))?;
+    let scatter_fn = scatter_module
+        .function(&radix_scatter_with_indices_entry(dtype)?)
+        .map_err(|e| BoltError::Other(format!("radix i32 scatter function: {e}")))?;
 
     // #19: the kernel-side MSB-flip (`bolt_radix_msb_flip_i32`) is no
     // longer invoked from this path. The host-side `radix_pre_transform_i32`
@@ -1373,8 +1384,10 @@ fn run_radix_pipeline_i32(
     // copy). The contents are fully overwritten each pass (the D2H fills
     // `hist_host`, `compute_block_offsets` rewrites `offsets_host` from index
     // 0), so carrying stale bytes across passes is benign.
-    let mut hist_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
-    let mut offsets_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)?;
+    let mut hist_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)
+        .map_err(|e| BoltError::Other(format!("radix i32 pinned histogram allocation: {e}")))?;
+    let mut offsets_host: PinnedHostBuffer<u32> = PinnedHostBuffer::<u32>::new(block_hist_len)
+        .map_err(|e| BoltError::Other(format!("radix i32 pinned offsets allocation: {e}")))?;
 
     // ----- per-pass loop: histogram → host-scan → scatter -------------
     for step in 0..radix_steps {
@@ -1393,12 +1406,14 @@ fn run_radix_pipeline_i32(
         // underlying allocation has at least block_hist_len u32 entries; we zero
         // exactly that many bytes.
         unsafe {
-            cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)?;
+            cuda_sys::memset_d8(hist_dev.device_ptr(), 0, hist_bytes)
+                .map_err(|e| BoltError::Other(format!("radix i32 histogram zero: {e}")))?;
         }
 
         launch_radix_histogram(
             &hist_fn, &keys_ping, &hist_dev, n_rows_u32, shift, grid_x, block_size, &stream,
-        )?;
+        )
+        .map_err(|e| BoltError::Other(format!("radix i32 histogram launch: {e}")))?;
 
         // PERF (radix round-trip): D2H the per-block-per-digit histogram as an
         // *async* copy on the sort stream into the hoisted pinned buffer, then
@@ -1414,9 +1429,12 @@ fn run_radix_pipeline_i32(
                 hist_dev.device_ptr(),
                 block_hist_len,
                 stream.raw(),
-            )?;
+            )
+            .map_err(|e| BoltError::Other(format!("radix i32 histogram D2H: {e}")))?;
         }
-        stream.synchronize()?;
+        stream
+            .synchronize()
+            .map_err(|e| BoltError::Other(format!("radix i32 histogram synchronize: {e}")))?;
 
         // Build per-block-per-digit exclusive output offsets on the host (cheap
         // — `num_blocks * 16` u32s). This is what makes the scatter stable
@@ -2987,6 +3005,15 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
 
+    /// Every direct low-level GPU test must own a current CUDA context.
+    /// Production reaches these functions through `Engine`, which supplies
+    /// one; the old ignored tests accidentally depended on some unrelated test
+    /// having created a context first and failed with CUDA_ERROR_INVALID_VALUE
+    /// when run as a focused blocking gate.
+    fn gpu_context() -> crate::cuda::CudaContext {
+        crate::cuda::CudaContext::new(0).expect("create CUDA context for GPU sort test")
+    }
+
     // -- pure-host helpers --
 
     #[test]
@@ -3163,6 +3190,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort"]
     fn gpu_sort_dimension_isolation() {
+        let _ctx = gpu_context();
         fn scramble_idx(n: usize, seed: u64) -> Vec<usize> {
             let mut idx: Vec<usize> = (0..n).collect();
             let mut s = seed;
@@ -3284,6 +3312,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort"]
     fn gpu_sort_int32_asc_round_trip() {
+        let _ctx = gpu_context();
         // 16384 = 2^14, exact power of two: no padding required, exercises the
         // happy path without truncation noise.
         let n = 16_384usize;
@@ -3327,6 +3356,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort"]
     fn gpu_sort_int64_desc_with_padding() {
+        let _ctx = gpu_context();
         let n = 16_385usize;
         let values: Vec<i64> = (0..n as i64).map(|i| (i * 7919) % 1_000_000).collect();
         let arr = Int64Array::from(values.clone());
@@ -3356,6 +3386,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort"]
     fn gpu_sort_float64_asc_with_padding() {
+        let _ctx = gpu_context();
         let n = 20_000usize;
         let values: Vec<f64> = (0..n).map(|i| ((i as f64) * 1.61803398875).sin()).collect();
         let arr = Float64Array::from(values.clone());
@@ -3383,6 +3414,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort"]
     fn gpu_sort_record_batch_keeps_columns_in_sync() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         // Key = scrambled 0..n; payload = 100 + key. After sorting by key,
         // payload[i] should equal sorted_key[i] + 100.
@@ -3444,6 +3476,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_int32_asc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         let mut values: Vec<i32> = (0..n as i32).collect();
         let mut rng_state: u64 = 0xfeedface;
@@ -3475,6 +3508,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_int64_asc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         // Use a range that includes negatives so the MSB-flip path is
         // exercised — without it the negatives would sort after positives.
@@ -3505,6 +3539,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_float32_asc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         // Spread of negatives and positives; inject a -0.0 and a NaN.
         let mut values: Vec<f32> = (0..n as i32)
@@ -3552,6 +3587,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_float64_asc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         let mut values: Vec<f64> = (0..n as i64)
             .map(|i| ((i * 7919) % 200_000 - 100_000) as f64 * 0.25)
@@ -3592,6 +3628,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_int32_desc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         let mut values: Vec<i32> = (0..n as i32).map(|i| i - 8_192).collect(); // include negatives
         let mut rng_state: u64 = 0xabad_cafe;
@@ -3629,6 +3666,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_two_key_asc_asc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         // Force lots of ties on key A so key B's tie-break is observable.
         let key_a: Vec<i32> = (0..n as i32).map(|i| i % 64).collect();
@@ -3671,6 +3709,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:sort_radix"]
     fn gpu_sort_radix_two_key_asc_desc_round_trip() {
+        let _ctx = gpu_context();
         let n = 16_384usize;
         let key_a: Vec<i32> = (0..n as i32).map(|i| i % 32).collect();
         let key_b: Vec<i32> = (0..n as i32).map(|i| (i * 17) % 1000).collect();
@@ -3992,18 +4031,18 @@ mod tests {
         let buckets = RADIX_BUCKETS as usize;
         // block 0: digit0=2, digit1=1 ; block 1: digit0=1, digit1=3.
         let mut hist = vec![0u32; 2 * buckets];
-        hist[0 * buckets + 0] = 2;
+        hist[0 * buckets] = 2;
         hist[0 * buckets + 1] = 1;
-        hist[1 * buckets + 0] = 1;
-        hist[1 * buckets + 1] = 3;
+        hist[buckets] = 1;
+        hist[buckets + 1] = 3;
         let mut offs = vec![0u32; 2 * buckets];
         compute_block_offsets(&hist, 2, &mut offs).unwrap();
         // digit 0 region [0,3): block0 at 0 (len 2), block1 at 2 (len 1).
-        assert_eq!(offs[0 * buckets + 0], 0);
-        assert_eq!(offs[1 * buckets + 0], 2);
+        assert_eq!(offs[0 * buckets], 0);
+        assert_eq!(offs[buckets], 2);
         // digit 1 region [3,7): block0 at 3 (len 1), block1 at 4 (len 3).
         assert_eq!(offs[0 * buckets + 1], 3);
-        assert_eq!(offs[1 * buckets + 1], 4);
+        assert_eq!(offs[buckets + 1], 4);
     }
 
     /// End-to-end host simulation: drive `compute_block_offsets` exactly as the
@@ -4015,7 +4054,7 @@ mod tests {
         let buckets = RADIX_BUCKETS as usize;
         let block = RADIX_BLOCK_SIZE as usize;
         let n = 3 * block + 37; // 3 full blocks + a partial tail.
-        let num_blocks = (n + block - 1) / block;
+        let num_blocks = n.div_ceil(block);
 
         // Deterministic pseudo-random digits in 0..16.
         let digits: Vec<u32> = (0..n)
