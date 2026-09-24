@@ -171,7 +171,7 @@ impl ExtendedDeviceCol {
                 let host_validity: Vec<u8> = validity.to_vec()?;
                 let arr: BooleanArray = host_values
                     .into_iter()
-                    .zip(host_validity.into_iter())
+                    .zip(host_validity)
                     .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
                     .collect();
                 Ok(Arc::new(arr) as ArrayRef)

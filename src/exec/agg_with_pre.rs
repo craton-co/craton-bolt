@@ -895,7 +895,7 @@ enum ResolvedHostCol<'a> {
 impl<'a> ResolvedHostCol<'a> {
     fn as_ref(&self) -> &HostCol {
         match self {
-            ResolvedHostCol::Borrowed { col, .. } => *col,
+            ResolvedHostCol::Borrowed { col, .. } => col,
             ResolvedHostCol::Owned { col, .. } => col,
         }
     }
@@ -1456,6 +1456,7 @@ impl PreCol {
     /// Download the column to host and verify the length matches `n_rows`.
     /// Also downloads the validity bitmap (if present) parallel to the
     /// values.
+    #[allow(clippy::wrong_self_convention)]
     fn to_host_col(self, n_rows: usize) -> BoltResult<HostCol> {
         let PreCol { values, valid_mask } = self;
         let validity: Option<Vec<u8>> = match valid_mask {

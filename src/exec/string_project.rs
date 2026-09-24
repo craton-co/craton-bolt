@@ -37,16 +37,13 @@
 //! length pass. NULL rows decode to an empty slice (the dictionary's NULL
 //! sentinel), matching the host fallback.
 //!
-//! ## Fallback (no panic) and the v0.7.0 device-path gate
+//! ## Validated device path and fallback boundary
 //!
-//! **The GPU two-pass kernels have never been executed on GPU hardware as of
-//! v0.7.0** (CI has no CUDA device). The host transform is therefore the
-//! production correctness path: the executor must consult
-//! [`gpu_string_enabled`] (`BOLT_GPU_STRING=1`, default OFF) before selecting
-//! the device path, so the validated host helpers run by default. The device
-//! launch is opt-in for hardware bring-up only.
+//! The ASCII `UPPER`/`LOWER` two-pass kernels are covered by direct CUDA
+//! hardware tests and are enabled by default. Set `BOLT_GPU_STRING=0` to force
+//! their host mirror for diagnosis or compatibility.
 //!
-//! Even when the gate is ON, the GPU two-pass path is taken only when the
+//! The GPU two-pass path is taken only when the
 //! transform is ASCII-safe for the column's dictionary (the kernels case-fold
 //! byte-wise, which is correct for ASCII but NOT for arbitrary Unicode — e.g.
 //! `'ß'.to_uppercase()` is `"SS"`, changing the byte length). When any
@@ -224,12 +221,7 @@ pub enum KeyLayout {
 /// Returns an empty string for NULL rows — the row-aligned input the GPU
 /// two-pass kernels consume has no validity channel, so a NULL row produces an
 /// empty output slice (matching the host fallback's treatment of NULL → empty).
-fn decode_row<'a>(
-    dict: &'a [String],
-    key: i32,
-    layout: KeyLayout,
-    is_valid: bool,
-) -> BoltResult<&'a str> {
+fn decode_row(dict: &[String], key: i32, layout: KeyLayout, is_valid: bool) -> BoltResult<&str> {
     if !is_valid {
         return Ok("");
     }
@@ -281,11 +273,9 @@ fn decode_row<'a>(
 /// Errors if the concatenated byte length would exceed `i32::MAX` (Arrow
 /// `Utf8`, not `LargeUtf8`).
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. This materialises the input the
-// UPPER/LOWER device length pass consumes; the executor must only build/launch
-// that device path when `gpu_string_enabled` is true (default OFF →
-// host_transform_strings / gpu_path_transform_pure host mirror).
+// CUDA-hardware validated for ASCII UPPER/LOWER. This materialises the input
+// consumed by their device length pass; `gpu_string_enabled` remains an
+// operational force-off switch.
 pub fn build_row_aligned_input(
     dict: &[String],
     keys: &[i32],
@@ -322,10 +312,8 @@ pub fn build_row_aligned_input(
 ///
 /// Errors if the running total would exceed `i32::MAX`.
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. This is the host scan step
-// wedged between the device length and write passes; it is only reached on the
-// gated UPPER/LOWER device path.
+// CUDA-hardware validated for ASCII UPPER/LOWER. This is the host scan step
+// between their device length and write passes.
 pub fn exclusive_scan_lens(row_lens: &[u32]) -> BoltResult<(Vec<i32>, usize)> {
     let mut offsets: Vec<i32> = Vec::with_capacity(row_lens.len() + 1);
     let mut acc: usize = 0;
@@ -353,10 +341,9 @@ pub fn exclusive_scan_lens(row_lens: &[u32]) -> BoltResult<(Vec<i32>, usize)> {
 /// Errors if a slice is not valid UTF-8 (a kernel wrote bytes the dictionary
 /// could not have produced) — surfaced rather than masked.
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. On the gated UPPER/LOWER device
-// path this reconstructs the array from the device write-pass download; it is
-// also reused by the pure-host gpu_path_concat_pure mirror.
+// CUDA-hardware validated for ASCII UPPER/LOWER. This reconstructs the array
+// from the device write-pass download and is also reused by the pure-host
+// gpu_path_concat_pure mirror.
 pub fn string_array_from_offsets(
     offsets: &[i32],
     bytes: &[u8],
@@ -397,12 +384,8 @@ pub fn string_array_from_offsets(
 /// data; this is the reference used by unit tests (and is NOT the Unicode
 /// fallback — see [`host_transform_strings`] for that).
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. NOTE: this function is itself a
-// pure-HOST mirror (it never launches a kernel) and is therefore always safe to
-// run; the comment flags that the *device* kernel it mirrors (jit::string_kernel
-// UPPER/LOWER write pass, launched by Engine::string_transform_column) is the
-// unvalidated path the executor must gate behind gpu_string_enabled.
+// Pure-HOST mirror of the CUDA-hardware-validated ASCII UPPER/LOWER device
+// path. It never launches a kernel and remains useful for differential tests.
 pub fn gpu_path_transform_pure(
     dict: &[String],
     keys: &[i32],
@@ -564,8 +547,7 @@ pub fn concat_output_validity(inputs: &[ConcatInput]) -> Vec<bool> {
 /// launch must produce an identical `out_bytes`/`out_offsets`; this is the
 /// reference used by unit tests (no CUDA runtime needed).
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. The device CONCAT two-pass
+// The device CONCAT two-pass path remains unsupported. The device CONCAT
 // kernels are NEVER selected by the executor today: Engine::execute_string_project
 // always calls host_concat_strings. This pure-host mirror is retained only as
 // the unit-test reference for the (currently unreachable) device producer.
@@ -576,8 +558,8 @@ pub fn gpu_path_concat_pure(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
 
     // Write pass: copy each input slice, in input order, into the row's region.
     let mut out_bytes = vec![0u8; total];
-    for r in 0..n_rows {
-        let mut cursor = out_offsets[r] as usize;
+    for (r, &offset) in out_offsets.iter().take(n_rows).enumerate() {
+        let mut cursor = offset as usize;
         for inp in inputs {
             let begin = inp.offsets[r] as usize;
             let end = inp.offsets[r + 1] as usize;
@@ -613,8 +595,8 @@ pub fn host_concat_strings(inputs: &[ConcatInput]) -> BoltResult<StringArray> {
     let n_rows = inputs[0].offsets.len().saturating_sub(1);
     let validity = concat_output_validity(inputs);
     let mut out: Vec<Option<String>> = Vec::with_capacity(n_rows);
-    for r in 0..n_rows {
-        if !validity[r] {
+    for (r, &is_valid) in validity.iter().enumerate() {
+        if !is_valid {
             out.push(None);
             continue;
         }

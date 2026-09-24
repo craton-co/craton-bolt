@@ -192,8 +192,7 @@ fn execute_inner(
         }
     };
 
-    let out = build_tier2_twokey_result(partial, &aggregate.output_schema);
-    out
+    build_tier2_twokey_result(partial, &aggregate.output_schema)
 }
 
 // ---------------------------------------------------------------------------

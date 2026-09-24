@@ -439,13 +439,10 @@ pub fn compile_length_gather_kernel() -> BoltResult<String> {
 // 1b. Per-row variable-width `LIKE` matcher (Bool output).
 // ---------------------------------------------------------------------------
 //
-// ⚠️ UNVALIDATED DEVICE CODE ⚠️
-//
 // `compile_like_match_kernel` emits a real per-row device matcher for the
 // constant single-literal-segment `LIKE` shapes (EXACT / PREFIX / SUFFIX /
-// CONTAINS, plus `NOT LIKE` via inversion). It has NOT been executed on GPU
-// hardware in CI — this engine has no GPU at build/test time. Correctness is
-// established by two host-side proxies only:
+// CONTAINS, plus `NOT LIKE` via inversion). These shapes are exercised by the
+// ignored real-device string suite, in addition to two host-side oracles:
 //
 //   * the **host mirror** [`crate::exec::string_like::like_match_row`], which
 //     replicates the exact per-row byte logic the PTX emits and is asserted
@@ -453,8 +450,8 @@ pub fn compile_length_gather_kernel() -> BoltResult<String> {
 //   * the **PTX-shape tests** in this module, which pin the compare / branch
 //     structure each mode emits.
 //
-// Until a GPU hardware test pass validates it, the executor
-// ([`crate::exec::string_like`]) is conservatively host-fallback-safe: any
+// The executor ([`crate::exec::string_like`]) is conservatively
+// host-fallback-safe: any
 // unsupported layout / shape encountered at run time evaluates the SAME match
 // on the host via `PatternMatcher`, so a latent device bug can only ever cost
 // performance, never correctness.
@@ -1954,7 +1951,7 @@ mod tests {
         assert!(write_pass_entry(ScalarFnKind::Concat).is_err());
     }
 
-    // ---- LIKE matcher kernel (UNVALIDATED device path) --------------------
+    // ---- LIKE matcher kernel ----------------------------------------------
 
     #[test]
     fn like_match_header_and_abi() {

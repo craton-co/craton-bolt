@@ -539,8 +539,7 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
     //
     // Strides 128, 64, 32: inter-warp tree reduction (phase 1).
     let phase1_strides: [i32; 3] = [128, 64, 32];
-    let mut step = 0usize;
-    for &stride in &phase1_strides {
+    for (step, &stride) in phase1_strides.iter().enumerate() {
         let neighbor_pred = format!("%p{}", 1 + (step % 4));
         let stride_bytes = stride as usize * elem_bytes;
         writeln!(
@@ -593,7 +592,6 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
         .map_err(write_err)?;
         writeln!(ptx, "SKIP_ADD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-        step += 1;
     }
 
     // Strides 16, 8, 4, 2, 1: intra-warp shuffle reduction (phase 2).
@@ -969,8 +967,7 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
     // under a single `tid < stride` predicate so we share the barrier and the
     // address arithmetic.
     let phase1_strides: [i32; 3] = [128, 64, 32];
-    let mut step = 0usize;
-    for &stride in &phase1_strides {
+    for (step, &stride) in phase1_strides.iter().enumerate() {
         let neighbor_pred = format!("%p{}", 1 + (step % 4));
         let sum_stride_bytes = stride as usize * AVG_SUM_ELEM_BYTES;
         let cnt_stride_bytes = stride as usize * AVG_COUNT_ELEM_BYTES;
@@ -1016,7 +1013,6 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
 
         writeln!(ptx, "AVG_SKIP_ADD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-        step += 1;
     }
 
     // Phase 2: warp-shuffle intra-warp reduction. Gate on tid < 32; the

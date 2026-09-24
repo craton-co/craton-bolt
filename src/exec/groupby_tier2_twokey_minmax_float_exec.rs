@@ -516,7 +516,7 @@ mod tests {
     fn rejects_int64_value_column() {
         let plan = build_twokey_float_minmax_plan(true, DataType::Int64);
         let n = 300_000;
-        let k: Vec<i32> = (0..n as i32).collect();
+        let k: Vec<i32> = (0..n).collect();
         let v: Vec<i64> = (0..n).map(|i| i as i64).collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("k1", ArrowDataType::Int32, false),
@@ -540,7 +540,7 @@ mod tests {
     fn rejects_float32_value_column() {
         let plan = build_twokey_float_minmax_plan(true, DataType::Float32);
         let n = 300_000;
-        let k: Vec<i32> = (0..n as i32).collect();
+        let k: Vec<i32> = (0..n).collect();
         let v: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("k1", ArrowDataType::Int32, false),

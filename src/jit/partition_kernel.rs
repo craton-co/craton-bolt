@@ -133,7 +133,6 @@ pub const SHMEM_STAGING_MIN_ROWS: u32 = NUM_PARTITIONS * 2;
 /// unchanged. New call sites should prefer the host-side dispatcher
 /// [`compile_partition_kernel_for_n_rows`] which selects the right
 /// variant for the input size.
-#[cfg(not(feature = "rust-cuda"))]
 pub fn compile_partition_kernel() -> BoltResult<String> {
     compile_partition_kernel_global_atomics()
 }
@@ -150,71 +149,12 @@ pub fn compile_partition_kernel() -> BoltResult<String> {
 /// Returns PTX for a kernel that exports the same [`KERNEL_ENTRY`]
 /// symbol regardless of which variant was selected — the launch site
 /// does not need to branch on the choice.
-#[cfg(not(feature = "rust-cuda"))]
 pub fn compile_partition_kernel_for_n_rows(n_rows: u32) -> BoltResult<String> {
     if n_rows < SHMEM_STAGING_MIN_ROWS {
         compile_partition_kernel_global_atomics()
     } else {
         compile_partition_kernel_shmem_staging()
     }
-}
-
-/// `rust-cuda` feature variant — see the non-rust-cuda doc on
-/// [`compile_partition_kernel_global_atomics`] for the algorithm and the
-/// kernel signature. When the `rust-cuda` feature is on, the PTX is
-/// compiled at build time from `kernels/src/lib.rs` via `cuda_builder` +
-/// `rustc_codegen_nvvm` and we just emit the embedded artefact here.
-/// The shmem-staging variant is hand-emit-only — under `rust-cuda` we
-/// fall back to the single embedded global-atomics PTX.
-///
-/// See docs/rust_cuda/03_partition_kernel_spike.md and
-/// docs/rust_cuda/08_wave_a_outcome.md.
-#[cfg(feature = "rust-cuda")]
-pub fn compile_partition_kernel() -> BoltResult<String> {
-    // Compiled by build.rs via cuda_builder when --features rust-cuda is on.
-    // Layout: kernels/src/lib.rs --rustc_codegen_nvvm--> $OUT_DIR/partition.ptx.
-    const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/partition.ptx"));
-
-    if PTX.is_empty() {
-        // Defensive: build.rs must have populated the file when the
-        // feature is on. An empty string means cuda_builder silently
-        // failed or the feature gate logic in build.rs is broken.
-        return Err(BoltError::Other(
-            "partition_kernel: rust-cuda PTX artefact is empty — \
-             cuda_builder did not produce a valid PTX file. See \
-             docs/rust_cuda/08_wave_a_outcome.md."
-                .to_string(),
-        ));
-    }
-
-    Ok(PTX.to_owned())
-}
-
-/// `rust-cuda` mirror of [`compile_partition_kernel_for_n_rows`]. The
-/// rust-cuda path ships a single embedded PTX; under that feature both
-/// "variants" map to the same artefact, so the dispatcher choice is a
-/// no-op. See the `#[cfg(feature = "rust-cuda")]` doc on
-/// [`compile_partition_kernel`].
-#[cfg(feature = "rust-cuda")]
-pub fn compile_partition_kernel_for_n_rows(_n_rows: u32) -> BoltResult<String> {
-    compile_partition_kernel()
-}
-
-/// `rust-cuda` mirror of [`compile_partition_kernel_global_atomics`].
-/// Same artefact as [`compile_partition_kernel`] — see that doc.
-#[cfg(feature = "rust-cuda")]
-pub fn compile_partition_kernel_global_atomics() -> BoltResult<String> {
-    compile_partition_kernel()
-}
-
-/// `rust-cuda` mirror of [`compile_partition_kernel_shmem_staging`]. The
-/// hand-emit shmem-staging PTX has no rust-cuda counterpart yet; under
-/// the feature we fall back to the global-atomics artefact. The
-/// host-side dispatcher will therefore always select the latter under
-/// `rust-cuda`, which is the safe default until Wave B.
-#[cfg(feature = "rust-cuda")]
-pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
-    compile_partition_kernel()
 }
 
 /// Hand-emit the original "global atomics" partition kernel.
@@ -235,7 +175,6 @@ pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
 ///
 /// Deterministic and pure: same input → same output, no I/O. The
 /// dispatcher can cache the result indefinitely.
-#[cfg(not(feature = "rust-cuda"))]
 pub fn compile_partition_kernel_global_atomics() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
@@ -370,7 +309,6 @@ pub fn compile_partition_kernel_global_atomics() -> BoltResult<String> {
 /// variant — see the doc on [`compile_partition_kernel_global_atomics`].
 ///
 /// Deterministic and pure: same input → same output, no I/O.
-#[cfg(not(feature = "rust-cuda"))]
 pub fn compile_partition_kernel_shmem_staging() -> BoltResult<String> {
     let mut ptx = String::new();
     let entry = KERNEL_ENTRY;
@@ -574,14 +512,10 @@ fn write_err(e: std::fmt::Error) -> BoltError {
 // ---------------------------------------------------------------------------
 // PTX-shape tests (host-only — do NOT require a GPU).
 //
-// These assert the *hand-emitted* PTX shape (specific opcodes, register
-// names, header `.version 7.5`). The rust-cuda variant produces
-// semantically equivalent but textually different PTX (NVVM picks its
-// own register allocator, header is `.version 7.8+`, etc.), so we gate
-// these tests off when `--features rust-cuda` is on. The Wave A outcome
-// doc tracks what replaces them on the rust-cuda path.
+// These assert the maintained hand-emitted PTX shape (specific opcodes,
+// register names, header `.version 7.5`).
 // ---------------------------------------------------------------------------
-#[cfg(all(test, not(feature = "rust-cuda")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

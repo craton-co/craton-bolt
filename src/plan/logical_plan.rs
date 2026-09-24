@@ -36,7 +36,7 @@ pub fn intern_timezone(name: &str) -> &'static str {
     let mut guard = INTERN.lock().expect("timezone interner mutex poisoned");
     let set = guard.get_or_insert_with(HashSet::new);
     if let Some(existing) = set.get(name) {
-        return *existing;
+        return existing;
     }
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
     set.insert(leaked);
@@ -903,6 +903,7 @@ fn binary(op: BinaryOp, l: Expr, r: Expr) -> Expr {
     }
 }
 
+#[allow(clippy::should_implement_trait)]
 impl Expr {
     /// Wrap `self` in an `Alias`.
     pub fn alias(self, name: impl Into<String>) -> Expr {
@@ -1225,19 +1226,18 @@ impl Expr {
                 }
                 let mut acc: Option<DataType> = None;
                 for (label, t) in &arms {
-                    match t {
-                        Some(t) => match acc {
+                    if let Some(t) = t {
+                        match acc {
                             None => acc = Some(*t),
                             Some(prev) => {
                                 acc = Some(unify_case_dtypes(prev, *t).ok_or_else(|| {
                                     BoltError::Type(format!(
                                         "CASE {label} has incompatible dtype {t:?} \
-                                         with previous arms ({prev:?})"
+                                     with previous arms ({prev:?})"
                                     ))
                                 })?);
                             }
-                        },
-                        None => {}
+                        }
                     }
                 }
                 acc.ok_or_else(|| {
@@ -1354,12 +1354,10 @@ impl Expr {
                             Ok(DataType::Date32)
                         }
                         DataType::Timestamp(_, _) => Ok(*target),
-                        other => {
-                            return Err(BoltError::Type(format!(
-                                "CAST(... FORMAT ...) string→temporal must target Date32 \
+                        other => Err(BoltError::Type(format!(
+                            "CAST(... FORMAT ...) string→temporal must target Date32 \
                                  or Timestamp, got {other:?}"
-                            )));
-                        }
+                        ))),
                     }
                 }
             }
@@ -2017,7 +2015,7 @@ pub(crate) fn decimal128_arith_result(
             // the dividend's integer-digit count.
             const MIN_DIV_SCALE: i8 = 6;
             let new_s = s1.max(MIN_DIV_SCALE);
-            let new_p = p1.max(1).min(MAX_P);
+            let new_p = p1.clamp(1, MAX_P);
             Some(Ok(Decimal128(new_p, new_s)))
         }
         other => Some(Err(BoltError::Type(format!(

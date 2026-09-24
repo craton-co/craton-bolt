@@ -1190,9 +1190,22 @@ fn decimal_sum_from_batch(
     // dense buffer is also exactly what both the GPU upload and the host
     // fallback consume.
     let mut host: Vec<i128> = Vec::with_capacity(da.len() - da.null_count());
+    // The block reducer carries a wrapping hi/lo pair, so an overflow that
+    // happens *inside one block* cannot be recovered by checked-folding the
+    // downloaded block partials. Detect it while we already walk Arrow to
+    // strip NULLs. This preserves the same left-to-right checked-add contract
+    // as `decimal_sum_host` without another pass over the source column.
+    let mut checked_total: i128 = 0;
     for i in 0..da.len() {
         if !da.is_null(i) {
-            host.push(da.value(i));
+            let value = da.value(i);
+            checked_total = checked_total.checked_add(value).ok_or_else(|| {
+                BoltError::Type(
+                    "SUM(Decimal128) precision overflow: accumulator exceeds i128 range"
+                        .to_string(),
+                )
+            })?;
+            host.push(value);
         }
     }
 
@@ -1202,6 +1215,7 @@ fn decimal_sum_from_batch(
         // cheap; this is the documented graceful fallback.
         None => decimal_sum_host(&host)?,
     };
+    debug_assert_eq!(total, checked_total);
     let _ = n_rows; // n_rows is the pre-strip row count; we sum the survivors.
     Ok(Scalar::Decimal128(total, precision, scale))
 }
@@ -3528,7 +3542,7 @@ mod tests {
             (DataType::Float64, &arrow_schema::DataType::Float64),
         ];
         for (dt, arrow_dt) in cases {
-            let arr = null_scalar_array(dt.clone()).expect("null scalar");
+            let arr = null_scalar_array(*dt).expect("null scalar");
             assert_eq!(arr.len(), 1, "exactly one row for {dt:?}");
             assert_eq!(arr.data_type(), *arrow_dt, "typed NULL for {dt:?}");
             assert!(arr.is_null(0), "row must be NULL for {dt:?}");
@@ -3570,7 +3584,7 @@ mod tests {
             let batch = all_null_batch("v", in_dt, 4);
             let col = ColumnIO {
                 name: "v".to_string(),
-                dtype: in_dt.clone(),
+                dtype: *in_dt,
             };
 
             // MIN / MAX preserve the input dtype.
@@ -3578,7 +3592,7 @@ mod tests {
                 AggregateExpr::Min(Expr::Column("v".to_string())),
                 AggregateExpr::Max(Expr::Column("v".to_string())),
             ] {
-                let out_field = Field::new("m", in_dt.clone(), true);
+                let out_field = Field::new("m", *in_dt, true);
                 let out =
                     build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 4)
                         .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) all-null: {e:?}"));
@@ -3590,7 +3604,7 @@ mod tests {
             }
 
             // SUM widens Int32 -> Int64; preserves the others.
-            let out_field = Field::new("s", sum_out_dt.clone(), true);
+            let out_field = Field::new("s", *sum_out_dt, true);
             let agg = AggregateExpr::Sum(Expr::Column("v".to_string()));
             let out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 4)
                 .unwrap_or_else(|e| panic!("SUM({in_dt:?}) all-null: {e:?}"));
@@ -3614,20 +3628,20 @@ mod tests {
             let batch = empty_batch("v", in_dt);
             let col = ColumnIO {
                 name: "v".to_string(),
-                dtype: in_dt.clone(),
+                dtype: *in_dt,
             };
             for agg in [
                 AggregateExpr::Min(Expr::Column("v".to_string())),
                 AggregateExpr::Max(Expr::Column("v".to_string())),
             ] {
-                let out_field = Field::new("m", in_dt.clone(), true);
+                let out_field = Field::new("m", *in_dt, true);
                 let out =
                     build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 0)
                         .unwrap_or_else(|e| panic!("MIN/MAX({in_dt:?}) empty: {e:?}"));
                 assert_eq!(out.len(), 1);
                 assert!(out.is_null(0), "MIN/MAX({in_dt:?}) over empty must be NULL");
             }
-            let out_field = Field::new("s", sum_out_dt.clone(), true);
+            let out_field = Field::new("s", *sum_out_dt, true);
             let agg = AggregateExpr::Sum(Expr::Column("v".to_string()));
             let out = build_one_aggregate(&agg, &out_field, std::slice::from_ref(&col), &batch, 0)
                 .unwrap_or_else(|e| panic!("SUM({in_dt:?}) empty: {e:?}"));
@@ -3649,7 +3663,7 @@ mod tests {
         ] {
             let col = ColumnIO {
                 name: "v".to_string(),
-                dtype: in_dt.clone(),
+                dtype: in_dt,
             };
             let out_field = Field::new("c", DataType::Int64, true);
             let agg = AggregateExpr::Count(Expr::Column("v".to_string()));
@@ -3694,7 +3708,7 @@ mod tests {
             let batch = empty_batch("v", &in_dt);
             let col = ColumnIO {
                 name: "v".to_string(),
-                dtype: in_dt.clone(),
+                dtype: in_dt,
             };
             let out_field = Field::new("a", DataType::Float64, true);
             let agg = AggregateExpr::Avg(Expr::Column("v".to_string()));

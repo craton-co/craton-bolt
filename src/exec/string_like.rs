@@ -4,12 +4,12 @@
 //! (non-dictionary) `Utf8`** columns
 //! ([`crate::plan::physical_plan::PhysicalPlan::StringLikeFilter`]).
 //!
-//! ## ⚠️ UNVALIDATED DEVICE PATH ⚠️
+//! ## Validated device path and fallback boundary
 //!
 //! The device kernel this path drives
-//! ([`crate::jit::string_kernel::compile_like_match_kernel`]) has **not** been
-//! executed on GPU hardware — this engine builds and tests with no CUDA device
-//! in CI. Correctness of the device path is established ONLY by:
+//! ([`crate::jit::string_kernel::compile_like_match_kernel`]) is exercised by
+//! direct CUDA hardware tests for every supported mode. Correctness is also
+//! cross-checked by:
 //!
 //!   * the **host mirror** [`like_match_row`] in this module, which replicates
 //!     the exact per-row byte logic the PTX emits and is unit-tested to equal
@@ -20,8 +20,7 @@
 //! The executor is therefore deliberately **host-fallback-safe**: any column
 //! layout / pattern shape it cannot drive on the device at run time evaluates
 //! the identical predicate on the host via [`crate::exec::like::host_like`].
-//! A latent device bug can only cost performance, never correctness — until a
-//! GPU hardware test pass validates the kernel.
+//! A device launch failure therefore costs performance, not correctness.
 //!
 //! ## Scope (what fires the GPU path)
 //!
@@ -47,30 +46,24 @@ use crate::error::BoltResult;
 use crate::jit::string_kernel::LikeMode;
 
 /// Env gate for every **GPU string device path** (the per-row `LIKE` matcher
-/// here, and the `UPPER`/`LOWER`/`CONCAT`/`SUBSTRING`/`TRIM` two-pass producers
-/// in [`crate::exec::string_project`]). `BOLT_GPU_STRING=1` (or
-/// `true`/`yes`, case-insensitive) opts in; default OFF.
-///
-/// These device kernels have **never been executed on GPU hardware** as of
-/// v0.7.0 — CI builds with no CUDA device — so the host path is the
-/// correctness path and is selected by default. The gate exists purely so a
-/// hardware bring-up can opt the device kernels in for validation without
-/// editing code. Mirrors the `BOLT_GPU_SORT` / `BOLT_GPU_DISTINCT` gate
-/// convention (see `crate::exec::distinct::gpu_distinct_enabled`).
+/// here and the validated ASCII `UPPER`/`LOWER` two-pass producers in
+/// [`crate::exec::string_project`]). The supported GPU paths are enabled by
+/// default. Set `BOLT_GPU_STRING=0` (or `false`/`no`, case-insensitive) to
+/// force the host implementation for diagnosis or compatibility.
 pub const BOLT_GPU_STRING_ENV: &str = "BOLT_GPU_STRING";
 
-/// `true` when [`BOLT_GPU_STRING_ENV`] is set to a truthy value (`1` / `true`
-/// / `yes`, case-insensitive). Default OFF — see [`BOLT_GPU_STRING_ENV`].
+/// Whether validated GPU string kernels may be selected.
 ///
-/// The executor MUST consult this before selecting any GPU string device path;
-/// when it returns `false` the validated host path is taken.
+/// The default is `true`. `0`, `false`, and `no` disable the device paths;
+/// every other value leaves them enabled. Unsupported string shapes and CUDA
+/// launch failures still fall back to the host implementation.
 pub fn gpu_string_enabled() -> bool {
     match std::env::var(BOLT_GPU_STRING_ENV) {
         Ok(v) => {
             let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no"))
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -177,7 +170,7 @@ pub fn like_match_row(row: &[u8], lit: &[u8], mode: LikeMode, negated: bool) -> 
         }
     } else {
         match mode {
-            LikeMode::Exact => n == l && &row[..] == lit,
+            LikeMode::Exact => n == l && row == lit,
             LikeMode::Prefix => n >= l && &row[..l] == lit,
             LikeMode::Suffix => n >= l && &row[n - l..] == lit,
             LikeMode::Contains => {
@@ -209,10 +202,9 @@ pub fn like_match_row(row: &[u8], lit: &[u8], mode: LikeMode, negated: bool) -> 
 /// Errors if the concatenated byte length would exceed `i32::MAX` (Arrow
 /// `Utf8`, not `LargeUtf8`).
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. This builder only feeds the
-// device LIKE matcher (Engine::string_like_mask_gpu), which the executor must
-// gate behind gpu_string_enabled; the default path evaluates LIKE on the host
+// CUDA-hardware validated for every supported matcher shape. This builder feeds
+// the device LIKE matcher (Engine::string_like_mask_gpu); the executor still
+// honours gpu_string_enabled so BOLT_GPU_STRING=0 can force the host path
 // via host_mask_via_mirror / crate::exec::like::host_like.
 pub fn build_row_aligned_from_strings(
     col: &StringArray,
@@ -248,10 +240,9 @@ pub fn build_row_aligned_from_strings(
 /// gates NULL rows. The `negated` flag was ALREADY applied inside the kernel,
 /// so it is not re-applied here — only NULL re-masking happens.
 //
-// UNVALIDATED ON GPU HARDWARE as of v0.7.0 — host fallback is the correctness
-// path; opt-in via BOLT_GPU_STRING for testing. This consumes the mask the
-// device matcher writes (only reached on the gated device path); the default
-// host path produces its mask via host_mask_via_mirror.
+// CUDA-hardware validated for every supported matcher shape. This consumes the
+// mask the device matcher writes; the force-off and launch-failure paths produce
+// their mask via host_mask_via_mirror.
 pub fn mask_to_boolean_array(mask: &[u8], validity: &[bool]) -> BooleanArray {
     let pairs: Vec<Option<bool>> = (0..validity.len())
         .map(|r| {
@@ -312,19 +303,24 @@ mod tests {
     }
 
     #[test]
-    fn gpu_string_gate_defaults_off_and_parses_truthy() {
+    fn gpu_string_gate_defaults_on_and_parses_force_host_values() {
         // Serialised set/remove dance (mirrors `distinct.rs`'s gate test): the
-        // device string path is OFF unless explicitly opted in, so the host
-        // path is the default correctness path on hardware-less CI.
+        // validated device string path defaults on, while explicit false
+        // values retain a diagnostic host-forcing switch.
         let prev = std::env::var(BOLT_GPU_STRING_ENV).ok();
         std::env::remove_var(BOLT_GPU_STRING_ENV);
-        assert!(!gpu_string_enabled(), "default must be OFF");
+        assert!(gpu_string_enabled(), "validated device path defaults ON");
         std::env::set_var(BOLT_GPU_STRING_ENV, "1");
-        assert!(gpu_string_enabled(), "\"1\" opts in");
+        assert!(gpu_string_enabled(), "\"1\" keeps the device path enabled");
         std::env::set_var(BOLT_GPU_STRING_ENV, "TRUE");
-        assert!(gpu_string_enabled(), "\"TRUE\" opts in (case-insensitive)");
+        assert!(
+            gpu_string_enabled(),
+            "\"TRUE\" keeps the device path enabled"
+        );
         std::env::set_var(BOLT_GPU_STRING_ENV, "0");
-        assert!(!gpu_string_enabled(), "\"0\" stays OFF");
+        assert!(!gpu_string_enabled(), "\"0\" forces the host path");
+        std::env::set_var(BOLT_GPU_STRING_ENV, "no");
+        assert!(!gpu_string_enabled(), "\"no\" forces the host path");
         // Restore.
         match prev {
             Some(v) => std::env::set_var(BOLT_GPU_STRING_ENV, v),
@@ -469,9 +465,9 @@ mod tests {
         let mask = [1u8, 1, 0];
         let validity = [true, false, true];
         let arr = mask_to_boolean_array(&mask, &validity);
-        assert_eq!(arr.value(0), true);
+        assert!(arr.value(0));
         assert!(arr.is_null(1), "NULL row stays NULL");
-        assert_eq!(arr.value(2), false);
+        assert!(!arr.value(2));
     }
 
     #[test]

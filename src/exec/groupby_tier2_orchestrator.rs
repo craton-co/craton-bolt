@@ -652,11 +652,11 @@ mod tests {
     /// `(K * HASH_MULTIPLIER) & (NUM_PARTITIONS - 1) == 0` so the
     /// partition kernel maps them all to partition 0. Then we just need
     /// > BLOCK_GROUPS = 1024 distinct such keys. The modular inverse of
-    /// HASH_MULTIPLIER mod 2^32 lets us reverse the hash and walk keys
-    /// directly. We don't bother computing it here — instead we scan i32
-    /// upward until we find 1500 keys whose hash falls in partition 0;
-    /// that's O(n_partitions × n_keys) ≈ 6 M iterations and runs in
-    /// milliseconds at test time.
+    /// > HASH_MULTIPLIER mod 2^32 lets us reverse the hash and walk keys
+    /// > directly. We don't bother computing it here — instead we scan i32
+    /// > upward until we find 1500 keys whose hash falls in partition 0;
+    /// > that's O(n_partitions × n_keys) ≈ 6 M iterations and runs in
+    /// > milliseconds at test time.
     #[test]
     #[ignore = "requires CUDA toolkit + JIT at runtime (executes Tier-2 pipeline with pathological input)"]
     fn spill_fires_on_pathological_input() {

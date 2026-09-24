@@ -822,7 +822,7 @@ mod eligibility_tests {
     fn rejects_float_value_column() {
         let plan = build_twokey_minmax_plan(true, DataType::Float64);
         let n = 300_000;
-        let k: Vec<i32> = (0..n as i32).collect();
+        let k: Vec<i32> = (0..n).collect();
         let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("k1", ArrowDataType::Int32, false),

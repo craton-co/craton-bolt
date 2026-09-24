@@ -264,10 +264,7 @@ impl DictRegistry {
                     }
                     // Resolve the comparison BEFORE mutating `chosen` so we
                     // never hold a borrow of `chosen` across a mutation.
-                    let conflict = match chosen.get(key) {
-                        None => None, // first sighting
-                        Some(prev) => Some(dicts_conflict(prev, dict)),
-                    };
+                    let conflict = chosen.get(key).map(|prev| dicts_conflict(prev, dict));
                     // `prev` above is `&&DictionaryColumnAny`; `dicts_conflict`
                     // takes `&DictionaryColumnAny`, and Rust auto-derefs the
                     // extra reference at the call site.

@@ -518,7 +518,7 @@ pub(crate) fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyVal
         let raw = match comp.original_dtype {
             DataType::Int32 | DataType::Float32 => {
                 // 32-bit field at `bit_offset`. Mask to u32.
-                ((u >> comp.bit_offset) & 0xFFFF_FFFFu64) as u64
+                (u >> comp.bit_offset) & 0xFFFF_FFFFu64
             }
             DataType::Int64 | DataType::Float64 => {
                 // 64-bit field: there can be at most one component and

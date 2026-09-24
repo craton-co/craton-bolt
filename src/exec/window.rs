@@ -473,10 +473,8 @@ impl Accumulator {
                             self.int_extreme = x;
                         }
                     }
-                    AggKind::Max => {
-                        if x > self.int_extreme {
-                            self.int_extreme = x;
-                        }
+                    AggKind::Max if x > self.int_extreme => {
+                        self.int_extreme = x;
                     }
                     _ => {}
                 }
@@ -499,10 +497,10 @@ impl Accumulator {
                                 self.extreme = x;
                             }
                         }
-                        AggKind::Max => {
-                            if float_total_cmp(x, self.extreme) == std::cmp::Ordering::Greater {
-                                self.extreme = x;
-                            }
+                        AggKind::Max
+                            if float_total_cmp(x, self.extreme) == std::cmp::Ordering::Greater =>
+                        {
+                            self.extreme = x;
                         }
                         _ => {}
                     }

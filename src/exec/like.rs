@@ -615,11 +615,11 @@ mod tests {
         let out = host_like(&arr, "foo%", None, false).expect("ok");
         assert_eq!(out.len(), 5);
         // foo, NULL, bar, NULL, fool  → t, NULL, f, NULL, t
-        assert_eq!(out.value(0), true);
+        assert!(out.value(0));
         assert!(out.is_null(1));
-        assert_eq!(out.value(2), false);
+        assert!(!out.value(2));
         assert!(out.is_null(3));
-        assert_eq!(out.value(4), true);
+        assert!(out.value(4));
     }
 
     #[test]
@@ -627,9 +627,9 @@ mod tests {
         // NOT LIKE: `NULL NOT LIKE 'pat'` is still NULL, not TRUE.
         let arr = StringArray::from(vec![Some("foo"), None, Some("bar")]);
         let out = host_like(&arr, "foo", None, true).expect("ok");
-        assert_eq!(out.value(0), false);
+        assert!(!out.value(0));
         assert!(out.is_null(1), "NULL NOT LIKE 'pat' must be NULL");
-        assert_eq!(out.value(2), true);
+        assert!(out.value(2));
     }
 
     // ─── ESCAPE clause (v0.7) ────────────────────────────────────────────
@@ -734,10 +734,10 @@ mod tests {
             Some("axb"), // unescaped `%` would match, escaped does not
         ]);
         let out = host_like(&arr, r"a\%b", Some('\\'), false).expect("ok");
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), false);
+        assert!(out.value(0));
+        assert!(!out.value(1));
         assert!(out.is_null(2));
-        assert_eq!(out.value(3), false);
+        assert!(!out.value(3));
     }
 
     /// Patterns whose escape sequences happen to leave only literal
@@ -786,12 +786,12 @@ mod tests {
     #[test]
     fn v6_pathological_multi_percent_is_linear() {
         let pat = "%a%a%a%a%a%a%a%a%b";
-        let s: String = std::iter::repeat('a').take(10_000).collect();
+        let s: String = "a".repeat(10_000);
         assert!(!m(pat, &s), "no 'b' in the input → must not match");
 
         // Same pattern, but the input *does* end in `b` → must match,
         // also resolved quickly.
-        let mut s2: String = std::iter::repeat('a').take(10_000).collect();
+        let mut s2: String = "a".repeat(10_000);
         s2.push('b');
         assert!(m(pat, &s2), "input ends in 'b' → must match");
     }
@@ -929,12 +929,8 @@ mod tests {
     fn host_like_default_is_case_sensitive() {
         let arr = StringArray::from(vec![Some("FOO"), Some("foo")]);
         let out = host_like(&arr, "foo", None, false).expect("ok");
-        assert_eq!(
-            out.value(0),
-            false,
-            "FOO must NOT match case-sensitive 'foo'"
-        );
-        assert_eq!(out.value(1), true);
+        assert!(!out.value(0), "FOO must NOT match case-sensitive 'foo'");
+        assert!(out.value(1));
     }
 
     /// ILIKE preserves SQL 3VL NULL propagation: `NULL ILIKE 'x'` is NULL,

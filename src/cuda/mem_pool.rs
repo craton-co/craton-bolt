@@ -1000,10 +1000,7 @@ unsafe fn driver_free_default_backend(ptr: CUdeviceptr) -> BoltResult<()> {
         // `ctx_binder::invalidate_owning_ctx`) is blocked on this same guard
         // and has not yet reached `cuCtxDestroy_v2`. `owning` is a live
         // `CUcontext` captured via `cuCtxGetCurrent` on the engine thread.
-        if let Err(e) = unsafe { cuda_sys::ctx_set_current(owning) } {
-            // Could not bind; do not free against the wrong/no context.
-            return Err(e);
-        }
+        unsafe { cuda_sys::ctx_set_current(owning) }?;
         // Free against the now-current owning context.
         // SAFETY: the owning context is now current (just bound) and `ptr`'s
         // pool block belongs to it; delegates to the caller's `# Safety`
@@ -1181,6 +1178,7 @@ pub struct DeviceMemPool {
     // peeking the oldest `(Instant, tick)` across all shards and popping the
     // single global minimum — see `evict_one` for the deadlock-free
     // shard-fan-out protocol and the extended lock-order invariant.
+    #[allow(clippy::type_complexity)]
     lru_index: [Mutex<BTreeMap<(Instant, u64), (usize, CUdeviceptr)>>; LRU_SHARDS],
     /// Process-wide monotonic counter feeding `PooledBlock::tick`.
     /// `Relaxed` is sufficient: we only need uniqueness, not ordering
@@ -3674,7 +3672,7 @@ mod tests {
         // all of them — the loop stops as soon as a retry fits.
         let freed_after = test_support::drained_ptrs().len();
         assert!(
-            freed_after >= freed_before + 1,
+            freed_after > freed_before,
             "expected at least one incremental eviction; freed before={}, after={}",
             freed_before,
             freed_after

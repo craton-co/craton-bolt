@@ -257,6 +257,7 @@ impl PtxCache {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.by_key.is_empty()
     }
@@ -339,19 +340,36 @@ impl PtxCache {
         }
     }
 
-    /// Pop the tail (LRU) entry, removing it from the map and freeing
-    /// its node slot. No-op when the cache is empty.
-    fn evict_lru(&mut self) {
-        let Some(tail_idx) = self.tail else {
-            return;
+    /// Pop the least-recently-used *ready* entry, removing it from the map and
+    /// freeing its node slot. Returns `false` when every resident entry is
+    /// still compiling.
+    ///
+    /// An empty `OnceCell` is an in-flight compile slot. Evicting it would let
+    /// a later caller insert a second cell for the same PTX while the first
+    /// loader is still running, defeating the cache's compile-once contract.
+    /// When all entries are in flight, callers temporarily allow the cache to
+    /// exceed its configured cap; the next insertion after a compile finishes
+    /// restores the bound by evicting a ready entry.
+    fn evict_lru_ready(&mut self) -> bool {
+        let mut candidate = self.tail;
+        let ready_idx = loop {
+            let Some(idx) = candidate else {
+                return false;
+            };
+            let node = self.node(idx);
+            if node.entry.module.get().is_some() {
+                break idx;
+            }
+            candidate = node.prev;
         };
-        self.unlink(tail_idx);
-        let node = self.nodes[tail_idx]
+        self.unlink(ready_idx);
+        let node = self.nodes[ready_idx]
             .take()
-            .expect("PtxCache: tail pointed at a freed slot");
+            .expect("PtxCache: ready eviction candidate pointed at a freed slot");
         self.by_key.remove(&node.key);
-        self.free_list.push(tail_idx);
+        self.free_list.push(ready_idx);
         self.evictions = self.evictions.saturating_add(1);
+        true
     }
 
     /// Cache-hit path: look up `key`, verify the stored PTX text matches
@@ -398,7 +416,12 @@ impl PtxCache {
         cap: usize,
     ) -> Arc<OnceCell<Arc<CudaModuleInner>>> {
         while self.len() >= cap {
-            self.evict_lru();
+            if !self.evict_lru_ready() {
+                // Every entry is currently loading. Temporary oversubscription
+                // is safer than evicting an in-flight cell and compiling the
+                // same PTX more than once.
+                break;
+            }
         }
         let cell = Arc::new(OnceCell::new());
         let idx = self.alloc_slot(LruNode {
@@ -658,8 +681,8 @@ impl CudaModule {
         // CUDA option values use pointer-sized slots; the option SEMANTICS
         // require the value to fit in u32 for *_SIZE_BYTES options, but the
         // casting through `usize` is correct.
-        let info_size_slot = JIT_LOG_BUF_SIZE as usize as *mut c_void;
-        let error_size_slot = JIT_LOG_BUF_SIZE as usize as *mut c_void;
+        let info_size_slot = JIT_LOG_BUF_SIZE as *mut c_void;
+        let error_size_slot = JIT_LOG_BUF_SIZE as *mut c_void;
         let mut values: [*mut c_void; 4] = [
             info_buf.as_mut_ptr() as *mut c_void,
             info_size_slot,
@@ -864,6 +887,20 @@ mod tests {
         }
     }
 
+    /// Insert a cache entry whose compile has already completed. LRU policy
+    /// tests use ready entries; empty cells are deliberately protected as
+    /// in-flight compiles.
+    fn insert_ready(cache: &mut PtxCache, key: (u64, u64), ptx: &str, cap: usize) {
+        let cell = cache.insert_empty(key, ptx.to_owned(), cap);
+        assert!(
+            cell.set(Arc::new(CudaModuleInner {
+                raw: ptr::null_mut(),
+            }))
+            .is_ok(),
+            "fresh cache cell"
+        );
+    }
+
     // -- parse_cap (P3, env-var parsing in isolation) ----------------------
 
     #[test]
@@ -927,13 +964,13 @@ mod tests {
         let k = |i: u64| (i, 0u64);
 
         // Insert A, B → list (MRU → LRU): B, A. Cache at cap.
-        cache.insert_empty(k(0), "ptx-A".to_owned(), cap);
-        cache.insert_empty(k(1), "ptx-B".to_owned(), cap);
+        insert_ready(&mut cache, k(0), "ptx-A", cap);
+        insert_ready(&mut cache, k(1), "ptx-B", cap);
         assert_eq!(cache.len(), cap);
         assert_eq!(cache.evictions(), 0);
 
         // Insert C without touching A — A is LRU and gets evicted.
-        cache.insert_empty(k(2), "ptx-C".to_owned(), cap);
+        insert_ready(&mut cache, k(2), "ptx-C", cap);
         assert!(
             !cache.by_key.contains_key(&k(0)),
             "A should have been evicted"
@@ -944,9 +981,9 @@ mod tests {
 
         // Reset for the LRU-specific case.
         let mut cache = PtxCache::new();
-        cache.insert_empty(k(0), "ptx-A".to_owned(), cap);
-        cache.insert_empty(k(1), "ptx-B".to_owned(), cap);
-        cache.insert_empty(k(2), "ptx-C".to_owned(), cap); // evict A
+        insert_ready(&mut cache, k(0), "ptx-A", cap);
+        insert_ready(&mut cache, k(1), "ptx-B", cap);
+        insert_ready(&mut cache, k(2), "ptx-C", cap); // evict A
         assert!(!cache.by_key.contains_key(&k(0)));
 
         // ACCESS B → bump to MRU. C is now the LRU.
@@ -955,7 +992,7 @@ mod tests {
             .expect("B is still cached");
 
         // Insert D — must evict C (LRU after the bump), NOT B.
-        cache.insert_empty(k(3), "ptx-D".to_owned(), cap);
+        insert_ready(&mut cache, k(3), "ptx-D", cap);
         assert!(
             !cache.by_key.contains_key(&k(2)),
             "C should have been LRU-evicted after B was touched"
@@ -971,14 +1008,14 @@ mod tests {
         let cap = 3usize;
         let k = |i: u64| (i, 0u64);
 
-        cache.insert_empty(k(10), "ptx-A".to_owned(), cap);
-        cache.insert_empty(k(11), "ptx-B".to_owned(), cap);
-        cache.insert_empty(k(12), "ptx-C".to_owned(), cap);
+        insert_ready(&mut cache, k(10), "ptx-A", cap);
+        insert_ready(&mut cache, k(11), "ptx-B", cap);
+        insert_ready(&mut cache, k(12), "ptx-C", cap);
         assert_eq!(cache.len(), cap);
 
         let _ = cache.get_and_touch(k(10), "ptx-A").expect("A is cached");
 
-        cache.insert_empty(k(13), "ptx-D".to_owned(), cap);
+        insert_ready(&mut cache, k(13), "ptx-D", cap);
         assert!(
             cache.by_key.contains_key(&k(10)),
             "A must survive — just touched"
@@ -1008,6 +1045,43 @@ mod tests {
 
         let miss = cache.get_and_touch(k(43), "anything");
         assert!(miss.is_none());
+    }
+
+    /// In-flight slots must survive cap pressure so racing callers keep
+    /// sharing one `OnceCell` and therefore one PTXAS invocation.
+    #[test]
+    fn ptx_cache_does_not_evict_inflight_slots() {
+        let mut cache = PtxCache::new();
+        let cap = 1usize;
+        let k = |i: u64| (i, 0u64);
+
+        let first = cache.insert_empty(k(1), "ptx-1".to_owned(), cap);
+        let second = cache.insert_empty(k(2), "ptx-2".to_owned(), cap);
+        assert_eq!(
+            cache.len(),
+            2,
+            "all-in-flight cache may temporarily exceed its cap"
+        );
+        assert!(matches!(cache.get_and_touch(k(1), "ptx-1"), Some(Ok(_))));
+        assert!(matches!(cache.get_and_touch(k(2), "ptx-2"), Some(Ok(_))));
+
+        assert!(
+            first
+                .set(Arc::new(CudaModuleInner {
+                    raw: ptr::null_mut(),
+                }))
+                .is_ok(),
+            "fresh OnceCell"
+        );
+        let _third = cache.insert_empty(k(3), "ptx-3".to_owned(), cap);
+        assert_eq!(
+            cache.len(),
+            2,
+            "one ready entry is evicted while in-flight entries remain"
+        );
+        assert!(cache.get_and_touch(k(1), "ptx-1").is_none());
+        assert!(matches!(cache.get_and_touch(k(2), "ptx-2"), Some(Ok(_))));
+        drop(second);
     }
 
     /// JIT-H1 regression: `get_and_touch` is the SINGLE source of truth for
@@ -1100,7 +1174,7 @@ mod tests {
             }));
         }
         for h in handles {
-            h.join().unwrap();
+            let _ = h.join().unwrap();
         }
 
         assert_eq!(
@@ -1120,7 +1194,7 @@ mod tests {
         // First call: cold miss, loader fires once.
         {
             let calls = Arc::clone(&calls);
-            CudaModule::from_ptx_with(&ptx, move |_| {
+            let _ = CudaModule::from_ptx_with(&ptx, move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(stub_module())
             })
@@ -1131,7 +1205,7 @@ mod tests {
         // Subsequent calls: warm hit, loader must NOT fire.
         for _ in 0..5 {
             let calls = Arc::clone(&calls);
-            CudaModule::from_ptx_with(&ptx, move |_| {
+            let _ = CudaModule::from_ptx_with(&ptx, move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(stub_module())
             })
@@ -1348,10 +1422,10 @@ mod tests {
 
         // Step 1: cold miss on a unique key.
         let ptx_a = "// ptx_cache_stats test A — unique tag 41c6b7d92f8e0a13".to_string();
-        CudaModule::from_ptx_with(&ptx_a, |_| Ok(stub_module())).unwrap();
+        let _ = CudaModule::from_ptx_with(&ptx_a, |_| Ok(stub_module())).unwrap();
         let (h1, m1, e1) = ptx_cache_stats();
         assert!(
-            m1 >= m0 + 1,
+            m1 > m0,
             "fresh miss must advance misses by >= 1 (m0={}, m1={})",
             m0,
             m1
@@ -1367,7 +1441,7 @@ mod tests {
         let fired = Arc::new(AtomicUsize::new(0));
         {
             let fired = Arc::clone(&fired);
-            CudaModule::from_ptx_with(&ptx_a, move |_| {
+            let _ = CudaModule::from_ptx_with(&ptx_a, move |_| {
                 fired.fetch_add(1, Ordering::SeqCst);
                 Ok(stub_module())
             })
@@ -1380,7 +1454,7 @@ mod tests {
         );
         let (h2, m2, e2) = ptx_cache_stats();
         assert!(
-            h2 >= h1 + 1,
+            h2 > h1,
             "warm hit must advance hits by >= 1 (h1={}, h2={})",
             h1,
             h2
@@ -1401,7 +1475,7 @@ mod tests {
                 "// ptx_cache_stats test eviction burst {} — unique tag bd7e54f08a2c91{:04x}",
                 i, i
             );
-            CudaModule::from_ptx_with(&ptx, |_| Ok(stub_module())).unwrap();
+            let _ = CudaModule::from_ptx_with(&ptx, |_| Ok(stub_module())).unwrap();
         }
         let (h3, m3, e3) = ptx_cache_stats();
         assert!(
@@ -1414,7 +1488,7 @@ mod tests {
             m3,
         );
         assert!(
-            e3 >= e2 + 1,
+            e3 > e2,
             "inserting cap+1 fresh entries into a cache already at \
              least at cap (we just inserted `cap+1` plus prior step's \
              entry) must produce >= 1 eviction (e2={}, e3={}, cap={})",
@@ -1446,7 +1520,7 @@ mod tests {
         // Second call: loader fires again (cell was not poisoned), count = 2.
         {
             let calls = Arc::clone(&calls);
-            CudaModule::from_ptx_with(&ptx, move |_| {
+            let _ = CudaModule::from_ptx_with(&ptx, move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(stub_module())
             })

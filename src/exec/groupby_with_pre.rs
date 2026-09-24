@@ -355,7 +355,7 @@ pub fn execute_groupby_with_pre(
         .unwrap_or(false);
     let synthesised_null_group = if key_src_has_nulls {
         match &key_host.validity {
-            Some(vmask) if vmask.iter().any(|&b| b == 0) => {
+            Some(vmask) if vmask.contains(&0) => {
                 // Sentinel collision: a genuine (valid) key literally equal to
                 // `NULL_GROUP_KEY` can't be told apart from the synthesised
                 // NULL group. No valid-flag-with-pre fallback exists yet, so
@@ -394,7 +394,7 @@ pub fn execute_groupby_with_pre(
     // valid-flag-with-pre fallback yet, so we still reject with a clear
     // error rather than silently producing wrong results. A `log::warn!`
     // makes the bail-out observable in production.
-    if host_keys.iter().any(|&k| k == EMPTY_KEY) {
+    if host_keys.contains(&EMPTY_KEY) {
         log::warn!(
             "execute_groupby_with_pre: GROUP BY key '{}' contains \
              i64::MIN (classic-kernel empty-slot sentinel); rejecting \
@@ -1876,7 +1876,7 @@ fn resolve_agg_input_slow<'a>(
                 ))
             })?;
             let resolved = match &host_col.validity {
-                Some(v) if v.iter().any(|&b| b == 0) => {
+                Some(v) if v.contains(&0) => {
                     let mask: Vec<bool> = v.iter().map(|&b| b != 0).collect();
                     ResolvedHostCol::BorrowedWithValidity {
                         col: host_col,
@@ -1983,8 +1983,8 @@ enum ResolvedHostCol<'a> {
 impl<'a> ResolvedHostCol<'a> {
     fn as_ref(&self) -> &HostCol {
         match self {
-            ResolvedHostCol::Borrowed(c) => *c,
-            ResolvedHostCol::BorrowedWithValidity { col, .. } => *col,
+            ResolvedHostCol::Borrowed(c) => c,
+            ResolvedHostCol::BorrowedWithValidity { col, .. } => col,
             ResolvedHostCol::Owned { col, .. } => col,
         }
     }
@@ -2181,14 +2181,20 @@ fn build_agg_array(
             pack_array(out_field.dtype, Scalars::I64(out))
         }
         (AggregateExpr::Avg(_), AccDownload::Avg { sum, count }) => {
-            let mut out: Vec<f64> = Vec::with_capacity(n_groups);
+            if out_field.dtype != DataType::Float64 {
+                return Err(BoltError::Type(format!(
+                    "GROUP BY with pre AVG output dtype must be Float64, got {:?}",
+                    out_field.dtype
+                )));
+            }
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(n_groups);
             for (_, slot) in groups {
                 let s = sum[*slot];
                 let c = count[*slot];
-                let v = if c == 0 { 0.0 } else { s / (c as f64) };
+                let v = (c != 0).then(|| s / (c as f64));
                 out.push(v);
             }
-            pack_array(out_field.dtype, Scalars::F64(out))
+            Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
         }
         // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
         // finalisation from the host-side Welford state. Output is always
@@ -2470,6 +2476,7 @@ impl PreCol {
     }
 
     /// Download the column to host and verify the length matches `n_rows`.
+    #[allow(clippy::wrong_self_convention)]
     fn to_host_col(self, n_rows: usize) -> BoltResult<HostCol> {
         let PreCol { values, valid_mask } = self;
         let validity: Option<Vec<u8>> = match valid_mask {

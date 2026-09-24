@@ -283,7 +283,7 @@ impl<T: Pod> GpuBuffer<T> {
         let _span = tracing::info_span!(
             "transfer",
             direction = "h2d",
-            bytes = slice.len() * size_of::<T>(),
+            bytes = std::mem::size_of_val(slice),
         )
         .entered();
         let mut buf = Self::with_capacity(slice.len())?;
@@ -610,7 +610,7 @@ impl<T: Pod> GpuBuffer<T> {
         let _span = tracing::info_span!(
             "transfer",
             direction = "h2d",
-            bytes = src.len() * size_of::<T>(),
+            bytes = std::mem::size_of_val(src),
         )
         .entered();
         if src.len() > self.capacity {
@@ -874,14 +874,14 @@ fn fence_all_streams(streams: &StreamSet, fence: StreamFenceFn) {
     }
 }
 
-/// Test seam: when set, `Drop` fences through this stub instead of the real
-/// `cuStreamSynchronize`. Host-only tests install a recorder here to assert
-/// the *number of distinct streams fenced* without a GPU, then clear it.
-///
-/// `thread_local` + `Cell` keeps it `!Sync` and avoids any cross-test
-/// interference under the default single-threaded test harness path that
-/// touches it. Production never sets it, so the hot path is one `Cell`
-/// read returning `None`.
+// Test seam: when set, `Drop` fences through this stub instead of the real
+// `cuStreamSynchronize`. Host-only tests install a recorder here to assert
+// the number of distinct streams fenced without a GPU, then clear it.
+//
+// `thread_local` + `Cell` keeps it `!Sync` and avoids any cross-test
+// interference under the default single-threaded test harness path that
+// touches it. Production never sets it, so the hot path is one `Cell`
+// read returning `None`.
 #[cfg(test)]
 thread_local! {
     static DROP_FENCE_OVERRIDE: Cell<Option<StreamFenceFn>> = const { Cell::new(None) };
@@ -933,10 +933,10 @@ fn real_ctx_fence() -> crate::cuda::cuda_sys::CUresult {
     unsafe { cuda_sys::cuCtxSynchronize() }
 }
 
-/// Test seam: when set, the [`fence_all_streams`] device-wide fallback syncs
-/// through this stub instead of the real `cuCtxSynchronize`. Host-only tests
-/// install a recorder here to assert the fallback fires (exactly once, on the
-/// per-stream-failure path) without a GPU. Mirrors [`DROP_FENCE_OVERRIDE`].
+// Test seam: when set, the `fence_all_streams` device-wide fallback syncs
+// through this stub instead of the real `cuCtxSynchronize`. Host-only tests
+// install a recorder here to assert the fallback fires (exactly once, on the
+// per-stream-failure path) without a GPU. Mirrors `DROP_FENCE_OVERRIDE`.
 #[cfg(test)]
 thread_local! {
     static DROP_CTX_FENCE_OVERRIDE: Cell<Option<CtxFenceFn>> = const { Cell::new(None) };
@@ -1102,9 +1102,9 @@ fn record_defer_events(streams: &StreamSet) -> Option<Vec<cuda_sys::CUevent>> {
     Some(events)
 }
 
-/// Test seam: when set, a non-empty-`used_streams` `Drop` reclaims through this
-/// stub instead of [`real_drop_reclaim`]. Host-only tests install a recorder to
-/// assert whether a block was deferred vs. freed inline — without a GPU.
+// Test seam: when set, a non-empty-`used_streams` `Drop` reclaims through this
+// stub instead of `real_drop_reclaim`. Host-only tests install a recorder to
+// assert whether a block was deferred vs. freed inline — without a GPU.
 #[cfg(test)]
 thread_local! {
     static DROP_RECLAIM_OVERRIDE: Cell<Option<DropReclaimFn>> = const { Cell::new(None) };
@@ -2010,7 +2010,7 @@ mod pinned_safety_tests {
         // `as_ptr()` is allowed to be null for an empty buffer, but the
         // slice itself must be a valid empty borrow; `iter().count()`
         // forces the compiler to actually walk it.
-        assert_eq!(s.iter().count(), 0);
+        assert_eq!(s.len(), 0);
     }
 
     #[test]

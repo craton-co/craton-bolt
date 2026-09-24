@@ -368,7 +368,7 @@ pub fn try_execute_resident(
     // MIN < 0 means a negative key is present, which the dense-slot shmem path
     // can't represent, so we decline exactly as the host scan did. A reduce
     // failure falls back to the host-upload path (`.ok()?`), never an error.
-    if keys_gpu.len() == 0 {
+    if keys_gpu.is_empty() {
         return Some(build_empty_result(plan));
     }
     let max_key = reduce_i32_device(keys_gpu, ReduceOp::Max, &stream).ok()?;
@@ -418,7 +418,7 @@ fn present_via_count(
         module_path!(),
         "shmem_count_for_presence".to_string(),
         None,
-        || crate::jit::shmem_count_kernel::compile_shmem_count_kernel(),
+        crate::jit::shmem_count_kernel::compile_shmem_count_kernel,
     )?;
     let function = module.function(crate::jit::shmem_count_kernel::KERNEL_ENTRY)?;
 
@@ -495,7 +495,7 @@ fn reduce_i32_device(keys: &GpuVec<i32>, op: ReduceOp, stream: &CudaStream) -> B
     let n_rows = keys.len();
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let block = REDUCE_BLOCK_SIZE;
-    let grid_x = ((n_rows_u32 + block - 1) / block).max(1);
+    let grid_x = n_rows_u32.div_ceil(block).max(1);
     let partials = GpuVec::<i32>::zeros_async(grid_x as usize, stream.raw())?;
 
     let module = module_cache::get_or_build_module(

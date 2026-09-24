@@ -168,11 +168,9 @@ fn key_array_contains_sentinel(arr: &dyn Array) -> BoltResult<bool> {
     if let Some(int64) = arr.as_any().downcast_ref::<Int64Array>() {
         // `iter()` yields `Option<i64>` and naturally skips NULLs only via
         // the `flatten` step below; we want to inspect every non-NULL value.
-        for opt in int64.iter() {
-            if let Some(v) = opt {
-                if v == I64_EMPTY_SENTINEL {
-                    return Ok(true);
-                }
+        for v in int64.iter().flatten() {
+            if v == I64_EMPTY_SENTINEL {
+                return Ok(true);
             }
         }
         return Ok(false);
@@ -621,7 +619,7 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
     // sentinel-free valid-flag variant. Review C7 also adds a pre-encoding
     // scan above for the Int64 case; this remains the safety net for
     // encoded packings whose bit pattern only collides post-encoding.
-    if host_keys.iter().any(|&k| k == EMPTY_KEY) {
+    if host_keys.contains(&EMPTY_KEY) {
         log::warn!(
             "execute_groupby: encoded GROUP BY key collides with i64::MIN \
              sentinel after packing (likely Float64 -0.0 or a 2-col \
@@ -1602,17 +1600,14 @@ fn run_welford_aggregate(
     // value-valid mask through key_valid (the same shape used by
     // prepare_filtered_keys above). When `value_valid` is None every key
     // row survives and we can zip directly.
-    let value_valid_filtered: Option<Vec<bool>> = match value_valid.as_deref() {
-        None => None,
-        Some(v) => Some(match key_valid {
-            Some(kv) => kv
-                .iter()
-                .zip(v.iter())
-                .filter_map(|(&kk, &vv)| if kk { Some(vv) } else { None })
-                .collect(),
-            None => v.to_vec(),
-        }),
-    };
+    let value_valid_filtered: Option<Vec<bool>> = value_valid.as_deref().map(|v| match key_valid {
+        Some(kv) => kv
+            .iter()
+            .zip(v.iter())
+            .filter_map(|(&kk, &vv)| if kk { Some(vv) } else { None })
+            .collect(),
+        None => v.to_vec(),
+    });
 
     // Fold rows into per-slot Welford states. The two row pointers are
     // `idx_keys` (walks `host_keys`, always one per surviving key row) and
@@ -1696,7 +1691,7 @@ enum FilteredKeys<'a> {
 impl<'a> FilteredKeys<'a> {
     fn col(&self) -> &GpuVec<i64> {
         match self {
-            FilteredKeys::Borrowed { group_col, .. } => *group_col,
+            FilteredKeys::Borrowed { group_col, .. } => group_col,
             FilteredKeys::Owned { group_col, .. } => group_col,
         }
     }
@@ -2875,14 +2870,20 @@ fn build_agg_array(
             pack_array(out_field.dtype, Scalars::I64(out))
         }
         (AggregateExpr::Avg(_), AccDownload::Avg { sum, count }) => {
-            let mut out: Vec<f64> = Vec::with_capacity(n_groups);
+            if out_field.dtype != DataType::Float64 {
+                return Err(BoltError::Type(format!(
+                    "GROUP BY AVG output dtype must be Float64, got {:?}",
+                    out_field.dtype
+                )));
+            }
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(n_groups);
             for (_, slot) in groups {
                 let s = sum[*slot];
                 let c = count[*slot];
-                let v = if c == 0 { 0.0 } else { s / (c as f64) };
+                let v = (c != 0).then(|| s / (c as f64));
                 out.push(v);
             }
-            pack_array(out_field.dtype, Scalars::F64(out))
+            Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
         }
         // Grouped Decimal128 SUM/MIN/MAX: build a `Decimal128Array` directly
         // from the per-group raw i128 accumulator slots, tagged with the
@@ -3394,10 +3395,7 @@ pub(crate) mod utf8_groupby {
         let mut string_keys: Vec<Option<StringArray>> =
             Vec::with_capacity(aggregate.group_by.len());
         for &ord in &aggregate.group_by {
-            let io = match aggregate.inputs.get(ord) {
-                Some(io) => io,
-                None => return None, // malformed; let the main path raise it
-            };
+            let io = aggregate.inputs.get(ord)?;
             let col_idx = match table_batch.schema().index_of(&io.name) {
                 Ok(i) => i,
                 Err(_) => return None,
@@ -3613,49 +3611,48 @@ pub(crate) mod utf8_groupby {
         }
 
         let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(int_result.num_columns());
-        for col in 0..int_result.num_columns() {
-            if col < m_keys {
-                if let Some(dict) = &dicts[col] {
-                    // This key was a string: decode the Int32 codes back to
-                    // strings, preserving NULL slots (the synthesised NULL
-                    // group surfaces as a NULL code -> NULL string).
-                    let codes = int_result
-                        .column(col)
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .ok_or_else(|| {
-                            BoltError::Other(format!(
-                                "execute_groupby (utf8): key column {col} of the integer \
+        for (col, dict) in dicts.iter().enumerate() {
+            if let Some(dict) = dict {
+                // This key was a string: decode the Int32 codes back to
+                // strings, preserving NULL slots (the synthesised NULL
+                // group surfaces as a NULL code -> NULL string).
+                let codes = int_result
+                    .column(col)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        BoltError::Other(format!(
+                            "execute_groupby (utf8): key column {col} of the integer \
                                  result was not Int32"
-                            ))
-                        })?;
-                    let mut strings: Vec<Option<String>> = Vec::with_capacity(codes.len());
-                    for i in 0..codes.len() {
-                        if codes.is_null(i) {
-                            strings.push(None);
-                        } else {
-                            let c = codes.value(i);
-                            match dict.string_of(c) {
-                                Some(s) => strings.push(Some(s.to_string())),
-                                None => {
-                                    return Err(BoltError::Other(format!(
-                                        "execute_groupby (utf8): group key code {c} out of \
+                        ))
+                    })?;
+                let mut strings: Vec<Option<String>> = Vec::with_capacity(codes.len());
+                for i in 0..codes.len() {
+                    if codes.is_null(i) {
+                        strings.push(None);
+                    } else {
+                        let c = codes.value(i);
+                        match dict.string_of(c) {
+                            Some(s) => strings.push(Some(s.to_string())),
+                            None => {
+                                return Err(BoltError::Other(format!(
+                                    "execute_groupby (utf8): group key code {c} out of \
                                          dictionary range ({} entries)",
-                                        dict.decode.len()
-                                    )))
-                                }
+                                    dict.decode.len()
+                                )))
                             }
                         }
                     }
-                    out_cols.push(Arc::new(StringArray::from(strings)) as ArrayRef);
-                    continue;
                 }
-                // Non-string key: pass the column through unchanged.
-                out_cols.push(int_result.column(col).clone());
-            } else {
-                // Aggregate result column: unchanged.
-                out_cols.push(int_result.column(col).clone());
+                out_cols.push(Arc::new(StringArray::from(strings)) as ArrayRef);
+                continue;
             }
+            // Non-string key: pass the column through unchanged.
+            out_cols.push(int_result.column(col).clone());
+        }
+        // Aggregate result columns are unchanged.
+        for col in m_keys..int_result.num_columns() {
+            out_cols.push(int_result.column(col).clone());
         }
 
         // Build the output schema: restore the ORIGINAL key fields (Utf8),
@@ -4527,7 +4524,7 @@ mod tests {
         for i in 0..3 {
             let k = ks.value(i);
             let s = ss.value(i);
-            assert_eq!(Some(&s), expected.get(&k).map(|x| x), "key={} sum={}", k, s);
+            assert_eq!(Some(&s), expected.get(&k), "key={} sum={}", k, s);
         }
     }
 

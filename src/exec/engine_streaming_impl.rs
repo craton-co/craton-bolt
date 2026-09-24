@@ -51,7 +51,7 @@ impl Engine {
     /// `CountRows`/`StringLikeFilter` (wrap a child sub-plan whose own scan would
     /// have to be threaded — out of scope for this minimal, correctness-first
     /// cut). Those keep the existing materialise-whole-table behaviour exactly.
-    pub(crate) fn streamable_leaf_scan<'p>(phys: &'p PhysicalPlan) -> Option<&'p str> {
+    pub(crate) fn streamable_leaf_scan(phys: &PhysicalPlan) -> Option<&str> {
         match phys {
             PhysicalPlan::Projection { table, .. }
             | PhysicalPlan::StringLength { table, .. }
@@ -155,7 +155,7 @@ impl Engine {
                 ))
             })?
         };
-        Ok(QueryHandle { batch })
+        Ok(QueryHandle::from_record_batch(batch))
     }
 
     /// If `phys` is a **streamable scalar aggregate** — a no-GROUP-BY aggregate
@@ -186,7 +186,7 @@ impl Engine {
     /// `pre`+reduce pipeline the whole-table path would, just on one morsel at a
     /// time, so any `pre` shape the whole-table aggregate accepts is accepted
     /// here too.
-    pub(crate) fn streamable_scalar_aggregate<'p>(phys: &'p PhysicalPlan) -> Option<&'p str> {
+    pub(crate) fn streamable_scalar_aggregate(phys: &PhysicalPlan) -> Option<&str> {
         use crate::plan::logical_plan::AggregateExpr;
         let PhysicalPlan::Aggregate {
             table, aggregate, ..
@@ -298,7 +298,7 @@ impl Engine {
         loop_result?;
 
         let batch = combine_scalar_aggregate_partials(aggregate, &partials)?;
-        Ok(QueryHandle { batch })
+        Ok(QueryHandle::from_record_batch(batch))
     }
 
     /// If `phys` is a **streamable grouped aggregate** — a `GROUP BY` whose
@@ -331,9 +331,9 @@ impl Engine {
     /// rebuilt verbatim from the partials by the merge); their dtypes may be any
     /// type the per-batch executor and the row-key relation support
     /// (Int/Float/Bool/Utf8).
-    pub(crate) fn streamable_grouped_aggregate<'p>(
-        phys: &'p PhysicalPlan,
-    ) -> Option<(&'p str, Vec<crate::exec::streaming::GroupedFold>)> {
+    pub(crate) fn streamable_grouped_aggregate(
+        phys: &PhysicalPlan,
+    ) -> Option<(&str, Vec<crate::exec::streaming::GroupedFold>)> {
         use crate::exec::streaming::GroupedFold;
         use crate::plan::logical_plan::AggregateExpr;
         let PhysicalPlan::Aggregate {
@@ -452,6 +452,6 @@ impl Engine {
         } else {
             merge_grouped_partials(&partials, aggregate.group_by.len(), folds)?
         };
-        Ok(QueryHandle { batch })
+        Ok(QueryHandle::from_record_batch(batch))
     }
 }

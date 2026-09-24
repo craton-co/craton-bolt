@@ -982,12 +982,17 @@ fn finalize_agg_column(
             pack_typed_array(out_field.dtype, TypedColumn::I64(out))
         }
         AggregateExpr::Avg(_) => {
-            // AVG always outputs Float64.
-            let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
+            if out_field.dtype != DataType::Float64 {
+                return Err(BoltError::Type(format!(
+                    "wide GROUP BY AVG output dtype must be Float64, got {:?}",
+                    out_field.dtype
+                )));
+            }
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(sorted.len());
             for (_, accs) in sorted {
                 match accs.get(i) {
                     Some(Accumulator::Avg { sum, n }) => {
-                        let v = if *n == 0 { 0.0 } else { sum / (*n as f64) };
+                        let v = (*n != 0).then(|| sum / (*n as f64));
                         out.push(v);
                     }
                     _ => {
@@ -998,7 +1003,7 @@ fn finalize_agg_column(
                     }
                 }
             }
-            pack_typed_array(out_field.dtype, TypedColumn::F64(out))
+            Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
         }
         AggregateExpr::Sum(_) | AggregateExpr::Min(_) | AggregateExpr::Max(_) => {
             // SUM keeps input dtype (via cast from the wider accumulator);

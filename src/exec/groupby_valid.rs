@@ -1251,17 +1251,14 @@ fn run_welford_aggregate_valid(
     // Re-project the value-valid mask through key_valid so its index
     // axis aligns with host_keys (same shape as
     // `crate::exec::groupby::prepare_filtered_keys`).
-    let value_valid_filtered: Option<Vec<bool>> = match value_valid.as_deref() {
-        None => None,
-        Some(v) => Some(match key_valid {
-            Some(kv) => kv
-                .iter()
-                .zip(v.iter())
-                .filter_map(|(&kk, &vv)| if kk { Some(vv) } else { None })
-                .collect(),
-            None => v.to_vec(),
-        }),
-    };
+    let value_valid_filtered: Option<Vec<bool>> = value_valid.as_deref().map(|v| match key_valid {
+        Some(kv) => kv
+            .iter()
+            .zip(v.iter())
+            .filter_map(|(&kk, &vv)| if kk { Some(vv) } else { None })
+            .collect(),
+        None => v.to_vec(),
+    });
 
     let mut states_by_key: std::collections::HashMap<i64, crate::exec::welford::WelfordState> =
         std::collections::HashMap::new();
@@ -1335,7 +1332,7 @@ enum FilteredKeys<'a> {
 impl<'a> FilteredKeys<'a> {
     fn col(&self) -> &GpuVec<i64> {
         match self {
-            FilteredKeys::Borrowed { group_col, .. } => *group_col,
+            FilteredKeys::Borrowed { group_col, .. } => group_col,
             FilteredKeys::Owned { group_col, .. } => group_col,
         }
     }
