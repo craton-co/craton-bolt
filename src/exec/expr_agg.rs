@@ -373,18 +373,14 @@ fn eval_inner(expr: &Expr, env: &ColumnEnv<'_>, n_rows: usize) -> BoltResult<Hos
         Expr::Alias(inner, _) => eval_inner(inner, env, n_rows),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, n_rows),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, n_rows),
-        // v0.7: CASE is lowered to GPU `Op::Select` for scan-chain
-        // Project / Filter positions (and the pre-aggregation kernel
-        // feeding GROUP BY / aggregates). It still has no host-side
-        // evaluator, so any CASE that survives to a host-side
-        // `PhysicalPlan::Project` / `PhysicalPlan::Filter` (HAVING,
-        // post-aggregate SELECT, etc.) lands here with a clear
-        // not-yet-supported message.
-        Expr::Case { .. } => Err(BoltError::Plan(
-            "CASE in host-side expressions (HAVING / post-aggregate \
-             projection / sort) is not yet supported; coming in a follow-up"
-                .into(),
-        )),
+        // CASE is host-evaluable as well as GPU-lowerable. The host path is
+        // required whenever an arm can produce SQL NULL (the fused PTX
+        // `selp` path has no per-row validity write) and is also the canonical
+        // three-valued reference used by strict IN-list lowering.
+        Expr::Case {
+            branches,
+            else_branch,
+        } => eval_case(branches, else_branch.as_deref(), env, n_rows),
         Expr::Like {
             expr,
             pattern,
@@ -466,6 +462,170 @@ fn eval_inner(expr: &Expr, env: &ColumnEnv<'_>, n_rows: usize) -> BoltResult<Hos
     }
 }
 
+/// Evaluate a searched CASE expression with SQL three-valued WHEN semantics.
+///
+/// A WHEN arm fires only for `Some(true)`; `Some(false)` and `None` (UNKNOWN)
+/// both fall through to the next arm. The first true arm wins. If no arm fires,
+/// the ELSE value is used, or SQL NULL when ELSE is absent.
+fn eval_case(
+    branches: &[(Expr, Expr)],
+    else_branch: Option<&Expr>,
+    env: &ColumnEnv<'_>,
+    n_rows: usize,
+) -> BoltResult<HostColumn> {
+    if branches.is_empty() {
+        return Err(BoltError::Plan(
+            "expr_agg: CASE requires at least one WHEN branch".into(),
+        ));
+    }
+
+    let mut conditions: Vec<Vec<Option<bool>>> = Vec::with_capacity(branches.len());
+    let mut values: Vec<HostColumn> = Vec::with_capacity(branches.len());
+    for (when, then) in branches {
+        let cond = eval_inner(when, env, n_rows)?;
+        match cond {
+            HostColumn::Bool(v) if v.len() == n_rows => conditions.push(v),
+            HostColumn::Bool(v) => {
+                return Err(BoltError::Other(format!(
+                    "expr_agg: CASE condition produced {} rows, expected {n_rows}",
+                    v.len()
+                )))
+            }
+            other => {
+                return Err(BoltError::Type(format!(
+                    "expr_agg: CASE WHEN condition must be Bool, got {:?}",
+                    other.dtype()
+                )))
+            }
+        }
+        values.push(eval_inner(then, env, n_rows)?);
+    }
+    let else_value = match else_branch {
+        Some(expr) => Some(eval_inner(expr, env, n_rows)?),
+        None => None,
+    };
+
+    let target = values
+        .iter()
+        .chain(else_value.iter())
+        .filter(|col| column_has_non_null(col))
+        .try_fold(None, |acc: Option<DataType>, col| {
+            let dt = col.dtype();
+            Ok::<_, BoltError>(Some(match acc {
+                None => dt,
+                Some(prev) if prev == dt => prev,
+                Some(prev) if is_numeric(prev) && is_numeric(dt) => unify_numeric(prev, dt)?,
+                Some(prev) => {
+                    return Err(BoltError::Type(format!(
+                        "expr_agg: CASE arms have incompatible dtypes {prev:?} and {dt:?}"
+                    )))
+                }
+            }))
+        })?
+        .unwrap_or(DataType::Int64);
+
+    let values: Vec<HostColumn> = values
+        .into_iter()
+        .map(|col| coerce_case_column(col, target, n_rows))
+        .collect::<BoltResult<_>>()?;
+    let else_value = else_value
+        .map(|col| coerce_case_column(col, target, n_rows))
+        .transpose()?
+        .unwrap_or_else(|| null_column(target, n_rows));
+
+    let mut selected: Vec<Option<usize>> = vec![None; n_rows];
+    for row in 0..n_rows {
+        selected[row] = conditions.iter().position(|cond| cond[row] == Some(true));
+    }
+
+    macro_rules! select_case_values {
+        ($variant:ident) => {{
+            let branch_values: Vec<Vec<_>> = values
+                .into_iter()
+                .map(|col| match col {
+                    HostColumn::$variant(v) => Ok(v),
+                    other => Err(BoltError::Other(format!(
+                        "expr_agg: CASE coercion produced {:?}, expected {:?}",
+                        other.dtype(),
+                        target
+                    ))),
+                })
+                .collect::<BoltResult<_>>()?;
+            let else_values = match else_value {
+                HostColumn::$variant(v) => v,
+                other => {
+                    return Err(BoltError::Other(format!(
+                        "expr_agg: CASE ELSE coercion produced {:?}, expected {:?}",
+                        other.dtype(),
+                        target
+                    )))
+                }
+            };
+            HostColumn::$variant(
+                selected
+                    .iter()
+                    .enumerate()
+                    .map(|(row, branch)| match branch {
+                        Some(idx) => branch_values[*idx][row].clone(),
+                        None => else_values[row].clone(),
+                    })
+                    .collect(),
+            )
+        }};
+    }
+
+    Ok(match target {
+        DataType::Bool => select_case_values!(Bool),
+        DataType::Int32 | DataType::Date32 => select_case_values!(I32),
+        DataType::Int64 | DataType::Timestamp(_, _) => select_case_values!(I64),
+        DataType::Float32 => select_case_values!(F32),
+        DataType::Float64 => select_case_values!(F64),
+        DataType::Utf8 => select_case_values!(Utf8),
+        other => {
+            return Err(BoltError::Type(format!(
+                "expr_agg: CASE host evaluator does not support output dtype {other:?}"
+            )))
+        }
+    })
+}
+
+fn column_has_non_null(col: &HostColumn) -> bool {
+    match col {
+        HostColumn::Bool(v) => v.iter().any(Option::is_some),
+        HostColumn::I32(v) => v.iter().any(Option::is_some),
+        HostColumn::I64(v) => v.iter().any(Option::is_some),
+        HostColumn::F32(v) => v.iter().any(Option::is_some),
+        HostColumn::F64(v) => v.iter().any(Option::is_some),
+        HostColumn::Utf8(v) => v.iter().any(Option::is_some),
+    }
+}
+
+fn null_column(dtype: DataType, n_rows: usize) -> HostColumn {
+    match dtype {
+        DataType::Bool => HostColumn::Bool(vec![None; n_rows]),
+        DataType::Int32 | DataType::Date32 => HostColumn::I32(vec![None; n_rows]),
+        DataType::Int64 | DataType::Timestamp(_, _) => HostColumn::I64(vec![None; n_rows]),
+        DataType::Float32 => HostColumn::F32(vec![None; n_rows]),
+        DataType::Float64 => HostColumn::F64(vec![None; n_rows]),
+        DataType::Utf8 => HostColumn::Utf8(vec![None; n_rows]),
+        _ => HostColumn::I64(vec![None; n_rows]),
+    }
+}
+
+fn coerce_case_column(col: HostColumn, target: DataType, n_rows: usize) -> BoltResult<HostColumn> {
+    if col.len() != n_rows {
+        return Err(BoltError::Other(format!(
+            "expr_agg: CASE arm produced {} rows, expected {n_rows}",
+            col.len()
+        )));
+    }
+    if !column_has_non_null(&col) {
+        Ok(null_column(target, n_rows))
+    } else {
+        cast_column(col, target)
+    }
+}
+
 /// Evaluate `expr LIKE 'pattern'` / `expr NOT LIKE 'pattern'` on the host.
 ///
 /// `expr` must produce a `Utf8` (or `Utf8`-castable) column. `pattern`'s
@@ -532,7 +692,7 @@ fn eval_like(
 fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i32> {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64; // [0, 399]
+    let yoe = y - era * 400; // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
@@ -1358,7 +1518,7 @@ fn eval_integer_op(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult
 fn zip_integer_i32(op: BinaryOp, a: Vec<Option<i32>>, b: Vec<Option<i32>>) -> Vec<Option<i32>> {
     debug_assert_eq!(a.len(), b.len());
     a.into_iter()
-        .zip(b.into_iter())
+        .zip(b)
         .map(|(x, y)| match (x, y) {
             (Some(x), Some(y)) => match op {
                 BinaryOp::Mod => x.checked_rem(y), // None on y==0 or i32::MIN % -1
@@ -1385,7 +1545,7 @@ fn zip_integer_i32(op: BinaryOp, a: Vec<Option<i32>>, b: Vec<Option<i32>>) -> Ve
 fn zip_integer_i64(op: BinaryOp, a: Vec<Option<i64>>, b: Vec<Option<i64>>) -> Vec<Option<i64>> {
     debug_assert_eq!(a.len(), b.len());
     a.into_iter()
-        .zip(b.into_iter())
+        .zip(b)
         .map(|(x, y)| match (x, y) {
             (Some(x), Some(y)) => match op {
                 BinaryOp::Mod => x.checked_rem(y),
@@ -1418,7 +1578,7 @@ where
 {
     debug_assert_eq!(a.len(), b.len());
     a.into_iter()
-        .zip(b.into_iter())
+        .zip(b)
         .map(|(x, y)| match (x, y) {
             (Some(x), Some(y)) => match op {
                 BinaryOp::Add => Some(T::wrapping_add(x, y)),
@@ -1441,7 +1601,7 @@ where
 {
     debug_assert_eq!(a.len(), b.len());
     a.into_iter()
-        .zip(b.into_iter())
+        .zip(b)
         .map(|(x, y)| match (x, y) {
             (Some(x), Some(y)) => Some(match op {
                 BinaryOp::Add => T::add(x, y),
@@ -1455,8 +1615,8 @@ where
         .collect()
 }
 
-/// Integer arithmetic abstraction: wrapping ops plus checked division
-/// (returns `None` on a divide-by-zero).
+/// Integer arithmetic abstraction: wrapping add/sub/mul plus checked division
+/// (returns `None` on divide-by-zero or the signed `MIN / -1` overflow).
 trait IntArith: Copy {
     fn wrapping_add(a: Self, b: Self) -> Self;
     fn wrapping_sub(a: Self, b: Self) -> Self;
@@ -1475,13 +1635,7 @@ impl IntArith for i32 {
         a.wrapping_mul(b)
     }
     fn checked_div(a: Self, b: Self) -> Option<Self> {
-        if b == 0 {
-            None
-        } else {
-            // `wrapping_div` handles `i32::MIN / -1`; the SQL spec is silent
-            // on overflow here, but wrapping matches the device-side codegen.
-            Some(a.wrapping_div(b))
-        }
+        a.checked_div(b)
     }
 }
 
@@ -1496,11 +1650,7 @@ impl IntArith for i64 {
         a.wrapping_mul(b)
     }
     fn checked_div(a: Self, b: Self) -> Option<Self> {
-        if b == 0 {
-            None
-        } else {
-            Some(a.wrapping_div(b))
-        }
+        a.checked_div(b)
     }
 }
 
@@ -1657,7 +1807,7 @@ fn eval_logical(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<Ho
     debug_assert_eq!(a.len(), b.len());
     let out: Vec<Option<bool>> = a
         .into_iter()
-        .zip(b.into_iter())
+        .zip(b)
         .map(|(x, y)| match op {
             BinaryOp::And => match (x, y) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
@@ -2320,6 +2470,55 @@ mod tests {
         match out {
             HostColumn::I32(v) => assert_eq!(v, vec![Some(5), None, Some(6)]),
             other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn eval_case_uses_first_true_and_unknown_falls_through() {
+        let c1 = HostColumn::Bool(vec![Some(false), None, Some(true), Some(true)]);
+        let c2 = HostColumn::Bool(vec![Some(true), Some(true), Some(true), Some(false)]);
+        let env = env_of(&[("c1", &c1), ("c2", &c2)]);
+        let expr = Expr::Case {
+            branches: vec![
+                (col("c1"), Expr::Literal(Literal::Int32(10))),
+                (col("c2"), Expr::Literal(Literal::Int32(20))),
+            ],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Int32(30)))),
+        };
+        let out = eval_expr(&expr, &env, DataType::Int32, 4).expect("CASE");
+        match out {
+            HostColumn::I32(v) => assert_eq!(
+                v,
+                vec![Some(20), Some(20), Some(10), Some(10)],
+                "UNKNOWN WHEN falls through and the first true arm wins"
+            ),
+            other => panic!("expected I32, got {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn eval_case_can_emit_typed_null_bool() {
+        let chain = HostColumn::Bool(vec![Some(true), Some(false), None]);
+        let env = env_of(&[("chain", &chain)]);
+        // CASE WHEN chain THEN TRUE WHEN NOT chain THEN FALSE ELSE NULL END
+        // is the canonical strict-3VL wrapper used by literal IN lowering.
+        let expr = Expr::Case {
+            branches: vec![
+                (col("chain"), Expr::Literal(Literal::Bool(true))),
+                (
+                    Expr::Unary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(col("chain")),
+                    },
+                    Expr::Literal(Literal::Bool(false)),
+                ),
+            ],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Null))),
+        };
+        let out = eval_expr(&expr, &env, DataType::Bool, 3).expect("nullable Bool CASE");
+        match out {
+            HostColumn::Bool(v) => assert_eq!(v, vec![Some(true), Some(false), None]),
+            other => panic!("expected Bool, got {:?}", other.dtype()),
         }
     }
 

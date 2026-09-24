@@ -1773,7 +1773,7 @@ mod tests {
         // Each stored file is header (~`#bolt-ptx-cache v1 ` + 32 hex + `\n`,
         // ~52 bytes) plus a 100-byte body => well over 100 bytes apiece, so a
         // handful of them blows past the 200-byte cap and forces eviction.
-        let body: String = std::iter::repeat('x').take(100).collect();
+        let body: String = "x".repeat(100);
         for i in 0..6u64 {
             cache.store(&hash_to_key(i, i), &body).expect("store");
         }
@@ -2139,11 +2139,11 @@ mod tests {
         // A single safe char is the minimum accepted key.
         assert!(valid_key("a"));
         // A very long all-safe-charset key is still accepted (no length cap).
-        let long: String = std::iter::repeat('a').take(4096).collect();
+        let long: String = "a".repeat(4096);
         assert!(valid_key(&long), "a long all-safe key must be accepted");
         // A long key that is ALL dots is still rejected (traversal guard wins
         // regardless of length).
-        let long_dots: String = std::iter::repeat('.').take(64).collect();
+        let long_dots: String = ".".repeat(64);
         assert!(
             !valid_key(&long_dots),
             "an all-dots run must be rejected at any length"

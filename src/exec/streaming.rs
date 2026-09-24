@@ -160,9 +160,9 @@ impl TableSource {
             TableSource::Streaming(producer) => {
                 let mut out = Vec::new();
                 for (i, item) in producer().enumerate() {
-                    match item {
-                        Ok(b) => out.push(b),
-                        Err(e) => return Err(e),
+                    {
+                        let b = item?;
+                        out.push(b)
                     }
                     let _ = i;
                 }
@@ -854,10 +854,10 @@ pub fn merge_grouped_partials(
             let state = groups.entry(key).or_insert_with(|| GroupState {
                 accums: vec![None; n_aggs],
             });
-            for a in 0..n_aggs {
+            for (a, &fold) in agg_folds.iter().enumerate() {
                 let col = batch.column(n_group_cols + a);
                 if let Some(v) = merge_num_at(col.as_ref(), row)? {
-                    state.accums[a] = Some(MergeNum::fold(state.accums[a], v, agg_folds[a]));
+                    state.accums[a] = Some(MergeNum::fold(state.accums[a], v, fold));
                 }
             }
         }

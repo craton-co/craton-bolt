@@ -929,11 +929,11 @@ fn emit_binary(
             // Other arithmetic on temporal operands surfaces as the
             // catch-all unsupported error below (no mnemonic).
             let is_temporal_sub = matches!(op, Sub)
-                && match (dtype, result_dtype) {
-                    (DataType::Date32, DataType::Int32) => true,
-                    (DataType::Timestamp(_, _), DataType::Int64) => true,
-                    _ => false,
-                };
+                && matches!(
+                    (dtype, result_dtype),
+                    (DataType::Date32, DataType::Int32)
+                        | (DataType::Timestamp(_, _), DataType::Int64)
+                );
             if !is_temporal_sub {
                 if result_dtype != dtype {
                     return Err(BoltError::Other(format!(

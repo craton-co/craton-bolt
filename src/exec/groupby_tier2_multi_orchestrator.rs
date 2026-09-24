@@ -233,7 +233,7 @@ pub fn execute_tier2_multi_sum(
         module_path!(),
         "scatter_with_dest_idx".to_string(),
         None,
-        || scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel(),
+        scatter_with_dest_idx_kernel::compile_scatter_with_dest_idx_kernel,
     )?;
     let claim_fn = claim_module.function(scatter_with_dest_idx_kernel::KERNEL_ENTRY)?;
 
@@ -270,7 +270,7 @@ pub fn execute_tier2_multi_sum(
         module_path!(),
         "scatter_values_by_dest_idx".to_string(),
         None,
-        || scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel(),
+        scatter_values_by_dest_idx_kernel::compile_scatter_values_by_dest_idx_kernel,
     )?;
 
     for j in 0..n_vals {

@@ -686,7 +686,7 @@ mod stage5_tests {
         let n_groups: usize = 8;
         let keys: Vec<i32> = (0..n).map(|i| (i % n_groups) as i32).collect();
         let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
-        let expected = expected_avgs(&keys, &[vals.clone()], n_groups);
+        let expected = expected_avgs(&keys, std::slice::from_ref(&vals), n_groups);
 
         let plan = PhysicalPlan::Aggregate {
             table: "t".into(),

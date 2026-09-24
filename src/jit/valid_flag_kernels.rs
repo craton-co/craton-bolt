@@ -769,7 +769,7 @@ pub const VALID_AGG_KERNEL_WITH_VALIDITY_ENTRY: &str = "bolt_groupby_agg_valid_w
 /// `arrow_buffer::BooleanBuffer::from_iter`, so existing Arrow NullBuffer
 /// payloads can be reused directly if the caller already has one.
 pub fn pack_validity_bits(validity: &[bool]) -> Vec<u8> {
-    let n_bytes = (validity.len() + 7) / 8;
+    let n_bytes = validity.len().div_ceil(8);
     let mut out = vec![0u8; n_bytes];
     for (i, &v) in validity.iter().enumerate() {
         if v {
@@ -810,7 +810,7 @@ pub fn pack_validity_bits(validity: &[bool]) -> Vec<u8> {
 /// missing rows are treated as NULL (bit `0`). The output is always
 /// `ceil(n_rows / 8)` bytes.
 pub fn unpacked_to_packed_validity(unpacked: &[u8], n_rows: usize) -> Vec<u8> {
-    let n_bytes = (n_rows + 7) / 8;
+    let n_bytes = n_rows.div_ceil(8);
     let mut out = vec![0u8; n_bytes];
     let limit = n_rows.min(unpacked.len());
     for i in 0..limit {

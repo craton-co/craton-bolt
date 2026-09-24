@@ -237,7 +237,7 @@ fn with_pinned_scratch<R>(
         }
         // SAFETY of unwrap: just installed `Some` if it was `None`.
         let (buf, _) = slot.as_mut().expect("pinned scratch was just installed");
-        debug_assert!(buf.len() >= NUM_PARTITIONS as usize + 1);
+        debug_assert!(buf.len() > NUM_PARTITIONS as usize);
         f(buf)
     })
 }

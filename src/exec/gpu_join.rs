@@ -257,14 +257,14 @@ const SENTINEL_I64_MIN: i64 = i64::MIN;
 /// Sentinel value for empty row-index slots and unused collision-list
 /// `head` / `next_idx` entries. Must match `u32::MAX` everywhere it
 /// appears in the kernels.
-#[allow(dead_code)]
+#[cfg(any(feature = "cuda-stub", test))]
 const SENTINEL_U32_MAX: u32 = u32::MAX;
 
 /// Process-wide pool of `i64::MIN`-filled host storage. Grown on demand.
 static SENTINEL_I64_MIN_POOL: Mutex<&'static [i64]> = Mutex::new(&[]);
 
 /// Process-wide pool of `u32::MAX`-filled host storage. Grown on demand.
-#[allow(dead_code)]
+#[cfg(any(feature = "cuda-stub", test))]
 static SENTINEL_U32_MAX_POOL: Mutex<&'static [u32]> = Mutex::new(&[]);
 
 /// Return a `&'static [i64]` of length `cap` whose every element is
@@ -292,7 +292,7 @@ pub fn get_sentinel_i64_min_vec(cap: usize) -> &'static [i64] {
 /// Return a `&'static [u32]` of length `cap` whose every element is
 /// `u32::MAX`. Reuses a process-wide buffer; only allocates when `cap`
 /// exceeds the largest previous request.
-#[allow(dead_code)]
+#[cfg(any(feature = "cuda-stub", test))]
 pub fn get_sentinel_u32_max_vec(cap: usize) -> &'static [u32] {
     let storage: &'static [u32] = {
         let mut guard = SENTINEL_U32_MAX_POOL.lock();
@@ -2272,7 +2272,7 @@ fn launch_probe_collision_kernel(
     if let Some(m) = matched_dev {
         debug_assert_eq!(
             m.len(),
-            ((n_build_rows as usize) + 31) / 32,
+            (n_build_rows as usize).div_ceil(32),
             "probe-collision matched bitmap must be ceil(build_n_rows/32) u32 words"
         );
     }
@@ -2364,7 +2364,7 @@ fn launch_unmatched_build_kernel(
     // `compile_unmatched_build_kernel` doc.
     debug_assert_eq!(
         matched_dev.len(),
-        ((n_build_rows as usize) + 31) / 32,
+        (n_build_rows as usize).div_ceil(32),
         "unmatched-build matched bitmap must be ceil(build_n_rows/32) u32 words"
     );
     let spec = HashJoinKernelSpec {
@@ -3198,8 +3198,7 @@ fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
     let n_workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
     // Split into approximately equal chunks. The last chunk picks up any
     // remainder so we don't leave rows un-hashed.
     let chunk = n.div_ceil(n_workers).max(1);
@@ -3231,16 +3230,16 @@ fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
     // is joined before we return, so the `out` slice outlives every borrow.
     std::thread::scope(|scope| {
         let mut handles: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::with_capacity(n_workers);
-        for (s, slice) in row_starts.iter().copied().zip(out_slices.into_iter()) {
+        for (s, slice) in row_starts.iter().copied().zip(out_slices) {
             let h = scope.spawn(move || {
-                for j in 0..slice.len() {
+                for (j, slot) in slice.iter_mut().enumerate() {
                     let i = s + j;
                     let h = if arr.is_null(i) {
                         0
                     } else {
                         utf8_hash64(arr.value(i).as_bytes())
                     };
-                    slice[j] = h;
+                    *slot = h;
                 }
             });
             handles.push(h);
@@ -3274,12 +3273,11 @@ fn assign_indices_from_hashes(
 ) -> BoltResult<()> {
     let n = arr.len();
     debug_assert_eq!(n, hashes.len());
-    for i in 0..n {
+    for (i, &h) in hashes.iter().enumerate() {
         if arr.is_null(i) {
             out.push(-1);
             continue;
         }
-        let h = hashes[i];
         let idx = match dict.entry(h) {
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -4463,7 +4461,7 @@ mod tests {
             enc[1],
             (((-1i32) as u32 as u64) << 32 | ((-2i32) as u32 as u64)) as i64
         );
-        assert_eq!(enc[2], (0u64 << 32 | 5u64) as i64);
+        assert_eq!(enc[2], 5u64 as i64);
         assert_eq!(
             enc[3],
             (((i32::MAX as u32 as u64) << 32) | (i32::MIN as u32 as u64)) as i64
@@ -5120,7 +5118,7 @@ mod tests {
         );
         // And a single-element counter would therefore be exactly 8 bytes, vs
         // the 4 bytes a wrap-prone u32 counter would occupy.
-        assert_eq!(1 * std::mem::size_of::<u64>(), 8);
+        assert_eq!(std::mem::size_of::<u64>(), 8);
         assert_ne!(std::mem::size_of::<u64>(), std::mem::size_of::<u32>());
     }
 }

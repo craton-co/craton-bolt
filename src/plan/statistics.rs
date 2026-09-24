@@ -549,7 +549,7 @@ fn range_selectivity(
         _ => return DEFAULT_RANGE_SELECTIVITY,
     };
     let span = max - min;
-    if !(span > 0.0) {
+    if span.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         // Degenerate / inverted range (single-valued column or bad stats):
         // a uniform fraction is undefined, so keep the conservative default.
         return DEFAULT_RANGE_SELECTIVITY;

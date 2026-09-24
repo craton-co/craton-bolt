@@ -2160,11 +2160,11 @@ fn emit_binary(
             // PTX is otherwise identical to the corresponding integer
             // sub.s32 / sub.s64.
             let is_temporal_sub = matches!(op, Sub)
-                && match (dtype, result_dtype) {
-                    (DataType::Date32, DataType::Int32) => true,
-                    (DataType::Timestamp(_, _), DataType::Int64) => true,
-                    _ => false,
-                };
+                && matches!(
+                    (dtype, result_dtype),
+                    (DataType::Date32, DataType::Int32)
+                        | (DataType::Timestamp(_, _), DataType::Int64)
+                );
             if !is_temporal_sub {
                 if result_dtype != dtype {
                     return Err(BoltError::Other(format!(
@@ -2710,7 +2710,7 @@ pub(crate) fn validate_kernel_name(name: &str) -> BoltResult<()> {
         "b32", "b64", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "f16", "f32", "f64",
         "pred",
     ];
-    if RESERVED.iter().any(|r| *r == name) {
+    if RESERVED.contains(&name) {
         return Err(BoltError::Other(format!(
             "ptx_gen: kernel name '{}' is a PTX reserved identifier",
             name

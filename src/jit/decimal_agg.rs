@@ -169,8 +169,7 @@ pub fn compile_decimal_sum_kernel() -> BoltResult<String> {
     // Phase 1: inter-warp shared-memory tree at strides 128, 64, 32.
     // %rd7 / %rd9 are this thread's lo / hi shared slot addresses (kept live).
     let phase1_strides: [i32; 3] = [128, 64, 32];
-    let mut step = 0usize;
-    for &stride in &phase1_strides {
+    for (step, &stride) in phase1_strides.iter().enumerate() {
         let neighbor_pred = format!("%p{}", 1 + (step % 4));
         let stride_bytes = stride as usize * 8;
         writeln!(
@@ -212,7 +211,6 @@ pub fn compile_decimal_sum_kernel() -> BoltResult<String> {
         writeln!(ptx, "\tst.shared.u64 [%rd9], %rd17;").map_err(write_err)?;
         writeln!(ptx, "DEC_SKIP_ADD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-        step += 1;
     }
 
     // Phase 2: warp-0-only intra-warp shuffle reduction (strides 16..1).
@@ -511,8 +509,7 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
 
     // Phase 1: inter-warp shared-memory tree at strides 128, 64, 32.
     let phase1_strides: [i32; 3] = [128, 64, 32];
-    let mut step = 0usize;
-    for &stride in &phase1_strides {
+    for (step, &stride) in phase1_strides.iter().enumerate() {
         let neighbor_pred = format!("%p{}", 1 + (step % 4));
         let stride_bytes = stride as usize * 8;
         writeln!(
@@ -555,7 +552,6 @@ pub fn compile_decimal_minmax_kernel(which: DecimalMinMax) -> BoltResult<String>
         writeln!(ptx, "\tst.shared.u64 [%rd9], %rd17;").map_err(write_err)?;
         writeln!(ptx, "DEC_SKIP_ADD_{step}:", step = step).map_err(write_err)?;
         writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
-        step += 1;
     }
 
     // Phase 2: warp-0-only intra-warp shuffle reduction (strides 16..1).

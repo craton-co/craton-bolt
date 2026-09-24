@@ -81,7 +81,7 @@ pub fn build_tier2_twokey_result(
                 sums.len()
             )));
         }
-        for (k_packed, v) in keys_i64.into_iter().zip(sums.into_iter()) {
+        for (k_packed, v) in keys_i64.into_iter().zip(sums) {
             let (k1, k2) = unpack_i64(k_packed);
             key1_out.push(k1);
             key2_out.push(k2);
@@ -94,11 +94,7 @@ pub fn build_tier2_twokey_result(
     //    the GPU-pipeline cost upstream.
     if total > 1 {
         let mut zipped: Vec<(i32, i32, f64)> = Vec::with_capacity(total);
-        for ((k1, k2), v) in key1_out
-            .into_iter()
-            .zip(key2_out.into_iter())
-            .zip(sums_out.into_iter())
-        {
+        for ((k1, k2), v) in key1_out.into_iter().zip(key2_out).zip(sums_out) {
             zipped.push((k1, k2, v));
         }
         zipped.sort_by(|a, b| {
@@ -368,7 +364,7 @@ mod tests {
             *oracle.entry((a, b)).or_insert(0.0) += *v;
         }
         let mut oracle_rows: Vec<((i32, i32), f64)> = oracle.into_iter().collect();
-        oracle_rows.sort_by(|a, b| a.0.cmp(&b.0));
+        oracle_rows.sort_by_key(|a| a.0);
 
         assert_eq!(got_k1.len(), oracle_rows.len());
         for (i, ((a, b), v)) in oracle_rows.iter().enumerate() {

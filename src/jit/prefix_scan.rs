@@ -1407,6 +1407,11 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
     })
 }
 
+/// Adapt a `std::fmt::Error` into a `BoltError`.
+fn write_err(e: std::fmt::Error) -> BoltError {
+    BoltError::Other(format!("prefix_scan: write failed: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1890,9 +1895,4 @@ mod tests {
         // The value budget is the binding (smaller) of the two row caps.
         assert!((LOOKBACK_MAX_ROWS as usize) < i32::MAX as usize);
     }
-}
-
-/// Adapt a `std::fmt::Error` into a `BoltError`.
-fn write_err(e: std::fmt::Error) -> BoltError {
-    BoltError::Other(format!("prefix_scan: write failed: {}", e))
 }

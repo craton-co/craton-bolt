@@ -460,10 +460,10 @@ fn fence_all_streams(streams: &StreamSet, fence: StreamFenceFn) {
     }
 }
 
-/// Test seam: when set, `Drop` fences through this stub instead of the real
-/// `cuStreamSynchronize`. Host-only tests install a recorder here to assert
-/// the *number of distinct streams fenced* without a GPU, then clear it.
-/// Mirrors `DROP_FENCE_OVERRIDE` in `crate::cuda::buffer`.
+// Test seam: when set, `Drop` fences through this stub instead of the real
+// `cuStreamSynchronize`. Host-only tests install a recorder here to assert
+// the number of distinct streams fenced without a GPU, then clear it.
+// Mirrors `DROP_FENCE_OVERRIDE` in `crate::cuda::buffer`.
 #[cfg(test)]
 thread_local! {
     static DROP_FENCE_OVERRIDE: Cell<Option<StreamFenceFn>> = const { Cell::new(None) };
@@ -513,9 +513,9 @@ fn real_ctx_fence() -> crate::cuda::cuda_sys::CUresult {
     unsafe { cuda_sys::cuCtxSynchronize() }
 }
 
-/// Test seam: when set, the [`fence_all_streams`] device-wide fallback syncs
-/// through this stub instead of the real `cuCtxSynchronize`. Mirrors
-/// `DROP_FENCE_OVERRIDE`.
+// Test seam: when set, the `fence_all_streams` device-wide fallback syncs
+// through this stub instead of the real `cuCtxSynchronize`. Mirrors
+// `DROP_FENCE_OVERRIDE`.
 #[cfg(test)]
 thread_local! {
     static DROP_CTX_FENCE_OVERRIDE: Cell<Option<CtxFenceFn>> = const { Cell::new(None) };

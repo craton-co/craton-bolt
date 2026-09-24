@@ -404,8 +404,10 @@ mod tests {
     fn cloned_revision_owned_copies_fields() {
         assert!(None::<&HostTableRevision>.cloned_revision_owned().is_none());
 
-        let mut rev = HostTableRevision::default();
-        rev.table_revision = 7;
+        let mut rev = HostTableRevision {
+            table_revision: 7,
+            ..HostTableRevision::default()
+        };
         rev.column_revisions.insert("a".to_string(), 3);
         rev.column_revisions.insert("b".to_string(), 4);
         let owned = Some(&rev)

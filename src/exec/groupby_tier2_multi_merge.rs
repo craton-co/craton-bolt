@@ -194,7 +194,7 @@ mod tests {
     fn out_schema_n(n_vals: usize) -> Schema {
         let mut fields = vec![Field::new("key", DataType::Int32, false)];
         for j in 0..n_vals {
-            fields.push(Field::new(&format!("sum_v{j}"), DataType::Float64, false));
+            fields.push(Field::new(format!("sum_v{j}"), DataType::Float64, false));
         }
         Schema::new(fields)
     }

@@ -940,7 +940,7 @@ mod tests {
             _ => panic!("not a query"),
         };
         match *query.body {
-            SetExpr::Select(s) => (*s).selection.expect("a WHERE"),
+            SetExpr::Select(s) => s.selection.expect("a WHERE"),
             _ => panic!("not a SELECT"),
         }
     }

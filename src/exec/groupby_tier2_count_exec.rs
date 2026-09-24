@@ -484,7 +484,7 @@ mod tests {
     fn rejects_negative_key() {
         let plan = build_count_plan(DataType::Int32);
         let n = 300_000;
-        let mut keys: Vec<i32> = (0..n as i32).collect();
+        let mut keys: Vec<i32> = (0..n).collect();
         keys[42] = -1;
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "k",
@@ -506,7 +506,7 @@ mod tests {
         let n = 300_000;
         // All keys are 0..127 — n_groups estimator returns 128, well below
         // BLOCK_GROUPS (which is >= 1024 in every variant).
-        let keys: Vec<i32> = (0..n).map(|i| (i % 128) as i32).collect();
+        let keys: Vec<i32> = (0..n).map(|i| i % 128).collect();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "k",
             ArrowDataType::Int32,

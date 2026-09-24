@@ -230,7 +230,12 @@ extern "C" {
 // `CUDA_ERROR_STUB`, which `check()` maps to `BoltError::Unsupported(...)`.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "cuda-stub")]
-#[allow(non_snake_case, unused_variables)]
+#[allow(
+    non_snake_case,
+    unused_variables,
+    clippy::missing_safety_doc,
+    clippy::too_many_arguments
+)]
 mod stubs {
     use super::*;
 

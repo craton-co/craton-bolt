@@ -492,8 +492,9 @@ fn execute_cross_join(
     // Stage-3 GPU CROSS fast path. Gates:
     //   * Total cells in [CROSS_JOIN_GPU_MIN_CELLS, CROSS_JOIN_GPU_CELL_CAP).
     //   * GPU available (errors fall through to host).
-    if total >= crate::exec::gpu_join::CROSS_JOIN_GPU_MIN_CELLS
-        && total < crate::exec::gpu_join::CROSS_JOIN_GPU_CELL_CAP
+    if (crate::exec::gpu_join::CROSS_JOIN_GPU_MIN_CELLS
+        ..crate::exec::gpu_join::CROSS_JOIN_GPU_CELL_CAP)
+        .contains(&total)
     {
         match crate::exec::gpu_join::execute_cross_join_on_gpu(&lhs, &rhs, arrow_schema.clone()) {
             Ok(batch) => return Ok(QueryHandle::from_record_batch(batch)),
@@ -814,9 +815,7 @@ impl BuildSlot {
     fn push(&mut self, v: u32) {
         match self {
             BuildSlot::Inline([a]) => {
-                let mut heap = Vec::with_capacity(2);
-                heap.push(*a);
-                heap.push(v);
+                let heap = vec![*a, v];
                 *self = BuildSlot::Heap(heap);
             }
             BuildSlot::Heap(vec) => vec.push(v),
@@ -1996,6 +1995,7 @@ mod nested_loop_streaming_tests {
     fn col(name: &str) -> Expr {
         Expr::Column(name.to_string())
     }
+    #[allow(dead_code)]
     fn lit_i32(v: i32) -> Expr {
         Expr::Literal(Literal::Int32(v))
     }

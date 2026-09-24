@@ -68,7 +68,7 @@ pub fn build_tier2_result(
 
     // 3. Sort by key ASC. Zip / sort / unzip — see strategy note above.
     if keys_out.len() > 1 {
-        let mut zipped: Vec<(i32, f64)> = keys_out.into_iter().zip(sums_out.into_iter()).collect();
+        let mut zipped: Vec<(i32, f64)> = keys_out.into_iter().zip(sums_out).collect();
         zipped.sort_by_key(|(k, _)| *k);
         keys_out = Vec::with_capacity(total);
         sums_out = Vec::with_capacity(total);

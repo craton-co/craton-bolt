@@ -295,7 +295,7 @@ impl GatheredCol {
                 }
                 let arr: arrow_array::BooleanArray = host_values
                     .into_iter()
-                    .zip(host_validity.into_iter())
+                    .zip(host_validity)
                     .map(|(v, m)| if m == 1 { Some(v == 1) } else { None })
                     .collect();
                 Ok(Arc::new(arr) as arrow_array::ArrayRef)
@@ -386,7 +386,7 @@ fn timestamp_array_from_i64(
 ) -> arrow_array::ArrayRef {
     use crate::plan::logical_plan::TimeUnit;
     use std::sync::Arc;
-    let tz_owned: Option<std::sync::Arc<str>> = tz.map(|s| Arc::from(s));
+    let tz_owned: Option<std::sync::Arc<str>> = tz.map(Arc::from);
     match unit {
         TimeUnit::Second => {
             Arc::new(arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned))
@@ -1701,11 +1701,11 @@ mod tests {
             .expect("BooleanArray");
         assert_eq!(ba.len(), 4);
         assert_eq!(ba.null_count(), 2);
-        assert_eq!(ba.is_null(0), false);
-        assert_eq!(ba.value(0), true);
+        assert!(!ba.is_null(0));
+        assert!(ba.value(0));
         assert!(ba.is_null(1));
-        assert_eq!(ba.is_null(2), false);
-        assert_eq!(ba.value(2), false);
+        assert!(!ba.is_null(2));
+        assert!(!ba.value(2));
         assert!(ba.is_null(3));
     }
 

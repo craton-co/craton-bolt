@@ -939,13 +939,10 @@ fn line_column_to_byte_offset(sql: &str, line: u64, column: u64) -> Option<usize
     // Walk to the start of `line`. sqlparser counts a `\n` as the line
     // terminator; carriage returns are not consumed specially.
     while current_line < line {
-        match bytes[byte_offset..].iter().position(|&b| b == b'\n') {
-            Some(nl_rel) => {
-                byte_offset += nl_rel + 1;
-                current_line += 1;
-            }
-            // The line number is beyond the input.
-            None => return None,
+        {
+            let nl_rel = bytes[byte_offset..].iter().position(|&b| b == b'\n')?;
+            byte_offset += nl_rel + 1;
+            current_line += 1;
         }
         if byte_offset > bytes.len() {
             return None;
@@ -1356,6 +1353,7 @@ impl MutualRecursiveCtePlan {
 /// single-CTE fast path ([`RecursiveCtePlan`], possibly non-linear/naive) or a
 /// multi-CTE lockstep system ([`MutualRecursiveCtePlan`]).
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RecursiveQueryPlan {
     /// Exactly one recursive CTE (linear or non-linear).
     Single(RecursiveCtePlan),
@@ -1821,10 +1819,9 @@ fn lower_values_relation(
 
     // Coerce every cell to its column's common dtype.
     for row in &mut lits {
-        for ci in 0..n_cols {
+        for (ci, cell) in row.iter_mut().enumerate().take(n_cols) {
             let target = schema.fields[ci].dtype;
-            let coerced = coerce_values_literal(row[ci].clone(), target)?;
-            row[ci] = coerced;
+            *cell = coerce_values_literal(cell.clone(), target)?;
         }
     }
 
@@ -2835,7 +2832,7 @@ pub fn plan_count_distinct_groupby(
         .map(|(_, (e, _))| e)
         .collect();
     for g in &parsed_group_by.all_cols {
-        if !non_cd_items.iter().any(|e| *e == g) {
+        if !non_cd_items.contains(&g) {
             return Ok(None);
         }
     }
@@ -3151,6 +3148,7 @@ enum PlainAggTag {
 }
 
 /// Classify a SELECT item for the generalized COUNT(DISTINCT)+GROUP BY shape.
+#[allow(clippy::large_enum_variant)]
 enum CdSelectItem {
     /// A group-key expression (matched structurally against GROUP BY).
     GroupKey,
@@ -3302,6 +3300,18 @@ pub fn plan_multi_agg_groupby(
             }
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
         }
+    }
+
+    // This detector owns only queries that actually contain COUNT(DISTINCT).
+    // Establish that before classifying the other aggregates: classification
+    // deliberately rejects VAR_POP / STDDEV because the mixed host executor
+    // cannot compute them, but an ordinary GROUP BY containing one of those
+    // aggregates must fall through to the normal Welford-capable path.
+    let has_count_distinct = items
+        .iter()
+        .any(|(e, _)| matches!(try_count_distinct(e, &resolver), Ok(Some(_))));
+    if !has_count_distinct {
+        return Ok(None);
     }
 
     // Classify each SELECT item. A genuinely-unsupported aggregate (e.g.
@@ -7261,6 +7271,17 @@ fn plan_select(
                 // them with that casing and downstream code (executor,
                 // physical planner) refers to them by that exact name.
                 for f in &scan_schema_for_wildcard.fields {
+                    // Dictionary/rank helper fields are present only so
+                    // rewritten predicates can resolve them. They are not
+                    // user table columns and StringProject does not emit them,
+                    // so exposing one through `*` both leaks an implementation
+                    // detail and leaves an outer Project with no input column.
+                    // Join schemas qualify the right-hand helper (`right.X`);
+                    // inspect the leaf name in both qualified and plain cases.
+                    let leaf_name = f.name.rsplit('.').next().unwrap_or(&f.name);
+                    if leaf_name.starts_with("__idx_") || leaf_name.starts_with("__rank_") {
+                        continue;
+                    }
                     items.push((
                         SqlExpr::Identifier(Ident::with_quote('"', f.name.clone())),
                         None,
@@ -7603,7 +7624,7 @@ fn plan_select(
                 }
                 let mut arg_cols: Vec<usize> = Vec::with_capacity(args.len());
                 for a in &args {
-                    let lowered = lower_expr(*a, &resolver, 0)?;
+                    let lowered = lower_expr(a, &resolver, 0)?;
                     let idx = all_group_by
                         .iter()
                         .position(|g| expr_eq(g, &lowered))
@@ -7933,7 +7954,7 @@ fn plan_select(
             }
             // Non-window item: reject any window function nested inside it so
             // the user gets a clear message rather than a silent miss.
-            if sql_expr_contains_window(sql_expr, &resolver, 0)? {
+            if sql_expr_contains_window(sql_expr, 0)? {
                 return Err(BoltError::Sql(
                     "window functions are only supported as a top-level SELECT item \
                      (optionally aliased), not nested inside a larger expression"
@@ -9411,11 +9432,7 @@ fn window_specs_eq(
 /// clause) anywhere in its tree. Used to reject window functions nested
 /// inside a larger SELECT expression, which the host executor does not lower
 /// yet.
-fn sql_expr_contains_window(
-    e: &SqlExpr,
-    resolver: &NameResolver,
-    depth: usize,
-) -> BoltResult<bool> {
+fn sql_expr_contains_window(e: &SqlExpr, depth: usize) -> BoltResult<bool> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(BoltError::Sql(format!(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
@@ -9430,27 +9447,27 @@ fn sql_expr_contains_window(
     // Recurse into the common composite expression shapes.
     let any = match e {
         SqlExpr::BinaryOp { left, right, .. } => {
-            sql_expr_contains_window(left, resolver, depth + 1)?
-                || sql_expr_contains_window(right, resolver, depth + 1)?
+            sql_expr_contains_window(left, depth + 1)?
+                || sql_expr_contains_window(right, depth + 1)?
         }
         SqlExpr::UnaryOp { expr, .. }
         | SqlExpr::IsNull(expr)
         | SqlExpr::IsNotNull(expr)
         | SqlExpr::Nested(expr)
-        | SqlExpr::Cast { expr, .. } => sql_expr_contains_window(expr, resolver, depth + 1)?,
+        | SqlExpr::Cast { expr, .. } => sql_expr_contains_window(expr, depth + 1)?,
         SqlExpr::Between {
             expr, low, high, ..
         } => {
-            sql_expr_contains_window(expr, resolver, depth + 1)?
-                || sql_expr_contains_window(low, resolver, depth + 1)?
-                || sql_expr_contains_window(high, resolver, depth + 1)?
+            sql_expr_contains_window(expr, depth + 1)?
+                || sql_expr_contains_window(low, depth + 1)?
+                || sql_expr_contains_window(high, depth + 1)?
         }
         SqlExpr::Function(f) => {
             let mut found = false;
             if let FunctionArguments::List(list) = &f.args {
                 for arg in &list.args {
                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
-                        if sql_expr_contains_window(inner, resolver, depth + 1)? {
+                        if sql_expr_contains_window(inner, depth + 1)? {
                             found = true;
                             break;
                         }
@@ -10105,7 +10122,9 @@ fn lower_expr_in_having(
                     },
                 });
             }
-            Ok(acc.expect("non-empty IN list guarantees at least one chain element"))
+            Ok(strict_three_valued_bool(acc.expect(
+                "non-empty IN list guarantees at least one chain element",
+            )))
         }
         // HAVING ... BETWEEN ...: desugar the same way as the scalar lowerer
         // but route each operand through `lower_expr_in_having` so aggregate
@@ -11162,8 +11181,8 @@ fn lower_nullif(args: &[&SqlExpr], resolver: &NameResolver<'_>, depth: usize) ->
 /// to a balanced OR/AND chain of element-wise comparisons.
 const MAX_IN_LIST_VALUES: usize = 64;
 
-/// Desugar SQL `<expr> [NOT] IN (v1, v2, ..., vN)` into the equivalent
-/// chain of element-wise comparisons:
+/// Desugar SQL `<expr> [NOT] IN (v1, v2, ..., vN)` into a strict
+/// three-valued chain of element-wise comparisons:
 ///
 ///   * `IN`     → `(expr = v1) OR  (expr = v2) OR  ... OR  (expr = vN)`
 ///   * `NOT IN` → `(expr <> v1) AND (expr <> v2) AND ... AND (expr <> vN)`
@@ -11212,7 +11231,36 @@ fn lower_in_list(
             },
         });
     }
-    Ok(acc.expect("non-empty IN list guarantees at least one chain element"))
+    Ok(strict_three_valued_bool(acc.expect(
+        "non-empty IN list guarantees at least one chain element",
+    )))
+}
+
+/// Preserve a boolean expression's SQL three-valued result explicitly.
+///
+/// The fused GPU boolean path historically materialised `UNKNOWN` as a stored
+/// value when an `IN`/`NOT IN` literal list contained NULL. Wrapping the raw
+/// comparison chain as
+///
+/// `CASE WHEN chain THEN TRUE WHEN NOT chain THEN FALSE ELSE NULL END`
+///
+/// makes the nullable result explicit in the logical tree. Physical lowering
+/// routes this NULL-producing CASE through the host evaluator, which preserves
+/// TRUE/FALSE/UNKNOWN in SELECT, WHERE, and HAVING positions alike.
+fn strict_three_valued_bool(chain: Expr) -> Expr {
+    Expr::Case {
+        branches: vec![
+            (chain.clone(), Expr::Literal(Literal::Bool(true))),
+            (
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(chain),
+                },
+                Expr::Literal(Literal::Bool(false)),
+            ),
+        ],
+        else_branch: Some(Box::new(Expr::Literal(Literal::Null))),
+    }
 }
 
 /// Lower a SQL `CASE` expression — both the plain form (no operand) and
@@ -15895,6 +15943,10 @@ mod multi_agg_groupby_tests {
         assert!(detect("SELECT region, SUM(amount) FROM sales GROUP BY region").is_none());
         assert!(
             detect("SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region").is_none()
+        );
+        assert!(
+            detect("SELECT region, VAR_POP(amount) FROM sales GROUP BY region").is_none(),
+            "ordinary Welford aggregates belong to the normal GROUP BY path"
         );
     }
 

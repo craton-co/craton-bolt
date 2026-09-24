@@ -359,6 +359,12 @@ impl LoadCounter {
     }
 }
 
+impl Default for LoadCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // v0.6 / M1+M6: KernelSpec-keyed cache layer.
 //
@@ -1509,10 +1515,10 @@ mod global_module_cache_tests {
     fn global_cache_evicts_in_fifo_order() {
         let mut cache = GlobalModuleCache::new(2);
 
-        cache.insert(k(1), module());
-        cache.insert(k(2), module());
+        let _ = cache.insert(k(1), module());
+        let _ = cache.insert(k(2), module());
         // At cap. Inserting k(3) must evict k(1) (the front of the FIFO).
-        cache.insert(k(3), module());
+        let _ = cache.insert(k(3), module());
 
         assert!(cache.get(&k(1)).is_none(), "oldest key must be evicted");
         assert!(cache.get(&k(2)).is_some(), "k(2) must survive");
@@ -1530,13 +1536,13 @@ mod global_module_cache_tests {
     fn global_cache_insert_is_idempotent_and_preserves_fifo_position() {
         let mut cache = GlobalModuleCache::new(2);
 
-        cache.insert(k(1), module());
-        cache.insert(k(2), module());
+        let _ = cache.insert(k(1), module());
+        let _ = cache.insert(k(2), module());
         // Re-insert k(1): no-op, must NOT move it to the back of the FIFO.
-        cache.insert(k(1), module());
+        let _ = cache.insert(k(1), module());
         assert_eq!(cache.by_key.len(), 2, "idempotent insert must not grow map");
 
-        cache.insert(k(3), module());
+        let _ = cache.insert(k(3), module());
         assert!(
             cache.get(&k(1)).is_none(),
             "k(1) kept its original FIFO position and was evicted first"
@@ -1555,7 +1561,7 @@ mod global_module_cache_tests {
 
         let in_use = cache.insert(k(1), module());
         // Force eviction of k(1) by inserting past the cap of 1.
-        cache.insert(k(2), module());
+        let _ = cache.insert(k(2), module());
         assert!(cache.get(&k(1)).is_none(), "k(1) evicted from the map");
 
         // The caller's clone is still a usable handle — the module was NOT
@@ -2034,7 +2040,7 @@ mod kernelspec_cache_tests {
 
         let (hits_after, _) = kernelspec_cache_stats();
         assert!(
-            hits_after >= hits_before + 1,
+            hits_after > hits_before,
             "expected at least one hit bump (before={}, after={}); the warm \
              call must have flowed through the hit path",
             hits_before,
@@ -2936,7 +2942,7 @@ mod radix_sort_cache_tests {
 
         let (hits_after, _) = radix_sort_cache_stats();
         assert!(
-            hits_after >= hits_before + 1,
+            hits_after > hits_before,
             "expected at least one hit bump (before={}, after={}); the warm \
              call must have flowed through the hit path",
             hits_before,

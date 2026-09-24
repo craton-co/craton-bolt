@@ -632,7 +632,7 @@ mod tests {
     fn rejects_int64_value_column() {
         let plan = build_twokey_avg_plan(1);
         let n = 300_000;
-        let k1: Vec<i32> = (0..n as i32).collect();
+        let k1: Vec<i32> = (0..n).collect();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("k1", ArrowDataType::Int32, false),
             ArrowField::new("k2", ArrowDataType::Int32, false),

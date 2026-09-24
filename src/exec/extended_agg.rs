@@ -714,7 +714,7 @@ mod tests {
         let min_arr = min_arr.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(min_arr.len(), 1);
         assert!(!min_arr.is_null(0));
-        assert_eq!(min_arr.value(0), false);
+        assert!(!min_arr.value(0));
 
         let max_arr = execute_extended_scalar(
             &AggregateExpr::Max(col_expr("b")),
@@ -725,7 +725,7 @@ mod tests {
         let max_arr = max_arr.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(max_arr.len(), 1);
         assert!(!max_arr.is_null(0));
-        assert_eq!(max_arr.value(0), true);
+        assert!(max_arr.value(0));
     }
 
     /// 4. All-null input → MIN and MAX both return a single NULL.

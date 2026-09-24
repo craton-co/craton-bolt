@@ -83,7 +83,7 @@ impl Engine {
                 "StringLength: failed to build output RecordBatch: {e}"
             ))
         })?;
-        Ok(QueryHandle { batch: batch_out })
+        Ok(QueryHandle::from_record_batch(batch_out))
     }
 
     /// Compute `LENGTH(<source>)` for the GPU-resident `Utf8` column `source`
@@ -258,7 +258,7 @@ impl Engine {
                 check_len(keys_host.len(), n_rows)?;
                 lens_i32
                     .into_iter()
-                    .zip(keys_host.into_iter())
+                    .zip(keys_host)
                     .map(|(len, key)| if key == 0 { None } else { Some(len as i64) })
                     .collect()
             }
@@ -388,7 +388,7 @@ impl Engine {
                 "StringProject: failed to build output RecordBatch: {e}"
             ))
         })?;
-        Ok(QueryHandle { batch: batch_out })
+        Ok(QueryHandle::from_record_batch(batch_out))
     }
 
     /// Compute a [`StringTransform`](crate::exec::string_project::StringTransform)
@@ -397,8 +397,8 @@ impl Engine {
     ///
     /// `SUBSTRING`/`TRIM` are realised via the byte-identical host mirror
     /// ([`crate::exec::string_project::host_transform_strings`]) regardless of
-    /// the dictionary contents — their GPU two-pass producers exist but are
-    /// unvalidated on hardware (matching the CONCAT path).
+    /// the dictionary contents — their GPU two-pass producers remain
+    /// unsupported, like CONCAT.
     ///
     /// For `UPPER`/`LOWER`:
     /// GPU path (ASCII dictionaries): materialise a row-aligned offsets+bytes
@@ -476,7 +476,7 @@ impl Engine {
         // SUBSTRING / TRIM are realised host-side (byte-identical to the host
         // helpers in `string_ops_extended`). The GPU two-pass producers for
         // these exist in `jit::string_kernel` and are PTX-shape-tested, but are
-        // unvalidated on hardware (like CONCAT / LIKE), so we take the
+        // not part of the supported device surface, so we take the
         // correctness-guaranteed host path here. Results are identical either
         // way; wiring the device launch is a follow-up.
         if transform.is_host_realized() {
@@ -491,10 +491,8 @@ impl Engine {
             return Ok(Arc::new(arr) as ArrayRef);
         }
 
-        // Gate: the GPU two-pass UPPER/LOWER device path is UNVALIDATED. By
-        // default (gate OFF) take the validated host mirror, which is
-        // byte-identical for ASCII dictionaries. The device launch below is
-        // only reached when `BOLT_GPU_STRING` is truthy.
+        // The validated ASCII UPPER/LOWER device path is enabled by default.
+        // `BOLT_GPU_STRING=0` forces its byte-identical host mirror.
         if !crate::exec::string_project::gpu_string_enabled() {
             let arr = host_transform_strings(dict, &keys_host, layout, validity_slice, transform)?;
             return Ok(Arc::new(arr) as ArrayRef);
@@ -635,8 +633,8 @@ impl Engine {
     /// `compile_concat_write_pass`) exist and are PTX-shape-tested; this executor
     /// currently realises the result via the byte-identical host mirror
     /// ([`crate::exec::string_project::host_concat_strings`]) so the path is
-    /// correctness-guaranteed (the device concat kernel is unvalidated on
-    /// hardware, like the LIKE matcher). Wiring the device launch here is a
+    /// correctness-guaranteed (the device concat kernel is not part of the
+    /// supported device surface). Wiring the device launch here is a
     /// follow-up; results are identical either way.
     fn string_concat_column(
         &self,
@@ -711,10 +709,9 @@ impl Engine {
     /// `NOT LIKE` over a non-dictionary `Utf8` column, then materialise the
     /// surviving rows.
     ///
-    /// ⚠️ UNVALIDATED DEVICE PATH. The matcher kernel
-    /// ([`crate::jit::string_kernel::compile_like_match_kernel`]) has not run on
-    /// GPU hardware; correctness is guaranteed by the host mirror in
-    /// [`crate::exec::string_like`] and by this executor's clean host fallback.
+    /// The matcher kernel is covered by direct CUDA hardware tests for all
+    /// supported modes. Correctness is additionally cross-checked by the host
+    /// mirror in [`crate::exec::string_like`], which is also the clean fallback.
     ///
     /// Flow: execute `input` (a bare scan → row-aligned source batch); pull the
     /// `column` as a host `StringArray`; build a row-aligned offsets+bytes
@@ -782,10 +779,8 @@ impl Engine {
         // Build the boolean mask: GPU device path, with a host fallback that
         // produces the identical mask if the launch is not viable.
         //
-        // The GPU LIKE matcher is an UNVALIDATED device path; by default
-        // (gate OFF) we skip it entirely and take the validated host mirror,
-        // which produces the byte-identical mask. The device launch is only
-        // attempted when `BOLT_GPU_STRING` is truthy.
+        // The validated GPU LIKE matcher is enabled by default.
+        // `BOLT_GPU_STRING=0` selects its byte-identical host mirror.
         let mask: arrow_array::BooleanArray = if !crate::exec::string_like::gpu_string_enabled() {
             crate::exec::string_like::host_mask_via_mirror(str_arr, literal, mode, negated)
         } else {
@@ -820,7 +815,7 @@ impl Engine {
                 "StringLikeFilter: failed to rebuild RecordBatch: {e}"
             ))
         })?;
-        Ok(QueryHandle { batch: out })
+        Ok(QueryHandle::from_record_batch(out))
     }
 
     /// GPU per-row LIKE matcher: upload the row-aligned column + literal, launch
@@ -828,7 +823,8 @@ impl Engine {
     /// 0/1 mask, and re-apply NULL 3VL into a [`arrow_array::BooleanArray`].
     ///
     /// Returns `Err` (so the caller can host-fall-back) for any non-viable
-    /// launch condition. UNVALIDATED device path — see the executor doc.
+    /// launch condition. The supported modes are covered by real-GPU
+    /// end-to-end tests.
     fn string_like_mask_gpu(
         &self,
         col: &arrow_array::StringArray,

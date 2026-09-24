@@ -1085,7 +1085,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "MutualRecursiveCte: 2 CTEs");
         assert_eq!(lines[1], "  Cte: a (n) recursive UNION");
-        assert!(lines.iter().any(|l| *l == "  Cte: b (n) non-recursive"));
+        assert!(lines.contains(&"  Cte: b (n) non-recursive"));
         assert!(lines.iter().any(|l| l.trim() == "Main:"));
     }
 
