@@ -214,7 +214,7 @@ fn rank_skips_dense_rank_does_not() {
     let vs = col_i32(out, 0);
     let rk = i64_vec(out, 1);
     let dr = i64_vec(out, 2);
-    for i in 0..vs.len() {
+    for i in 0..rk.len() {
         let (erk, edr) = match vs.value(i) {
             10 => (1, 1), // tie group of two -> rank 1, dense 1
             20 => (3, 2), // RANK skips to 3 (two rows preceded); DENSE = 2
@@ -249,13 +249,13 @@ fn running_sum_range_peers_share_value() {
 
     let vs = col_i32(out, 0);
     let rs = i64_vec(out, 1);
-    for i in 0..vs.len() {
+    for (i, got) in rs.iter().enumerate() {
         let expected = match vs.value(i) {
             10 => 20, // both peers see the peer-group-inclusive running sum
             20 => 40,
             other => panic!("unexpected v={other}"),
         };
-        assert_eq!(rs[i], expected, "running SUM at v={}", vs.value(i));
+        assert_eq!(*got, expected, "running SUM at v={}", vs.value(i));
     }
 }
 
@@ -346,13 +346,13 @@ fn avg_over_partition_no_order_is_full_partition() {
 
     let k = col_str(out, 0);
     let av = f64_vec(out, 1);
-    for i in 0..k.len() {
+    for (i, got) in av.iter().enumerate() {
         let expected = match k.value(i) {
             "a" => 2.0, // (1+3)/2
             "b" => 10.0,
             other => panic!("unexpected k={other}"),
         };
-        assert_eq!(av[i], expected, "AVG for partition {}", k.value(i));
+        assert_eq!(*got, expected, "AVG for partition {}", k.value(i));
     }
 }
 

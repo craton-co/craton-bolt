@@ -251,7 +251,7 @@ fn not_in_subquery_with_null_in_projection_is_3vl() {
         .expect("projected NOT IN with NULL in set");
     let out = h.record_batch();
     assert_eq!(out.num_rows(), 3, "one row per probe row");
-    let k = col_int32(&out, 0);
+    let k = col_int32(out, 0);
     let m = out
         .column(1)
         .as_any()

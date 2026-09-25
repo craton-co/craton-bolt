@@ -31,7 +31,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::Engine;
@@ -462,6 +464,59 @@ fn primitive_aggregates_all_null_returns_sql_null() {
     assert_out_null(&run_single_row_query("SELECT MIN(v) FROM t", batch.clone()));
     assert_out_null(&run_single_row_query("SELECT MAX(v) FROM t", batch.clone()));
     assert_out_null(&run_single_row_query("SELECT AVG(v) FROM t", batch));
+}
+
+/// Grouped AVG follows the same empty-state contract: an existing group whose
+/// values are all NULL emits a NULL AVG, while an empty relation emits no
+/// groups at all. This is a direct device-backed GROUP BY regression.
+#[test]
+#[ignore = "gpu:tier1"]
+fn grouped_avg_all_null_and_empty_are_sql_null_semantics() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("g", arrow_schema::DataType::Int32, false),
+        ArrowField::new("v", arrow_schema::DataType::Int64, true),
+    ]));
+
+    let all_null = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![7, 7, 7])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None, None])) as ArrayRef,
+        ],
+    )
+    .expect("all-null grouped batch");
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("t", all_null).expect("register");
+    let out = engine
+        .sql("SELECT g, AVG(v) AS a FROM t GROUP BY g")
+        .expect("grouped AVG")
+        .into_record_batch();
+    assert_eq!(out.num_rows(), 1, "the all-NULL group still exists");
+    let key = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let avg = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(key.value(0), 7);
+    assert!(avg.is_null(0), "AVG(all-NULL group) must be SQL NULL");
+    drop(engine);
+
+    let empty = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef,
+        ],
+    )
+    .expect("empty grouped batch");
+    let mut empty_engine = Engine::new().expect("ctx");
+    empty_engine.register_table("t", empty).expect("register");
+    let out = empty_engine
+        .sql("SELECT g, AVG(v) AS a FROM t GROUP BY g")
+        .expect("empty grouped AVG")
+        .into_record_batch();
+    assert_eq!(out.num_rows(), 0, "empty input has no groups");
 }
 
 /// First-row and last-row NULL positions stress the strip path's loop bounds:

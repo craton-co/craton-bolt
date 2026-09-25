@@ -61,7 +61,7 @@ fn engine_sql_advances_queries_total() {
     let after = metrics_snapshot().counter(Counter::QueriesTotal);
 
     assert!(
-        after >= before + 1,
+        after > before,
         "a query attempt must advance QueriesTotal (before={before}, after={after})"
     );
 }

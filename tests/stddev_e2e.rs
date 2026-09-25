@@ -9,7 +9,7 @@
 //!
 //! * STDDEV_POP(x)  = sqrt( Σ (x_i - mean)^2 / N )
 //! * STDDEV_SAMP(x) = sqrt( Σ (x_i - mean)^2 / (N - 1) )   for N > 1
-//!                  = NULL                                  for N <= 1
+//!   = NULL for N <= 1
 //!
 //! Each test uses a small fixture (`[1, 2, 3, 4, 5]`) where the deviations
 //! cancel cleanly: mean = 3, Σ deviations^2 = 10, so σ_pop = √2 and
@@ -379,13 +379,11 @@ fn e2e_stddev_samp_single_row_is_null() {
     );
 }
 
-/// GROUP BY + STDDEV is out of scope for v0.5; the engine must surface a
-/// clear error rather than a silent wrong result. We assert on the error
-/// path the executor emits (`STDDEV_POP / STDDEV_SAMP are not yet
-/// supported with GROUP BY`).
+/// GROUP BY + STDDEV_POP uses the grouped Welford finalizer. Pin the current
+/// support contract against hand-computed per-group population deviations.
 #[test]
 #[ignore = "gpu:tier1"]
-fn e2e_stddev_with_group_by_is_rejected() {
+fn e2e_stddev_with_group_by_matches_cpu() {
     use craton_bolt::Engine;
 
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -399,14 +397,29 @@ fn e2e_stddev_with_group_by_is_rejected() {
     let mut engine = Engine::new().expect("ctx");
     engine.register_table("t", batch).unwrap();
 
-    // `QueryHandle` is not `Debug`, so match rather than `.expect_err()`.
-    let err = match engine.sql("SELECT k, STDDEV_POP(v) FROM t GROUP BY k") {
-        Ok(_) => panic!("STDDEV with GROUP BY must error in v0.5"),
-        Err(e) => e,
-    };
-    let msg = format!("{err}");
+    let out = engine
+        .sql("SELECT k, STDDEV_POP(v) FROM t GROUP BY k")
+        .expect("grouped STDDEV_POP executes")
+        .into_record_batch();
+    let keys = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("group key is Int32");
+    let values = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("STDDEV_POP is Float64");
+    let got: std::collections::HashMap<i32, f64> = (0..out.num_rows())
+        .map(|row| (keys.value(row), values.value(row)))
+        .collect();
+    assert_eq!(got.len(), 2);
+    assert!((got[&1] - 0.5).abs() < 1e-12, "group 1: {:?}", got[&1]);
+    let expected_group_2 = (2.0_f64 / 3.0).sqrt();
     assert!(
-        msg.contains("STDDEV") && msg.contains("GROUP BY"),
-        "expected STDDEV / GROUP BY rejection, got: {msg}"
+        (got[&2] - expected_group_2).abs() < 1e-12,
+        "group 2: {:?}",
+        got[&2]
     );
 }

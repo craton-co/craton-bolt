@@ -1,0 +1,108 @@
+---
+source: tests/ptx_golden_tests.rs
+---
+.version 7.5
+.target sm_70
+.address_size 64
+
+.shared .align 8 .b8 sdata[2048];
+
+.visible .entry bolt_reduce(
+	.param .u64 bolt_reduce_param_0,
+	.param .u64 bolt_reduce_param_1,
+	.param .u32 bolt_reduce_param_2
+)
+{
+	.reg .pred  %p<8>;
+	.reg .b32   %r<16>;
+	.reg .b64   %rd<24>;
+	.reg .b64   %rl<8>;
+	.reg .b32   %rv<4>;
+
+	mov.u32 %r{0}, %ctaid.x;
+	mov.u32 %r{1}, %ntid.x;
+	mov.u32 %r{2}, %tid.x;
+	mad.lo.s32 %r{3}, %r{0}, %r{1}, %r{2};
+	ld.param.u32 %r{4}, [bolt_reduce_param_2];
+	ld.param.u64 %rd{0}, [bolt_reduce_param_0];
+	cvta.to.global.u64 %rd{0}, %rd{0};
+	setp.ge.u32 %p{0}, %r{3}, %r{4};
+	@%p{0} bra LOAD_IDENTITY;
+	mul.wide.u32 %rd{1}, %r{3}, 4;
+	add.s64 %rd{2}, %rd{0}, %rd{1};
+	ld.global.nc.s32 %rv0, [%rd{2}];
+	cvt.s64.s32 %rl{0}, %rv0;
+	bra AFTER_LOAD;
+LOAD_IDENTITY:
+	mov.s64 %rl{0}, 0;
+AFTER_LOAD:
+	mul.wide.u32 %rd{3}, %r{2}, 8;
+	mov.u64 %rd{4}, sdata;
+	add.s64 %rd{5}, %rd{4}, %rd{3};
+	st.shared.s64 [%rd{5}], %rl{0};
+	bar.sync 0;
+	setp.lt.s32 %p{1}, %r{2}, 128;
+	@!%p{1} bra SKIP_ADD_0;
+	add.s64 %rd{6}, %rd{5}, 1024;
+	ld.shared.s64 %rl{1}, [%rd{6}];
+	ld.shared.s64 %rl{2}, [%rd{5}];
+	add.s64 %rl{3}, %rl{2}, %rl{1};
+	st.shared.s64 [%rd{5}], %rl{3};
+SKIP_ADD_0:
+	bar.sync 0;
+	setp.lt.s32 %p{2}, %r{2}, 64;
+	@!%p{2} bra SKIP_ADD_1;
+	add.s64 %rd{6}, %rd{5}, 512;
+	ld.shared.s64 %rl{1}, [%rd{6}];
+	ld.shared.s64 %rl{2}, [%rd{5}];
+	add.s64 %rl{3}, %rl{2}, %rl{1};
+	st.shared.s64 [%rd{5}], %rl{3};
+SKIP_ADD_1:
+	bar.sync 0;
+	setp.lt.s32 %p{3}, %r{2}, 32;
+	@!%p{3} bra SKIP_ADD_2;
+	add.s64 %rd{6}, %rd{5}, 256;
+	ld.shared.s64 %rl{1}, [%rd{6}];
+	ld.shared.s64 %rl{2}, [%rd{5}];
+	add.s64 %rl{3}, %rl{2}, %rl{1};
+	st.shared.s64 [%rd{5}], %rl{3};
+SKIP_ADD_2:
+	bar.sync 0;
+	setp.ge.u32 %p{4}, %r{2}, 32;
+	@%p{4} bra DONE;
+	ld.shared.s64 %rl{4}, [%rd{5}];
+	mov.b64 {%r{5}, %r{6}}, %rl{4};
+	shfl.sync.down.b32 %r{7}, %r{5}, 16, 0x1f, 0xffffffff;
+	shfl.sync.down.b32 %r{8}, %r{6}, 16, 0x1f, 0xffffffff;
+	mov.b64 %rl{5}, {%r{7}, %r{8}};
+	add.s64 %rl{4}, %rl{4}, %rl{5};
+	mov.b64 {%r{5}, %r{6}}, %rl{4};
+	shfl.sync.down.b32 %r{7}, %r{5}, 8, 0x1f, 0xffffffff;
+	shfl.sync.down.b32 %r{8}, %r{6}, 8, 0x1f, 0xffffffff;
+	mov.b64 %rl{5}, {%r{7}, %r{8}};
+	add.s64 %rl{4}, %rl{4}, %rl{5};
+	mov.b64 {%r{5}, %r{6}}, %rl{4};
+	shfl.sync.down.b32 %r{7}, %r{5}, 4, 0x1f, 0xffffffff;
+	shfl.sync.down.b32 %r{8}, %r{6}, 4, 0x1f, 0xffffffff;
+	mov.b64 %rl{5}, {%r{7}, %r{8}};
+	add.s64 %rl{4}, %rl{4}, %rl{5};
+	mov.b64 {%r{5}, %r{6}}, %rl{4};
+	shfl.sync.down.b32 %r{7}, %r{5}, 2, 0x1f, 0xffffffff;
+	shfl.sync.down.b32 %r{8}, %r{6}, 2, 0x1f, 0xffffffff;
+	mov.b64 %rl{5}, {%r{7}, %r{8}};
+	add.s64 %rl{4}, %rl{4}, %rl{5};
+	mov.b64 {%r{5}, %r{6}}, %rl{4};
+	shfl.sync.down.b32 %r{7}, %r{5}, 1, 0x1f, 0xffffffff;
+	shfl.sync.down.b32 %r{8}, %r{6}, 1, 0x1f, 0xffffffff;
+	mov.b64 %rl{5}, {%r{7}, %r{8}};
+	add.s64 %rl{4}, %rl{4}, %rl{5};
+	setp.ne.s32 %p{5}, %r{2}, 0;
+	@%p{5} bra DONE;
+	ld.param.u64 %rd{7}, [bolt_reduce_param_1];
+	cvta.to.global.u64 %rd{7}, %rd{7};
+	mul.wide.u32 %rd{8}, %r{0}, 8;
+	add.s64 %rd{9}, %rd{7}, %rd{8};
+	st.global.s64 [%rd{9}], %rl{4};
+DONE:
+	ret;
+}

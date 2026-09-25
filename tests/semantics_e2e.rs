@@ -314,6 +314,95 @@ fn in_subquery_with_null_in_set_matches_non_null() {
     assert_eq!(got, vec![1]);
 }
 
+/// Literal-list membership uses the same strict three-valued truth table as
+/// subquery membership. A matching value is TRUE even when another list item
+/// is NULL; a non-match is UNKNOWN (NULL), not FALSE.
+#[test]
+#[ignore = "gpu:e2e"]
+fn literal_in_and_not_in_with_null_are_three_valued() {
+    let mut engine = Engine::new().expect("CUDA ctx");
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "k",
+        ArrowDataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let handle = engine
+        .sql("SELECT k, k IN (1, NULL), k NOT IN (1, NULL) FROM t ORDER BY k")
+        .expect("strict literal IN projection");
+    let out = handle.record_batch();
+    let in_values = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .expect("IN result is Bool");
+    let not_in_values = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .expect("NOT IN result is Bool");
+
+    assert!(in_values.value(0), "1 IN (1,NULL)");
+    assert!(!not_in_values.value(0), "1 NOT IN (1,NULL)");
+    assert!(in_values.is_null(1), "2 IN (1,NULL) is UNKNOWN");
+    assert!(not_in_values.is_null(1), "2 NOT IN (1,NULL) is UNKNOWN");
+
+    let filtered = engine
+        .sql("SELECT k FROM t WHERE k NOT IN (1, NULL)")
+        .expect("strict literal NOT IN filter");
+    assert_eq!(
+        filtered.num_rows(),
+        0,
+        "UNKNOWN literal NOT IN rows must not pass WHERE"
+    );
+}
+
+/// Default integer division/remainder follows SQL-compatible NULL semantics
+/// for divide-by-zero and the signed overflow corner. This is deliberately an
+/// end-to-end public-SQL test: it proves the planner selected the NULL-aware
+/// host tier instead of the historical device zero/wrap convention.
+#[test]
+#[ignore = "gpu:e2e"]
+fn integer_division_and_remainder_invalid_rows_are_null() {
+    let mut engine = Engine::new().expect("CUDA ctx");
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", ArrowDataType::Int32, false),
+        ArrowField::new("b", ArrowDataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![10, 7, i32::MIN])),
+            Arc::new(Int32Array::from(vec![2, 0, -1])),
+        ],
+    )
+    .expect("batch");
+    engine.register_table("t", batch).expect("register");
+
+    let handle = engine
+        .sql("SELECT a / b, a % b FROM t")
+        .expect("SQL-compatible integer division");
+    let out = handle.record_batch();
+    let div = col_int32(out, 0);
+    let rem = col_int32(out, 1);
+
+    assert_eq!(div.value(0), 5);
+    assert_eq!(rem.value(0), 0);
+    assert!(div.is_null(1), "division by zero must be NULL");
+    assert!(rem.is_null(1), "remainder by zero must be NULL");
+    assert!(div.is_null(2), "INT_MIN / -1 must not wrap");
+    assert!(rem.is_null(2), "INT_MIN % -1 must not reach GPU UB");
+
+    let filtered = engine
+        .sql("SELECT a FROM t WHERE a / b > 0")
+        .expect("division in WHERE");
+    assert_eq!(filtered.num_rows(), 1, "NULL predicates are filtered out");
+    assert_eq!(col_int32(filtered.record_batch(), 0).value(0), 10);
+}
+
 // ===========================================================================
 // Item 3 — Two-key COUNT(col) with NULLs in col counts only non-null rows.
 // ===========================================================================
