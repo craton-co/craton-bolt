@@ -41,7 +41,7 @@ fn cpu_tier2_multi_sum_model(
 ) -> Vec<(i32, Vec<f64>)> {
     let n_vals = vals.len();
     assert!(
-        n_vals >= 1 && n_vals <= 4,
+        (1..=4).contains(&n_vals),
         "n_vals must be 1..=4, got {n_vals}"
     );
     for (j, v) in vals.iter().enumerate() {
@@ -60,8 +60,8 @@ fn cpu_tier2_multi_sum_model(
     // GPU pipeline's layout: the partition pass writes per-row partition
     // ids; the scatter pass writes per-row keys + values aligned by slot.
     let mut buckets: Vec<Vec<usize>> = (0..NUM_PARTITIONS).map(|_| Vec::new()).collect();
-    for i in 0..keys.len() {
-        let pid = partition_of(keys[i]) as usize;
+    for (i, &key) in keys.iter().enumerate() {
+        let pid = partition_of(key) as usize;
         buckets[pid].push(i);
     }
 
@@ -76,7 +76,7 @@ fn cpu_tier2_multi_sum_model(
                 slot[j] += vals[j][i];
             }
         }
-        flat.extend(table.into_iter());
+        flat.extend(table);
     }
 
     // Sort by key ASC for deterministic comparison.
@@ -90,8 +90,8 @@ fn cpu_naive_multi_sum_groupby(keys: &[i32], vals: &[Vec<f64>]) -> Vec<(i32, Vec
     let mut table: HashMap<i32, Vec<f64>> = HashMap::with_capacity(keys.len().min(1 << 20));
     for i in 0..keys.len() {
         let slot = table.entry(keys[i]).or_insert_with(|| vec![0.0; n_vals]);
-        for j in 0..n_vals {
-            slot[j] += vals[j][i];
+        for (j, col) in vals.iter().enumerate() {
+            slot[j] += col[i];
         }
     }
     let mut flat: Vec<(i32, Vec<f64>)> = table.into_iter().collect();
@@ -112,7 +112,7 @@ fn fixture(
     seed: u64,
 ) -> (Vec<i32>, Vec<Vec<f64>>) {
     assert!(n_distinct_keys > 0, "n_distinct_keys must be positive");
-    assert!(n_vals >= 1 && n_vals <= 4, "n_vals must be 1..=4");
+    assert!((1..=4).contains(&n_vals), "n_vals must be 1..=4");
     let modulus = n_distinct_keys as u64;
     let mut rng = Xorshift64Star::new(seed);
 
@@ -121,12 +121,12 @@ fn fixture(
     for _ in 0..n_rows {
         let k = (rng.next_u64() % modulus) as i32;
         keys.push(k);
-        for j in 0..n_vals {
+        for (j, col) in vals.iter_mut().enumerate() {
             // Vary scale slightly per column so a column-misalignment bug
             // shows up as wrong sums rather than coincidentally-matching
             // values across columns.
             let v = rng.next_signed_unit_f64() * (1.0 + j as f64 * 0.5);
-            vals[j].push(v);
+            col.push(v);
         }
     }
     (keys, vals)
@@ -290,7 +290,7 @@ fn fixture_aligned_multiples(
     n_vals: usize,
     seed: u64,
 ) -> (Vec<i32>, Vec<Vec<f64>>) {
-    assert!(n_vals >= 1 && n_vals <= 4);
+    assert!((1..=4).contains(&n_vals));
     let modulus = n_distinct_keys as u64;
     let mut state: u64 = seed.wrapping_add(0xDEAD_BEEF_CAFE_BABE);
     if state == 0 {

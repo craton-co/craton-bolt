@@ -44,13 +44,13 @@ use std::collections::HashMap;
 /// `tests/tier2_groupby_e2e.rs` (same `Xorshift64Star`, no extra dev-deps) but
 /// emits the columns the COUNT paths need:
 ///
-///   * `id1`  — low cardinality  (`[0, n_id1)`),  drives one half of the
-///              two-key composite group.
-///   * `id2`  — medium cardinality (`[0, n_id2)`), the other half.
-///   * `id3`  — high cardinality  (`[0, n_id3)`), the single i32 key.
-///   * `v1`   — a non-null value column. COUNT(v1) therefore equals the row
-///              count per group (no NULLs to exclude), which keeps the CPU
-///              reference a pure row-count and makes COUNT(v1) == COUNT(*).
+/// * `id1` — low cardinality (`[0, n_id1)`), drives one half of the
+///   two-key composite group.
+/// * `id2` — medium cardinality (`[0, n_id2)`), the other half.
+/// * `id3` — high cardinality (`[0, n_id3)`), the single i32 key.
+/// * `v1` — a non-null value column. COUNT(v1) therefore equals the row
+///   count per group (no NULLs to exclude), which keeps the CPU reference a
+///   pure row-count and makes COUNT(v1) == COUNT(*).
 ///
 /// Values are returned as parallel vectors so the test can both build the Arrow
 /// batch and feed the CPU reference from the exact same data.
@@ -109,7 +109,7 @@ fn cpu_naive_count_groupby2(a: &[i32], b: &[i32]) -> Vec<(i32, i32, i64)> {
         *table.entry((a[i], b[i])).or_insert(0) += 1;
     }
     let mut flat: Vec<(i32, i32, i64)> = table.into_iter().map(|((x, y), c)| (x, y, c)).collect();
-    flat.sort_by(|l, r| (l.0, l.1).cmp(&(r.0, r.1)));
+    flat.sort_by_key(|l| (l.0, l.1));
     flat
 }
 
@@ -295,7 +295,7 @@ fn tier2_count_two_key_i64() {
     let mut actual: Vec<(i32, i32, i64)> = (0..out.num_rows())
         .map(|i| (k1.value(i), k2.value(i), cnt.value(i)))
         .collect();
-    actual.sort_by(|l, r| (l.0, l.1).cmp(&(r.0, r.1)));
+    actual.sort_by_key(|l| (l.0, l.1));
 
     assert_eq!(
         actual.len(),

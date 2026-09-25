@@ -196,24 +196,29 @@ fn scan_env_var_literals(text: &str) -> BTreeSet<String> {
     found
 }
 
-/// (2) Every `CRATON_*` / `BOLT_*` env-var name literal in `src/` must be
-/// documented verbatim in `docs/ENV_VARS.md` (or be on the allowlist).
+/// Collect production/runtime Rust inputs that can read environment variables.
+fn collect_env_source_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("src"), &mut files);
+    collect_rs_files(&root.join("benches"), &mut files);
+    let build = root.join("build.rs");
+    if build.is_file() {
+        files.push(build);
+    }
+    files
+}
+
+/// (2) Every `CRATON_*` / `BOLT_*` env-var name literal in production,
+/// build-time, or benchmark Rust must be documented verbatim in
+/// `docs/ENV_VARS.md` (or be on the allowlist).
 #[test]
 fn env_var_doc_parity() {
     let root = repo_root();
-    let src_dir = root.join("src");
-    assert!(
-        src_dir.is_dir(),
-        "expected a src/ directory at {}",
-        src_dir.display()
-    );
-
-    let mut rs_files = Vec::new();
-    collect_rs_files(&src_dir, &mut rs_files);
+    let rs_files = collect_env_source_files(&root);
     assert!(
         !rs_files.is_empty(),
-        "found no .rs files under {}",
-        src_dir.display()
+        "found no production/build/benchmark Rust files under {}",
+        root.display()
     );
 
     let mut discovered: BTreeSet<String> = BTreeSet::new();
@@ -238,7 +243,8 @@ fn env_var_doc_parity() {
 
     assert!(
         missing.is_empty(),
-        "the following env var name(s) appear as string literals in src/ but \
+        "the following env var name(s) appear as string literals in production, \
+         build-time, or benchmark Rust but \
          are NOT documented in docs/ENV_VARS.md: {missing:?}. Either document \
          each in docs/ENV_VARS.md or, if it is deliberately not a configuration \
          knob, add it to ENV_VAR_ALLOWLIST in tests/doc_consistency_test.rs \
@@ -316,68 +322,166 @@ fn scan_env_var_doc_names(text: &str) -> BTreeSet<String> {
     found
 }
 
-/// (4) Reverse-direction parity, **non-failing by design** (diagnostic only).
-///
-/// [`env_var_doc_parity`] enforces `src/` → `docs/ENV_VARS.md` (every var read
-/// in code is documented). This complementary check looks the *other* way —
-/// `docs/ENV_VARS.md` → `src/` — to surface vars that are documented but no
-/// longer referenced as a string literal in `src/` (stale docs, renamed vars,
-/// or — legitimately — a var documented ahead of a sibling code change that
-/// hasn't landed on this branch yet).
-///
-/// It deliberately **never asserts**: a documented-but-not-yet-in-`src/` var is
-/// a valid transient state (docs can lead code across a multi-PR campaign), so
-/// failing CI on it would be wrong. We only `eprintln!` a diagnostic. Promote a
-/// finding to a hard failure only once the var set has been reconciled and you
-/// want to lock it down.
+/// (4) Reverse-direction parity: every documented variable must have a real
+/// production, build-time, or benchmark source location. This makes
+/// `ENV_VARS.md` a partially generated inventory: code discovers the canonical
+/// set and CI rejects both undocumented code knobs and stale documented knobs.
 #[test]
-fn env_var_reverse_parity_diagnostic() {
+fn env_var_reverse_parity() {
     let root = repo_root();
-    let src_dir = root.join("src");
+    let rs_files = collect_env_source_files(&root);
 
-    let mut rs_files = Vec::new();
-    collect_rs_files(&src_dir, &mut rs_files);
-
-    let mut in_src: BTreeSet<String> = BTreeSet::new();
+    let mut in_code: BTreeSet<String> = BTreeSet::new();
     for file in &rs_files {
         let text = read_to_string(file);
-        in_src.extend(scan_env_var_literals(&text));
+        in_code.extend(scan_env_var_literals(&text));
     }
 
     let docs = read_to_string(&root.join("docs").join("ENV_VARS.md"));
     let documented = scan_env_var_doc_names(&docs);
 
-    // Vars documented ahead of (or independently from) their `src/` call site.
-    // Listing one here silences its diagnostic line; it is NOT an assertion —
-    // an unlisted var still only warns, never fails. Curated so the test stays
-    // green for any not-yet-reconciled var.
-    const DOC_LEADS_SRC: &[&str] = &[
-        // Read in `src/exec/string_ops_extended.rs` by a sibling LPAD/RPAD
-        // length-cap change; documented here ahead of that code landing on
-        // this branch.
-        "CRATON_MAX_PAD_LEN",
-    ];
-    let lead: BTreeSet<&str> = DOC_LEADS_SRC.iter().copied().collect();
-
     let mut documented_only: Vec<String> = Vec::new();
     for var in &documented {
-        if in_src.contains(var) || lead.contains(var.as_str()) {
+        if in_code.contains(var) {
             continue;
         }
         documented_only.push(var.clone());
     }
 
-    // Diagnostic only — never `assert!`. Keep this test green by construction.
-    if !documented_only.is_empty() {
-        eprintln!(
-            "[doc-consistency] note: {} env var(s) are documented in \
-             docs/ENV_VARS.md but not found as a `CRATON_*`/`BOLT_*` string \
-             literal in src/: {documented_only:?}. This is informational only \
-             (the var may be read via build.rs, a benches/ gate, or a sibling \
-             code change not yet on this branch). Reconcile docs/src or add the \
-             name to DOC_LEADS_SRC in tests/doc_consistency_test.rs if the lead \
-             is intentional.",
-            documented_only.len()
+    assert!(
+        documented_only.is_empty(),
+        "docs/ENV_VARS.md contains stale env-var entries with no literal in \
+         production, build-time, or benchmark Rust: {documented_only:?}"
+    );
+}
+
+/// (5) The user-facing documentation index must include every first-class
+/// engineering reference and the archived kernel-research directory.
+#[test]
+fn readme_documentation_index_covers_first_class_docs() {
+    let root = repo_root();
+    let readme = read_to_string(&root.join("README.md"));
+    for required in [
+        "docs/CUDARC_ADOPTION.md",
+        "docs/CONTRIBUTING_KERNEL.md",
+        "docs/SQL_REFERENCE.md",
+        "docs/API_SURFACE.md",
+        "docs/ENV_VARS.md",
+        "kernels/",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README.md project/documentation index is missing `{required}`"
         );
     }
+}
+
+/// (6) Root API additions that define execution placement must be reflected in
+/// the checked-in API inventory in the same change.
+#[test]
+fn execution_tier_public_api_is_documented() {
+    let root = repo_root();
+    let api = read_to_string(&root.join("docs").join("API_SURFACE.md"));
+    for required in [
+        "`QueryHandle`",
+        "`ExecutionTier`",
+        "planned_execution_tier",
+        "pub use exec::{Engine, EngineBuilder, QueryHandle}",
+    ] {
+        assert!(
+            api.contains(required),
+            "docs/API_SURFACE.md is missing public API token `{required}`"
+        );
+    }
+}
+
+/// (7) SQL support claims must publish the same three-tier vocabulary exposed
+/// by the planner API, making placement drift reviewable and machine-checked.
+#[test]
+fn sql_reference_has_execution_tier_contract() {
+    let root = repo_root();
+    let sql = read_to_string(&root.join("docs").join("SQL_REFERENCE.md"));
+    for required in [
+        "Execution tier",
+        "`Gpu`",
+        "`Host`",
+        "`Hybrid`",
+        "planned_execution_tier",
+    ] {
+        assert!(
+            sql.contains(required),
+            "docs/SQL_REFERENCE.md is missing execution-tier marker `{required}`"
+        );
+    }
+}
+
+/// (8) Local CI must rehearse the high-value hosted commands exactly. Keep the
+/// strings intentionally literal so a workflow edit requires the matching
+/// local-script edit in the same review.
+#[test]
+fn local_and_hosted_ci_commands_stay_in_sync() {
+    let root = repo_root();
+    let workflow = read_to_string(&root.join(".github").join("workflows").join("ci.yml"));
+    let local = read_to_string(&root.join("ci_local.sh"));
+    for command in [
+        "cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings",
+        "cargo test --lib --tests --no-default-features --features cuda-stub,flight",
+        "cargo test --lib --tests --no-default-features --features cuda-stub,substrait",
+        "--ignore-filename-regex 'src/cuda/'",
+        "--fail-under-lines 50",
+        "cargo deny --all-features check advisories licenses bans",
+        "bash scripts/check_public_api.sh",
+        "--features cudarc -- --ignored --test-threads=1",
+    ] {
+        assert!(
+            workflow.contains(command),
+            ".github/workflows/ci.yml is missing canonical command `{command}`"
+        );
+        assert!(
+            local.contains(command),
+            "ci_local.sh is missing hosted-CI command `{command}`"
+        );
+    }
+    assert!(
+        !local.contains("curl | bash") && !local.contains("| bash"),
+        "ci_local.sh must not execute network-fetched shell installers"
+    );
+}
+
+/// (9) Every GitHub Action is immutable-SHA pinned, and the retired rust-cuda
+/// downloader cannot re-enter the root build graph unnoticed.
+#[test]
+fn release_hardening_guards() {
+    let root = repo_root();
+    let workflows = root.join(".github").join("workflows");
+    for entry in fs::read_dir(&workflows).expect("read workflows directory") {
+        let path = entry.expect("workflow directory entry").path();
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let workflow = read_to_string(&path);
+        for line in workflow.lines().map(str::trim) {
+            let Some(action) = line.strip_prefix("uses: ") else {
+                continue;
+            };
+            let Some((_, revision)) = action.split_once('@') else {
+                panic!("action has no revision in {}: `{line}`", path.display());
+            };
+            let sha = revision.split_whitespace().next().unwrap_or("");
+            assert!(
+                sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "GitHub Action must be pinned to a 40-hex commit SHA in {}: `{line}`",
+                path.display()
+            );
+        }
+    }
+
+    let manifest = read_to_string(&root.join("Cargo.toml"));
+    let build = read_to_string(&root.join("build.rs"));
+    assert!(!manifest.contains("cuda_builder"));
+    assert!(!manifest.contains("rust-cuda ="));
+    assert!(!build.contains("compile_rust_cuda_kernels"));
 }

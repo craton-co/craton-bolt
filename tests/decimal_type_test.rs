@@ -246,14 +246,24 @@ fn decimal128_mul_two_columns_lowers_in_v07() {
     );
 }
 
-/// Division on Decimal128 lowers to a Div128 kernel instruction.
-/// `Decimal128(10, 2) / Decimal128(12, 2)` → `Decimal128(10, 6)`.
+/// Decimal division is rejected by default because the device instruction's
+/// divide-by-zero behavior is not SQL-compatible. The legacy instruction
+/// remains available only through the explicit compatibility switch.
 #[test]
-fn decimal128_div_lowers_in_v07() {
+fn decimal128_div_requires_explicit_legacy_opt_in() {
     let provider = provider_with_two_decimals();
     let plan = parse_sql("SELECT x / y FROM d", &provider)
         .expect("Decimal128 / Decimal128 must parse + type-check");
-    let phys = lower_physical(&plan).expect("Decimal128 / Decimal128 must lower in v0.7");
+    let err = lower_physical(&plan).expect_err("unsafe decimal division must be off by default");
+    assert!(err.to_string().contains("BOLT_LEGACY_ARITHMETIC=1"));
+
+    let previous = std::env::var_os("BOLT_LEGACY_ARITHMETIC");
+    std::env::set_var("BOLT_LEGACY_ARITHMETIC", "1");
+    let phys = lower_physical(&plan).expect("explicit legacy decimal division must still lower");
+    match previous {
+        Some(value) => std::env::set_var("BOLT_LEGACY_ARITHMETIC", value),
+        None => std::env::remove_var("BOLT_LEGACY_ARITHMETIC"),
+    }
     assert_eq!(
         phys.output_schema().fields[0].dtype,
         DataType::Decimal128(10, 6)
@@ -416,8 +426,7 @@ fn sum_decimal128_overflow_errors() {
         .expect("register");
     let err = engine
         .sql("SELECT SUM(d) FROM t")
-        .err()
-        .expect("SUM(Decimal128) on overflowing input must error");
+        .expect_err("SUM(Decimal128) on overflowing input must error");
     let msg = format!("{err}");
     assert!(
         msg.contains("overflow") && msg.contains("Decimal128"),

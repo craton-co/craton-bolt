@@ -6,9 +6,9 @@
 //! This file is the regression net for an imminent refactor of the Tier-2
 //! integer MIN/MAX reduce kernels:
 //!
-//!   * single-key i32  -> `partition_reduce_kernel_minmax`
-//!   * two-key  i64    -> `partition_reduce_kernel_minmax_i64` (via the
-//!                        host-side `(k1<<32)|(k2&0xFFFF_FFFF)` two-key pack)
+//! * single-key i32 -> `partition_reduce_kernel_minmax`
+//! * two-key i64 -> `partition_reduce_kernel_minmax_i64` (via the host-side
+//!   `(k1<<32)|(k2&0xFFFF_FFFF)` two-key pack)
 //!
 //! No existing GPU e2e exercises these paths over a *high-cardinality*
 //! INTEGER value column, so the refactor would otherwise land uncovered.
@@ -154,7 +154,7 @@ fn cpu_minmax_two_key(k1: &[i32], k2: &[i32], vals: &[i64]) -> Vec<(i32, i32, i6
         .into_iter()
         .map(|((a, b), (mn, mx))| (a, b, mn, mx))
         .collect();
-    flat.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    flat.sort_by_key(|x| (x.0, x.1));
     flat
 }
 
@@ -338,7 +338,7 @@ fn tier2_two_key_minmax_i64_int_values() {
     let mut min_actual: Vec<(i32, i32, i64)> = (0..min_out.num_rows())
         .map(|i| (min_k1.value(i), min_k2.value(i), min_vals.value(i)))
         .collect();
-    min_actual.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    min_actual.sort_by_key(|a| (a.0, a.1));
 
     // --- MAX(ival) ---
     let max_h = engine
@@ -351,7 +351,7 @@ fn tier2_two_key_minmax_i64_int_values() {
     let mut max_actual: Vec<(i32, i32, i64)> = (0..max_out.num_rows())
         .map(|i| (max_k1.value(i), max_k2.value(i), max_vals.value(i)))
         .collect();
-    max_actual.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    max_actual.sort_by_key(|a| (a.0, a.1));
 
     assert_eq!(
         min_actual.len(),

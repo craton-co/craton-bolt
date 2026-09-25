@@ -220,7 +220,7 @@ fn e2e_gpu_inner_join_small_falls_through_to_host() {
         .expect("INNER JOIN");
     let out = h.record_batch();
 
-    let expected: usize = probe_keys.iter().filter(|k| (**k as i32) < 64).count();
+    let expected: usize = probe_keys.iter().filter(|k| **k < 64).count();
     assert_eq!(
         out.num_rows(),
         expected,
@@ -340,15 +340,7 @@ fn two_key_inner_join() {
             }
         })
         .collect();
-    let p_b: Vec<i32> = (0..n_probe as i32)
-        .map(|i| {
-            if (i as usize) < n_build {
-                i % 64
-            } else {
-                i % 64
-            }
-        })
-        .collect();
+    let p_b: Vec<i32> = (0..n_probe as i32).map(|i| i % 64).collect();
     let p_v: Vec<i32> = (0..n_probe as i32).map(|i| 50_000 + i).collect();
 
     let t1 = int32x3_batch("a", "b", "bv", b_a.clone(), b_b.clone(), b_v.clone());
@@ -949,25 +941,20 @@ fn streaming_intern_high_cardinality_utf8() {
 
     // Spot-check the equi-join invariant: every matched pair has equal
     // string keys.
-    let k_indices: Vec<usize> = out
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| if f.name() == "k" { Some(i) } else { None })
-        .collect();
-    assert_eq!(
-        k_indices.len(),
-        2,
-        "output schema must carry both 'k' columns"
-    );
+    let output_schema = out.schema();
+    let left_k_idx = output_schema
+        .index_of("k")
+        .expect("output schema carries the left join key");
+    let right_k_idx = output_schema
+        .index_of("right.k")
+        .expect("duplicate right join key uses the planner's qualified name");
     let left_k = out
-        .column(k_indices[0])
+        .column(left_k_idx)
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("left k column is Utf8");
     let right_k = out
-        .column(k_indices[1])
+        .column(right_k_idx)
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("right k column is Utf8");

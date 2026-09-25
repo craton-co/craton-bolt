@@ -156,8 +156,8 @@ fn host_like_not_like_inverts_and_preserves_nulls() {
 // ===========================================================================
 
 /// `SELECT s FROM t WHERE s LIKE 'foo%'` over a NON-dict Utf8 column now
-/// lowers to the GPU `PhysicalPlan::StringLikeFilter` (UNVALIDATED device
-/// path), not the host `Expr::Like` filter. The supported single-literal-
+/// lowers to the real-device-validated GPU `PhysicalPlan::StringLikeFilter`,
+/// not the host `Expr::Like` filter. The supported single-literal-
 /// segment shapes (EXACT/PREFIX/SUFFIX/CONTAINS) take the GPU path; everything
 /// else (`_`, ESCAPE, interior `%`) stays on the host filter.
 #[test]
@@ -366,11 +366,13 @@ fn lowering_preserves_pattern_verbatim() {
         PhysicalPlan::Project { input, .. } => input.as_ref(),
         other => other,
     };
-    if let PhysicalPlan::Filter { predicate, .. } = inner {
-        if let Expr::Like { pattern, .. } = predicate {
-            assert_eq!(pattern, "_b%");
-            return;
-        }
+    if let PhysicalPlan::Filter {
+        predicate: Expr::Like { pattern, .. },
+        ..
+    } = inner
+    {
+        assert_eq!(pattern, "_b%");
+        return;
     }
     panic!("expected Filter(Like{{ pattern: \"_b%\" }}), got {phys:?}");
 }

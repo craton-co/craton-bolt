@@ -1600,17 +1600,16 @@ fn golden_agg_kernel_max_float64_smoke() {
 // instruction (the substring would still pass, but the wiring would be
 // silently wrong).
 //
-// First-run bootstrap (`#[ignore]`):
-//   These tests are `#[ignore]`'d so the default `cargo test` run on a
-//   fresh checkout does NOT fail just because the snapshot files don't
-//   exist yet. To populate / refresh the snapshots, run:
+// Snapshot maintenance:
+//   These snapshots are checked in and run in the default host suite. After
+//   an intentional codegen change, review and refresh them with:
 //
-//     cargo insta test --accept -- --include-ignored
+//     cargo insta test
+//     cargo insta review
 //
-//   (or `cargo test --include-ignored` followed by `cargo insta accept`).
-//   Once the snapshot files exist under `tests/snapshots/` they can be
-//   checked into version control, and a future PR that changes the
-//   normalized PTX will produce a reviewable diff via `cargo insta review`.
+//   Keeping these tests non-ignored is important: the real-GPU gate runs all
+//   ignored tests, so a bootstrap ignore would contaminate that gate while
+//   leaving the register-flow contract unenforced in ordinary CI.
 //
 //   We use `omit_expression => true` so each snapshot file is just the
 //   normalized PTX payload (no `expression: ...` header) — small, stable,
@@ -1628,75 +1627,57 @@ macro_rules! assert_ptx_snapshot {
     }};
 }
 
-// The bootstrap-gate reason — repeated in every `#[ignore = "..."]` below
-// because Rust requires that attribute argument to be a string literal (it
-// cannot reference a const). To avoid drift, edit all sites together.
-//
-// Bootstrap: `cargo insta test --accept -- --include-ignored`
-
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_scalar_projection_int32() {
     let ptx = build_ptx_for("SELECT int_col + 1 FROM t");
     assert_ptx_snapshot!("scalar_projection_int32", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_scalar_projection_float64() {
     let ptx = build_ptx_for("SELECT f64_col * 2.0 FROM t");
     assert_ptx_snapshot!("scalar_projection_float64", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_predicate_filter_int32() {
     let ptx = build_ptx_for("SELECT int_col FROM t WHERE int_col = 5");
     assert_ptx_snapshot!("predicate_filter_int32", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_predicate_filter_and_or() {
     let ptx = build_ptx_for("SELECT a FROM t WHERE a = 1 AND (b = 2 OR c = 3)");
     assert_ptx_snapshot!("predicate_filter_and_or", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_sum_int32_reduction_kernel() {
     let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Int32).expect("compile");
     assert_ptx_snapshot!("sum_int32_reduction_kernel", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_groupby_keys_kernel() {
     let ptx = compile_groupby_keys_kernel().expect("compile keys kernel");
     assert_ptx_snapshot!("groupby_keys_kernel", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_prefix_scan_kernel() {
     let ptx = compile_prefix_scan_kernel().expect("compile prefix scan");
     assert_ptx_snapshot!("prefix_scan_kernel", ptx);
 }
 
-/// Snapshot test for the Blelloch variant. Bootstrap with
-/// `cargo insta test --accept -- --include-ignored` — the snapshot will
-/// land alongside the Hillis-Steele one under `tests/snapshots/` and
-/// later refactors that drift the normalized PTX will produce a
-/// reviewable diff.
+/// Snapshot test for the Blelloch variant. Intentional changes are reviewed
+/// alongside the Hillis-Steele snapshot under `tests/snapshots/`.
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_prefix_scan_kernel_blelloch() {
     let ptx = compile_prefix_scan_kernel_blelloch().expect("compile blelloch");
     assert_ptx_snapshot!("prefix_scan_kernel_blelloch", ptx);
 }
 
 #[test]
-#[ignore = "bootstrap"]
 fn snapshot_float_atomic_min_kernel() {
     let ptx = compile_groupby_float_atomic_kernel(ReduceOp::Min, DataType::Float64)
         .expect("compile float atomic kernel");

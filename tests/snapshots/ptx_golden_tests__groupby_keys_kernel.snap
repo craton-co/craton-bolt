@@ -1,0 +1,65 @@
+---
+source: tests/ptx_golden_tests.rs
+---
+.version 7.5
+.target sm_70
+.address_size 64
+
+.visible .entry bolt_groupby_keys(
+	.param .u64 bolt_groupby_keys_param_0,
+	.param .u64 bolt_groupby_keys_param_1,
+	.param .u32 bolt_groupby_keys_param_2,
+	.param .u32 bolt_groupby_keys_param_3,
+	.param .u64 bolt_groupby_keys_param_4
+)
+{
+	.reg .pred  %p<8>;
+	.reg .b32   %r<24>;
+	.reg .b64   %rd<24>;
+	.reg .b64   %rl<16>;
+
+	mov.u32 %r{0}, %ctaid.x;
+	mov.u32 %r{1}, %ntid.x;
+	mov.u32 %r{2}, %tid.x;
+	mad.lo.s32 %r{3}, %r{0}, %r{1}, %r{2};
+	ld.param.u32 %r{4}, [bolt_groupby_keys_param_2];
+	setp.ge.u32 %p{0}, %r{3}, %r{4};
+	@%p{0} bra DONE;
+	ld.param.u32 %r{5}, [bolt_groupby_keys_param_3];
+	sub.s32 %r{6}, %r{5}, 1;
+	mul.lo.u32 %r{7}, %r{5}, 2;
+	ld.param.u64 %rd{0}, [bolt_groupby_keys_param_0];
+	cvta.to.global.u64 %rd{0}, %rd{0};
+	mul.wide.u32 %rd{1}, %r{3}, 8;
+	add.s64 %rd{2}, %rd{0}, %rd{1};
+	ld.global.nc.s64 %rl{0}, [%rd{2}];
+	mov.s64 %rl{1}, -7046029254386353131;
+	mul.lo.s64 %rl{2}, %rl{0}, %rl{1};
+	shr.u64 %rl{3}, %rl{2}, 32;
+	cvt.u32.u64 %r{8}, %rl{3};
+	and.b32 %r{9}, %r{8}, %r{6};
+	ld.param.u64 %rd{3}, [bolt_groupby_keys_param_1];
+	cvta.to.global.u64 %rd{3}, %rd{3};
+	mov.s64 %rl{4}, -9223372036854775808;
+	mov.u32 %r{10}, 0;
+PROBE_LOOP:
+	add.u32 %r{10}, %r{10}, 1;
+	setp.gt.u32 %p{1}, %r{10}, %r{7};
+	@%p{1} bra OVERFLOW;
+	mul.wide.u32 %rd{4}, %r{9}, 8;
+	add.s64 %rd{5}, %rd{3}, %rd{4};
+	atom.global.cas.b64 %rl{5}, [%rd{5}], %rl{4}, %rl{0};
+	setp.eq.s64 %p{2}, %rl{5}, %rl{4};
+	@%p{2} bra DONE;
+	setp.eq.s64 %p{3}, %rl{5}, %rl{0};
+	@%p{3} bra DONE;
+	add.s32 %r{9}, %r{9}, 1;
+	and.b32 %r{9}, %r{9}, %r{6};
+	bra PROBE_LOOP;
+OVERFLOW:
+	ld.param.u64 %rd{6}, [bolt_groupby_keys_param_4];
+	cvta.to.global.u64 %rd{6}, %rd{6};
+	atom.global.add.u32 %r{11}, [%rd{6}], 1;
+DONE:
+	ret;
+}

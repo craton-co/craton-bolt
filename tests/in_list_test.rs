@@ -3,11 +3,14 @@
 //! Integration tests for the SQL `IN (...)` list operator.
 //!
 //! The SQL frontend desugars `<probe> [NOT] IN (v1, v2, ..., vN)` into a
-//! chain of element-wise comparisons reusing existing binary operators:
+//! chain of element-wise comparisons reusing existing binary operators,
+//! wrapped in an explicit three-valued CASE:
 //!
 //!   * `IN`     → `(probe = v1) OR  (probe = v2) OR  ...`
 //!   * `NOT IN` → `(probe <> v1) AND (probe <> v2) AND ...`
 //!
+//! The CASE preserves SQL UNKNOWN for NULL probes/list elements instead of
+//! allowing the fused boolean path to materialise a stored false/true value.
 //! These tests pin the lowered plan shape (no GPU needed) and the
 //! cap / empty-list behaviour. They live alongside the other plan-
 //! shape tests (`having_test.rs`, `is_null_test.rs`).
@@ -41,7 +44,7 @@ fn t_provider() -> MemTableProvider {
 /// predicate. Tests that pin the IN-list desugaring all look at this
 /// single predicate slot.
 fn filter_predicate(plan: &LogicalPlan) -> &Expr {
-    fn find<'a>(p: &'a LogicalPlan) -> Option<&'a Expr> {
+    fn find(p: &LogicalPlan) -> Option<&Expr> {
         match p {
             LogicalPlan::Filter { predicate, .. } => Some(predicate),
             LogicalPlan::Project { input, .. }
@@ -53,6 +56,26 @@ fn filter_predicate(plan: &LogicalPlan) -> &Expr {
         }
     }
     find(plan).expect("expected a Filter node somewhere in the plan")
+}
+
+/// Extract the raw comparison chain from the strict three-valued wrapper:
+/// `CASE WHEN chain THEN TRUE WHEN NOT chain THEN FALSE ELSE NULL END`.
+fn strict_chain(expr: &Expr) -> &Expr {
+    let Expr::Case {
+        branches,
+        else_branch,
+    } = expr
+    else {
+        panic!("expected strict three-valued CASE wrapper, got {expr:?}");
+    };
+    assert_eq!(branches.len(), 2);
+    assert!(matches!(branches[0].1, Expr::Literal(Literal::Bool(true))));
+    assert!(matches!(branches[1].1, Expr::Literal(Literal::Bool(false))));
+    assert!(matches!(
+        else_branch.as_deref(),
+        Some(Expr::Literal(Literal::Null))
+    ));
+    &branches[0].0
 }
 
 /// Count the number of `BinaryOp::Eq` (or `NotEq`) leaves in the predicate
@@ -94,7 +117,7 @@ fn contains_op(e: &Expr, target: BinaryOp) -> bool {
 fn in_list_three_values_lowers_to_or_chain_of_eq() {
     let sql = "SELECT v FROM t WHERE k IN (1, 2, 3)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = filter_predicate(&plan);
+    let pred = strict_chain(filter_predicate(&plan));
 
     assert_eq!(
         count_op(pred, BinaryOp::Eq),
@@ -124,7 +147,7 @@ fn in_list_three_values_lowers_to_or_chain_of_eq() {
 fn in_list_five_values_produces_five_eq_leaves() {
     let sql = "SELECT v FROM t WHERE k IN (10, 20, 30, 40, 50)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = filter_predicate(&plan);
+    let pred = strict_chain(filter_predicate(&plan));
 
     assert_eq!(
         count_op(pred, BinaryOp::Eq),
@@ -172,7 +195,7 @@ fn in_list_five_values_produces_five_eq_leaves() {
 fn not_in_list_lowers_to_and_chain_of_neq() {
     let sql = "SELECT v FROM t WHERE k NOT IN (1, 2, 3)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = filter_predicate(&plan);
+    let pred = strict_chain(filter_predicate(&plan));
 
     assert_eq!(
         count_op(pred, BinaryOp::NotEq),
@@ -202,7 +225,7 @@ fn not_in_list_lowers_to_and_chain_of_neq() {
 fn in_list_single_value_collapses_to_single_eq() {
     let sql = "SELECT v FROM t WHERE k IN (42)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = filter_predicate(&plan);
+    let pred = strict_chain(filter_predicate(&plan));
 
     assert_eq!(count_op(pred, BinaryOp::Eq), 1);
     assert!(
@@ -273,7 +296,7 @@ fn in_list_at_cap_succeeds() {
     let values: Vec<String> = (0..64).map(|i| i.to_string()).collect();
     let sql = format!("SELECT v FROM t WHERE k IN ({})", values.join(", "));
     let plan = parse_sql(&sql, &t_provider()).expect("at-cap IN list should lower");
-    let pred = filter_predicate(&plan);
+    let pred = strict_chain(filter_predicate(&plan));
     assert_eq!(count_op(pred, BinaryOp::Eq), 64);
 }
 
@@ -300,11 +323,37 @@ fn in_list_composes_with_outer_and() {
         panic!("expected top-level AND, got {pred:?}");
     };
     // The IN-chain side has two Eqs and at least one OR.
-    let in_side = if count_op(left, BinaryOp::Eq) == 2 {
+    let wrapped_in_side = if matches!(left.as_ref(), Expr::Case { .. }) {
         left
     } else {
         right
     };
+    let in_side = strict_chain(wrapped_in_side);
     assert_eq!(count_op(in_side, BinaryOp::Eq), 2);
     assert!(contains_op(in_side, BinaryOp::Or));
+}
+
+#[test]
+fn in_list_with_null_has_explicit_unknown_else() {
+    let plan = parse_sql("SELECT v FROM t WHERE k IN (1, NULL, 3)", &t_provider()).expect("parse");
+    let wrapped = filter_predicate(&plan);
+    let chain = strict_chain(wrapped);
+    assert_eq!(count_op(chain, BinaryOp::Eq), 3);
+    assert!(
+        format!("{chain:?}").contains("Null"),
+        "NULL list element must remain in the strict comparison chain: {chain:?}"
+    );
+}
+
+#[test]
+fn not_in_list_with_null_has_explicit_unknown_else() {
+    let plan =
+        parse_sql("SELECT v FROM t WHERE k NOT IN (1, NULL, 3)", &t_provider()).expect("parse");
+    let wrapped = filter_predicate(&plan);
+    let chain = strict_chain(wrapped);
+    assert_eq!(count_op(chain, BinaryOp::NotEq), 3);
+    assert!(
+        format!("{chain:?}").contains("Null"),
+        "NULL list element must remain in the strict comparison chain: {chain:?}"
+    );
 }

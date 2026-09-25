@@ -68,7 +68,7 @@ fn reference_naive(col0: &[i32], col1: &[i32], vals: &[f64]) -> Vec<(i32, i32, f
         *acc.entry((col0[i], col1[i])).or_insert(0.0) += vals[i];
     }
     let mut out: Vec<(i32, i32, f64)> = acc.into_iter().map(|((k1, k2), v)| (k1, k2, v)).collect();
-    out.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    out.sort_by_key(|a| (a.0, a.1));
     out
 }
 
@@ -88,7 +88,7 @@ fn reference_packed(col0: &[i32], col1: &[i32], vals: &[f64]) -> Vec<(i32, i32, 
             (k1, k2, v)
         })
         .collect();
-    out.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    out.sort_by_key(|a| (a.0, a.1));
     out
 }
 

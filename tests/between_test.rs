@@ -73,7 +73,7 @@ fn strip_alias(e: &Expr) -> &Expr {
 }
 
 /// Assert `e` is `Expr::Binary { op, .. }` and return its (left, right).
-fn unwrap_binary<'a>(e: &'a Expr, op: BinaryOp) -> (&'a Expr, &'a Expr) {
+fn unwrap_binary(e: &Expr, op: BinaryOp) -> (&Expr, &Expr) {
     match strip_alias(e) {
         Expr::Binary {
             op: actual,

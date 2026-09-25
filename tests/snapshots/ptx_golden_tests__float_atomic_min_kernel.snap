@@ -1,0 +1,103 @@
+---
+source: tests/ptx_golden_tests.rs
+---
+.version 7.5
+.target sm_70
+.address_size 64
+
+.visible .entry bolt_groupby_agg(
+	.param .u64 bolt_groupby_agg_param_0,
+	.param .u64 bolt_groupby_agg_param_1,
+	.param .u64 bolt_groupby_agg_param_2,
+	.param .u64 bolt_groupby_agg_param_3,
+	.param .u32 bolt_groupby_agg_param_4,
+	.param .u32 bolt_groupby_agg_param_5
+)
+{
+	.reg .pred  %p<9>;
+	.reg .b32   %r<24>;
+	.reg .b64   %rd<24>;
+	.reg .b64   %rl<16>;
+	.reg .u32   %nstime;
+	.reg .b64   %vrl<8>;
+	.reg .f64   %vfd<8>;
+
+	mov.u32 %r{0}, %ctaid.x;
+	mov.u32 %r{1}, %ntid.x;
+	mov.u32 %r{2}, %tid.x;
+	mad.lo.s32 %r{3}, %r{0}, %r{1}, %r{2};
+	ld.param.u32 %r{4}, [bolt_groupby_agg_param_4];
+	setp.ge.u32 %p{0}, %r{3}, %r{4};
+	@%p{0} bra DONE;
+	ld.param.u32 %r{5}, [bolt_groupby_agg_param_5];
+	sub.s32 %r{6}, %r{5}, 1;
+	ld.param.u64 %rd{0}, [bolt_groupby_agg_param_0];
+	cvta.to.global.u64 %rd{0}, %rd{0};
+	mul.wide.u32 %rd{1}, %r{3}, 8;
+	add.s64 %rd{2}, %rd{0}, %rd{1};
+	ld.global.s64 %rl{0}, [%rd{2}];
+	mov.s64 %rl{1}, -7046029254386353131;
+	mul.lo.s64 %rl{2}, %rl{0}, %rl{1};
+	shr.u64 %rl{3}, %rl{2}, 32;
+	cvt.u32.u64 %r{7}, %rl{3};
+	and.b32 %r{8}, %r{7}, %r{6};
+	ld.param.u64 %rd{3}, [bolt_groupby_agg_param_1];
+	cvta.to.global.u64 %rd{3}, %rd{3};
+	mov.s64 %rl{4}, -9223372036854775808;
+	mul.lo.u32 %r{9}, %r{5}, 2;
+PROBE_LOOP:
+	mul.wide.u32 %rd{4}, %r{8}, 8;
+	add.s64 %rd{5}, %rd{3}, %rd{4};
+	ld.global.s64 %rl{5}, [%rd{5}];
+	setp.eq.s64 %p{1}, %rl{5}, %rl{0};
+	@%p{1} bra FOUND;
+	setp.eq.s64 %p{2}, %rl{5}, %rl{4};
+	@%p{2} bra DONE;
+	setp.eq.u32 %p{3}, %r{9}, 0;
+	@%p{3} bra DONE;
+	sub.u32 %r{9}, %r{9}, 1;
+	add.s32 %r{8}, %r{8}, 1;
+	and.b32 %r{8}, %r{8}, %r{6};
+	mov.u32 %nstime, 32;
+	nanosleep.u32 %nstime;
+	bra PROBE_LOOP;
+FOUND:
+	ld.param.u64 %rd{6}, [bolt_groupby_agg_param_3];
+	cvta.to.global.u64 %rd{6}, %rd{6};
+	mul.wide.u32 %rd{7}, %r{8}, 8;
+	add.s64 %rd{8}, %rd{6}, %rd{7};
+	ld.param.u64 %rd{9}, [bolt_groupby_agg_param_2];
+	cvta.to.global.u64 %rd{9}, %rd{9};
+	mul.wide.u32 %rd{10}, %r{3}, 8;
+	add.s64 %rd{11}, %rd{9}, %rd{10};
+	ld.global.f64 %vfd0, [%rd{11}];
+	mov.f64 %vfd3, 0d0000000000000000;
+	setp.eq.f64 %p{4}, %vfd0, %vfd3;
+	selp.f64 %vfd0, %vfd3, %vfd0, %p{4};
+CAS_LOOP:
+	ld.global.b64 %vrl0, [%rd{8}];
+	mov.b64 %vfd1, %vrl0;
+	mov.f64 %vfd3, 0d0000000000000000;
+	setp.eq.f64 %p{4}, %vfd1, %vfd3;
+	selp.f64 %vfd1, %vfd3, %vfd1, %p{4};
+	testp.notanumber.f64 %p{3}, %vfd0;
+	testp.notanumber.f64 %p{5}, %vfd1;
+	not.pred %p{6}, %p{3};
+	not.pred %p{7}, %p{5};
+	setp.lt.f64 %p{8}, %vfd0, %vfd1;
+	and.pred %p{8}, %p{8}, %p{6};
+	and.pred %p{8}, %p{8}, %p{7};
+	and.pred %p{5}, %p{5}, %p{6};
+	or.pred  %p{3}, %p{8}, %p{5};
+	selp.f64 %vfd2, %vfd0, %vfd1, %p{3};
+	mov.b64 %vrl1, %vfd2;
+	setp.eq.b64 %p{5}, %vrl1, %vrl0;
+	@%p{5} bra DONE;
+	atom.global.cas.b64 %vrl2, [%rd{8}], %vrl0, %vrl1;
+	setp.eq.b64 %p{6}, %vrl2, %vrl0;
+	@!%p{6} mov.u32 %nstime, 32;
+	@!%p{6} nanosleep.u32 %nstime;
+	@!%p{6} bra CAS_LOOP;
+DONE:
+	ret;
+}

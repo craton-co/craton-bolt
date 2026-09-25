@@ -60,7 +60,7 @@ fn cpu_shmem_sum_model(
     if n_rows == 0 || n_groups_usize == 0 {
         return vec![0.0; n_groups_usize];
     }
-    let n_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+    let n_blocks = n_rows.div_ceil(rows_per_block);
 
     // Final result; we fold block-local partials into this.
     let mut result = vec![0.0_f64; n_groups_usize];

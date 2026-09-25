@@ -96,7 +96,7 @@ fn cpu_tier2_sum_model(keys: &[i32], vals: &[f64]) -> Vec<(i32, f64)> {
         for &(k, v) in bucket {
             *table.entry(k).or_insert(0.0) += v;
         }
-        flat.extend(table.into_iter());
+        flat.extend(table);
     }
 
     // Sort by key ASC so the caller can compare deterministically.

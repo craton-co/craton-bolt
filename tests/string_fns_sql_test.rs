@@ -680,12 +680,10 @@ fn trim_runs_end_to_end() {
 
 // ---- GPU end-to-end: LIKE / NOT LIKE over a non-dict Utf8 column ------------
 //
-// ⚠️ UNVALIDATED device path. The matcher kernel
-// (`jit::string_kernel::compile_like_match_kernel`) has not run on GPU
-// hardware; these `#[ignore = "gpu:string"]` tests are the bring-up harness.
-// Until they pass on a real device, correctness is guaranteed by the host
-// mirror (`exec::string_like::like_match_row` vs `exec::like::PatternMatcher`)
-// and the PTX-shape tests in `jit::string_kernel`. Run with:
+// These `#[ignore = "gpu:string"]` tests are the canonical real-device
+// regression harness. They complement the host mirror
+// (`exec::string_like::like_match_row` vs `exec::like::PatternMatcher`) and
+// the PTX-shape tests in `jit::string_kernel`. Run with:
 //     cargo test --test string_fns_sql_test -- --ignored
 // on a GPU host.
 
