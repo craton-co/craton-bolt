@@ -307,32 +307,14 @@ For non-bare aggregate inputs that aren't covered by the pre kernel's outputs (r
 
 Each is a self-contained future change, not a blocker for the existing surface.
 
-## rust-cuda alternative emitter (experimental, opt-in)
+## Retired rust-cuda spike
 
-In addition to the default hand-emit PTX path (every kernel in
-`src/jit/*_kernel.rs`), the crate ships a second emitter that compiles
-Rust source code to PTX via the `rustc_codegen_nvvm` backend. This is
-gated behind `--features rust-cuda` and is currently *narrow in scope*:
-only the partition kernel (`src/jit/partition_kernel.rs` →
-`kernels/src/lib.rs::bolt_partition`) has a rust-cuda implementation.
+The former `rust-cuda` feature and `cuda_builder` build hook were removed.
+They depended on a stale, incompatible toolchain and could download and
+execute LLVM/libNVVM components during a build without repository-controlled
+integrity verification. The root build graph now has one maintained,
+deterministic PTX emitter and no build-time code-generator download.
 
-When the feature is enabled, `build.rs` invokes `cuda_builder` to
-compile `kernels/` to a PTX module (`OUT_DIR/partition.ptx`), and
-`compile_partition_kernel()` returns the embedded PTX bytes rather than
-the hand-emit string. Constants (`NUM_PARTITIONS`, `HASH_MULTIPLIER`)
-are duplicated between the two paths but verified equal via inline
-inspection (see `kernels/src/lib.rs:37` ≡ `src/jit/partition_kernel.rs:79`).
-
-Why a parallel path? The hand-emit PTX text emitter is fast,
-type-aware, and produces deterministic output — but it sits below the
-Rust type system. The rust-cuda path proves the same kernel can be
-written as readable Rust, with the cost of a much heavier toolchain
-(nightly + libNVVM + LLVM). The crate's default remains the hand-emit
-path; rust-cuda is a spike toward "everything in Rust" that may or may
-not become the default in a future release. The feature flag, the
-`kernels/` crate, and `build.rs`'s `cuda_builder` invocation are the
-authoritative reference for the current scope.
-
-Practical impact for downstream users: zero unless you opt in via
-`--features rust-cuda` AND have the rust-cuda toolchain installed (see
-`kernels/rust-toolchain.toml`).
+`kernels/` is retained as archived research source only. Cargo excludes it from
+the workspace and package; it is not build input and is not a supported
+downstream feature.

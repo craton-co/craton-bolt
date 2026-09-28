@@ -1,16 +1,14 @@
-# Opt-in env vars
+# Environment variables
 
 craton-bolt honours several env vars to switch experimental code paths on or
 to configure resource limits without recompiling. All defaults are
 conservative production-safe choices; nothing in this list needs to be set
 for ordinary use.
 
-The vars below were discovered by grepping `std::env::var(...)` across the
-crate; the source file column is the call site that actually reads the
-variable. This list aims to track every runtime/build var the crate reads,
-but the codebase moves quickly — treat it as best-effort, and re-grep
-`std::env::var` / `env::var_os` if you need the ground truth for a given
-release. (Pure path-resolution lookups like `HOME` / `LOCALAPPDATA` /
+The table is machine-checked in both directions against quoted `CRATON_*` and
+`BOLT_*` names in `src/` by `tests/doc_consistency_test.rs`. A code change that
+adds or removes a runtime knob must update this file in the same commit.
+(Pure path-resolution lookups like `HOME` / `LOCALAPPDATA` /
 `USERPROFILE` / `XDG_CACHE_HOME`, read only to compute the platform-default
 PTX-cache directory, are not configuration knobs and are omitted.)
 
@@ -43,9 +41,10 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_GPU_JOIN_TABLE_CAP_MB`     | driver-detected      | `64..=4096` | Override hash-table byte cap (MiB)              |
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
-| `BOLT_GPU_SORT`                  | off                  | `1`         | Opt into the GPU radix-sort path for `ORDER BY` |
+| `BOLT_GPU_SORT`                  | planner heuristic    | `1` / `0`   | Force a GPU attempt / force host for `ORDER BY` |
 | `BOLT_GPU_DISTINCT`              | off                  | `1`/`true`/`yes` | Opt into the GPU sort-based `DISTINCT` path |
-| `BOLT_GPU_STRING`                | off                  | `1`/`true`/`yes` | Opt into the (host-validated-only) GPU string device kernels |
+| `BOLT_GPU_STRING`                | on                   | `0`/`false`/`no` | Force validated GPU string shapes to their host mirrors |
+| `BOLT_LEGACY_ARITHMETIC`         | off                  | `1`         | Opt into historical zero/wrapping division semantics |
 | `BOLT_GPU_WINDOW`                | off                  | `1`         | Opt into the GPU window-function path           |
 | `BOLT_PREFIX_SCAN_ALGO`          | Hillis-Steele        | `blelloch` / `lookback` | Select the GPU prefix-scan kernel   |
 | `BOLT_HASH_ALGO`                 | linear-probe         | `robin_hood` / `rh` | Select the GROUP BY keys hash kernel    |
@@ -53,6 +52,11 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_SORT_USE_GRAPH`            | off                  | `1`         | Opt into CUDA-graph capture for bitonic sort    |
 | `BOLT_BENCH_GPU`                 | off                  | `1`         | Enable GPU paths in `cargo bench`               |
 | `BOLT_BENCH_THRESHOLD`           | off                  | `1`         | Enable the Utf8-sort threshold bench            |
+| `BOLT_SCALING_ROWS`              | bounded sweep        | CSV rows    | Override real-GPU scaling row counts            |
+| `BOLT_VRAM_PRESSURE_ROWS`        | unset                | rows        | Add one near-capacity GPU benchmark point       |
+| `BOLT_REGRESSION_WRITE_BASELINE` | unset                | path        | Write host benchmark medians as JSON            |
+| `BOLT_REGRESSION_BASELINE`       | unset                | path        | Compare host benchmark medians with JSON        |
+| `BOLT_REGRESSION_THRESHOLD_PCT`  | `5`                  | percent     | Report slowdowns above this percentage          |
 | `CUDA_PATH`                      | toolkit-default      | path        | Build-time CUDA toolkit location (build.rs)     |
 | `CARGO_FEATURE_CUDA_STUB`        | unset                | `1`         | Build-time: skip CUDA discovery (build.rs)      |
 
@@ -181,27 +185,14 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 ## GPU sort
 
 ### `BOLT_GPU_SORT`
-- **Default**: off (treats unset / anything other than exactly `"1"` as
-  disabled; the value is trimmed before the comparison)
-- **Type**: must equal exactly `"1"` to enable — `"true"` / `"yes"` / `"on"`
-  are deliberately **not** accepted so the gate stays unambiguous
-- **What**: Opts the `ORDER BY` executor into the GPU radix-sort path
-  (v0.7). When set, the executor *may* route a sort through the radix kernel
-  for supported key dtypes (`Int32` / `Int64`, ASC or DESC, including
-  multi-key); when unset (the default) the historical bitonic / host sort
-  paths run instead. Nullable key columns and unsupported dtypes
-  (`Float*` / `Bool` / `Utf8`) always fall back regardless of this var.
-- **When**: Enable to exercise or benchmark the radix path on large
-  single- or multi-key integer `ORDER BY`s. Left off by default because the
-  bitonic / host paths are the bake-tested steady-state until the radix path
-  has more production mileage.
-- **Notes**: Latched lazily on first read into a process-wide atomic, so the
-  value is effectively frozen for the process lifetime once a sort runs. The
-  dtype-support check is consulted before the env var, so an unsupported sort
-  never even reads it.
-- **Source**: `src/jit/sort_kernel_radix.rs` (env var name constant
-  `BOLT_GPU_SORT_ENV`, line 150); dispatch gate in `src/exec/sort.rs`
-  (`try_gpu_sort_radix`).
+- **Default**: planner heuristic.
+- **Type**: exactly `1` forces a GPU attempt; exactly `0` forces host; unset or
+  any other value delegates to the planner.
+- **What**: The default planner selects validated radix sorting for large,
+  non-null Int32/Int64 single- and multi-key ASC/DESC shapes. Unsupported
+  layouts fall back to host. This variable is an operational override, not a
+  feature gate.
+- **Source**: `src/exec/sort.rs::gpu_sort_override`.
 
 ## JIT module cache
 
@@ -270,38 +261,38 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 ## GPU DISTINCT and window paths
 
 ### `BOLT_GPU_DISTINCT`
-- **Default**: off
-- **Type**: truthy string — `1`, `true`, or `yes` (case-insensitive, trimmed)
-  enable; anything else (including unset) is off
-- **What**: Opts `DISTINCT` into the GPU sort-based dedup path for a single
+- **Default**: on
+- **Type**: `0`, `false`, or `no` (case-insensitive, trimmed) forces host;
+  every other value leaves planner selection enabled
+- **What**: Controls the GPU sort-based dedup path for a single
   fixed-width primitive key (`Int32` / `Int64` / `Float32` / `Float64`). Utf8
   and wide multi-key shapes always fall back to the host path regardless of
   this var, as does any input below the device sort's own row threshold.
-- **When**: Enable to exercise or benchmark the device `DISTINCT` path. Left
-  off by default so the host path stays the production default until the
-  device round-trip has soak time on real hardware. Mirrors the `BOLT_GPU_SORT`
-  gate convention.
+- **When**: Set an explicit false value only for differential diagnosis.
+  Unsupported shapes and capacity declines always fall back to the host.
 - **Source**: `src/exec/distinct.rs::gpu_distinct_enabled` (line 419).
 
 ### `BOLT_GPU_STRING`
-- **Default**: off
-- **Type**: truthy string — `1`, `true`, or `yes` (case-insensitive, trimmed)
-  enable; anything else (including unset) is off
-- **What**: Single gate for **every GPU string device path**: the per-row
-  `LIKE` / `NOT LIKE` / `ILIKE` matcher (`StringLikeFilter` /
-  `compile_like_match_kernel`) and the `UPPER` / `LOWER` / `CONCAT` /
-  `SUBSTRING` / `TRIM` two-pass producers in `src/exec/string_project.rs`. When
-  off (the default) those operations take the **host** code path, which is the
-  correctness path. The device kernels are **host-validated only** — they have
-  never been executed on GPU hardware as of v0.7.0 (CI builds with no CUDA
-  device), so the gate exists purely so a hardware bring-up can opt the device
-  kernels in for validation without editing code.
-- **When**: Enable only on a GPU host doing string-kernel bring-up /
-  validation. Leave off for ordinary use. Mirrors the `BOLT_GPU_SORT` /
-  `BOLT_GPU_DISTINCT` gate convention.
-- **Source**: `src/exec/string_like.rs::gpu_string_enabled` (env var name
-  constant `BOLT_GPU_STRING_ENV`, line 60); re-exported (with
-  `gpu_string_enabled`) from `src/exec/string_project.rs`.
+- **Default**: on.
+- **Type**: `0`, `false`, or `no` (case-insensitive, trimmed) forces host;
+  every other value leaves validated device paths enabled.
+- **What**: Controls hardware-validated non-dictionary
+  EXACT/PREFIX/SUFFIX/CONTAINS LIKE and ASCII UPPER/LOWER. Unsupported patterns,
+  Unicode case mapping, SUBSTRING, TRIM, and CONCAT remain host paths
+  regardless of this value.
+- **Source**: `src/exec/string_like.rs::gpu_string_enabled`.
+
+### `BOLT_LEGACY_ARITHMETIC`
+- **Default**: off.
+- **Type**: exactly `1` enables.
+- **What**: Restores the historical GPU convention where integer/Decimal128
+  division by zero produces zero and integer `INT_MIN / -1` wraps. With the
+  default off, integer invalid rows are NULL where the host evaluator can
+  represent them, and unsupported nullable aggregate/Decimal shapes are
+  rejected instead of silently returning non-standard values.
+- **When**: Temporary compatibility only for applications that explicitly
+  depended on pre-fix results.
+- **Source**: `src/plan/physical_plan.rs::legacy_arithmetic_enabled`.
 
 ### `BOLT_GPU_WINDOW`
 - **Default**: off
@@ -314,8 +305,8 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 - **When**: Enable to exercise or benchmark the device window path. Off by
   default because device behavior is unverifiable in CI without a GPU. Mirrors
   the `BOLT_GPU_SORT` gate convention.
-- **Source**: `src/exec/window.rs::try_execute_window_gpu` (env var name
-  constant `BOLT_GPU_WINDOW_ENV`, line 1037; gate at line 1419).
+- **Source**: `src/exec/window.rs::try_execute_window_gpu` (env-var-name
+  constant BOLT_GPU_WINDOW_ENV).
 
 ## Benchmark gates
 
@@ -339,6 +330,42 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 - **When**: Set when explicitly running the Utf8-sort threshold bench
   (`cargo bench --bench utf8_sort_bench`).
 - **Source**: `benches/utf8_sort_bench.rs::bench_enabled` (line 84).
+
+### `BOLT_SCALING_ROWS`
+- **Default**: `1000,10000,100000,1000000,10000000`
+- **Type**: comma-separated positive row counts
+- **What**: Replaces the default row sweep in the real-device scaling
+  benchmark.
+- **Source**: `benches/scaling_benchmarks.rs::configured_rows`.
+
+### `BOLT_VRAM_PRESSURE_ROWS`
+- **Default**: unset
+- **Type**: one positive row count
+- **What**: Adds a deliberately near-capacity point to the scaling benchmark.
+  Select it from the current device's free VRAM; allocation failure must
+  remain bounded and diagnostic.
+- **Source**: `benches/scaling_benchmarks.rs::configured_rows`.
+
+### `BOLT_REGRESSION_WRITE_BASELINE`
+- **Default**: unset
+- **Type**: filesystem path
+- **What**: Writes the regression benchmark's current host-side medians as
+  JSON.
+- **Source**: `benches/regression.rs`.
+
+### `BOLT_REGRESSION_BASELINE`
+- **Default**: unset
+- **Type**: filesystem path
+- **What**: Reads a JSON median baseline and reports per-benchmark comparison
+  results.
+- **Source**: `benches/regression.rs`.
+
+### `BOLT_REGRESSION_THRESHOLD_PCT`
+- **Default**: `5`
+- **Type**: non-negative floating-point percentage
+- **What**: Sets the slowdown percentage reported as a regression when
+  `BOLT_REGRESSION_BASELINE` is active.
+- **Source**: `benches/regression.rs`.
 
 ## Build-time
 
@@ -426,8 +453,7 @@ path in every case.
   the per-substage launches each call. Falls back to ordinary launches when
   off.
 - **Source**: `src/exec/gpu_sort.rs::sort_uses_graph`
-  (env var name constant `BOLT_SORT_USE_GRAPH_ENV`, line 1722;
-  gate consulted at line 1942).
+  (env-var-name constant BOLT_SORT_USE_GRAPH_ENV).
 
 ## Query planning and execution limits
 

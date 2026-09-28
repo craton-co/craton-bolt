@@ -50,38 +50,56 @@ symbols resolved at link time), but `cargo test` / `cargo bench` will
 fail at link time because they actually try to resolve `nvcuda.dll` /
 `libcuda.so`.
 
-The `#[ignore]`-marked tests in `tests/memory_tests.rs` and
-`tests/e2e_tests.rs` are the ones that genuinely launch kernels; they
-require a real GPU and run with `cargo test --features cuda-stub --
---ignored` on a CUDA-equipped host (the stub feature still gates the
-link to `libcuda` — drop `--no-default-features` / `--features
-cuda-stub` to link the real driver).
+Tests whose ignore reason starts with `gpu:` genuinely launch kernels. They
+require a real device and run with the default `cudarc` backend:
+
+```bash
+BOLT_BENCH_GPU=1 cargo test -- --ignored --test-threads=1
+```
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy`,
-`cargo check`, `cargo test --lib --tests`, and `cargo test --doc` across
-the matrix `{ubuntu-latest, windows-latest} × {stable, 1.74}`, all under
-the `cuda-stub` feature so no CUDA toolkit is needed on the runners.
-Dependabot tracks Cargo and GitHub-Actions updates weekly.
+The repository has one workflow, `.github/workflows/ci.yml`, and one faithful
+local rehearsal, `ci_local.sh`.
+
+### CI truth table
+
+| Gate | Hosted CI | `ci_local.sh` | Blocking |
+|------|-----------|---------------|----------|
+| fmt, strict clippy, host tests, doctests | Linux/Windows; stable + MSRV where applicable | same `cuda-stub` flags | yes |
+| default `cudarc`, `flight`, `substrait` | compile plus executable feature smokes | same | yes |
+| rustdoc public API snapshot | pinned cargo-public-api + nightly | identical | yes |
+| DuckDB/reference and property tests | separate `reference-tests` shard | same | yes |
+| line coverage | `--lib --tests`, `src/cuda` excluded, minimum 50% | identical | yes |
+| cargo-deny licenses/advisories/all-features | pinned setup | locked local tool install | yes |
+| package/publish dry-run | clean tree, no `--allow-dirty` | identical | yes |
+| live CUDA | self-hosted runner, serialized ignored suite | when `BOLT_LOCAL_GPU=1` | yes |
+
+All third-party actions are pinned by commit SHA. A missing self-hosted GPU
+runner leaves the required job queued; it cannot report a false-green result.
+Dependabot tracks Cargo and GitHub Actions updates weekly.
 
 ## Build commands
 
 ```bash
-# Full clean build (~7 min cold from scratch because polars pulls in a lot).
+# Full default build.
 cargo build --release
 
 # Library only.
 cargo build --lib
 
-# Quick check.
-cargo check --lib --tests --benches
+# Quick ordinary check (heavy reference engines are excluded).
+cargo check --lib --tests
+
+# DuckDB/Polars reference shards.
+cargo test --features reference-tests --test diff_duckdb
+cargo bench --features reference-benches --bench query_benchmarks
 
 # Format.
 cargo fmt
 
-# Lint.
-cargo clippy --all-targets
+# CI-equivalent lint.
+cargo clippy --lib --tests --no-default-features --features cuda-stub -- -D warnings
 ```
 
 ## Test commands
@@ -97,8 +115,8 @@ cargo test --lib
 cargo test --test e2e_tests
 cargo test --test memory_tests
 
-# Live-GPU tests. Requires an actual NVIDIA GPU.
-cargo test -- --ignored
+# Live-GPU tests. Requires an actual NVIDIA GPU and must be serialized.
+BOLT_BENCH_GPU=1 cargo test -- --ignored --test-threads=1
 
 # Run a single test by name (substring match).
 cargo test ptx_for_trivial_select_contains
@@ -108,17 +126,19 @@ cargo test ptx_for_trivial_select_contains
 
 1. **Pure-host unit tests** (`#[test]`, no `#[ignore]`). Always run. Examples: `pack_keys_two_int32`, `sql_substring_unicode_round_down_at_start`, `unify_numeric` behaviour, dictionary dedup.
 2. **PTX-shape tests** (`#[test]`, no `#[ignore]`). Always run. Emit a PTX string and assert that it contains specific instructions / labels / parameter declarations. They don't need a GPU but catch JIT regressions.
-3. **Live-GPU tests** (`#[test] #[ignore]`). Skipped by default. Need both `cuda.lib` AND an actual GPU. Marked with `#[ignore = "requires CUDA device — run with cargo test -- --ignored"]`.
+3. **Live-GPU tests** (`#[test] #[ignore = "gpu:…"]`). Skipped by ordinary
+   loops and mandatory in the self-hosted gate. They require `cuda.lib`, an
+   actual GPU, and `--test-threads=1`.
 
 ## Benchmark commands
 
 ```bash
-# CPU-only benchmarks (planner, codegen, CPU reference, Polars).
+# Ordinary benchmarks.
 cargo bench
 
-# Add the GPU engine path. Requires an actual NVIDIA GPU.
-BOLT_BENCH_GPU=1 cargo bench           # bash
-$env:BOLT_BENCH_GPU="1"; cargo bench   # PowerShell
+# Add reference engines and the GPU path.
+BOLT_BENCH_GPU=1 cargo bench --features reference-benches           # bash
+$env:BOLT_BENCH_GPU="1"; cargo bench --features reference-benches   # PowerShell
 
 # A single bench group.
 cargo bench --bench query_benchmarks -- plan

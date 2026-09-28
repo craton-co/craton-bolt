@@ -205,21 +205,43 @@ target/criterion/
 
 Open `target/criterion/report/index.html` for the top-level summary.
 
-### What's not yet measured
+### Scaling and VRAM-pressure protocol
+
+[`benches/scaling_benchmarks.rs`](../benches/scaling_benchmarks.rs) provides a
+real-device fused filter/projection sweep. It defaults to 1 K, 10 K, 100 K,
+1 M, and 10 M rows; an explicit list can extend it through 100 M:
+
+```bash
+BOLT_BENCH_GPU=1 \
+BOLT_SCALING_ROWS=1000,10000,100000,1000000,10000000,100000000 \
+cargo bench --bench scaling_benchmarks
+```
+
+For capacity behavior, add one point selected from the installed device's free
+VRAM and record both total/free VRAM before the run:
+
+```bash
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+BOLT_BENCH_GPU=1 BOLT_VRAM_PRESSURE_ROWS=100000000 \
+cargo bench --bench scaling_benchmarks
+```
+
+The pressure point must either complete or return a bounded
+`BoltError::GpuCapacity`/host fallback; a driver fault or process OOM is a
+failure. Cross-GPU comparisons belong in separate rows with exact model,
+driver, toolkit, power mode, and row sweep. The current canonical numbers are
+RTX 2060-only and must not be generalized to another GPU class.
+
+### Remaining measurement detail
 
 - **Per-shape `engine_execute` breakdown.** Right now `engine_execute`
   is a single end-to-end measurement. A useful extension is to break
   it into the constituent costs: kernel launch latency, h2d transfer,
   compute, d2h transfer, and (for `filtered`) compaction or gather
   overhead.
-- **Long-tail / large-N sweep.** The lightweight suite is fixed at
-  1 M rows; the heavy suite at 50 M; the h2o.ai suite at 10 M. A
-  full throughput-vs-row-count curve from ~1 K up to ~100 M would be
-  the natural follow-up.
-- **Memory-pressure tests.** No measurements anywhere near VRAM
-  limits. A 100 M-row dataset (~3.2 GB at the lightweight schema)
-  starts to stress consumer GPUs and is the regime where memory-
-  management decisions show up.
+- **Additional GPU classes.** The reproducible harness now covers scaling and
+  pressure, but this checkout has evidence from one RTX 2060 only. A second
+  model's results must be measured on that hardware, never estimated.
 
 ---
 

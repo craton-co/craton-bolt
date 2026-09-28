@@ -2,20 +2,17 @@
 
 # Maintainers
 
-This file lists the current maintainers of **Craton Bolt** while the GitHub
-team handle referenced in [`CODEOWNERS`](CODEOWNERS)
-(`@craton-co/craton-bolt-maintainers`) is being provisioned.
+This file lists the current maintainers of **Craton Bolt**. The individual
+GitHub account below is also the live owner in [`CODEOWNERS`](CODEOWNERS), so
+review requests are satisfiable without a placeholder organization team.
 
 ## Current maintainers
 
 | Maintainer                | Contact                              |
 |---------------------------|--------------------------------------|
-| Craton Software Company   | opensource@craton.com.ar        |
+| [@victor-craton](https://github.com/victor-craton) | opensource@craton.com.ar |
 
-## Interim review process
-
-Until the GitHub team exists, the auto-review-request in `CODEOWNERS` is a
-no-op. In the meantime:
+## Review process
 
 - Open your pull request as normal, following
   [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -28,6 +25,3 @@ no-op. In the meantime:
 Maintainership is granted by existing maintainers based on sustained,
 high-quality contributions. There is no formal application process — keep
 contributing, and we will reach out.
-
-When the GitHub team is provisioned, this file will be updated with
-individual handles and `CODEOWNERS` will begin to auto-request reviews.

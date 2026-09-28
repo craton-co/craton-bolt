@@ -4,6 +4,11 @@ A narrative walk through Craton Bolt from `cargo add` to a working `GROUP BY`.
 If you read this end-to-end you should reach a successful query in under ten
 minutes; if you don't, that's a bug — please file an issue.
 
+> **Pre-1.0 execution contract.** Craton Bolt is not production-ready.
+> “Supported SQL” does not imply device-only execution: inspect
+> `QueryHandle::planned_execution_tier()` for `Gpu`, `Host`, or `Hybrid`, and
+> review [`LIMITATIONS.md`](LIMITATIONS.md) before relying on a workload.
+
 For the exhaustive SQL surface see
 [`SQL_REFERENCE.md`](SQL_REFERENCE.md). For the architectural picture
 underneath the API see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the env
@@ -167,8 +172,8 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   the date type / timestamp unit + timezone is preserved), in both the
   scalar and `GROUP BY` paths; `SUM` over a temporal column is rejected by
   design (see `SQL_REFERENCE.md`).
-- Scalar expressions: arithmetic and comparisons (GPU), including
-  `Decimal128` `+` / `-` / `*` / `/` and mixed Decimal/integer arithmetic
+- Scalar expressions: arithmetic and comparisons, including
+  `Decimal128` `+` / `-` / `*` and mixed Decimal/integer arithmetic
   (GPU; scale-aligned comparisons too), `IN` / `BETWEEN` (desugar to GPU
   comparison chains), `CASE` / `CAST` / `COALESCE` / `NULLIF` (GPU for
   numeric / `Bool` / `Date32` / `Timestamp` **and `Decimal128`** results — the
@@ -179,19 +184,14 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   GPU lowering), `TRY_CAST` / `SAFE_CAST` (NULL-on-failure, host-evaluated;
   Float↔`Decimal128` rejected at type-check) and `CAST(... FORMAT '<pattern>')`
   (host-evaluated temporal⇄string, bounded pattern vocab),
-  `LIKE` (GPU over a **dictionary** `Utf8` column via integer index-membership;
-  the non-dictionary device matcher is host-validated-only and host by default —
-  see below), `||` (host-side), `NOT` (GPU). String
-  functions: `LENGTH` (GPU integer output); `UPPER` / `LOWER`, `SUBSTRING`
-  (literal args) and single-arg `TRIM` over a bare `Utf8` scan run on the
-  **host** by default via the `StringProject` producer (custom-chars `TRIM` and
+  `LIKE` (GPU over dictionary inputs and validated non-dictionary shapes),
+  `||` (host-side), `NOT` (host-side). String functions: `LENGTH` (GPU
+  integer output); ASCII `UPPER` / `LOWER` use their validated device path,
+  while Unicode case mapping, `SUBSTRING` (literal args), and single-arg
+  `TRIM` over a bare `Utf8` scan run on the host (custom-chars `TRIM` and
   computed `SUBSTRING` args fall back to the host `Project`); `CONCAT` is
-  host-side and NULL-if-any-arg-NULL. The matching GPU **string device
-  producers** (`UPPER` / `LOWER` / `CONCAT` / `SUBSTRING` / `TRIM`) and the
-  non-dictionary `LIKE` matcher are implemented and PTX-shape-tested but
-  **host-validated only** as of v0.7.0 — they are off by default and reached
-  only behind the opt-in `BOLT_GPU_STRING` env var (see
-  [`ENV_VARS.md`](ENV_VARS.md)).
+  host-side and NULL-if-any-arg-NULL. `BOLT_GPU_STRING=0` forces validated
+  device string shapes to their host mirrors for differential diagnosis.
 - Joins: one or more `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`
   JOINs per `SELECT`, with `ON` / `USING (...)` / `NATURAL` constraints
   (equi-keys only). Each shape has a gated GPU fast path that falls back
@@ -227,16 +227,15 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   per-type GPU-lowering caveats in `SQL_REFERENCE.md`). `Decimal128`,
   `Date32`, and `Timestamp` columns have GPU gather (filter / compaction)
   and upload wired, so they survive a filtered query end-to-end.
-  `Decimal128` arithmetic (`+` / `-` / `*` / `/`, mixed with integers),
+  `Decimal128` arithmetic (`+` / `-` / `*`, mixed with integers),
   scale-aligned comparisons, and integer↔decimal / decimal-rescale CAST now
   run on the GPU; temporal `MIN` / `MAX` run on the GPU and preserve the date
   type / timestamp unit + timezone.
 - Utf8 predicates: equality / inequality against string literals (folded
   to integer comparisons on the dictionary index at plan time, GPU),
-  `LIKE` (a **dictionary** `Utf8` column folds to a GPU integer
-  index-membership predicate; a non-dictionary column uses the
-  host-validated-only device matcher, host by default, opt-in via
-  `BOLT_GPU_STRING` — see [`ENV_VARS.md`](ENV_VARS.md)), and — as of v0.7 —
+  `LIKE` (dictionary columns fold to GPU integer membership; supported
+  non-dictionary shapes use the hardware-validated device matcher by default,
+  with `BOLT_GPU_STRING=0` as force-host), and — as of v0.7 —
   **ordering comparisons against a string literal** (`WHERE name < 'M'`,
   GPU via byte/binary collation; not locale/ICU), and **ordering of two Utf8
   columns** (`a < b`, GPU via a cross-dictionary rank compare — a NULL on
@@ -407,7 +406,7 @@ craton-bolt = { version = "0.7", features = ["pool-sharded"] }
 | Feature        | Default | What it does                                                            |
 | -------------- | ------- | ----------------------------------------------------------------------- |
 | `cuda-stub`    | off     | Build without linking CUDA. Every FFI entry returns `CUDA_ERROR_STUB`. Useful for `cargo check` on a CUDA-less host or docs.rs. Cannot execute queries. |
-| `cudarc`       | off     | Route low-level driver calls through the `cudarc` crate instead of the hand-rolled FFI. Stage-1 spike; see `docs/CUDARC_ADOPTION.md`. |
+| `cudarc`       | on      | Supported default primary-context and CUDA driver adapter; see `docs/CUDARC_ADOPTION.md`. |
 | `pool-sharded` | off     | Swap the memory-pool bucket map from a `DashMap` to a fixed 32-way mutex-array shard. Turn on only if profiling shows DashMap contention. |
 | `pool-watcher` | off     | Spawn a background thread that polls device memory and proactively evicts when free / total drops below `BOLT_POOL_WATCH_LOW_WATER_FRAC` (default 10%). Off by default — adds a permanently-resident thread. |
 

@@ -27,7 +27,10 @@ git tag -a vX.Y.Z -m "vX.Y.Z — <one-line release summary>"
 git push origin vX.Y.Z
 ```
 
-GitHub Actions will pick up the tag; confirm the CI run is green before proceeding.
+The current workflow does not trigger on tags. Before creating the tag,
+confirm the exact commit is green on `dev`/`main`; after pushing the tag,
+verify it resolves to that already-green commit. Release automation is not
+implied by the tag.
 
 ## 3. Publishing to crates.io
 
@@ -73,7 +76,7 @@ the publish step:
 | Secret | Purpose |
 |--------|---------|
 | `CRATES_IO_TOKEN` | `cargo publish` in CI |
-| `CODECOV_TOKEN` | Coverage upload (once wired) |
+| `CODECOV_TOKEN` | Optional upload for the already-wired Codecov step; the local 50% line gate remains authoritative |
 
 ## 7. Announcing the release
 

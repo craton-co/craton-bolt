@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Change to the script's directory so it runs correctly regardless of where it's called
 cd "$(dirname "$0")"
@@ -27,12 +27,13 @@ RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/ap
 
 # Add Rust components
 RUN rustup component add rustfmt clippy llvm-tools-preview
+RUN rustup toolchain install nightly-2026-04-03 --profile minimal
 
-# Install cargo-binstall (A tool to download pre-compiled cargo binaries directly)
-RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-
-# Fast-install cargo-llvm-cov and cargo-deny using pre-compiled binaries
-RUN cargo binstall -y cargo-llvm-cov cargo-deny
+# Build the audited tools through Cargo rather than executing a network-fetched
+# shell installer in the CI image.
+RUN cargo install --locked cargo-llvm-cov --version 0.6.16 \
+ && cargo install --locked cargo-deny --version 0.20.2 \
+ && cargo install --locked cargo-public-api --version 0.52.0
 EOF
 
 # Build images in parallel
@@ -117,8 +118,8 @@ TESTS_PID=$!
   _step 'rustfmt check'
   cargo fmt --all -- --check
 
-  _step 'clippy (advisory)'
-  cargo clippy --lib --tests --features cuda-stub --no-default-features || echo '⚠️ Clippy failed but is non-blocking'
+  echo '>>> Running clippy (blocking)'
+  cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings
 
   _step 'cargo check (lib, strict)'
   RUSTFLAGS='-D warnings' cargo check --lib --features cuda-stub --no-default-features
@@ -126,32 +127,31 @@ TESTS_PID=$!
   _step 'cargo check --features cudarc'
   cargo check --lib --features cudarc --no-default-features
 
-  _step 'feature build (cuda-stub,flight)'
-  cargo check --lib --tests --no-default-features --features cuda-stub,flight
+  echo '>>> Running feature tests (flight + substrait)'
+  cargo test --lib --tests --no-default-features --features cuda-stub,flight
+  cargo test --lib --tests --no-default-features --features cuda-stub,substrait
 
-  _step 'feature build (cuda-stub,substrait)'
-  cargo check --lib --tests --no-default-features --features cuda-stub,substrait
+  echo '>>> Running public API snapshot gate'
+  bash scripts/check_public_api.sh
 
   _step 'cargo doc'
   cargo doc --no-default-features --features cuda-stub --no-deps
 
-  _step 'cargo publish --dry-run'
-  cargo publish --dry-run --allow-dirty --no-default-features --features cuda-stub
+  echo '>>> Running package (cargo publish --dry-run)'
+  cargo publish --dry-run --no-default-features --features cuda-stub
 
-  _step 'cargo llvm-cov'
-  cargo llvm-cov --no-default-features --features cuda-stub --lib --lcov --output-path lcov.info || echo '⚠️ Coverage failed but is non-blocking'
-  cargo llvm-cov --no-default-features --features cuda-stub --lib --summary-only || true
+  echo '>>> Running coverage (host, >=50% lines)'
+  cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
+  cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
 
   _step 'cargo deny (licenses + bans)'
   cargo deny check licenses bans
 
-  _step 'cargo deny (advisories)'
-  cargo deny check advisories || echo '⚠️ cargo-deny advisories failed but is non-blocking'
+  echo '>>> Running cargo deny (advisories, blocking)'
+  cargo deny check advisories
 
-  _step 'cargo deny (all-features)'
-  cargo deny --all-features check advisories licenses bans || echo '⚠️ cargo-deny all-features failed but is non-blocking'
-
-  rm -f /ci_tmp/others_failed_step
+  echo '>>> Running cargo deny (all-features, blocking)'
+  cargo deny --all-features check advisories licenses bans
 " 2>&1 | sed 's/^/[OTHERS] /'
     echo "${PIPESTATUS[0]}" > "$TMP_DIR/others.exit"
 ) &
@@ -189,8 +189,17 @@ if [[ $TESTS_EXIT -ne 0 || $OTHERS_EXIT -ne 0 ]]; then
     exit 1
 fi
 
+if [[ "${BOLT_LOCAL_GPU:-0}" == "1" ]]; then
+    echo ">>> Running blocking native GPU lane"
+    BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored --test-threads=1
+    BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests \
+        --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest \
+        -- --ignored --test-threads=1
+else
+    echo "GPU lane skipped. Set BOLT_LOCAL_GPU=1 on a CUDA host for full CI parity."
+fi
+
 echo ""
 echo "========================================"
 echo " LOCAL CI COMPLETED SUCCESSFULLY!"
 echo "========================================"
-echo "(Note: gpu-integration tests were skipped as they require a self-hosted physical NVIDIA GPU)"
