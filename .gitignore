@@ -1,5 +1,8 @@
-# Rust build artifacts
+# Rust build artifacts. The glob also covers the side target directories a
+# secondary toolchain needs (e.g. an MSRV or coverage run pointed at
+# `target-msrv/` via CARGO_TARGET_DIR), which are build output just the same.
 /target/
+/target-*/
 
 # Claude Code worktrees and session state
 .claude/

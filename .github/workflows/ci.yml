@@ -32,7 +32,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        toolchain: ["stable", "1.74"]
+        # The MSRV leg must match `rust-version` in Cargo.toml; the
+        # `msrv_is_consistent_across_repo` document-consistency test enforces
+        # that. 1.85 is the floor imposed by the committed Cargo.lock (a locked
+        # dependency declares `edition = "2024"`, which older Cargo cannot even
+        # parse), not by this crate's own syntax.
+        toolchain: ["stable", "1.85"]
 
     steps:
       - name: Checkout
@@ -425,5 +430,20 @@ jobs:
           # command makes ordinary test iteration substantially cheaper.
           BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored --test-threads=1
           BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest -- --ignored --test-threads=1
+        env:
+          RUSTFLAGS: ""
+
+      # The optional-subsystem end-to-end fixtures need BOTH a CUDA context
+      # (they build a real Engine) and their own cargo feature, so they are
+      # invisible to every other lane: the hosted feature lane runs only their
+      # host tier, and the two GPU commands above do not enable `flight` /
+      # `substrait`. Run their #[ignore]-gated tier here.
+      - name: Install protoc (substrait codegen)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: cargo test (GPU, optional subsystems)
+        run: |
+          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,flight --test flight_e2e -- --ignored --test-threads=1
+          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,substrait --test substrait_e2e -- --ignored --test-threads=1
         env:
           RUSTFLAGS: ""

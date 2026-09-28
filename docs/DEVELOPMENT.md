@@ -12,7 +12,7 @@ building.
 
 | Tool                     | Why                                                                     |
 |--------------------------|-------------------------------------------------------------------------|
-| Rust 1.74+               | The crate uses 2021 edition; nothing newer is required.                 |
+| Rust 1.85+               | MSRV, built by its own CI matrix leg. The crate is 2021 edition; the floor comes from a locked dependency that declares `edition = "2024"`. |
 | `cargo`                  | Standard.                                                               |
 | CUDA Toolkit 12.x        | Provides `cuda.lib` (Windows) / `libcuda.so` (Linux) for the linker.    |
 | NVIDIA driver matching the toolkit | Required only for running tests / benchmarks on a real GPU.   |

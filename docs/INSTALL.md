@@ -11,7 +11,7 @@ For day-to-day build / test / bench commands once you're set up, see
 
 | Tool                                      | Why                                                                          |
 |-------------------------------------------|------------------------------------------------------------------------------|
-| Rust 1.74+                                | The crate uses the 2021 edition; 1.74 is the MSRV. Nothing newer is required. |
+| Rust 1.85+                                | 1.85 is the MSRV, verified by a dedicated CI matrix leg. The crate's own source is 2021 edition; the floor comes from the committed `Cargo.lock`, which pins a dependency whose manifest declares `edition = "2024"` — Cargo before 1.85 cannot parse it and fails before compiling anything. |
 | `cargo`                                   | Standard build driver.                                                       |
 | CUDA Toolkit 12.x                         | Provides `cuda.lib` (Windows) / `libcuda.so` (Linux) for the linker.         |
 | NVIDIA driver matching the toolkit        | Required only to *run* kernels on a real GPU (tests / benches).              |

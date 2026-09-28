@@ -11,7 +11,13 @@ documentation = "https://docs.rs/craton-bolt"
 readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
 categories   = ["database", "compilers"]
-rust-version = "1.74"
+# MSRV. The floor is set by the committed `Cargo.lock`, not by this crate's own
+# syntax: the locked dependency graph pulls `indexmap` 2.14, whose manifest
+# declares `edition = "2024"`, and only Cargo 1.85+ can parse that. Older
+# toolchains fail before compiling a single line of Bolt. `1.85` is verified by
+# a dedicated CI matrix leg and pinned by the `msrv_is_consistent_across_repo`
+# document-consistency test, so this value cannot drift from the gate again.
+rust-version = "1.85"
 exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "bolt_continue_prompt.md", "reviews", "reviews/*"]
 
 # --- Workspace shim ---------------------------------------------------------
@@ -179,6 +185,18 @@ required-features = ["reference-tests"]
 [[test]]
 name = "sql_proptest"
 required-features = ["reference-tests"]
+
+# Optional-subsystem end-to-end fixtures. Declaring `required-features` keeps
+# them out of the default `cargo test --lib --tests` graph (where the feature's
+# dependencies are not compiled) while making the dedicated feature lanes run
+# them, not merely type-check them.
+[[test]]
+name = "flight_e2e"
+required-features = ["flight"]
+
+[[test]]
+name = "substrait_e2e"
+required-features = ["substrait"]
 
 # Stage-6 microbench: throughput of `ORDER BY <utf8>` across a sweep of
 # cardinality ratios, used to calibrate `HIGH_CARDINALITY_THRESHOLD`.

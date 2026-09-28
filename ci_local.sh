@@ -28,6 +28,8 @@ RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/ap
 # Add Rust components
 RUN rustup component add rustfmt clippy llvm-tools-preview
 RUN rustup toolchain install nightly-2026-04-03 --profile minimal
+# MSRV leg — must match `rust-version` in Cargo.toml and the hosted matrix.
+RUN rustup toolchain install 1.85.0 --profile minimal
 
 # Build the audited tools through Cargo rather than executing a network-fetched
 # shell installer in the CI image.
@@ -127,6 +129,10 @@ TESTS_PID=$!
   _step 'cargo check --features cudarc'
   cargo check --lib --features cudarc --no-default-features
 
+  echo '>>> Running MSRV gate (1.85, mirrors the hosted matrix leg)'
+  cargo +1.85.0 check --lib --features cuda-stub --no-default-features
+  cargo +1.85.0 test --lib --tests --features cuda-stub --no-default-features
+
   echo '>>> Running feature tests (flight + substrait)'
   cargo test --lib --tests --no-default-features --features cuda-stub,flight
   cargo test --lib --tests --no-default-features --features cuda-stub,substrait
@@ -195,6 +201,13 @@ if [[ "${BOLT_LOCAL_GPU:-0}" == "1" ]]; then
     BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests \
         --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest \
         -- --ignored --test-threads=1
+    # The optional-subsystem e2e fixtures need a CUDA context AND their own
+    # feature, so neither the hosted feature lane nor the commands above reach
+    # their #[ignore]-gated tier.
+    BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,flight \
+        --test flight_e2e -- --ignored --test-threads=1
+    BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,substrait \
+        --test substrait_e2e -- --ignored --test-threads=1
 else
     echo "GPU lane skipped. Set BOLT_LOCAL_GPU=1 on a CUDA host for full CI parity."
 fi

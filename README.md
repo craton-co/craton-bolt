@@ -1,6 +1,6 @@
 # Craton Bolt
 
-[![crates.io](https://img.shields.io/crates/v/craton-bolt.svg)](https://crates.io/crates/craton-bolt) [![docs.rs](https://docs.rs/craton-bolt/badge.svg)](https://docs.rs/craton-bolt) [![CI](https://github.com/craton-co/craton-bolt/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/craton-bolt/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![MSRV: 1.74](https://img.shields.io/badge/MSRV-1.74-orange.svg)](Cargo.toml)
+[![crates.io](https://img.shields.io/crates/v/craton-bolt.svg)](https://crates.io/crates/craton-bolt) [![docs.rs](https://docs.rs/craton-bolt/badge.svg)](https://docs.rs/craton-bolt) [![CI](https://github.com/craton-co/craton-bolt/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/craton-bolt/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)](Cargo.toml)
 
 > JIT-compiled GPU SQL engine. SQL strings go in, NVIDIA PTX comes out at runtime, the GPU does the rest.
 
@@ -59,7 +59,10 @@ See [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) for the exact supported sub
 
 ### Requirements
 
-- Rust 1.74 or newer (2021 edition).
+- Rust 1.85 or newer. The crate itself is 2021 edition; the 1.85 floor comes
+  from the committed `Cargo.lock`, which pins a dependency whose manifest
+  declares `edition = "2024"` — older Cargo cannot parse it. A CI matrix leg
+  builds on exactly this version.
 - An NVIDIA CUDA Toolkit ≥ 12, with `cuda.lib` (Windows) / `libcuda.so` (Linux) on the linker path.
 - An NVIDIA GPU with compute capability ≥ 7.0 (Volta or newer) and a driver matching the toolkit.
 
