@@ -13,15 +13,32 @@ The project's two distinguishing ideas:
 
 ## Status
 
-**Active development — v0.8.0.** The crate compiles clean on Windows MSVC and Linux against a CUDA Toolkit ≥ 12. It targets `sm_70` (Volta) and newer. End-to-end pipelines for projection, filter, scalar aggregate, GROUP BY (multi-tier shared-memory + hash-partitioned), joins (`INNER` / `LEFT [OUTER]` / `RIGHT [OUTER]` / `FULL [OUTER]` on GPU when the shape qualifies, host-side hash join otherwise; `CROSS` on GPU or host; plus small-cardinality non-equi joins via a host nested-loop fallback), `DISTINCT`, `ORDER BY` (GPU bitonic sort integrated, plus an env-gated GPU radix path; host `lexsort` fallback), `LIMIT`, `HAVING`, `UNION [ALL]`, `EXCEPT [ALL]`, and `INTERSECT [ALL]` are implemented. The frontend also accepts CTEs (`WITH`, including `WITH RECURSIVE` — linear, non-linear, and mutual), derived tables and `LATERAL` subqueries in `FROM`, uncorrelated subqueries plus a single correlated `WHERE` subquery (`EXISTS` / `NOT EXISTS` / scalar), `VALUES` as a row source, the `generate_series` table-valued function, `DISTINCT ON`, host-side window functions with named `WINDOW` clauses and `QUALIFY`, super-aggregates (`ROLLUP` / `CUBE` / `GROUPING SETS`), and query-clause sugar (`FETCH` / `TOP` → `LIMIT`, `FOR UPDATE` no-op, `PREWHERE` → `WHERE`). The scalar surface includes `IN`, `BETWEEN`, `CASE`, `CAST`, `COALESCE` / `NULLIF`, and `LIKE` (numeric/Bool results lower to GPU). `Decimal128` has full GPU arithmetic (`+`, `-`, `*`, `/`) and comparisons, with scalar **and** grouped GPU `SUM` / `MIN` / `MAX`; `Date32` / `Timestamp` arithmetic (Date−Date, Timestamp−Timestamp, Day-INTERVAL) lowers to GPU. String predicates run as genuine integer GPU paths when dictionary-encoded — `=`, `!=`, `IN`, and `LIKE` \ equality over dictionary-encoded `Utf8` fold to pure integer index-membership predicates on the GPU, and `LENGTH` lowers to the integer `StringLength` GPU path. The non-dictionary string **device** path (the `LIKE` matcher plus the two-pass `UPPER` / `LOWER` / `CONCAT` / `SUBSTRING` / `TRIM` producers) is **host-validated only** as of v0.8.0 and **not enabled by default**: the byte-identical host path is the default correctness path, and the device kernels are reached only behind the opt-in `BOLT_GPU_STRING` env var (see [`docs/ENV_VARS.md`](docs/ENV_VARS.md) / [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)). [`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) is the authoritative list of the supported SQL surface. Production use is **not** recommended — the public API is unstable pre-1.0.
+**Active development — v0.7.0.** The crate targets CUDA ≥ 12 and `sm_70`
+(Volta) or newer. Projection, filtering, scalar and grouped aggregates, joins,
+sorts, set operations, windows, CTEs, subqueries, and the documented scalar
+surface are implemented, but support is not synonymous with device-only
+execution. Every physical plan and result reports a deterministic planned
+`Gpu`, `Host`, or `Hybrid` tier through `planned_execution_tier()`.
 
-> **CI runs no GPU code.** The CI pipeline builds, tests, lints, and runs
-> `cargo deny` using the `cuda-stub` feature only — it exercises **0 GPU
-> code paths** because no GPU runner exists. The `#[ignore]`-gated CUDA
-> integration tests are dark in CI; GPU correctness is validated separately
-> on developer/maintainer hardware (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
-> for the verification harness). Treat CI green as "host logic + codegen
-> shape are sound," not "GPU execution is verified."
+Planner-selected radix sorting is the default for supported large Int32/Int64
+keys, with host fallback for unsupported layouts. Non-dictionary
+EXACT/PREFIX/SUFFIX/CONTAINS `LIKE` and ASCII `UPPER`/`LOWER` have direct CUDA
+hardware coverage and are enabled by default; Unicode case mapping and
+SUBSTRING/TRIM/CONCAT remain explicit host implementations. Integer
+division/remainder uses SQL NULL semantics by default. Decimal division is
+rejected unless the caller explicitly enables the legacy non-standard mode.
+[`docs/SQL_REFERENCE.md`](docs/SQL_REFERENCE.md) is the authoritative surface
+and placement reference; [`docs/CUDARC_ADOPTION.md`](docs/CUDARC_ADOPTION.md)
+defines the supported CUDA-backend boundary.
+The durable developer references are
+[`docs/API_SURFACE.md`](docs/API_SURFACE.md),
+[`docs/ENV_VARS.md`](docs/ENV_VARS.md), and
+[`docs/CONTRIBUTING_KERNEL.md`](docs/CONTRIBUTING_KERNEL.md).
+
+> **Real GPU execution is a release gate.** Host planning/codegen tests run
+> with `cuda-stub`; the canonical self-hosted GPU lane serially runs the full
+> ignored device suite plus the split DuckDB/proptest conformance shard. A
+> missing or failing GPU runner blocks the canonical workflow.
 
 > **Limitations / not yet production-ready.** See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
 > for the consolidated list of requirements, pre-1.0 caveats, and known
@@ -65,13 +82,11 @@ cargo build --release
 
 Hosts without a CUDA toolkit can type-check the crate with `cargo build --no-default-features --features cuda-stub` — useful for CI and `docs.rs` builds.
 
-> **Windows note:** `.cargo/config.toml` sets `linker = "lld-link"` for the
-> `x86_64-pc-windows-msvc` target, so **LLVM's `lld-link` must be on `PATH`**
-> for any Windows build (install LLVM, e.g. `scoop install llvm`). Without LLVM,
-> open an MSVC dev shell (`vcvars64`) and override the linker back to MSVC with
-> `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe`. See
-> [`docs/INSTALL.md`](docs/INSTALL.md#windows-linker-lld-link) for details and
-> why `lld-link` is the default.
+> **Windows note:** `.cargo/config.toml` uses the Rust toolchain's `rust-lld`
+> driver for `x86_64-pc-windows-msvc`; no separate LLVM installation is
+> required. Run from an MSVC developer environment so the Windows SDK and C
+> runtime libraries are discoverable. See
+> [`docs/INSTALL.md`](docs/INSTALL.md#windows-linker-rust-lld).
 
 ### Run a query
 
@@ -199,7 +214,10 @@ BOLT_BENCH_GPU=1 cargo bench            # add the GPU engine path
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). All non-trivial changes should come with tests; the build machine doesn't have a GPU, so PTX-shape assertions (the "compile and search the emitted string") are an acceptable substitute for the JIT layer, and `#[ignore]`-gated tests are the convention for live-GPU integration. See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full workflow.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). All non-trivial changes need host
+coverage and, when they touch a device path, direct tests in the blocking
+self-hosted GPU lane. PTX-shape assertions complement device evidence; they do
+not replace it. See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ## Project layout
 
@@ -221,14 +239,17 @@ craton-bolt/
 │   ├── SQL_REFERENCE.md      # what works, what doesn't
 │   ├── API_SURFACE.md        # public API reference
 │   ├── ENV_VARS.md           # environment variables and tuning knobs
+│   ├── CUDARC_ADOPTION.md     # supported CUDA backend boundary
+│   ├── CONTRIBUTING_KERNEL.md # advanced PTX/kernel contribution guide
 │   ├── DEVELOPMENT.md        # building, testing, benchmarking
 │   ├── FAQ.md                # frequently asked questions
 │   ├── BENCHMARKS.md         # measured numbers and methodology
 │   ├── COMPETITIVE_BENCHMARKING.md  # how to run fair comparisons
-│   ├── GROUPBY_PERF.md       # GROUP BY kernel design and analysis
+│   ├── internal/             # retired audits and historical engineering notes
 │   ├── LIMITATIONS.md        # requirements, pre-1.0 caveats, known gaps
 │   ├── MIGRATION_GUIDE.md    # upgrading across breaking changes
-│   └── PATH_TO_1.0.md        # detailed 1.0 milestone plan
+│   └── PATH_TO_1.0.md        # current 1.0 milestone plan
+├── kernels/                  # archived rust-cuda research; not build input
 ├── src/
 │   ├── lib.rs                # crate root, public re-exports
 │   ├── error.rs              # BoltError + BoltResult
@@ -242,7 +263,10 @@ craton-bolt/
 │                            #   snapshots, proptest fuzzing, DuckDB cross-checks
 └── benches/
     ├── query_benchmarks.rs   # criterion + Polars + CPU-ref (small dataset)
-    └── olap_benchmarks.rs    # h2o.ai groupby vs Polars vs DuckDB
+    ├── olap_benchmarks.rs    # h2o.ai groupby vs Polars vs DuckDB
+    ├── compute_benchmarks.rs # compute-bound GPU/CPU comparison
+    ├── regression.rs         # parser/lowering/PTX regression microbench
+    └── scaling_benchmarks.rs # large-N and VRAM-pressure device sweep
 ```
 
 ## Security

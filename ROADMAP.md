@@ -125,8 +125,8 @@ dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
 
 - Disk-backed PTX cache in `src/jit/disk_cache.rs`. Opt-in via the
   `BOLT_PTX_CACHE_DIR=/path` env var; writes are atomic.
-- Criterion regression bench scaffold in `benches/regression.rs`
-  covering scalar agg / GROUP BY / filter at parse / lower / ptx_gen.
+- Criterion regression scaffold in `benches/regression.rs`, alongside
+  `query_benchmarks.rs`, `olap_benchmarks.rs`, and `compute_benchmarks.rs`.
 
 ### New in 0.6.0 — M7 (API stabilization)
 
@@ -153,16 +153,12 @@ dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
 
 v0.8 closed most of the v0.7 carry-overs and security/correctness findings. What remains:
 
-- Several v0.5 SQL scalar items still parse / type-check but reject at
-  the physical layer: GPU lowering for `CASE` / `CAST` / scalar string
-  funcs, `LIKE` with `ESCAPE`, and `||` in `WHERE`. (v0.7 *did* land
-  `Decimal128` arithmetic + comparisons, `Date` / `Timestamp`
-  arithmetic, and grouped `STDDEV` / `VAR`.)
-- The GPU radix sort is integrated into `src/exec/sort.rs` but is still
-  opt-in via `BOLT_GPU_SORT=1` rather than planner-selected by default.
-- The disk PTX cache honours `BOLT_PTX_CACHE_DIR`; the
-  `EngineBuilder::persistent_cache` knob is wired through the builder
-  surface but does not yet drive `EngineBuilder::build`.
+- String and relational shapes span `Gpu`, `Host`, and `Hybrid`; callers can
+  inspect `QueryHandle::planned_execution_tier()` instead of inferring a tier.
+- The planner selects the GPU radix sort by default for supported key shapes;
+  `BOLT_GPU_SORT` is a tri-state diagnostic override.
+- The disk PTX cache honors both `BOLT_PTX_CACHE_DIR` and
+  `EngineBuilder::persistent_cache`, with the builder taking precedence.
 - The lazy streaming executor behind `Engine::register_table_stream` is
   still the eager drain implementation (the signature is
   future-compatible).
@@ -175,26 +171,18 @@ dispatch, and the freeze checklist:
 
 ### Goals
 
-- **GPU lowering for the still-deferred scalar items**: `CASE WHEN ... END`
-  (predicated select) and `CAST` over documented primitive pairs.
-  (`UPPER` / `LOWER` / `LENGTH` and `LIKE` already lower to GPU as of
-  0.7; `SUBSTRING` / `TRIM` / `CONCAT` remain host-side.)
-- **Planner-driven radix-sort dispatch** — promote the integrated
-  `src/exec/sort.rs` radix path from `BOLT_GPU_SORT=1` opt-in to a
-  default selected on size / dtype.
-- **`EngineBuilder::persistent_cache` wiring** through
-  `EngineBuilder::build` (today the env-var path is the only
-  honoured surface).
+- **Broaden GPU-native coverage** for host-only string, window, set-op, and
+  dedup shapes while preserving the explicit execution-tier contract.
+- **Planner cost refinement** beyond the current dtype/cardinality radix-sort
+  heuristic.
 - **Security audit prep (M8 from `docs/PATH_TO_1.0.md`)** — dependency
   audit, public-surface review, and the freeze checklist needed
   before the 1.0 stabilisation window opens.
 
 ### Stretch goals
 
-- GPU hash join (the existing executor is host-side; a GPU-resident
-  probe path is the natural next step).
-- GPU lowering for `LIKE` with `ESCAPE` and `||` in `WHERE`
-  predicates.
+- Wider GPU join coverage beyond the current gated fast paths.
+- GPU lowering for `||` in `WHERE` predicates.
 
 ## 1.0 — public API freeze
 

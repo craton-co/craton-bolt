@@ -16,10 +16,11 @@ read this one.
 ## Not production ready
 
 **Do not depend on Craton Bolt in production.** It is a pre-1.0 (0.x), actively
-developed research/engineering engine. The public API is unstable, GPU code
-paths are not verified in CI, and several SQL features fall back to host-side
-execution or are only partially lowered to the GPU. Use it for evaluation,
-experimentation, and benchmarking — not for systems where correctness,
+developed research/engineering engine. The public API is unstable, and several
+SQL features intentionally use host or hybrid execution even though real-GPU
+paths are now a blocking CI gate.
+Use it for evaluation, experimentation, and benchmarking — not for systems
+where correctness,
 stability, or availability matter.
 
 ---
@@ -59,9 +60,10 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   The device-memory pool, the CUDA stream pool, and the JIT module caches are
   process-global statics whose resources (pooled pointers, streams, loaded
   `CudaModule`s) are **bound to the context that created them**. Constructing
-  and using **two `Engine`s at the same time** (two contexts on one device)
-  cross-contaminates those globals and is **not supported** — expect invalid
-  handles or faults.
+  and using **two `Engine`s at the same time** is unsupported.
+  `EngineBuilder::build` enforces this atomically and rejects the second live
+  engine before creating another context, so the unsupported shape cannot
+  cross-contaminate handles or fault the driver.
 - **Sequential** multi-engine use **is** supported: build an `Engine`, use it,
   drop it (its context tears down and the module caches are cleared), then build
   another. This is the right pattern for "reset" or per-job isolation.
@@ -82,17 +84,14 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 ---
 
-## GPU paths are not verified in CI
+## GPU verification boundary
 
-- CI (`.github/workflows/ci.yml`) builds, tests, lints, and runs `cargo deny`
-  using the **`cuda-stub`** feature only. It exercises **0 GPU code paths** —
-  no GPU runner exists.
-- The live-GPU integration tests are `#[ignore]`-gated and run **separately**
-  on developer/maintainer hardware (`cargo test --features cudarc -- --ignored`
-  on a GPU host). A scheduled, allow-failure GPU lane stub is documented in the
-  CI workflow for when a GPU runner becomes available.
-- Practical consequence: a green CI run validates host logic, planning, and
-  codegen *shape* (PTX-string assertions), **not** end-to-end GPU execution.
+- Hosted jobs use `cuda-stub` for planning, host logic, and PTX shape.
+- The canonical self-hosted GPU job is blocking. It runs every ignored CUDA
+  test serially (`BOLT_BENCH_GPU=1`, `--test-threads=1`) and then runs the
+  split DuckDB/proptest conformance shard.
+- A missing, cancelled, or failing canonical GPU runner therefore prevents a
+  green workflow; host-only evidence is never presented as device evidence.
 
 ---
 
@@ -100,85 +99,29 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 These are real, code-level behaviors to be aware of:
 
-- **Host-side fallbacks, not always GPU.** Despite the "errors instead of
-  silently falling back" aspiration stated for 1.0
-  ([`docs/PATH_TO_1.0.md`](PATH_TO_1.0.md) §5), the **current** engine routinely
-  falls back to host-side execution for sort, some joins, set ops, window
-  functions, string functions, and `DISTINCT`. "Runs" does not always mean "ran
-  on the GPU." See [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md) for the
-  per-feature execution tier (GPU / host-side / GPU-lowering-pending).
-- **`NOT IN` / `IN` with NULL — three-valued logic (now strict for the
-  subquery path).** SQL three-valued logic around `NOT IN (... NULL ...)` is a
-  classic correctness foot-gun in GPU engines (a `NULL` in the set makes the
-  predicate `UNKNOWN` for non-matching rows, so no row passes). The
-  subquery-membership lowering (`build_in_predicate`) now matches strict SQL:
-  - `expr NOT IN (set)` where the set contains a `NULL` folds to `Bool(false)`
-    (no row passes), because every row is `UNKNOWN`/`FALSE`;
-  - a `NULL` *probe* (`expr` itself is `NULL`) is excluded from `NOT IN` via an
-    explicit `expr IS NOT NULL` guard ANDed onto the lowered `<>` chain — the
-    raw GPU `<>` comparator would otherwise read the NULL probe as its stored
-    value and wrongly include it;
-  - `NULL` elements of a non-negated `IN` set are dropped (they can only
-    contribute `UNKNOWN`), and an empty / NULL-only set folds to `IN` → `false`,
-    `NOT IN` → `true`.
-
-  Caveat on scope: this strict handling lives in the **`IN`/`NOT IN`
-  subquery** path. The literal-list path (`WHERE x IN (v1, v2, …)`) desugars to
-  a plain `=`/`<>` comparison chain and relies on three-valued evaluation of
-  those comparators rather than the explicit set-NULL fold above; verify
-  behavior against your reference engine if you embed a literal `NULL` directly
-  in an `IN`/`NOT IN` value list.
-- **Grouped integer `SUM` overflow may go undetected for streaming inputs.**
-  Scalar and grouped integer `SUM` overflow is normally a hard error
-  (`BoltError::Type("SUM(integer) overflow")`; see
-  [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md)). For the **grouped** case the
-  overflow is currently detected via a **host-side recompute** of the per-group
-  sums, so an overflow may **not** be caught for streaming inputs the host
-  cannot replicate (the device produced the result but the host has no way to
-  re-derive it for the check). Tracked follow-up: an on-device overflow flag
-  that makes the check independent of the host recompute. Where the host
-  *can* re-fold (the host-materialized grouped path), the recompute uses
-  `i64::checked_add` per group and raises the same hard error on overflow
-  (`checked_group_sum` / `checked_group_sum_native_validity`,
-  `src/exec/groupby.rs`).
-- **Integer division by zero does not error — defined as `0` (deliberate).**
-  The GPU integer-division codegen (`emit_int_div_guarded`,
-  `src/jit/ptx_gen.rs`) defines `x / 0 => 0` rather than
-  raising the standard-SQL division-by-zero error: the divisor is sanitised
-  to a non-zero stand-in for the hardware `div` and the result is then
-  `selp`-ed back to `0` when the divisor was zero. The two's-complement
-  overflow corner `INT_MIN / -1` is likewise defined as a **wrapping**
-  `INT_MIN` (the `(INT_MIN, -1)` pair is steered away from the trapping
-  `div` and the result forced to `INT_MIN`), not an error. This is an
-  intentional, test-pinned engine choice to keep the division kernel
-  total/branch-free, and it diverges from standard SQL (and from DuckDB,
-  which raises a divide-by-zero error). Integer **float** division is
-  unaffected (IEEE `div.rn` semantics). **`Decimal128` division** (the
-  0.7 GPU `Op::Div128` path) follows the same convention: a zero divisor
-  yields a deterministic **`0`** quotient for that lane (non-trapping)
-  rather than the standard-SQL error.
-- **Grouped `AVG` of an empty / all-NULL group returns `0.0`, not NULL
-  (deliberate).** Standard SQL says `AVG` over zero contributing rows is
-  `NULL`; the engine instead returns `0.0` to keep the `AVG` output column
-  non-nullable (`src/exec/aggregate.rs`; the empty-input behavior is pinned
-  by `fused_avg_empty_input_returns_zero` and flagged in-code with a
-  `TODO(null)`). This diverges from standard SQL and from DuckDB (both of
-  which return `NULL`). Intentional for now; tracked as the `TODO(null)`
-  follow-up.
-- **GPU string device path is host-validated only (opt-in, off by default).**
-  The GPU string device kernels — the non-dictionary `LIKE` matcher
-  (`StringLikeFilter` / `compile_like_match_kernel`) and the `UPPER` / `LOWER`
-  / `CONCAT` / `SUBSTRING` / `TRIM` two-pass `StringProject` producers — are
-  implemented and PTX-shape-tested but have **never been executed on GPU
-  hardware** as of v0.7.0 (CI builds with no CUDA device). They are therefore
-  **HOST-VALIDATED ONLY** and **not enabled by default**: the byte-identical
-  **host** path is the correctness path and is selected by default, and the
-  device kernels are reached only when the opt-in `BOLT_GPU_STRING` env var is
-  set (default OFF — see [`docs/ENV_VARS.md`](ENV_VARS.md)). Dictionary
-  `Utf8` `LIKE` / equality / ordering predicates are unaffected: they fold to
-  pure-integer index-membership predicates that run on the GPU and are not part
-  of this string-device gate. (`LENGTH` likewise rides the integer-output
-  `StringLength` path, not a string producer.)
+- **Placement is explicit.** `PhysicalPlan::planned_execution_tier()` and
+  `QueryHandle::planned_execution_tier()` report `Gpu`, `Host`, or `Hybrid`.
+  Runtime-dependent supported paths are classified `Hybrid` up front.
+- **`IN` / `NOT IN` uses strict three-valued logic in both literal-list and
+  subquery forms.** Literal lists are wrapped in an explicit CASE that returns
+  TRUE, FALSE, or NULL; a NULL member therefore makes a non-match UNKNOWN.
+- **Streaming grouped integer `SUM` overflow is a hard error.** Per-morsel
+  device partials merge into an `i128` accumulator and are range-checked when
+  rebuilt as Int32/Int64. The result cannot wrap even when the source is not
+  replayed as one host batch.
+- **SQL-compatible integer division/remainder is the default.** Invalid rows
+  (`x / 0`, `x % 0`, and `INT_MIN / -1`) are NULL through the host evaluator.
+  Aggregate-feed integer division and Decimal128 division are rejected where a
+  nullable compatible path does not exist. `BOLT_LEGACY_ARITHMETIC=1` is the
+  explicit opt-in to the historical zero/wrapping device convention.
+- **Grouped AVG empty state is NULL.** Existing all-NULL groups emit NULL and an
+  empty relation emits no groups, matching standard SQL.
+- **Validated GPU string boundary.** Non-dictionary
+  EXACT/PREFIX/SUFFIX/CONTAINS `LIKE` and ASCII `UPPER`/`LOWER` have direct
+  CUDA-hardware coverage and are enabled by default. `BOLT_GPU_STRING=0`
+  forces their host mirrors. Unicode case mapping and
+  SUBSTRING/TRIM/CONCAT remain supported host implementations; their dormant
+  device producers are not presented as supported.
 - **String handling is dictionary/ASCII-oriented.** String predicates operate
   over dictionary-encoded literals, and the GPU case-folding functions
   (`UPPER` / `LOWER`) are byte/ASCII-oriented — treat non-ASCII / multi-byte

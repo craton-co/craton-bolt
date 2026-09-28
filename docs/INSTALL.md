@@ -16,7 +16,7 @@ For day-to-day build / test / bench commands once you're set up, see
 | CUDA Toolkit 12.x                         | Provides `cuda.lib` (Windows) / `libcuda.so` (Linux) for the linker.         |
 | NVIDIA driver matching the toolkit        | Required only to *run* kernels on a real GPU (tests / benches).              |
 | NVIDIA GPU with compute capability ≥ 7.0  | Required only for live-GPU tests and `cargo bench` with `BOLT_BENCH_GPU=1`.  |
-| **`lld-link` (LLVM) — Windows only**      | `.cargo/config.toml` hard-sets `linker = "lld-link"` for the `x86_64-pc-windows-msvc` target, so it must be on `PATH` for every Windows build (see [Windows linker: lld-link](#windows-linker-lld-link)). A fallback to MSVC `link.exe` is documented below for hosts without LLVM. |
+| **MSVC build environment — Windows only** | Supplies the Windows SDK and CRT libraries. `.cargo/config.toml` uses the Rust toolchain's bundled `rust-lld` driver (see [Windows linker: rust-lld](#windows-linker-rust-lld)). |
 
 You do **not** need a GPU or the CUDA toolkit to build, type-check, or run the
 offline test suite — see [Building without CUDA](#building-without-cuda)
@@ -26,10 +26,8 @@ below.
 
 Craton Bolt targets the **CUDA 12.x** toolkit series. Specifically:
 
-- The optional `cudarc` backend pins the `cuda-12060` API surface
-  (CUDA 12.6), so 12.6 is the reference toolkit.
-- The default (hand-rolled FFI) backend links `cuda.lib` / `libcuda.so` and
-  works against any CUDA **12.x** install (12.0 through 12.6+).
+- The default `cudarc` backend pins the `cuda-12060` API surface. It is
+  validated with CUDA 12.x and CUDA 13.3 drivers/toolkits.
 - `build.rs` deliberately prefers the **highest-versioned 12.x** install when
   several toolkits are present on the host (e.g. it picks `v12.6` over `v12.4`
   over `v11.8`). On Windows it also prefers a `v12.x` install over a `v13.x`
@@ -58,8 +56,9 @@ untested.
 
 ### Default build (linked CUDA path)
 
-The default feature set is empty (`default = []`). This is the production
-build: the hand-rolled `extern "C"` FFI links against the real CUDA driver.
+The default feature set is `default = ["cudarc"]`. This is the supported
+production build: cudarc owns the primary CUDA context while the remaining
+adapter calls link against the driver import library.
 
 ```bash
 cargo build --release
@@ -71,28 +70,25 @@ toolkit automatically from `CUDA_PATH` or the platform-default install
 locations; set `CUDA_PATH` explicitly to pin a specific install (see
 [`ENV_VARS.md`](./ENV_VARS.md)).
 
-### Windows linker: lld-link
+### Windows linker: rust-lld
 
 On Windows, `.cargo/config.toml` hard-sets the linker for the
 `x86_64-pc-windows-msvc` target:
 
 ```toml
 [target.x86_64-pc-windows-msvc]
-linker = "lld-link"
+linker = "rust-lld"
 ```
 
-This applies to **every** Windows build (`cargo build`, `cargo test`,
-`cargo bench`), so **`lld-link` must be on `PATH`**. It comes with LLVM —
-install it with `scoop install llvm`, `choco install llvm`, or any LLVM
-toolchain (it ships as `lld-link.exe`). The Rust toolchain also bundles a copy
-at `<sysroot>/lib/rustlib/x86_64-pc-windows-msvc/bin/gcc-ld/lld-link.exe` if a
-system LLVM is not desired.
+`rust-lld` ships with the Rust toolchain and accepts rustc's current
+`-flavor link` driver argument. A separate LLVM installation is unnecessary.
+Run from `vcvars64` (or equivalent) so SDK/CRT include and library roots exist.
 
-Why `lld-link` rather than MSVC's `link.exe`: the integration-test suite links
-~39 binaries that each embed the bundled `duckdb` dev-dependency. MSVC's
+Why LLD rather than MSVC's `link.exe`: the optional `reference-tests` shard
+links bundled DuckDB. MSVC's
 `link.exe` spawns `mspdbsrv.exe` for PDB debug info, and `mspdbsrv` enforces a
 hard concurrent-session limit that linking that many DuckDB-embedding binaries
-blows past (`LNK1318: Unexpected PDB error; LIMIT (12)`). `lld-link` generates
+can exceed (`LNK1318: Unexpected PDB error; LIMIT (12)`). LLD generates
 PDBs in-process with no `mspdbsrv` and no such limit. It only changes the
 *link* step; compiled rlibs are unaffected. See the comments in
 `.cargo/config.toml` for the full rationale.
@@ -116,9 +112,9 @@ cargo build --release
 ```
 
 This works fine for the library and a single binary; the `mspdbsrv` session
-limit only bites when linking the full ~39-binary integration-test suite in one
-go (`cargo test`), so prefer `lld-link` if you intend to run the integration
-tests. Do **not** edit `.cargo/config.toml` to make this change — the env-var
+limit only bites when linking the DuckDB reference shard, so prefer the
+committed `rust-lld` configuration if you intend to run it.
+Do **not** edit `.cargo/config.toml` to make this change — the env-var
 override keeps the committed config (which the CI/maintainer flow depends on)
 intact.
 
@@ -126,10 +122,10 @@ intact.
 
 | Feature        | Default | What it does |
 |----------------|---------|--------------|
-| *(none)*       | yes     | Production build. Links the real CUDA driver via hand-rolled FFI. |
+| `cudarc`       | yes     | Supported primary-context/driver adapter. See `docs/CUDARC_ADOPTION.md`. |
 | `cuda-stub`    | no      | Stub mode for GPU-less hosts / CI / `docs.rs`. Skips all CUDA discovery and link injection in `build.rs`; every FFI entry becomes a Rust shim returning `CUDA_ERROR_STUB`. The crate compiles, links, and runs offline tests without any toolkit. |
-| `cudarc`       | no      | Stage-1 spike that routes a handful of low-level CUDA driver calls through the pure-Rust [`cudarc`](https://crates.io/crates/cudarc) crate (v0.13, `cuda-12060`) instead of the hand-rolled FFI. Uses cudarc's primary context as the only CUDA context. See `docs/CUDARC_ADOPTION.md`. |
-| `rust-cuda`    | no      | Experimental: compiles the sibling `kernels/` crate to PTX at build time via `cuda_builder` (rustc_codegen_nvvm) instead of the hand-rolled string emitter for `partition_kernel.rs`. Requires the rust-cuda toolchain (nightly + libNVVM + LLVM — see `kernels/rust-toolchain.toml`). See `docs/JIT_PIPELINE.md`. |
+| `reference-tests` | no   | Compiles the bundled DuckDB conformance/proptest shard. Kept out of ordinary test loops. |
+| `reference-benches` | no | Compiles bundled DuckDB and Polars for comparative benchmarks. |
 | `pool-sharded` | no      | Stage-3 escape hatch: swaps the device-mem-pool bucket map for a fixed-size sharded array. Same API, different lock granularity. Turn on only if profiling shows the DashMap shard layer is the bottleneck. |
 | `pool-watcher` | no      | Stage-4 proactive eviction: spawns a background thread that polls `cuMemGetInfo_v2` and evicts pooled blocks when free VRAM drops below a threshold. Tunable via `BOLT_POOL_WATCH_*` env vars (see `ENV_VARS.md`). |
 
@@ -139,11 +135,8 @@ Example invocations:
 # GPU-less / CI / docs.rs build (no toolkit needed).
 cargo build --no-default-features --features cuda-stub
 
-# Opt into the cudarc backend.
-cargo build --features cudarc
-
-# Experimental rust-cuda PTX codegen (needs the rust-cuda toolchain).
-cargo build --features rust-cuda
+# Split DuckDB conformance shard (real GPU required to execute ignored tests).
+cargo test --features reference-tests -- --ignored --test-threads=1
 ```
 
 ### Building without CUDA

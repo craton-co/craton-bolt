@@ -4,17 +4,18 @@ The exact subset of SQL Craton Bolt's frontend accepts. The grammar is built on 
 
 This document tracks the 0.7.0 release. For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the gap to 1.0, see [`../ROADMAP.md`](../ROADMAP.md).
 
-A note on execution tiers. The SQL surface below is wider than the set of
-constructs that run end-to-end on the GPU. Throughout this document each
-feature is tagged with where it actually executes:
+### Execution tier
 
-- **GPU** — lowered to a PTX kernel and run on the device.
-- **host-side** — parses, type-checks, and *executes* correctly, but on a
-  host (CPU) code path rather than the GPU.
-- **parses; GPU lowering pending** — accepted by the frontend and
-  type-checker, but the physical layer rejects it at the GPU lowering
-  boundary with a clear `"… not yet lowered to GPU"` message. The query
-  fails rather than running on a slow fallback.
+Every prepared query exposes its planned execution tier through
+`QueryHandle::planned_execution_tier()`:
+
+- `Gpu` means all planned compute runs on the device.
+- `Host` means all planned compute runs on the host.
+- `Hybrid` means the plan crosses both execution tiers.
+
+The classifier is a stable, machine-readable API (`ExecutionTier`) rather than
+an inference from documentation labels. Unsupported expressions still fail
+with a precise lowering error; they are never silently reported as `Gpu`.
 
 ## Supported query shape
 
@@ -59,13 +60,13 @@ The plan's `DataType` enum is intentionally small.
 | `Float32`  | `Float32`       |                                                          |
 | `Float64`  | `Float64`       |                                                          |
 | `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
-| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, `*`, **`/`** all lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic (the integer side is auto-coerced); comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to GPU and are **scale-aligned** (differing scales are rescaled to `max(s)` before the i128 compare). **Scalar** `SUM`/`MIN`/`MAX` run on the GPU (dedicated i128 block-reduce kernels, host-fold fallback inside); **grouped** `SUM`/`MIN`/`MAX` now also run on the GPU (`bolt_groupby_agg_decimal`, a per-slot-locked 128-bit accumulator; `SUM` overflow errors, `MIN`/`MAX` preserve `(p, s)`). **CAST** integer↔Decimal128, Decimal128↔Decimal128 (rescale), and (plain) Float↔Decimal128 all lower to GPU; only `TRY_CAST`/`SAFE_CAST` of Float⇄Decimal128 is rejected (host evaluator has no Decimal column). GPU gather (filter/compaction) + upload are wired (16-byte interleaved layout). **CASE** with a Decimal128 result lowers to GPU (a pair of `selp.b64` via `Op::Select128`). |
+| `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, and `*` lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic. Division is rejected by default because the legacy device implementation does not implement SQL NULL/error semantics; `BOLT_LEGACY_ARITHMETIC=1` explicitly restores that compatibility path. Comparisons are GPU and scale-aligned. Scalar and grouped `SUM`/`MIN`/`MAX`, supported casts, gather/upload, and `CASE` are wired. |
 | `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; CAST to/from Date32 (string, etc.): parses; GPU lowering pending. |
 | `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. CAST to/from Timestamp: parses; GPU lowering pending. |
 
 `Decimal128`, `Date32`, and `Timestamp` arrived in 0.6 (plan + parser +
 type-check) and gained their GPU lowering in 0.7 (see the per-type notes
-above; the Decimal `/`, mixed Decimal/integer arithmetic, integer↔decimal
+above; mixed Decimal/integer arithmetic, integer↔decimal
 and decimal-rescale CAST, scale-aligned Decimal comparison, and temporal
 `MIN`/`MAX` routing all landed in the 0.7 wave). Interval (beyond
 Day-INTERVAL on dates), time-of-day, list, struct, and map are still not
@@ -94,22 +95,30 @@ Unary minus on a numeric literal is folded into a signed literal (`-5` becomes `
 - `Int64` op anything else → `Int64`.
 - Else → `Int32`.
 
-Integer division by zero produces `NULL` (host evaluator) or undefined behaviour (GPU kernel — IEEE follows for floats, integer div by zero is the user's problem). Float division follows IEEE-754: `1.0 / 0.0 = +inf`, `0.0 / 0.0 = NaN`.
+Integer division and remainder are evaluated on the host by default so
+division by zero, remainder by zero, and signed `MIN / -1` overflow produce
+SQL `NULL` per row. Integer division/remainder used as aggregate inputs are
+rejected rather than silently changing tier. `BOLT_LEGACY_ARITHMETIC=1`
+explicitly restores the old device path and its non-SQL behavior. Float
+division follows IEEE-754: `1.0 / 0.0 = +inf`, `0.0 / 0.0 = NaN`.
 
 #### Decimal128 arithmetic
 
-As of 0.7 `+`, `-`, `*`, **and `/`** over `Decimal128(p, s)` lower to the **GPU** via the dual-register (lo/hi) 128-bit IR (`Op::Add128` / `Sub128` / `Mul128` / `Div128`). **Mixed Decimal/integer** arithmetic is supported: an `Int32` / `Int64` peer is auto-coerced to `Decimal128(_, 0)` (Float peers are rejected — CAST explicitly to avoid losing exactness). Result-dtype rules follow the SQL convention (`logical_plan::decimal128_arith_result`):
+As of 0.7 `+`, `-`, and `*` over `Decimal128(p, s)` lower to the **GPU** via the dual-register (lo/hi) 128-bit IR (`Op::Add128` / `Sub128` / `Mul128`). **Mixed Decimal/integer** arithmetic is supported: an `Int32` / `Int64` peer is auto-coerced to `Decimal128(_, 0)` (Float peers are rejected — CAST explicitly to avoid losing exactness). Result-dtype rules follow the SQL convention (`logical_plan::decimal128_arith_result`):
 
 - **`+` / `-`**: operands rescaled to a common scale `s = max(s_l, s_r)`; result `Decimal128(min(max(p_l, p_r) + 1, 38), s)`.
 - **`*`**: result `Decimal128(min(p_l + p_r, 38), s_l + s_s)` (the raw i128 product carries the summed scale; no operand rescale).
-- **`/`**: result `Decimal128(min(max(p_l, 1), 38), max(s_l, 6))` — the quotient scale is the dividend's scale floored at **6** fractional digits, so an integer / low-scale dividend still gets fractional digits. The dividend is pre-scaled before a 128-bit truncating (toward zero) divide.
+- **`/`**: rejected by default because the legacy GPU quotient path returns a
+  non-SQL zero on a zero divisor. Set `BOLT_LEGACY_ARITHMETIC=1` only for
+  compatibility with that historical behavior.
 
-**Division by zero on the eager GPU path yields a deterministic `0`** for that lane (`Op::Div128` branches a zero divisor to a zero-quotient tail — non-trapping), consistent with the engine's integer-div-by-zero convention rather than raising the standard-SQL error. A result precision > 38 (Arrow's `Decimal128` ceiling) is a hard error rather than a silent wrap, as is an overflowing decimal `SUM`.
+A result precision above 38 (Arrow's `Decimal128` ceiling) is a hard error
+rather than a silent wrap, as is an overflowing decimal `SUM`.
 
 ```sql
 SELECT price * qty            FROM line_items;   -- Decimal * Decimal (GPU)
 SELECT amount + 1             FROM ledger;        -- mixed Decimal + integer (GPU)
-SELECT total / count          FROM ledger;        -- Decimal / Decimal, scale max(s,6) (GPU)
+-- Decimal division is rejected unless BOLT_LEGACY_ARITHMETIC=1 is explicit.
 SELECT * FROM ledger WHERE amount > 100.00;       -- scale-aligned Decimal compare (GPU)
 SELECT CAST(qty AS DECIMAL(20, 4)) FROM line_items;        -- integer -> Decimal (GPU)
 SELECT CAST(price AS DECIMAL(10, 2)) FROM line_items;      -- Decimal rescale (GPU)
@@ -123,7 +132,13 @@ For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supp
 
 ### IN and BETWEEN
 
-`<expr> [NOT] IN (v1, v2, …)` is supported (0.5). It desugars to an OR/AND chain of element-wise comparisons, so it executes wherever the underlying comparisons do — on the **GPU** for numeric columns. Capped at 64 values; a large-list hash probe is a follow-up. `IN` against a `Utf8` column is still not wired through the dictionary rewriter — use an explicit `OR` chain of literal equalities.
+`<expr> [NOT] IN (v1, v2, …)` is supported (0.5). Literal lists lower to
+an explicit `CASE` over an OR/AND comparison chain so SQL three-valued logic
+is preserved: a NULL left operand or unmatched list containing NULL yields
+NULL, including the `NOT IN` form. The expression executes wherever the
+underlying comparisons do. Lists are capped at 64 values. `IN` against a
+`Utf8` column is not wired through the dictionary rewriter; use an explicit
+`OR` chain of literal equalities.
 
 `<expr> [NOT] BETWEEN low AND high` is supported (0.5), desugared to `(expr >= low) AND (expr <= high)` (or the DeMorgan inverse), and likewise runs on the **GPU** for numeric operands.
 
@@ -150,7 +165,13 @@ For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supp
 
 ### LIKE
 
-`<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with `%` and `_` wildcards (with prefix / suffix / contains / exact fast paths). For a **dictionary-encoded** `Utf8` column the predicate folds at plan time to a dictionary-precompute → integer index-membership predicate that runs on the **GPU** (this is pure-integer codegen, not a string device kernel). For a **non-dictionary** `Utf8` column the matcher is the `StringLikeFilter` device kernel (`compile_like_match_kernel`, with EXACT/PREFIX/SUFFIX/CONTAINS specialisations) — but that device kernel is part of the **HOST-VALIDATED-ONLY** GPU string path: as of v0.7.0 it is **not enabled by default** and runs only when the opt-in `BOLT_GPU_STRING` env var is set (see [`ENV_VARS.md`](ENV_VARS.md) and [`LIMITATIONS.md`](LIMITATIONS.md)). With the gate off (the default) the **host-side** `host_like` path is taken, and it is also the fallback on any gate miss. `LIKE` with an `ESCAPE` clause is fully implemented: `<expr> [NOT] LIKE 'pattern' ESCAPE '\'` honours the escape character so a literal `%` / `_` / escape char in the pattern is matched verbatim (the escape is applied during pattern compilation, on both the GPU-lowered and host-side paths). WHERE-predicate `LIKE` is type-checked against the column dtype during lowering (must be `Utf8`).
+`<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with
+`%` and `_` wildcards. Dictionary inputs fold to a GPU integer-membership
+predicate. Non-dictionary inputs use the hardware-validated
+`StringLikeFilter` device kernel by default, with host fallback on an
+unsupported shape or device decline. `BOLT_GPU_STRING=0` is an explicit
+force-host diagnostic override. EXACT/PREFIX/SUFFIX/CONTAINS and `ESCAPE`
+forms are covered; the predicate is type-checked as `Utf8`.
 
 `<expr> [NOT] ILIKE 'pattern'` (case-insensitive `LIKE`) is also supported, with the same wildcard, fast-path, `ESCAPE`, and execution-tier behaviour as `LIKE`. ILIKE performs **Unicode-aware per-character case folding** when matching (not an ASCII-only fold), so case-insensitive matching is correct for non-ASCII text.
 
@@ -210,11 +231,20 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 
 **Temporal MIN / MAX status.** `COUNT`, `MIN`, and `MAX` over a `Date32` / `Timestamp` column **all work end-to-end** as of the 0.7 wave. The reduction runs on the **GPU** over the normalised integer storage (`Date32 → Int32`, `Timestamp → Int64`), and the result is rebuilt as the original temporal type — a `Date32` for dates, and a `Timestamp` **preserving the unit and timezone** for timestamps (`src/exec/aggregate.rs`, `src/exec/groupby.rs`, and the temporal-output schema builder in `src/exec/schema_convert.rs` were all wired through). This holds in both the scalar and `GROUP BY` paths. `SUM` over a temporal column is undefined SQL and is **rejected by design** (`"SUM over Date32/Timestamp is not supported"`). (`SUM`/`MIN`/`MAX` over `Decimal128` are likewise supported, preserving the input precision/scale — **scalar** on the GPU via i128 block-reduce kernels, **grouped** on the host.)
 
-**NULL / empty-input semantics.** The target behaviour is standard SQL, matching DuckDB: `MIN` / `MAX` / `SUM` / `AVG` over an all-NULL group **or an empty input** return SQL `NULL`, and `COUNT` returns `0`. This is the contract to rely on. (Historically there were two divergences the engine is converging away from: scalar `SUM` over an empty/all-NULL input returned `0` rather than `NULL`, and primitive `MIN` / `MAX` returned a type sentinel rather than `NULL`. The correct, documented behaviour is SQL `NULL`.) The Bool/Utf8 inputs (which thread validity through `extended_agg`) already return SQL `NULL` for an all-NULL group in both the scalar and GROUP BY paths. As of 0.5, scalar primitive aggregates honour validity: `COUNT(col)` excludes NULLs via the bitmap and `SUM`/`MIN`/`MAX`/`AVG` over `Int*`/`Float*` host-strip NULL positions before the GPU reduction (with a zero-copy fast path when `null_count == 0`).
+**NULL / empty-input semantics.** `MIN` / `MAX` / `SUM` / `AVG` over
+an all-NULL group or empty input return SQL `NULL`; `COUNT` returns `0`.
+This is enforced for scalar and grouped inputs, including grouped `AVG`.
+Primitive scalar aggregates strip NULL positions before device reduction
+(with a zero-copy fast path when `null_count == 0`), while Bool/Utf8 paths
+thread validity through `extended_agg`.
 
 `SUM` widens narrow integer inputs to the corresponding 64-bit type: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`.
 
-Integer `SUM` overflow is a **hard error**, not silent wraparound and not undefined behaviour: if the running `i64` accumulator overflows, the query fails loudly with a `BoltError::Type("SUM(integer) overflow")`. The same applies to `SUM(Decimal128)` — an overflowing decimal sum errors rather than wrapping. (Float `SUM` follows IEEE-754 and saturates to `±inf` instead of erroring.) See [`LIMITATIONS.md`](LIMITATIONS.md) for the caveat on grouped-`SUM` overflow detection for streaming inputs the host cannot replicate.
+Integer `SUM` overflow is a **hard error**, not silent wraparound and not
+undefined behaviour. Device accumulation records overflow and streaming
+partial merges use checked arithmetic, so materialized and streaming grouped
+inputs both fail with `BoltError::Type("SUM(integer) overflow")`. The same
+applies to `SUM(Decimal128)`; Float `SUM` follows IEEE-754.
 
 `COUNT(DISTINCT col)` is supported as the **sole SELECT item** (no other columns or aggregates alongside it). It lowers to `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` (NULL-excluding distinct count, executed via the host-side `Distinct` executor). As of the 0.7 wave (F3), two combined forms over the bare sole-item distinct-count are now accepted and lower on top of the same base plan:
 
@@ -354,7 +384,10 @@ Still rejected: `COUNT(DISTINCT ...) OVER (...)`, `FILTER` / `IGNORE NULLS` / `W
 **Uncorrelated** subqueries in `SELECT` and `WHERE` are supported and resolved to constants *before* physical lowering (`src/exec/subquery_resolve.rs`):
 
 - **Scalar** `(SELECT ...)` — the subquery must produce a single column; 0 rows folds to SQL `NULL`, 1 row to that value, and `>1` row is a clean error.
-- **`<expr> [NOT] IN (SELECT ...)`** — the single-column result set is folded into an `OR`/`AND` chain of equalities over `expr` (`expr = v1 OR …` / `expr <> v1 AND …`). NULLs are dropped from the value set; this matches strict SQL exactly for `IN` under `WHERE`, and diverges only for `NOT IN` against a set containing NULLs (documented in the module).
+- **`<expr> [NOT] IN (SELECT ...)`** — the single-column result set is
+  folded into strict SQL membership semantics. The resolver tracks whether
+  the set contains NULL and emits the required UNKNOWN result, so `NOT IN`
+  against a set containing NULL never admits a non-matching row in `WHERE`.
 
 An uncorrelated **scalar subquery** is also accepted in `ORDER BY` (it folds to a constant before physical lowering, exactly like a SELECT / WHERE scalar subquery).
 
@@ -425,7 +458,15 @@ For every `Utf8` column registered on a table, the engine builds a dictionary (i
 - `WHERE col = 'X'`  →  `WHERE __idx_col = i32/i64(idx_of_X)`
 - `WHERE col != 'X'` →  the same with `!=`
 
-After the rewrite the predicate is pure integer equality, which the standard codegen already handles. Literals not present in the dictionary collapse to a constant-false predicate. `IN (...)` against a Utf8 column is still *not* folded through the dictionary rewriter (it defers this shape — see `src/plan/string_literal_rewrite.rs`); rewrite as an `OR` chain of literal equalities. `LIKE` on a dictionary Utf8 column *is* supported and folds to a GPU integer index-membership predicate (dictionary-precompute → index membership); for a non-dictionary `Utf8` column the `StringLikeFilter` device matcher is **host-validated only** and gated off by default behind `BOLT_GPU_STRING`, so the **host-side** `host_like` path runs by default (see the LIKE section above and [`LIMITATIONS.md`](LIMITATIONS.md)). Ordering comparisons (`<`, `>`, `<=`, `>=`) of a Utf8 column against a string *literal* are also folded as of 0.7, via a **binary (UTF-8 byte) collation** precompute that partitions the dictionary by the literal and emits the same index-membership form (**GPU**; not locale/ICU collation). Column-vs-column Utf8 ordering remains a host string comparison.
+After the rewrite the predicate is pure integer equality, which the standard
+codegen already handles. Literals not present in the dictionary collapse to a
+constant-false predicate. `IN (...)` against a Utf8 column is not folded
+through the dictionary rewriter. `LIKE` on a dictionary input folds to GPU
+integer membership; the non-dictionary `StringLikeFilter` device matcher is
+hardware-validated and enabled by default, with host fallback and an explicit
+`BOLT_GPU_STRING=0` force-host diagnostic. Utf8 ordering against literals and
+column peers uses binary UTF-8 collation with GPU dictionary/rank lowering
+where supported and a host comparison otherwise.
 
 ## SELECT DISTINCT
 
@@ -573,7 +614,7 @@ SELECT region_id, ROW_NUMBER() OVER (PARTITION BY region_id ORDER BY price) FROM
 SELECT region_id, SUM(price) OVER (PARTITION BY region_id) AS region_total FROM sales;
 
 -- String functions
-SELECT UPPER(region), LENGTH(region) FROM sales;          -- UPPER (host by default; GPU device path host-validated-only behind BOLT_GPU_STRING), LENGTH (GPU)
+SELECT UPPER(region), LENGTH(region) FROM sales;          -- ASCII UPPER + LENGTH use validated GPU paths
 SELECT SUBSTRING(region FROM 1 FOR 2) FROM sales;         -- SUBSTRING (host-realized StringProject)
 SELECT TRIM(region) FROM sales;                           -- single-arg TRIM (host-realized StringProject)
 SELECT CONCAT(region, '-', name) FROM sales;              -- CONCAT, NULL-if-any-arg-NULL (host mirror)
@@ -662,7 +703,8 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - `CAST` to or from `Timestamp` / `String`. (`CAST` integer↔`Decimal128`, `Decimal128`↔`Decimal128` rescale, integer→`Date32`, and — as of 0.7 — **plain** Float↔`Decimal128` all **do** lower to GPU; only a `TRY_CAST`/`SAFE_CAST` of Float⇄`Decimal128` is rejected, at type-check, not at the GPU boundary — see the CASE / CAST section.)
 - GPU lowering of `NOT` in a predicate (runs host-side instead).
 - `SUBSTRING`, single-arg `TRIM`, and the `CONCAT` scalar function: these **execute end-to-end** but on a **host-side** projection rather than the GPU (so this is a host-execution tier, not a hard rejection). As of the 0.7 wave, `SUBSTRING(col FROM start [FOR len])` (literal start/length) and the single-argument `TRIM` / `LTRIM` / `RTRIM` (default-whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer; a custom trim-character set (`TRIM(chars FROM col)`) or computed `SUBSTRING` arguments fall back to the host `Project` evaluator. `CONCAT`'s dedicated GPU two-pass kernels exist and are PTX-shape-tested, but the executor uses the byte-identical host mirror for now (device launch wiring pending). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
-- `Decimal128` division (`/`) **now lowers to GPU** as of 0.7 (`Op::Div128`), so it is no longer in this list — see the "Decimal128 arithmetic" subsection.
+- `Decimal128` division (`/`) is rejected by default; the historical
+  non-standard GPU behavior requires `BOLT_LEGACY_ARITHMETIC=1`.
 
 ### Types and values
 - Time-of-day / general interval (beyond Day-`INTERVAL` on dates) literals and arithmetic. `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
@@ -677,15 +719,25 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - DML (`INSERT`, `UPDATE`, `DELETE`).
 
 ### Validity propagation
-- Scalar primitive aggregates honour validity as of 0.5: `COUNT(col)` excludes NULLs via the bitmap, and `SUM`/`MIN`/`MAX`/`AVG` host-strip NULL positions before the GPU reduction (the zero-null fast path stays a zero-copy upload). The Bool/Utf8 `extended_agg` path also honours nulls. Full per-row NULL propagation through `CASE` branches on the GPU is still a follow-up (a CASE that fires no WHEN currently yields a deterministic zero rather than SQL NULL).
+- Scalar primitive aggregates honor validity: `COUNT(col)` excludes NULLs,
+  and `SUM`/`MIN`/`MAX`/`AVG` return SQL NULL for empty/all-NULL inputs.
+  A nullable `CASE` is routed to the host evaluator when device lowering
+  cannot preserve its validity; it never substitutes a numeric zero.
 
 ## String functions
 
 `UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`, and `TRIM` are surfaced through the SQL frontend via `Expr::ScalarFn` and **execute end-to-end** as of 0.7 (see also the "Additional scalar string functions" table below for `CHAR_LENGTH` / `OCTET_LENGTH` / `POSITION` / `REPLACE` / `LEFT` / `RIGHT` / `LPAD` / `RPAD` / `REVERSE` / `INITCAP`).
 
-A note on the GPU string device path. The two-pass `PhysicalPlan::StringProject` device producers for `UPPER` / `LOWER` / `CONCAT` / `SUBSTRING` / `TRIM` are **HOST-VALIDATED ONLY** as of v0.7.0: the device kernels are implemented and PTX-shape-tested, but they have **never run on GPU hardware** (CI has no CUDA device), so they are **not enabled by default**. The byte-identical **host** producer is the correctness path and is selected by default; the device kernels are reached only behind the opt-in `BOLT_GPU_STRING` env var (default OFF — see [`ENV_VARS.md`](ENV_VARS.md) and [`LIMITATIONS.md`](LIMITATIONS.md)). `LENGTH` is the exception — it lowers through the integer-output `StringLength` path rather than a string producer.
+A note on the GPU string device path. `LIKE`, ASCII `UPPER`/`LOWER`, and
+`LENGTH` have been exercised on CUDA hardware and their supported shapes run
+on the GPU by default. `BOLT_GPU_STRING=0` forces the host implementation for
+differential diagnosis. Unicode case mapping and the variable-width
+`CONCAT`/`SUBSTRING`/`TRIM` producers remain host-side; the planner reports
+these mixed plans as `Hybrid` rather than implying device-only execution.
 
-- **`UPPER` / `LOWER`** are realized end-to-end via the two-pass `PhysicalPlan::StringProject` executor (variable-width output). The host producer is the default correctness path; the GPU device producer is host-validated-only behind `BOLT_GPU_STRING`.
+- **`UPPER` / `LOWER`** use the hardware-validated GPU producer for ASCII
+  inputs by default and the Unicode-correct host producer for unsupported
+  shapes.
 - **`LENGTH`** lowers to the **GPU** via `PhysicalPlan::StringLength` (dictionary-gather, `Int64` output).
 - **`SUBSTRING` / `TRIM`** execute **host-side** end-to-end. As of the 0.7 wave, `SUBSTRING(col FROM start [FOR len])` (with **integer-literal** start/length) and the **single-argument** `TRIM` / `LTRIM` / `RTRIM` (`TRIM BOTH` / `LEADING` / `TRAILING`, default whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer (one device-shaped pass mirrored on the host). A **custom trim-character set** (`TRIM(chars FROM col)`) or a computed (non-literal) `SUBSTRING` argument falls back to the host `Project` evaluator. Both are byte/character-correct and NULL-propagating.
 - **`CONCAT(a, b, ...)`** of `Utf8` columns executes end-to-end with **NULL-if-any-argument-NULL** semantics (standard SQL — a NULL in any source row makes the output row NULL). The dedicated N-input two-pass GPU producer kernels (`compile_concat_len_pass` / `compile_concat_write_pass`, supporting up to `CONCAT_MAX_INPUTS = 8` source columns) are implemented and PTX-shape-tested; the executor currently realises the result via the **byte-identical host mirror** (`string_project::host_concat_strings`), so results are correct and the device launch wiring is a follow-up. Arities beyond 8 source columns, computed/literal arguments, and non-Utf8 arguments take the host fallback (`string_ops_extended::concat`). The `||` concat operator likewise runs host-side.
