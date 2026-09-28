@@ -526,8 +526,10 @@ pub(crate) fn ensure_ctx_current() -> BoltResult<()> {
 /// even after the driver became usable.
 ///
 /// We use a `parking_lot::Mutex<bool>` rather than `OnceLock<()>` so the
-/// test path can clear the latch between cases — `OnceLock::take` is not
-/// stabilised until Rust 1.79 and our MSRV is 1.74. The fast path stays
+/// test path can clear the latch between cases. (`OnceLock::take` is
+/// available at the current 1.85 MSRV, but a `take` would only reset the
+/// cell, not let a caller observe/flip the latch under one lock, so the
+/// mutex remains the simpler shape.) The fast path stays
 /// O(1) and uncontended in production: a single un-poisoned mutex
 /// acquire per `init()` call, which itself is called O(1) times per
 /// process.

@@ -485,3 +485,56 @@ fn release_hardening_guards() {
     assert!(!manifest.contains("rust-cuda ="));
     assert!(!build.contains("compile_rust_cuda_kernels"));
 }
+
+/// (10) The declared MSRV is a real, uniformly-claimed gate.
+///
+/// `rust-version` in `Cargo.toml` is the single source of truth. This test
+/// pins every place that repeats it — the hosted CI matrix leg, the local CI
+/// rehearsal, and the three user-facing docs that quote a minimum Rust
+/// version — so a bump (or a stale claim) cannot survive review. The 1.74
+/// value that shipped before this guard existed could not build the committed
+/// lockfile at all, which is exactly the failure mode being locked out.
+#[test]
+fn msrv_is_consistent_across_repo() {
+    let root = repo_root();
+    let manifest = read_to_string(&root.join("Cargo.toml"));
+
+    let msrv = manifest
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("rust-version"))
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
+        .map(|rest| rest.trim().trim_matches('"').to_string())
+        .expect("Cargo.toml declares `rust-version`");
+
+    // The hosted matrix must build the declared MSRV, not some other version.
+    let workflow = read_to_string(&root.join(".github").join("workflows").join("ci.yml"));
+    assert!(
+        workflow.contains(&format!("\"stable\", \"{msrv}\"")),
+        ".github/workflows/ci.yml matrix must include the declared MSRV `{msrv}`"
+    );
+
+    // The local rehearsal must exercise the same toolchain. `rustup` needs a
+    // fully-qualified patch version, so accept `X.Y` extended with `.0`.
+    let local = read_to_string(&root.join("ci_local.sh"));
+    let pinned = format!("{msrv}.0");
+    assert!(
+        local.contains(&format!("cargo +{pinned} check"))
+            || local.contains(&format!("cargo +{msrv} check")),
+        "ci_local.sh must run an MSRV check on `{msrv}`"
+    );
+
+    // Every user-facing claim must quote the same number.
+    for doc in ["README.md", "docs/INSTALL.md", "docs/DEVELOPMENT.md"] {
+        let text = read_to_string(&root.join(doc));
+        assert!(
+            text.contains(&format!("Rust {msrv}")) || text.contains(&format!("MSRV-{msrv}")),
+            "{doc} must state the declared MSRV `{msrv}`"
+        );
+        // Guard against a stale second claim left behind by a partial bump.
+        assert!(
+            !text.contains("Rust 1.74"),
+            "{doc} still claims the retired 1.74 MSRV"
+        );
+    }
+}
