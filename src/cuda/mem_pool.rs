@@ -1310,7 +1310,7 @@ impl DeviceMemPool {
             for (idx, shard) in self.lru_index.iter().enumerate() {
                 let guard = shard.lock();
                 if let Some((k, _v)) = guard.first_key_value() {
-                    if best_key.map_or(true, |b| *k < b) {
+                    if best_key.is_none_or(|b| *k < b) {
                         best_key = Some(*k);
                         best_shard = Some(idx);
                     }
@@ -1921,7 +1921,7 @@ impl DeviceMemPool {
         self.for_each_bucket(|key, bucket| {
             if let Some(front) = bucket.blocks.front() {
                 non_empty.push(key);
-                if best_t.map_or(true, |t| front.inserted < t) {
+                if best_t.is_none_or(|t| front.inserted < t) {
                     best_key = Some(key);
                     best_t = Some(front.inserted);
                 }

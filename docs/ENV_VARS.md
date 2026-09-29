@@ -42,7 +42,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
 | `BOLT_GPU_SORT`                  | planner heuristic    | `1` / `0`   | Force a GPU attempt / force host for `ORDER BY` |
-| `BOLT_GPU_DISTINCT`              | off                  | `1`/`true`/`yes` | Opt into the GPU sort-based `DISTINCT` path |
+| `BOLT_GPU_DISTINCT`              | on                   | `0`/`false`/`no` | Force the single-primitive-key `DISTINCT` dedup to its host mirror |
 | `BOLT_GPU_STRING`                | on                   | `0`/`false`/`no` | Force validated GPU string shapes to their host mirrors |
 | `BOLT_LEGACY_ARITHMETIC`         | off                  | `1`         | Opt into historical zero/wrapping division semantics |
 | `BOLT_GPU_WINDOW`                | off                  | `1`         | Opt into the GPU window-function path           |
