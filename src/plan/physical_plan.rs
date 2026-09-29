@@ -5470,7 +5470,7 @@ fn expr_eager_safe_under_shortcircuit(e: &Expr) -> bool {
                 expr_eager_safe_under_shortcircuit(w) && expr_eager_safe_under_shortcircuit(t)
             }) && else_branch
                 .as_deref()
-                .map_or(true, expr_eager_safe_under_shortcircuit)
+                .is_none_or(expr_eager_safe_under_shortcircuit)
         }
         // LIKE against a constant pattern is total; safe iff the operand is.
         Expr::Like { expr, .. } => expr_eager_safe_under_shortcircuit(expr),

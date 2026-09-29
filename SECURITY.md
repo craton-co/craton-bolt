@@ -241,6 +241,23 @@ disabled (the default).
 - These controls reduce dependency drift but do not make upstream registries
   or action source intrinsically trusted. Pin updates require normal review.
 
+#### Accepted advisory debt
+
+The advisory gate is blocking on **both** the default and the `--all-features`
+graph. Two advisories are nonetheless tolerated, listed explicitly in
+`deny.toml` rather than suppressed by loosening the policy. Neither is
+reachable from the **default feature graph**, so neither affects a downstream
+dependant of this crate. Both are re-checked whenever the owning dependency is
+bumped, and both leave the graph on that bump.
+
+| Advisory | Crate | Reached via | Why it stands |
+|---|---|---|---|
+| `RUSTSEC-2024-0436` | `paste 1.0.15` | `arrow-flight 53`, optional `flight` feature | Unmaintained, not a vulnerability. A compile-time proc-macro, not linked into any artifact. arrow-flight 53 pins it; no maintained drop-in at this arrow major. |
+| `RUSTSEC-2025-0003` | `fast-float 0.2.0` | `polars 0.42`, `reference-benches` only | Unchecked read on empty input. Present only in the benchmark harness's reference engine, parsing benchmark-local fixture data; never in the library, integration tests, or a published artifact. Upstream has no patched release — the fix lives in the `fast-float2` fork adopted by later Polars. |
+
+There is no longer a non-blocking advisory lane: the former `rust-cuda`
+build-toolchain tree, which was the reason one existed, has been removed.
+
 ### Security properties / boundaries (summary)
 
 | Property | Status |

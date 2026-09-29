@@ -160,10 +160,10 @@ fn plan_of(
 
 /// `SELECT region, qty FROM sales WHERE qty > 10` as a Substrait plan.
 ///
-/// `emit` is left unset on the `ProjectRel` so the converter takes the
-/// Substrait default (input columns followed by the computed expressions) and
-/// the `RelRoot` names rename the projection's output — the shape a real
-/// producer emits for a two-column projection.
+/// A Substrait `ProjectRel` emits `input columns ++ expressions`, so the two
+/// projected expressions land at output indices 2 and 3; the explicit `emit`
+/// mapping selects exactly those, which is what a real producer sends for a
+/// two-column projection. The `RelRoot` names then label the result.
 fn filter_project_plan() -> proto::Plan {
     const GT: u32 = 1;
 
@@ -333,7 +333,6 @@ fn unknown_table_is_rejected() {
 // ---------------------------------------------------------------------------
 
 /// The fixture rows both execution tests share, matching [`provider`]'s schema.
-#[cfg(test)]
 fn sales_batch() -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("region", ArrowDataType::Int64, false),

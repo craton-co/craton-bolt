@@ -123,6 +123,33 @@ fn max_recursive_rows() -> usize {
         .unwrap_or(MAX_RECURSIVE_ROWS)
 }
 
+/// Count the `Scan`s of `table` in `plan`'s relational tree.
+///
+/// Used by the recursive-CTE driver to learn how many times the recursive term
+/// references the CTE. One reference is linear recursion; `k > 1` is a `k`-way
+/// self-join whose output grows as `n^k`, which is what the fan-out guard in
+/// [`Engine::execute_recursive_cte`] bounds.
+///
+/// Expression-nested subqueries are deliberately not walked: the SQL frontend
+/// rejects a self-reference inside a subquery, so every reference the driver
+/// can bind lives in this tree.
+fn count_scans_of(plan: &LogicalPlan, table: &str) -> usize {
+    match plan {
+        LogicalPlan::Scan { table: t, .. } => usize::from(t == table),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. } => count_scans_of(input, table),
+        LogicalPlan::Union { inputs, .. } => inputs.iter().map(|i| count_scans_of(i, table)).sum(),
+        LogicalPlan::SetOp { left, right, .. } | LogicalPlan::Join { left, right, .. } => {
+            count_scans_of(left, table) + count_scans_of(right, table)
+        }
+    }
+}
+
 /// Hard safety cap on the number of LEFT rows a LATERAL apply (feature F3) will
 /// drive (feature: LATERAL / correlated execution).
 ///
@@ -3232,6 +3259,10 @@ impl Engine {
 
         let cap = max_recursive_iterations();
         let mut iters = 0usize;
+        // How many times the recursive term scans the CTE. `> 1` is non-linear
+        // recursion (`rec.naive`), i.e. a self-join whose output grows as a
+        // power of the working set — see the fan-out guard inside the loop.
+        let self_refs = count_scans_of(&rec.recursive, &rec.name).max(1);
 
         // --- 2. Iterate to a fixpoint. ---
         loop {
@@ -3261,6 +3292,35 @@ impl Engine {
                     working_set.num_rows(),
                     max_recursive_rows()
                 )));
+            }
+
+            // Bounding the INPUT is not enough for a non-linear term. With `k`
+            // self-references the recursive term is a `k`-way self-join, whose
+            // output is bounded by `n^k` — and that intermediate is built
+            // INSIDE `run_with_cte`, where this cap can no longer see it. A
+            // cyclic `UNION ALL` therefore squares its way from a legal working
+            // set straight into a multi-GiB allocation and aborts the process
+            // (`memory allocation of N bytes failed`) instead of returning an
+            // error. Reject up front when the worst-case fan-out cannot fit
+            // under the cap; `checked_pow` treats an overflowing product as
+            // "definitely over".
+            if self_refs > 1 {
+                let worst_case = working_set.num_rows().checked_pow(self_refs as u32);
+                if worst_case.is_none_or(|rows| rows > max_recursive_rows()) {
+                    return Err(BoltError::Plan(format!(
+                        "WITH RECURSIVE: a non-linear recursive term with {} \
+                         self-references over a {}-row working set can derive up \
+                         to {} rows, exceeding the {}-row safety cap (set \
+                         {MAX_RECURSIVE_ROWS_ENV} to override) — the recursion \
+                         is multiplying rows without reaching a fixpoint",
+                        self_refs,
+                        working_set.num_rows(),
+                        worst_case
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "more than usize::MAX".to_string()),
+                        max_recursive_rows()
+                    )));
+                }
             }
 
             let rec_out = relabel(run_with_cte(&working_set, &rec.recursive)?)?;
@@ -7912,9 +7972,58 @@ mod tests {
         );
     }
 
+    /// `count_scans_of` must see every self-reference the recursive term makes,
+    /// including both sides of a join, because the fan-out guard raises the
+    /// working set to that power. Under-counting would let an explosive term
+    /// through; over-counting would reject a legal recursion.
+    #[test]
+    fn count_scans_of_counts_every_self_reference() {
+        use crate::plan::logical_plan::{Field, Schema};
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+        let scan = |t: &str| LogicalPlan::Scan {
+            table: t.to_string(),
+            projection: None,
+            schema: schema.clone(),
+        };
+
+        assert_eq!(count_scans_of(&scan("tc"), "tc"), 1);
+        assert_eq!(count_scans_of(&scan("other"), "tc"), 0);
+
+        // `tc JOIN tc` — the shape that squares the working set each iteration.
+        let self_join = LogicalPlan::Join {
+            left: Box::new(scan("tc")),
+            right: Box::new(scan("tc")),
+            on: Vec::new(),
+            filter: None,
+            join_type: crate::plan::logical_plan::JoinType::Inner,
+        };
+        assert_eq!(count_scans_of(&self_join, "tc"), 2);
+
+        // Nested under a Filter/Project, and mixed with a non-CTE scan.
+        let nested = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Join {
+                    left: Box::new(self_join.clone()),
+                    right: Box::new(scan("edges")),
+                    on: Vec::new(),
+                    filter: None,
+                    join_type: crate::plan::logical_plan::JoinType::Inner,
+                }),
+                predicate: Expr::Literal(crate::plan::logical_plan::Literal::Bool(true)),
+            }),
+            exprs: vec![Expr::Column("x".into())],
+        };
+        assert_eq!(count_scans_of(&nested, "tc"), 2);
+        assert_eq!(count_scans_of(&nested, "edges"), 1);
+    }
+
     /// A NON-LINEAR `UNION ALL` self-join over cyclic data grows without bound
-    /// under naive evaluation, so it must hit the iteration cap with a clean
-    /// error (the cap is the mandatory guard when dedup is unavailable).
+    /// under naive evaluation, so it must fail with a clean error rather than
+    /// aborting the process. The iteration cap alone does not achieve that: the
+    /// `k`-way self-join builds an `n^k` intermediate *inside* the recursive
+    /// subplan, so a 2-cycle squares its way to a multi-GiB allocation several
+    /// iterations before the iteration cap is reached. The fan-out guard is
+    /// what turns that into a `BoltError`.
     #[test]
     #[ignore = "gpu:e2e — recursive CTE subplans run through the GPU execute path"]
     fn recursive_non_linear_union_all_cycle_hits_cap() {

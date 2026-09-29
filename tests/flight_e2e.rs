@@ -161,14 +161,12 @@ fn schema_ipc_payload_decodes_to_source_schema() {
 /// it an already-bound listener without pulling in `tokio-stream`. Probing for
 /// a free ephemeral port keeps the fixture dependency-free; the window between
 /// release and re-bind is a test-only concern.
-#[cfg(test)]
 fn free_loopback_addr() -> std::net::SocketAddr {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe socket");
     probe.local_addr().expect("probe addr")
 }
 
 /// Build an engine holding `t(id, name)` for the live-server fixtures.
-#[cfg(test)]
 fn engine_with_fixture() -> craton_bolt::Engine {
     let (_, batch) = sample();
     let mut engine = craton_bolt::Engine::new().expect("CUDA ctx");
@@ -178,7 +176,6 @@ fn engine_with_fixture() -> craton_bolt::Engine {
 
 /// Encode an ad-hoc SQL string as the Flight SQL `cmd` bytes a client puts in
 /// a `Cmd` descriptor (a prost-encoded `google.protobuf.Any`).
-#[cfg(test)]
 fn statement_cmd(sql: &str) -> bytes::Bytes {
     use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
     use prost::Message;
@@ -192,7 +189,6 @@ fn statement_cmd(sql: &str) -> bytes::Bytes {
 }
 
 /// Serve `server` on `addr` until `shutdown` resolves, on a background task.
-#[cfg(test)]
 async fn spawn_server(
     server: craton_bolt::flight::FlightSqlServer,
     addr: std::net::SocketAddr,
