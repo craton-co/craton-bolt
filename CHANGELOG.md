@@ -36,6 +36,15 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
   `docs/ENV_VARS.md`.
 
 ### Fixed
+- **Non-linear `WITH RECURSIVE` no longer aborts the process.** A recursive
+  term with `k` self-references is a `k`-way self-join, and its `n^k`
+  intermediate is built inside the recursive subplan where neither the
+  working-set nor the accumulated-result row cap can see it. Over a cyclic
+  graph the working set squared each iteration and requested a 64 GiB host
+  allocation — killing the process — while still sitting under the 10M-row cap
+  and several iterations short of the iteration cap. The driver now rejects an
+  iteration whose worst-case fan-out cannot fit under `CRATON_MAX_RECURSIVE_ROWS`
+  and returns a `BoltError` instead.
 - **Shared-memory GROUP BY negative-key out-of-bounds guard** — the Tier-1
   shmem group-by path now bounds-checks negative / out-of-range keys before
   indexing the slot buffer, closing an OOB access.
