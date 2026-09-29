@@ -3079,25 +3079,24 @@ mod tests {
         assert_eq!(evicted, 0);
     }
 
-    /// L-5: per-bucket locks let concurrent frees into distinct size
-    /// classes proceed in parallel. We approximate "make progress" by
-    /// timing N parallel free streams vs. a sequential baseline: if a
-    /// single global mutex still gated everything, the parallel version
-    /// would be ~equal to the sequential one; with per-bucket locks it
-    /// should be measurably faster than 4× the per-thread time.
+    /// L-5: per-bucket locks let concurrent alloc/free streams into distinct
+    /// size classes run to completion without deadlocking, losing blocks, or
+    /// cross-contaminating each other's buckets.
     ///
-    /// The test is loose on purpose — CI machines have variable timing.
-    /// We just assert parallel < 4× sequential (any speedup at all).
+    /// This test deliberately asserts NO wall-clock ratio. It used to require
+    /// `par_elapsed < 1.5 × seq_elapsed`, which is a *performance*
+    /// characteristic and not a correctness property: on a loaded host the
+    /// scheduler can serve four contending threads worse than the sequential
+    /// baseline, so the assertion failed for reasons unrelated to the lock
+    /// split. That made it a coin flip inside the now-blocking GPU lane, which
+    /// runs every `#[ignore]`d test. The lock-granularity *speedup* is measured
+    /// by `bench_dashmap_baseline`; what remains here is the deterministic part.
     ///
-    /// `#[ignore]`: this is a wall-clock *performance characteristic*, not a
-    /// correctness property — the `par_elapsed < 1.5×seq_elapsed` comparison
-    /// is inherently flaky under machine load (a busy host can schedule the
-    /// parallel threads worse than the sequential baseline). The per-bucket
-    /// lock-split behaviour it probes is better measured by
-    /// `bench_dashmap_baseline`. Run explicitly with `--ignored` on a quiet
-    /// machine when validating the lock-granularity change.
+    /// Still `#[ignore]`d because it is a stress shape — 32K alloc/free round
+    /// trips, which reach the real driver under `BOLT_BENCH_GPU=1` — so it
+    /// stays out of the quick host loop and runs in the ignored lane.
     #[test]
-    #[ignore = "perf-timing: flaky under load; measured by bench_dashmap_baseline"]
+    #[ignore = "gpu:mempool — concurrency stress over the per-bucket lock split"]
     fn per_bucket_lock_allows_concurrent_progress() {
         use std::sync::Arc;
         use std::time::Duration;
@@ -3148,37 +3147,35 @@ mod tests {
         }
         let par_elapsed = par_start.elapsed();
 
-        // Sanity: both runs did real work.
+        // Sanity: both runs did real work. This is the only timing-derived
+        // assertion left, and it cannot flake — a completed run of 16K
+        // alloc/free pairs always takes more than a microsecond.
         assert!(seq_elapsed > Duration::from_micros(1));
         assert!(par_elapsed > Duration::from_micros(1));
 
-        // Loose check: with per-bucket locks we expect par_elapsed to be
-        // less than seq_elapsed (sub-linear-ish scaling). A single global
-        // mutex would force par_elapsed >= seq_elapsed. Allow generous
-        // headroom for CI noise — if par_elapsed > 1.5 * seq_elapsed
-        // something is clearly serialising.
-        //
-        // Under `--features pool-sharded` the four power-of-two sizes
-        // selected here happen to all map to shard 0 (`size_class % 32`),
-        // so concurrent threads contend on the same shard mutex — the
-        // sharded variant cannot beat the sequential baseline for this
-        // pathological size selection. Skip the concurrency assertion in
-        // that mode; the `bench_dashmap_baseline` micro-bench is the
-        // intended measurement vehicle for the sharded path anyway.
-        #[cfg(not(feature = "pool-sharded"))]
-        assert!(
-            par_elapsed < seq_elapsed + seq_elapsed / 2,
-            "parallel run ({:?}) should not be > 1.5x sequential ({:?}) — \
-             suggests a global lock is still serialising frees",
-            par_elapsed,
-            seq_elapsed
-        );
-        // Silence unused-variable warning under the cfg-gated assertion.
-        #[cfg(feature = "pool-sharded")]
-        {
-            let _ = par_elapsed;
-            let _ = seq_elapsed;
+        // The deterministic property: after equal sequential and concurrent
+        // workloads over four distinct size classes, every class still resolves
+        // to its own bucket and the freed blocks are pooled rather than lost. A
+        // bucket that deadlocked, dropped blocks, or cross-contaminated another
+        // size class would not land here.
+        for s in &sizes {
+            let (p, ab) = pool.alloc(*s).expect("pool still serves every class");
+            assert_eq!(
+                ab,
+                bucket_size(*s),
+                "size class {s} must round to its own bucket after contention"
+            );
+            pool.free(p, ab);
         }
+        assert_eq!(
+            pool.bucket_count(),
+            sizes.len(),
+            "exactly one bucket per size class must exist after concurrent use"
+        );
+        assert!(
+            pool.total_pooled_bytes() > 0,
+            "freed blocks must remain pooled, not returned to the driver"
+        );
     }
 
     /// Stage 2: the cross-bucket LRU index must evict the globally
