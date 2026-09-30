@@ -6711,6 +6711,79 @@ mod tests {
         }
     }
 
+    /// A NULL literal under a logical operator — the shape the strict
+    /// three-valued-logic fold of `IN` / `NOT IN` over a NULL-bearing set
+    /// produces — must never be lowered onto the GPU.
+    ///
+    /// On the device it does not even assemble (`and.b32` against the b64 NULL
+    /// placeholder is `Arguments mismatch for instruction 'and'` in ptxas), and
+    /// widening the register would still be wrong because the kernel's
+    /// AND-of-input-validity fold is not 3VL. This is a host-runnable stand-in
+    /// for the GPU-gated `tests/subquery_e2e_test.rs` cases, so a regression
+    /// trips in ordinary CI rather than only on the self-hosted GPU lane.
+    #[test]
+    fn null_literal_under_logic_lowers_to_host() {
+        let schema = Schema::new(vec![Field::new("k", DataType::Int32, true)]);
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: schema.clone(),
+        };
+        // `WHERE (k = 1) AND NULL`
+        let predicate = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column("k".into())),
+                right: Box::new(Expr::Literal(Literal::Int32(1))),
+            }),
+            right: Box::new(Expr::Literal(Literal::Null)),
+        };
+        assert!(
+            expr_contains_null_literal_under_logic(&predicate),
+            "the guard must recognise a NULL operand of AND"
+        );
+
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan.clone()),
+            predicate: predicate.clone(),
+        };
+        let phys = lower(&filter).expect("filter lowers");
+        assert!(
+            matches!(phys, PhysicalPlan::Filter { .. }),
+            "NULL-under-logic predicate must lower to the host Filter, got {phys:?}"
+        );
+        assert_ne!(
+            phys.planned_execution_tier(),
+            ExecutionTier::Gpu,
+            "a host-evaluated 3VL predicate must not be reported as a GPU plan"
+        );
+
+        // The same predicate under a projection must not be fused into the GPU
+        // scan kernel either — that path bypasses the Filter arm entirely.
+        let project = LogicalPlan::Project {
+            input: Box::new(filter),
+            exprs: vec![Expr::Column("k".into())],
+        };
+        let phys = lower(&project).expect("project over filter lowers");
+        assert_ne!(
+            phys.planned_execution_tier(),
+            ExecutionTier::Gpu,
+            "Project over a 3VL Filter must not fuse into the GPU scan, got {phys:?}"
+        );
+
+        // A projected 3VL value (`SELECT (k = 1) AND NULL`) is host too.
+        let projected = LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![Expr::Alias(Box::new(predicate), "m".into())],
+        };
+        let phys = lower(&projected).expect("projected 3VL lowers");
+        assert!(
+            matches!(phys, PhysicalPlan::Project { .. }),
+            "projected NULL-under-logic must lower to the host Project, got {phys:?}"
+        );
+    }
+
     #[test]
     fn planned_execution_tier_is_recursive_and_deterministic() {
         let gpu = tier_projection();
