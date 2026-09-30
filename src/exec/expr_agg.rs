@@ -1788,10 +1788,36 @@ where
 // Logical
 // ---------------------------------------------------------------------------
 
+/// Reinterpret an all-NULL operand of a logical op as a Bool NULL column.
+///
+/// A bare `Literal::Null` carries no static dtype, so [`eval_literal`]
+/// broadcasts it as an `I64` column of `None`s (NULL of any dtype is still
+/// NULL). In a logical position that untyped column is a Bool NULL — the shape
+/// the strict three-valued-logic fold of `IN` / `NOT IN` over a NULL-bearing
+/// set produces (`(k <> 2) AND NULL`). Only an operand that is entirely NULL is
+/// reinterpreted; a column carrying real non-Bool values is still a type error.
+fn coerce_all_null_to_bool(col: HostColumn) -> HostColumn {
+    let all_null = match &col {
+        HostColumn::I32(v) => v.iter().all(Option::is_none),
+        HostColumn::I64(v) => v.iter().all(Option::is_none),
+        HostColumn::F32(v) => v.iter().all(Option::is_none),
+        HostColumn::F64(v) => v.iter().all(Option::is_none),
+        _ => false,
+    };
+    if all_null {
+        let n = col.len();
+        HostColumn::Bool(vec![None; n])
+    } else {
+        col
+    }
+}
+
 /// Apply `AND OR`. Both operands must already be `Bool`. NULL behaves
 /// per SQL three-valued logic: `NULL AND false = false`, `NULL OR true =
 /// true`, otherwise NULL.
 fn eval_logical(op: BinaryOp, lhs: HostColumn, rhs: HostColumn) -> BoltResult<HostColumn> {
+    let lhs = coerce_all_null_to_bool(lhs);
+    let rhs = coerce_all_null_to_bool(rhs);
     let l_dt = lhs.dtype();
     let r_dt = rhs.dtype();
     if l_dt != DataType::Bool || r_dt != DataType::Bool {

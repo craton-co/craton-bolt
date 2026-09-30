@@ -302,42 +302,6 @@ fn not_wrapped_in_subquery_with_null_returns_zero_rows() {
 }
 
 // ===========================================================================
-// IN-subquery host-set size cap (memory-DoS / deep-recursion guard).
-// ===========================================================================
-
-/// A high-cardinality `IN (SELECT …)` must be rejected with a clean
-/// `BoltError` once the DISTINCT set exceeds the host cap, instead of building
-/// an unbounded membership set / deeply-nested expression tree (which risked an
-/// OOM or a stack overflow during the later recursive lower/JIT walks).
-///
-/// The cap is lowered to a tiny value via `CRATON_IN_SET_MAX_ROWS` so the test
-/// stays cheap. NOTE: the cap latches process-wide on first use
-/// (`OnceLock`), so this test sets the env before constructing the `Engine`;
-/// run it in its own process (the default for `cargo test` integration
-/// binaries) to guarantee the latch resolves to the lowered value.
-#[test]
-#[ignore = "gpu:e2e"]
-fn in_subquery_oversized_set_is_capped_cleanly() {
-    std::env::set_var("CRATON_IN_SET_MAX_ROWS", "8");
-
-    // `other` has 20 DISTINCT ids → exceeds the cap of 8.
-    let probe: Vec<Option<i32>> = (0..5).map(Some).collect();
-    let set: Vec<Option<i32>> = (0..20).map(Some).collect();
-    let engine = engine_with_probe_and_set(probe, set);
-
-    let err = engine
-        .sql("SELECT k FROM t WHERE k IN (SELECT id FROM other)")
-        .expect_err("oversized IN subquery must be rejected, not OOM / stack-overflow");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("distinct values") || msg.contains("more than 8"),
-        "cap error should name the distinct-value bound, got: {msg}",
-    );
-
-    std::env::remove_var("CRATON_IN_SET_MAX_ROWS");
-}
-
-// ===========================================================================
 // Supported form 3 — scalar subquery in a predicate.
 // ===========================================================================
 

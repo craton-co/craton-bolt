@@ -4372,6 +4372,93 @@ fn expr_contains_case(expr: &Expr) -> bool {
 /// the `expr_contains_concat` / `predicate_contains_unary` host-routing guards.
 /// `Expr::Like` carries its pattern in a `String` field (not a `Literal::Utf8`)
 /// and has its own `StringLikeFilter` route, so it is intentionally not matched.
+/// Does `expr` use a SQL `NULL` literal as an operand of a logical `AND` / `OR`?
+///
+/// This is the shape produced by the strict three-valued-logic fold of
+/// `IN` / `NOT IN` over a set that contains a NULL — e.g. `(k <> 2) AND NULL`
+/// or `(k = 1) OR NULL`. It must NOT reach the GPU kernel, for two independent
+/// reasons:
+///
+/// 1. **It does not compile.** A bare `Literal::Null` carries no dtype, so
+///    `ptx_gen::emit_const` materialises it as a zero placeholder in the b64
+///    (`rl`) register class, while a `Bool` lives in b32 (`r`). The logical
+///    arm then emits `and.b32 %r, %r, %rlN`, which ptxas rejects outright with
+///    `Arguments mismatch for instruction 'and'`.
+/// 2. **Widening the register would still be wrong.** The GPU convention is
+///    that a NULL's *value* is a don't-care and the NULL signal rides the
+///    per-row validity bitmap, which the kernel folds as an AND of its inputs'
+///    validity. Three-valued logic is not that fold: `FALSE AND NULL` is
+///    `FALSE`, not NULL, and `TRUE OR NULL` is `TRUE`, not NULL. A
+///    validity-AND would report NULL for every row.
+///
+/// The host evaluator (`exec::expr_agg`'s logical arm) implements exact SQL
+/// 3VL, so these expressions are routed there and the plan honestly reports a
+/// `Host` / `Hybrid` execution tier.
+fn expr_contains_null_literal_under_logic(expr: &Expr) -> bool {
+    /// Any `Literal::Null` anywhere beneath `expr`.
+    fn has_null_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(Literal::Null) => true,
+            Expr::Literal(_) | Expr::Column(_) => false,
+            Expr::Binary { left, right, .. } => has_null_literal(left) || has_null_literal(right),
+            Expr::Unary { operand, .. } => has_null_literal(operand),
+            Expr::Alias(inner, _) => has_null_literal(inner),
+            Expr::Case {
+                branches,
+                else_branch,
+            } => {
+                branches
+                    .iter()
+                    .any(|(w, t)| has_null_literal(w) || has_null_literal(t))
+                    || else_branch.as_deref().is_some_and(has_null_literal)
+            }
+            Expr::Like { expr, .. } => has_null_literal(expr),
+            Expr::Cast { expr, .. } => has_null_literal(expr),
+            Expr::CastFormat { expr, .. } => has_null_literal(expr),
+            Expr::ScalarFn { args, .. } => args.iter().any(has_null_literal),
+            Expr::ScalarSubquery(_) => false,
+            Expr::InSubquery { expr, .. } => has_null_literal(expr),
+            Expr::Extract { .. } | Expr::DateTrunc { .. } => false,
+        }
+    }
+
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+        } => has_null_literal(left) || has_null_literal(right),
+        Expr::Binary { left, right, .. } => {
+            expr_contains_null_literal_under_logic(left)
+                || expr_contains_null_literal_under_logic(right)
+        }
+        Expr::Unary { operand, .. } => expr_contains_null_literal_under_logic(operand),
+        Expr::Alias(inner, _) => expr_contains_null_literal_under_logic(inner),
+        Expr::Case {
+            branches,
+            else_branch,
+        } => {
+            branches.iter().any(|(w, t)| {
+                expr_contains_null_literal_under_logic(w)
+                    || expr_contains_null_literal_under_logic(t)
+            }) || else_branch
+                .as_deref()
+                .is_some_and(expr_contains_null_literal_under_logic)
+        }
+        Expr::Cast { expr, .. } | Expr::CastFormat { expr, .. } => {
+            expr_contains_null_literal_under_logic(expr)
+        }
+        Expr::ScalarFn { args, .. } => args.iter().any(expr_contains_null_literal_under_logic),
+        Expr::Like { expr, .. } => expr_contains_null_literal_under_logic(expr),
+        Expr::InSubquery { expr, .. } => expr_contains_null_literal_under_logic(expr),
+        Expr::Literal(_)
+        | Expr::Column(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::Extract { .. }
+        | Expr::DateTrunc { .. } => false,
+    }
+}
+
 fn expr_contains_utf8_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(Literal::Utf8(_)) => true,
@@ -6242,6 +6329,25 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                 // arm's `expr_contains_utf8_literal` guard, materialising and
                 // compacting the Utf8 column), then wrap a host `Project` for
                 // the SELECT list. Mirrors the `StringLikeFilter` route above.
+                // Same shape for a strict-3VL predicate: `SELECT k FROM t
+                // WHERE NOT (k IN (SELECT …))` over a NULL-bearing set folds to
+                // `NOT ((k = 1) OR NULL)`. Without this guard the Project arm
+                // sees a scan chain and fuses the predicate into the GPU scan
+                // kernel, bypassing the Filter arm's own guard entirely. Lower
+                // the Filter on its own so it routes to the host, then wrap the
+                // SELECT list.
+                if expr_contains_null_literal_under_logic(predicate) {
+                    let inner = lower_depth(input, depth + 1)?;
+                    let output_schema = plan.schema()?;
+                    if project_is_identity(exprs, inner.output_schema(), &output_schema) {
+                        return Ok(inner);
+                    }
+                    return Ok(PhysicalPlan::Project {
+                        input: Box::new(inner),
+                        exprs: exprs.clone(),
+                        output_schema,
+                    });
+                }
                 if expr_contains_utf8_literal(predicate) {
                     let inner = lower_depth(input, depth + 1)?;
                     let output_schema = plan.schema()?;
@@ -6254,6 +6360,25 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                         output_schema,
                     });
                 }
+            }
+            // A projected strict-3VL fold (`SELECT k NOT IN (SELECT …)` over a
+            // set containing NULL lowers to `… AND NULL`). The fused GPU scan
+            // kernel cannot compile it and its validity fold is not 3VL — see
+            // `expr_contains_null_literal_under_logic` — so evaluate the SELECT
+            // list on the host.
+            if exprs.iter().any(expr_contains_null_literal_under_logic) {
+                log::debug!(
+                    "physical_plan: NULL literal under a logical operator in a \
+                     projection; lowering to host-side PhysicalPlan::Project \
+                     (GPU validity folding is not SQL three-valued logic)"
+                );
+                let inner = lower_depth(input, depth + 1)?;
+                let output_schema = plan.schema()?;
+                return Ok(PhysicalPlan::Project {
+                    input: Box::new(inner),
+                    exprs: exprs.clone(),
+                    output_schema,
+                });
             }
             if is_scan_chain(input) {
                 lower_projection(input, Some(exprs), None)
@@ -6321,6 +6446,22 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     "physical_plan: Utf8 string literal in Filter predicate; \
                      lowering to host-side PhysicalPlan::Filter \
                      (GPU codegen has no Utf8 support)"
+                );
+                let inner = lower(input)?;
+                return Ok(PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: predicate.clone(),
+                });
+            }
+            // Strict three-valued logic over a NULL literal — the fold the
+            // `IN` / `NOT IN`-with-NULL path produces. The GPU kernel neither
+            // compiles it nor could evaluate it correctly; see
+            // `expr_contains_null_literal_under_logic`.
+            if expr_contains_null_literal_under_logic(predicate) {
+                log::debug!(
+                    "physical_plan: NULL literal under a logical operator in Filter \
+                     predicate; lowering to host-side PhysicalPlan::Filter \
+                     (GPU validity folding is not SQL three-valued logic)"
                 );
                 let inner = lower(input)?;
                 return Ok(PhysicalPlan::Filter {
