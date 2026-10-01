@@ -428,7 +428,15 @@ jobs:
           # The second command is the intentionally split DuckDB/proptest
           # conformance shard; keeping its bundled C++ build out of the core
           # command makes ordinary test iteration substantially cheaper.
-          BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored --test-threads=1
+          # `--lib --tests` scopes this to the actual test binaries. A bare
+          # `cargo test ... -- --ignored` also runs the DOCTEST phase with
+          # `--ignored`, which asks rustdoc to compile the ```ignore``` examples
+          # — snippets that are illustrative by construction (they use `?`
+          # without a Result-returning main, name private items, and so on) and
+          # are not meant to compile. That phase can never pass, so it would
+          # keep this lane permanently red. Doctests are covered by the
+          # `cargo test (doctests)` step in the build job.
+          BOLT_BENCH_GPU=1 cargo test --lib --tests --no-default-features --features cudarc -- --ignored --test-threads=1
           BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest -- --ignored --test-threads=1
         env:
           RUSTFLAGS: ""
