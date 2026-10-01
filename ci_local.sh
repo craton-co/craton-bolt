@@ -197,7 +197,12 @@ fi
 
 if [[ "${BOLT_LOCAL_GPU:-0}" == "1" ]]; then
     echo ">>> Running blocking native GPU lane"
-    BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc -- --ignored --test-threads=1
+    # `--lib --tests` scopes this to the test binaries. A bare `cargo test ...
+    # -- --ignored` also runs the doctest phase with `--ignored`, compiling the
+    # ```ignore``` examples that are illustrative by construction and cannot
+    # compile — that phase would keep the lane permanently red. Doctests run in
+    # the tests container above.
+    BOLT_BENCH_GPU=1 cargo test --lib --tests --no-default-features --features cudarc -- --ignored --test-threads=1
     BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests \
         --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest \
         -- --ignored --test-threads=1

@@ -36,6 +36,16 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
   `docs/ENV_VARS.md`.
 
 ### Fixed
+- **Strict three-valued-logic `IN` / `NOT IN` folds no longer reach the GPU.**
+  `(k <> 2) AND NULL` and `NOT ((k = 1) OR NULL)` failed to assemble
+  (`Arguments mismatch for instruction 'and'` — an untyped `Literal::Null`
+  materialises in the b64 register class while `Bool` lives in b32), and
+  widening the register would still have answered wrongly, because the
+  kernel's AND-of-input-validity fold is not 3VL (`FALSE AND NULL` is `FALSE`,
+  not NULL). These expressions now lower to the host evaluator, which
+  implements exact 3VL, and the plan reports a `Host` / `Hybrid` tier. The host
+  evaluator also learned to read an all-NULL untyped operand of a logical
+  operator as a Bool NULL.
 - **Non-linear `WITH RECURSIVE` no longer aborts the process.** A recursive
   term with `k` self-references is a `k`-way self-join, and its `n^k`
   intermediate is built inside the recursive subplan where neither the

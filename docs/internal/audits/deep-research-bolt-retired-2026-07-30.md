@@ -1,6 +1,8 @@
 # Deep research review retirement audit
 
-Status: **retired on 2026-07-30**
+Status: **retired on 2026-07-31** (implementation landed 2026-07-30; retired only
+once the validation ledger at the bottom of this file was actually run to
+completion the following day)
 
 Source reviewed: `deep-research-bolt.md`, an external working-tree report against
 the pre-retirement `dev` branch.
@@ -11,6 +13,11 @@ and longer-term product directions. Retirement means that each concrete defect
 or drift item has been implemented and tested, while recommendations that cannot
 be proven on this one machine have been converted into explicit support
 boundaries and reproducible gates rather than unverified claims.
+
+The ledger is deliberately the last section and the last thing to be filled in.
+Running it is what turned three of the dispositions below from claims into
+facts, and it surfaced five further defects — including two in the gates
+themselves — that are recorded inline rather than quietly fixed.
 
 ## Runtime and SQL closure
 
@@ -84,27 +91,59 @@ boundaries and reproducible gates rather than unverified claims.
 
 ## Validation ledger
 
-The final delivery was accepted only after all rows below completed from the
-isolated worktree and its unique target directory.
+Every row below was run from the isolated worktree against its own target
+directory, on the machine described under "Hardware and scope". No row is
+recorded from a cached or partial run.
 
 | Gate | Result |
 |---|---|
-| Host library and integration suite (`cuda-stub`) | 2,389 library tests passed, 169 ignored; every integration binary passed |
+| Host library and integration suite (`cuda-stub`) | 2,911 passed, 0 failed, 378 ignored across 54 binaries |
 | Rust doctests | 0 failed; 27 hardware/example doctests intentionally ignored |
-| Document consistency | 9 passed |
-| Strict Clippy | Passed with `-D warnings` |
+| Document consistency | 10 passed (the tenth pins the MSRV across manifest, CI, local CI, and docs) |
+| Strict Clippy (`-D warnings`) | Passed, after three `unnecessary_map_or` errors that a stale fingerprint had been hiding were fixed |
+| `rustfmt --check` | Passed |
 | Default `cudarc` compile | Passed |
-| Focused live-GPU engine/string/sort/dedup/streaming/AVG/Decimal regressions | Passed |
-| Complete ignored live-GPU suite | Pending final recorded run |
-| DuckDB/reference live-GPU shard | Pending final recorded run |
-| `flight` executable suite | Pending final recorded run |
-| `substrait` executable suite | Pending final recorded run |
-| MSRV 1.74 compile gate | Pending final recorded run |
-| Blocking coverage floor | Pending final recorded run |
-| `cargo deny` | Pending final recorded run |
-| Scaling and VRAM-pressure benchmark smoke | Pending final recorded run |
-| Clean package dry run and public-API snapshot | Pending final recorded run |
+| Complete ignored live-GPU suite | 386 passed, 0 failed across 54 binaries (`--lib --tests`, `--test-threads=1`, real `cudarc` backend, RTX 2060) |
+| DuckDB/reference live-GPU shard | See "Reference shard" below |
+| `flight` executable suite | 2,925 passed, 0 failed (host tier); both `gpu:e2e` live-gRPC round trips passed on device |
+| `substrait` executable suite | 2,952 passed, 0 failed (host tier); both `gpu:e2e` plan-execution fixtures passed on device |
+| MSRV compile + test gate | Passed on **1.85**, not the previously declared 1.74 — see the disposition row above |
+| Blocking coverage floor | 64.17% lines against the 50% floor (`--lib --tests`) |
+| `cargo deny` | `advisories ok, bans ok, licenses ok` on both the default and the `--all-features` graph |
+| Scaling and VRAM-pressure benchmark smoke | See "Benchmark smoke" below |
+| Clean package dry run | `cargo publish --dry-run` passed on a clean tree, no `--allow-dirty` |
+| Public-API snapshot | No drift against `docs/PUBLIC_API_SNAPSHOT.txt` |
 
-The working report is retired by this audit only after every pending ledger row
-is replaced by its exact result and the resulting commit is integrated into
-`dev`.
+### Hardware and scope
+
+All device rows were measured on a single NVIDIA GeForce RTX 2060 (12 GiB,
+driver 610.62, CUDA 13.3 toolkit), the same class the public benchmark numbers
+are scoped to. This audit makes no claim about a second GPU class.
+
+### Reference shard
+
+**Not run on this machine — blocked by the local C++ toolchain, not by this
+crate.** The `reference-tests` feature builds DuckDB 1.2.2 from bundled source,
+and its vendored third-party C++ does not compile against the only MSVC toolset
+installed here (14.51 / VS 18): `fmt/format.h` fails against the newer
+`__msvc_string_view.hpp` / `__msvc_ostream.hpp`, and `pcg_extras.hpp` uses the
+retired `stdext` namespace. No older toolset is present to fall back to.
+
+This is recorded as unrun rather than passed. The gate itself is real: the
+hosted `gpu-integration` lane runs this shard on Linux with gcc, where the same
+pinned DuckDB builds. Bumping the reference engine to a DuckDB release that
+compiles under MSVC 14.51 would also invalidate the "verified bit-equivalent
+against DuckDB 1.2" claim in `docs/BENCHMARKS.md`, so it is left as a deliberate
+follow-up rather than changed underneath the benchmark numbers.
+
+### What the final run cost
+
+The ledger's purpose is to be run, not asserted. Completing it surfaced five
+defects that no earlier gate could have caught, each fixed and recorded in the
+disposition tables above: the non-linear `WITH RECURSIVE` process abort, the
+strict-3VL PTX mismatch, the `IN`-cap test that shared a process, the dead MSRV
+matrix leg, and the failing supply-chain gate. Two further gate-design defects
+were fixed in passing — a flaky wall-clock assertion inside a blocking lane, and
+the GPU lane's trailing doctest phase, which `--ignored` forced to compile the
+deliberately-`ignore`d illustrative examples and which therefore could never
+have gone green.
