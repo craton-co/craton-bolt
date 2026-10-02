@@ -13,7 +13,7 @@ The project's two distinguishing ideas:
 
 ## Status
 
-**Active development — v0.7.0.** The crate targets CUDA ≥ 12 and `sm_70`
+**Active development — v0.9.0.** The crate targets CUDA ≥ 12 and `sm_70`
 (Volta) or newer. Projection, filtering, scalar and grouped aggregates, joins,
 sorts, set operations, windows, CTEs, subqueries, and the documented scalar
 surface are implemented, but support is not synonymous with device-only

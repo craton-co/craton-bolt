@@ -5,7 +5,7 @@ planned beyond it. For day-to-day progress, see `CHANGELOG.md`. For supported
 SQL today, see `docs/SQL_REFERENCE.md`. For the full 1.0 plan, see
 `docs/PATH_TO_1.0.md`. To install and build, see `docs/INSTALL.md`.
 
-## 0.8.0 (current — pre-production, API stabilising)
+## 0.9.0 (current — pre-production, API stabilising)
 
 v0.7 turns the v0.6 carry-overs into live code paths: it lights up the
 `Decimal128` / `Date` / `Timestamp` GPU lowering boundaries, wires the
@@ -149,9 +149,9 @@ dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
 - `docs/MIGRATION_GUIDE.md` covers the 0.3 → 0.5 → 0.6 upgrade path.
 - `docs/USER_GUIDE.md` ships as a 10-minute tutorial.
 
-### Known limitations (not bugs) — as of 0.8.0
+### Known limitations (not bugs) — as of 0.9.0
 
-v0.8 closed most of the v0.7 carry-overs and security/correctness findings. What remains:
+v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What remains:
 
 - String and relational shapes span `Gpu`, `Host`, and `Hybrid`; callers can
   inspect `QueryHandle::planned_execution_tier()` instead of inferring a tier.
@@ -163,9 +163,9 @@ v0.8 closed most of the v0.7 carry-overs and security/correctness findings. What
   still the eager drain implementation (the signature is
   future-compatible).
 
-## Beyond 0.8 — toward 1.0 (next)
+## Beyond 0.9 — toward 1.0 (next)
 
-With the v0.6 execution carry-overs largely landed in v0.7, the
+With the v0.8 execution carry-overs largely landed in v0.9, the
 remaining pre-1.0 work is the last GPU-lowering gaps, planner-driven
 dispatch, and the freeze checklist:
 
