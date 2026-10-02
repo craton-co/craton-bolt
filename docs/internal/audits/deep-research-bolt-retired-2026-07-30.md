@@ -110,7 +110,7 @@ recorded from a cached or partial run.
 | MSRV compile + test gate | Passed on **1.85**, not the previously declared 1.74 — see the disposition row above |
 | Blocking coverage floor | 64.17% lines against the 50% floor (`--lib --tests`) |
 | `cargo deny` | `advisories ok, bans ok, licenses ok` on both the default and the `--all-features` graph |
-| Scaling and VRAM-pressure benchmark smoke | See "Benchmark smoke" below |
+| Scaling and VRAM-pressure benchmark smoke | Full sweep 1 K → 100 M completed in one process, including the near-capacity point; see "Benchmark smoke" below for numbers and one recorded intermittent failure |
 | Clean package dry run | `cargo publish --dry-run` passed on a clean tree, no `--allow-dirty` |
 | Public-API snapshot | No drift against `docs/PUBLIC_API_SNAPSHOT.txt` |
 
@@ -135,6 +135,41 @@ pinned DuckDB builds. Bumping the reference engine to a DuckDB release that
 compiles under MSVC 14.51 would also invalidate the "verified bit-equivalent
 against DuckDB 1.2" claim in `docs/BENCHMARKS.md`, so it is left as a deliberate
 follow-up rather than changed underneath the benchmark numbers.
+
+### Benchmark smoke
+
+The documented protocol ran end to end — the full row sweep plus the
+near-capacity point in one process, `BOLT_BENCH_GPU=1`, RTX 2060 with 10.7 GiB
+free before the run:
+
+| Rows | Criterion median | Throughput |
+|---|---|---|
+| 1 K | 2.65 ms | 377 Kelem/s |
+| 10 K | 13.8 ms | 723 Kelem/s |
+| 100 K | 51.1 ms | 1.96 Melem/s |
+| 1 M | 357 ms | 2.80 Melem/s |
+| 10 M | 252 ms | 39.7 Melem/s |
+| 100 M (VRAM pressure) | 1.54 s | 64.8 Melem/s |
+
+These are smoke numbers, not publishable ones: the box was shared with other
+workloads throughout, the criterion intervals are correspondingly wide, and the
+run used 10 samples per point rather than the 20 s / ≥100 sample protocol
+`BENCHMARKS.md` requires for canonical figures. They establish that the harness
+works and that the pressure point completes; they do not update any published
+table.
+
+**Open follow-up — one intermittent failure worth recording.** An earlier
+execution of the identical sweep, while the GPU was contended by other
+processes, aborted at the 100 M point with a raw
+`CudaWithCode { code: 208, "resource already mapped" }` propagated out of
+`Engine::sql`. The same point passes in isolation (1.19 s, 84.3 Melem/s) and the
+same full sweep passes on a quiet machine, so this is load-dependent rather than
+a size limit. It matters because `BENCHMARKS.md` states the pressure point must
+either complete or return a bounded `BoltError::GpuCapacity` / host fallback —
+surfacing an opaque driver code is the documented failure mode. Not fixed here:
+reproducing it requires recreating the contention, and guessing at the mapping
+without a captured call site would be speculation. Tracked as an explicit
+follow-up rather than dropped.
 
 ### What the final run cost
 
