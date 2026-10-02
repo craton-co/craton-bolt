@@ -8,6 +8,86 @@ There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) direct
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-02
+
+### Changed
+- **BREAKING: integer and `Decimal128` arithmetic now follows SQL semantics by
+  default.** Integer division / remainder by zero and `MIN / -1` produce `NULL`
+  instead of `0` / a wrapped value, and `Decimal128` division by zero is
+  rejected instead of returning `0`. The historical behavior is still reachable
+  with `BOLT_LEGACY_ARITHMETIC=1`, which defaults off.
+- **BREAKING: grouped `AVG` over an empty or all-NULL group returns `NULL`**,
+  not `0.0`. Every grouped finalizer (standard, pre-aggregation, wide, and
+  validity-aware) now emits a nullable `Float64`.
+- **BREAKING: literal-list `IN` / `NOT IN` follows SQL three-valued logic.**
+  Literal lists lower to an explicit `CASE` chain, so scalar, filtered, and
+  `HAVING` uses share the same NULL semantics the subquery path already had.
+- **BREAKING: constructing a second concurrent `Engine` is now an error.**
+  `Engine::build` takes a process-wide permit before CUDA initialization and
+  releases it on failure or `Drop` (after context teardown). The documented
+  one-engine-per-process model is enforced instead of silently allowing
+  cross-context contamination of the process-global pools and caches.
+- **BREAKING: the `rust-cuda` feature was removed** (see Security).
+- **BREAKING: DuckDB and Polars moved behind `reference-tests` /
+  `reference-benches`.** Ordinary `cargo test` / `cargo check` loops no longer
+  compile a bundled DuckDB into ~39 integration binaries; the cross-engine
+  parity targets declare the features they need.
+- **BREAKING: the MSRV is now 1.85.** The previously declared 1.74 could not
+  build the committed `Cargo.lock` at all — a locked dependency declares
+  `edition = "2024"`, which older Cargo cannot parse — so the 1.74 CI matrix leg
+  was dead. 1.85 is verified by its own matrix leg and pinned by a
+  document-consistency test against the CI matrix, `ci_local.sh`, and every doc
+  that quotes it.
+- **`cudarc` is the supported CUDA adapter**, not a partial spike alongside a
+  hand-rolled FFI backend; `cuda-stub` remains the host-only validation adapter.
+- **GPU paths are planner-selected, not env-gated.** Radix GPU sort is chosen by
+  supported key shape and size, and single primitive-key `DISTINCT` uses GPU
+  dedup (which `UNION` inherits); supported non-dictionary string operations
+  select their GPU implementation by default. The `BOLT_GPU_*=0` overrides
+  remain for diagnosis.
+
+### Added
+- **Public `ExecutionTier` contract.** `ExecutionTier::{Gpu, Host, Hybrid}` is
+  re-exported at the crate root; `PhysicalPlan::planned_execution_tier()` and
+  `QueryHandle::planned_execution_tier()` report the deterministic placement
+  decision *before* results are collected, so "supported SQL" is no longer
+  conflated with "ran on the GPU". The SQL and execution docs are
+  machine-checked against the contract.
+- **Streaming grouped integer `SUM` overflow is detected.** Streaming
+  aggregation retains the checked source values overflow validation needs, so
+  detection no longer depends on a host replay that streaming inputs cannot
+  reproduce. Covered by a multi-morsel end-to-end regression.
+- **Committed public-API snapshot.** `docs/PUBLIC_API_SNAPSHOT.txt` plus
+  `scripts/check_public_api.sh` reject `pub` surface drift in CI using a
+  date-pinned nightly and `cargo-public-api`, replacing manual enumeration.
+- **Scaling and VRAM-pressure benchmark** (`benches/scaling_benchmarks.rs`):
+  a real-device row sweep (`BOLT_SCALING_ROWS`) plus one near-capacity point
+  (`BOLT_VRAM_PRESSURE_ROWS`).
+- **End-to-end fixtures for the optional subsystems.** `tests/flight_e2e.rs`
+  drives the Flight wire round-trip through the stock arrow-flight client
+  decoder and, on a GPU host, a live gRPC `get_flight_info` + `do_get`
+  round-trip plus the bearer-token gate. `tests/substrait_e2e.rs` converts
+  producer-shaped Substrait plans and executes them through
+  `Engine::run_logical_plan`. Both feature lanes now run these instead of
+  merely compiling the features.
+- **Targeted regressions for the documented semantic exceptions** — invalid
+  integer arithmetic, Decimal division rejection, grouped all-NULL `AVG`,
+  literal `NULL` membership, streaming `SUM` overflow, GPU-path defaults,
+  execution-tier reporting, engine isolation, and Decimal GPU overflow.
+
+### Docs
+- Retired the external `deep-research-bolt.md` review into
+  `docs/internal/audits/`, and archived the historical portions of
+  `PATH_TO_1.0.md` and `GROUPBY_PERF.md` under `docs/internal/history/` so the
+  top-level documents carry only current direction.
+- `README.md` lists `kernels/` in the project layout and indexes
+  `CUDARC_ADOPTION.md` / `CONTRIBUTING_KERNEL.md` under an explicit
+  advanced/developer section; the index is link-checked by a test.
+- `DEVELOPMENT.md` gained a CI truth table covering hosted and local gates;
+  `RELEASING.md`, `ROADMAP.md`, `SECURITY.md`, `USER_GUIDE.md`, and
+  `MAINTAINERS.md` / `CODEOWNERS` were corrected to match the repository
+  (tag behavior, Codecov status, persistent-cache wiring, real code owners).
+
 ## [0.8.0] - 2026-09-15
 
 ### Performance
@@ -741,7 +821,8 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
-[Unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/craton-co/craton-bolt/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/craton-co/craton-bolt/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/craton-co/craton-bolt/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/craton-co/craton-bolt/compare/v0.5.0...v0.6.0

@@ -1,4 +1,4 @@
-﻿# Development
+# Development
 
 How to build, test, benchmark, and extend Craton Bolt.
 
@@ -60,11 +60,11 @@ BOLT_BENCH_GPU=1 cargo test -- --ignored --test-threads=1
 ## Continuous integration
 
 The repository has one workflow, `.github/workflows/ci.yml`, and one faithful
-local rehearsal, `ci_local.sh`.
+local rehearsal, `../ci_local.sh`.
 
 ### CI truth table
 
-| Gate | Hosted CI | `ci_local.sh` | Blocking |
+| Gate | Hosted CI | `../ci_local.sh` | Blocking |
 |------|-----------|---------------|----------|
 | fmt, strict clippy, host tests, doctests | Linux/Windows; stable + MSRV where applicable | same `cuda-stub` flags | yes |
 | default `cudarc`, `flight`, `substrait` | compile plus executable feature smokes | same | yes |
