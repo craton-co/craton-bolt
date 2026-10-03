@@ -1235,6 +1235,7 @@ impl DeviceMemPool {
     /// respectively. The closure is total (always `Some(_)`), so the
     /// `fetch_update` itself never returns `Err`.
     #[inline]
+    #[allow(deprecated)] // `fetch_update` was renamed to `try_update` in newer Rust, but MSRV (1.85) requires `fetch_update`.
     fn sub_total_saturating(&self, n: usize) {
         let _ = self
             .total_bytes

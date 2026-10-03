@@ -113,6 +113,11 @@ ignore = [
     # (the fix lives in the `fast-float2` fork, adopted by later Polars); it
     # leaves the graph when the Polars reference engine is bumped.
     "RUSTSEC-2025-0003",
+    # RUSTSEC-2026-0249 — `smartstring 1.0.1` is unmaintained (repository archived).
+    # Reached only via `polars 0.42` under `reference-benches`. It is never linked into
+    # the library, integration tests, or published artifacts. Upstream has no patched
+    # release; it leaves the graph when the Polars reference engine is bumped.
+    "RUSTSEC-2026-0249",
 ]
 
 [sources]

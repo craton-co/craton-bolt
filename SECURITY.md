@@ -1,4 +1,4 @@
-﻿# Security Policy
+# Security Policy
 
 Thank you for helping keep Craton Bolt and its users safe.
 
@@ -254,6 +254,7 @@ bumped, and both leave the graph on that bump.
 |---|---|---|---|
 | `RUSTSEC-2024-0436` | `paste 1.0.15` | `arrow-flight 53`, optional `flight` feature | Unmaintained, not a vulnerability. A compile-time proc-macro, not linked into any artifact. arrow-flight 53 pins it; no maintained drop-in at this arrow major. |
 | `RUSTSEC-2025-0003` | `fast-float 0.2.0` | `polars 0.42`, `reference-benches` only | Unchecked read on empty input. Present only in the benchmark harness's reference engine, parsing benchmark-local fixture data; never in the library, integration tests, or a published artifact. Upstream has no patched release — the fix lives in the `fast-float2` fork adopted by later Polars. |
+| `RUSTSEC-2026-0249` | `smartstring 1.0.1` | `polars 0.42`, `reference-benches` only | Unmaintained, repository archived by owner. Present only in the benchmark harness's reference engine; never in the library, integration tests, or a published artifact. No patched release available. |
 
 There is no longer a non-blocking advisory lane: the former `rust-cuda`
 build-toolchain tree, which was the reason one existed, has been removed.

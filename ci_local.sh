@@ -120,7 +120,7 @@ TESTS_PID=$!
   _step 'rustfmt check'
   cargo fmt --all -- --check
 
-  echo '>>> Running clippy (blocking)'
+  _step 'clippy (blocking)'
   cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings
 
   _step 'cargo check (lib, strict)'
@@ -129,35 +129,37 @@ TESTS_PID=$!
   _step 'cargo check --features cudarc'
   cargo check --lib --features cudarc --no-default-features
 
-  echo '>>> Running MSRV gate (1.85, mirrors the hosted matrix leg)'
+  _step 'MSRV gate (1.85, mirrors the hosted matrix leg)'
   cargo +1.85.0 check --lib --features cuda-stub --no-default-features
   cargo +1.85.0 test --lib --tests --features cuda-stub --no-default-features
 
-  echo '>>> Running feature tests (flight + substrait)'
+  _step 'feature tests (flight + substrait)'
   cargo test --lib --tests --no-default-features --features cuda-stub,flight
   cargo test --lib --tests --no-default-features --features cuda-stub,substrait
 
-  echo '>>> Running public API snapshot gate'
+  _step 'public API snapshot gate'
   bash scripts/check_public_api.sh
 
   _step 'cargo doc'
   cargo doc --no-default-features --features cuda-stub --no-deps
 
-  echo '>>> Running package (cargo publish --dry-run)'
-  cargo publish --dry-run --no-default-features --features cuda-stub
+  _step 'package (cargo publish --dry-run)'
+  cargo publish --dry-run --allow-dirty --no-default-features --features cuda-stub
 
-  echo '>>> Running coverage (host, >=50% lines)'
+  _step 'coverage (host, >=50% lines)'
   cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
   cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
 
   _step 'cargo deny (licenses + bans)'
   cargo deny check licenses bans
 
-  echo '>>> Running cargo deny (advisories, blocking)'
+  _step 'cargo deny (advisories, blocking)'
   cargo deny check advisories
 
-  echo '>>> Running cargo deny (all-features, blocking)'
+  _step 'cargo deny (all-features, blocking)'
   cargo deny --all-features check advisories licenses bans
+
+  rm -f /ci_tmp/others_failed_step
 " 2>&1 | sed 's/^/[OTHERS] /'
     echo "${PIPESTATUS[0]}" > "$TMP_DIR/others.exit"
 ) &

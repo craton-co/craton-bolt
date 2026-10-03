@@ -5095,7 +5095,7 @@ impl Engine {
         // column, the input column ordinal that feeds it. `None` => not a pure
         // passthrough (predicate present, or a compute/cast/select op), so we
         // re-raise the decline rather than risk a wrong host result.
-        let out_src = passthrough_output_sources(kernel).ok_or_else(&reraise)?;
+        let out_src = passthrough_output_sources(kernel).ok_or_else(reraise)?;
 
         // Pull the source rows from the host-materialised table and pick the
         // mapped input column for each output, casting to the declared output
@@ -5108,7 +5108,7 @@ impl Engine {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(kernel.outputs.len());
         for (out_idx, out_io) in kernel.outputs.iter().enumerate() {
             let in_idx = out_src[out_idx];
-            let in_io = kernel.inputs.get(in_idx).ok_or_else(&reraise)?;
+            let in_io = kernel.inputs.get(in_idx).ok_or_else(reraise)?;
             let col_pos = src_schema.index_of(&in_io.name).map_err(|_| {
                 BoltError::Plan(format!(
                     "host projection fallback: input column '{}' not found in \

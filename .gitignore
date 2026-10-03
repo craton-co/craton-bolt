@@ -3,6 +3,7 @@
 # `target-msrv/` via CARGO_TARGET_DIR), which are build output just the same.
 /target/
 /target-*/
+lcov.info
 
 # Claude Code worktrees and session state
 .claude/
