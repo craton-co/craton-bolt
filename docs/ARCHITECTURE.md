@@ -2,7 +2,7 @@
 
 This document maps Craton Bolt's source tree to the runtime pipeline, and explains the major design decisions. For the SQL → PTX deep-dive read [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the full supported subset see [`SQL_REFERENCE.md`](SQL_REFERENCE.md).
 
-> **Current as of v0.7.0.** The engine has grown well past the original 0.1 / 0.3.0 baseline. The GPU hash-join family (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER`, plus `CROSS`) and the GPU sort paths (bitonic, integrated; plus an env-gated radix path) are live in the executor, with host-side fallbacks as the correctness reference. v0.6 added a small-cardinality non-equi (nested-loop) join, and v0.7 wired the `KernelSpec`-keyed module cache into the real call sites and landed the GPU radix-sort dispatch. The layer cake and the "Landed" / exclusion sections below reflect that v0.7 state; see [`CHANGELOG.md`](../CHANGELOG.md) for the full per-release delta and [`ROADMAP.md`](../ROADMAP.md) for what's still open.
+> **Current as of v0.9.0.** The engine has grown well past the original 0.1 / 0.3.0 baseline. The GPU hash-join family (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER`, plus `CROSS`) and the GPU sort paths (bitonic, integrated; plus an env-gated radix path) are live in the executor, with host-side fallbacks as the correctness reference. v0.6 added a small-cardinality non-equi (nested-loop) join, and v0.7 wired the `KernelSpec`-keyed module cache into the real call sites and landed the GPU radix-sort dispatch. The layer cake and the "Landed" / exclusion sections below reflect that v0.7 state; see [`CHANGELOG.md`](../CHANGELOG.md) for the full per-release delta and [`ROADMAP.md`](../ROADMAP.md) for what's still open.
 
 ## Layer cake
 

@@ -7,10 +7,10 @@ preserves the wave-by-wave progression for context.
 
 ---
 
-## Section 1 — Current benchmark results (0.7.0, RTX 2060)
+## Section 1 — Current benchmark results (0.9.0, RTX 2060)
 
 All GPU numbers were captured on **NVIDIA GeForce RTX 2060**, driver
-591.86 (WDDM), CUDA 12.6 toolkit, with the `BOLT_BENCH_GPU=1` environment
+610.88 (WDDM), CUDA 13.3 toolkit, with the `BOLT_BENCH_GPU=1` environment
 variable. Times are criterion medians from a 20 s measurement window
 (≥ 100 samples each); the criterion CI is under ±5 % on every reported
 number. All cross-engine results are verified bit-equivalent against
@@ -25,18 +25,16 @@ spec; see [`benches/olap_benchmarks.rs`](../benches/olap_benchmarks.rs).
 
 | Query                                  | DuckDB    | Polars     | Craton Bolt    | Fast path engaged                |
 | -------------------------------------- | --------- | ---------- | -------------- | -------------------------------- |
-| **q1** low-card SUM (id1, 100 grps)    | 6.9 ms    | 19.0 ms    | **51.4 ms**    | Tier-1 single-SUM                |
-| **q2** med-card 2-SUM (id2, 10 K grps) | 46.4 ms   | 99.4 ms    | **384 ms**     | Tier-2.1 multi-SUM (N-value reduce) |
-| **q3** two-key SUM (≈ 1 M grps)        | 498 ms    | 385 ms     | **219 ms** ⭐  | Tier-2.1 two-key (i64 partition_reduce) |
-| **q4** low-card 3-AVG (id1, 100 grps)  | 12.9 ms   | 97.0 ms    | **70.5 ms**    | Tier-1 AVG (SUM + COUNT)         |
-| **q5** high-card SUM (id3, 1 M grps)   | 623 ms    | 358 ms     | **237 ms** ⭐  | Tier-2.1 (NUM_PARTITIONS=4096, pass-2 on GPU) |
+| **q1** low-card SUM (id1, 100 grps)    | 7.1 ms    | 19.9 ms    | **4.1 ms** ⭐  | Tier-1 single-SUM                |
+| **q2** med-card 2-SUM (id2, 10 K grps) | 62.0 ms   | 104.7 ms   | **110.3 ms**   | Tier-2.1 multi-SUM (N-value reduce) |
+| **q3** two-key SUM (≈ 1 M grps)        | 496.9 ms  | 459.9 ms   | **126.7 ms** ⭐ | Tier-2.1 two-key (i64 partition_reduce) |
+| **q4** low-card 3-AVG (id1, 100 grps)  | 12.5 ms   | 97.6 ms    | **54.4 ms**    | Tier-1 AVG (SUM + COUNT)         |
+| **q5** high-card SUM (id3, 1 M grps)   | 508.7 ms  | 363.2 ms   | **213.3 ms** ⭐ | Tier-2.1 (NUM_PARTITIONS=4096, pass-2 on GPU) |
 
 
-Craton Bolt wins outright on the two highest-cardinality workloads (q3,
-q5) where GPU-parallel hash-partitioning outpaces CPU per-core hash
-tables. CPU-native engines win at low cardinality (q1, q4) where their
-per-thread L1-resident tables beat GPU atomic contention. See
-[The honest read](#the-honest-read) for the full analysis.
+Craton Bolt wins outright on three workloads (q1, q3, q5) where GPU parallelism
+and partitioning outpace CPU engines. DuckDB remains faster on q2 and q4.
+See [The honest read](#the-honest-read) for the full analysis.
 
 ### Heavy-arithmetic OLAP (50 M rows)
 
@@ -45,9 +43,9 @@ columns — the regime where GPU compute density pays off.
 
 | Query                                | Polars (CPU MT)         | Craton Bolt E2E (GPU)         | CPU reference (single-thread) | Winner                  |
 | ------------------------------------ | ----------------------- | ----------------------------- | ----------------------------- | ----------------------- |
-| **`proj`** (passthrough)             | **12.55 µs** *(zero-copy)* | 115.5 ms *(432.9 Melem/s)* | —                             | Polars (zero-copy)      |
-| **`arith`** (11-op chain)            | 4.05 s *(12.3 Melem/s)* | **124.8 ms** *(400.7 Melem/s)*| 1.06 s *(47.2 Melem/s)*       | **Craton Bolt — 32.4× faster** |
-| **`filtered`** (filter + 4-op arith) | 369 ms *(135.5 Melem/s)*| **41.8 ms** *(1.196 Gelem/s)* | —                             | **Craton Bolt — 8.8× faster**  |
+| **`proj`** (passthrough)             | **9.04 µs** *(zero-copy)* | 187.7 ms *(266.4 Melem/s)*    | —                             | Polars (zero-copy)      |
+| **`arith`** (11-op chain)            | 3.39 s *(14.7 Melem/s)* | **185.7 ms** *(269.3 Melem/s)*| 231.8 ms *(215.8 Melem/s)*    | **Craton Bolt — 18.3× faster** |
+| **`filtered`** (filter + 4-op arith) | 358.2 ms *(139.6 Melem/s)*| **110.0 ms** *(454.4 Melem/s)*| —                             | **Craton Bolt — 3.3× faster**  |
 
 ### CPU-side pipeline overhead (no GPU needed)
 
@@ -57,11 +55,11 @@ dataset, [`benches/query_benchmarks.rs`](../benches/query_benchmarks.rs)):
 
 | Query      | plan      | lower     | ptx_gen   | **Total**     |
 | ---------- | --------- | --------- | --------- | ------------- |
-| `proj`     | 13.713 µs | 429.53 ns | 6.9632 µs | **21.106 µs** |
-| `arith`    | 9.4081 µs | 563.19 ns | 9.4604 µs | **19.432 µs** |
-| `filtered` | 11.850 µs | 620.96 ns | 11.221 µs | **23.692 µs** |
+| `proj`     | 572.86 ns | 1.9292 µs | 9.5360 µs | **12.038 µs** |
+| `arith`    | 728.89 ns | 2.5480 µs | 12.295 µs | **15.572 µs** |
+| `filtered` | 822.18 ns | 2.8646 µs | 12.525 µs | **16.212 µs** |
 
-Even the worst-case query is well under 50 µs of pre-launch overhead.
+Even the worst-case query is well under 20 µs of pre-launch overhead.
 **JIT-compiling-on-every-query is a viable execution model** — the
 planning + codegen budget is negligible compared to any non-trivial GPU
 launch + h2d/d2h round trip, which is typically in the high tens to
@@ -70,27 +68,23 @@ hundreds of microseconds.
 ### The honest read
 
 On the standard groupby OLAP workload, Craton Bolt's GPU engine is now
-faster than both Polars and DuckDB on the two highest-cardinality queries
-(q3, q5), within striking distance on q4, and still trails CPU engines
-on the very-low-cardinality (q1) and medium-cardinality multi-SUM (q2)
-cases.
+faster than both Polars and DuckDB on three queries (q1, q3, q5), beats
+Polars on q4, and closely trails on q2.
 
 Where the time goes on the queries Craton Bolt still loses:
 
-- **q1 / q4 (100 groups).** With only 100 destination buckets, CPU
-  engines fit the entire hash table in L1 per thread; the GPU pays
-  fixed launch + D2H costs that dominate the actual compute.
-- **q2 (10 K groups, multi-SUM).** The Tier-2.1 multi-SUM path landed
-  late and gives a modest 1.15× speedup (444 ms → 384 ms) at this
-  cardinality. The path scales the same way single-SUM Tier-2.1 does,
-  so larger-cardinality multi-SUM workloads should track closer to
-  q3 / q5's 3.7× wins.
+- **q2 (10 K groups, multi-SUM).** The Tier-2.1 multi-SUM path measures at
+  110.3 ms and closely approaches Polars (104.7 ms), though DuckDB leads with
+  per-core thread-local tables (62.0 ms).
+- **q4 (100 groups, multi-AVG).** The Tier-1 AVG path measures at 54.4 ms
+  (beating Polars' 97.6 ms), but DuckDB's compact L1-resident state machine
+  runs in 12.5 ms.
 
 The `arith` win on the heavy-arithmetic OLAP table is real but somewhat
 amplified by Polars' eager-binary materialisation under chained
-`lit() * col() + …` expressions; the CPU reference loop (1.06 s) is the
+`lit() * col() + …` expressions; the CPU reference loop (231.8 ms) is the
 more honest CPU ceiling for that workload, and Craton Bolt is still
-**8.5× faster** than that.
+**1.25× faster** than that (and **18.3× faster** than Polars).
 
 ---
 
@@ -335,12 +329,12 @@ Tier-2 path; q2 (multi-SUM at medium cardinality) and q3 (two-key)
 fell through unchanged because neither Tier-1 nor host-pass-2 Tier-2 v0
 supported them.
 
-### Wave: Tier-2.1 — pass-2-on-GPU + multi-SUM + two-key (canonical numbers)
+### Wave: Tier-2.1 — pass-2-on-GPU + multi-SUM + two-key (0.7.0 historical)
 
 Three follow-ups landed together: (a) pass-2-on-GPU for the existing
 single-SUM Tier-2 (closes q5), (b) multi-SUM Tier-2 / Tier-2.1 for q2,
-(c) two-key Tier-2.1 for q3. These produced the canonical numbers in
-Section 1.
+(c) two-key Tier-2.1 for q3. These produced the 0.7.0 results (superseded
+in 0.9.0; see Section 1 for canonical numbers).
 
 | Query                              | Path engaged                                | Fresh-system time | Pre-fast-path baseline | Δ                |
 | ---------------------------------- | ------------------------------------------- | ----------------- | ---------------------- | ---------------- |

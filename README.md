@@ -191,23 +191,22 @@ for the canonical numbers and methodology.
 
 | Query | Polars (CPU MT) | Craton Bolt (GPU) | Speedup |
 |---|---|---|---|
-| 11-op arithmetic chain (50 M rows) | 4.05 s | **124.8 ms** | **32.4×** |
-| Filter + 4-op arithmetic (50 M rows) | 369 ms | **41.8 ms** | **8.8×** |
+| 11-op arithmetic chain (50 M rows) | 3.39 s | **185.7 ms** | **18.3×** |
+| Filter + 4-op arithmetic (50 M rows) | 358.2 ms | **110.0 ms** | **3.3×** |
 
 ### h2o.ai db-benchmark GROUP BY subset (10 M rows, RTX 2060)
 
 | Query | DuckDB | Polars | Craton Bolt | Notes |
 |---|---|---|---|---|
-| q1 low-card SUM (100 groups) | 6.9 ms | 19.0 ms | **51.4 ms** | DuckDB wins |
-| q2 med-card 2-SUM (10 K groups) | 46.4 ms | 99.4 ms | 384 ms | DuckDB wins |
-| q3 two-key SUM (~1 M groups) | 498 ms | 385 ms | **219 ms** ⭐ | Craton Bolt fastest |
-| q4 low-card 3-AVG (100 groups) | 12.9 ms | 97.0 ms | **70.5 ms** | DuckDB wins |
-| q5 high-card SUM (1 M groups) | 623 ms | 358 ms | **237 ms** ⭐ | Craton Bolt fastest |
+| q1 low-card SUM (100 groups) | 7.1 ms | 19.9 ms | **4.1 ms** ⭐ | Craton Bolt fastest |
+| q2 med-card 2-SUM (10 K groups) | 62.0 ms | 104.7 ms | 110.3 ms | DuckDB wins |
+| q3 two-key SUM (~1 M groups) | 496.9 ms | 459.9 ms | **126.7 ms** ⭐ | Craton Bolt fastest |
+| q4 low-card 3-AVG (100 groups) | 12.5 ms | 97.6 ms | 54.4 ms | DuckDB wins |
+| q5 high-card SUM (1 M groups) | 508.7 ms | 363.2 ms | **213.3 ms** ⭐ | Craton Bolt fastest |
 
-Craton Bolt wins outright on the two highest-cardinality workloads (q3, q5) where
-GPU-parallel hash-partitioning outpaces CPU per-core hash tables. CPU-native engines
-win at low cardinality (q1, q4) where their per-thread L1-resident tables beat GPU
-atomic contention. See [`docs/BENCHMARKS.md §honest read`](docs/BENCHMARKS.md#the-honest-read)
+Craton Bolt wins outright on three workloads (q1, q3, q5) where GPU parallelism
+and hash-partitioning outpace CPU engines. CPU-native engines remain faster on
+q2 and q4. See [`docs/BENCHMARKS.md §honest read`](docs/BENCHMARKS.md#the-honest-read)
 for the full analysis.
 
 ```bash

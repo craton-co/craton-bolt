@@ -90,7 +90,7 @@ license. See the [`DCO`](DCO) file at the repo root for the full text.
 
 See [`ROADMAP.md`](ROADMAP.md) for milestones — the "Beyond 0.7 — toward
 1.0" and "1.0 — public API freeze" sections list the work still planned.
-Items in the "Known limitations (not bugs) — as of 0.7.0" section are
+Items in the "Known limitations (not bugs) — as of 0.9.0" section are
 intentional gaps — flag in your PR if you want to tackle one.
 
 ## Licensing of contributions

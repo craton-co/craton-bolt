@@ -251,7 +251,7 @@ Source: `src/exec/engine.rs::execute_projection` and the per-shape executors.
 
 Each output `GpuVec` is round-tripped to a host `Vec<T>` via `cuMemcpyDtoH`, wrapped in the matching Arrow primitive array (`Int32Array`, `Float64Array`, etc.) or decoded back through a `DictionaryColumn` for Utf8 outputs. The arrays plus the schema build a `RecordBatch`, which the engine wraps in a `QueryHandle` and returns to the caller.
 
-> **Async transfer status (as of 0.7.0).** Async memcpy has landed and is
+> **Async transfer status (as of 0.9.0).** Async memcpy has landed and is
 > partially wired into the executors. The safe wrappers `memcpy_h2d_async` /
 > `memcpy_d2h_async` / `memset_d8_async` sit alongside a typed
 > `PinnedHostBuffer<T>` and additive `GpuBuffer::copy_from_async` /

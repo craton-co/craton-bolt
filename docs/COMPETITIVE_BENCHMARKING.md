@@ -10,7 +10,7 @@ that any future numbers should follow.
 
 ## TL;DR
 
-- Craton Bolt 0.7.0 is a single-node, multi-batch in-memory GPU SQL engine. Pick
+- Craton Bolt 0.9.0 is a single-node, multi-batch in-memory GPU SQL engine. Pick
   competitors that occupy the same niche; treat cross-niche comparisons as
   illustrative, not damning.
 - Use **ClickBench** as your primary suite: it's single-table, aggregation-heavy,
@@ -26,7 +26,7 @@ that any future numbers should follow.
 
 ## 1. What category is Craton Bolt in?
 
-Be specific about the contest before you measure. Craton Bolt 0.7.0 is:
+Be specific about the contest before you measure. Craton Bolt 0.9.0 is:
 
 - **Single-node** (one process, one GPU).
 - **Multi-batch in-memory** (a table may hold many `RecordBatch`es; the
@@ -73,11 +73,11 @@ buying anything *on that workload*, full stop.
 
 ### 3.1 Standard suites, ranked by fit
 
-| Suite | Tables | Queries | Fits Craton Bolt 0.7.0?       | Comment |
+| Suite | Tables | Queries | Fits Craton Bolt 0.9.0?       | Comment |
 | ----- | ------ | ------- | ------------------------- | ------- |
 | **ClickBench**     | 1 (`hits`)   | 43 | Yes (most queries)     | Aggregation-heavy single-table. Ideal. |
-| **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.7.0. |
-| **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.7.0 hash join (INNER on GPU; LEFT/RIGHT/FULL/CROSS on GPU or host) handles SSB joins. |
+| **SSB** (denormalised flat) | 1 | 13 | Yes              | Star Schema Benchmark; "denorm" form fits 0.9.0. |
+| **SSB** (joined)   | 5            | 13 | Partial (needs INNER) | The 0.9.0 hash join (INNER on GPU; LEFT/RIGHT/FULL/CROSS on GPU or host) handles SSB joins. |
 | **TPC-H** SF1      | 8            | 22 | Partial (~6 queries)  | Many queries need LEFT JOIN, subqueries, CTEs. |
 | **TPC-H** SF10+    | 8            | 22 | No                     | Multi-batch / streaming needed. |
 | **TPC-DS**         | 24           | 99 | No                     | Out of scope (post-1.0).               |
@@ -183,7 +183,7 @@ the values in your writeup.
 
 ## 6. What Craton Bolt will likely win and lose at
 
-Setting reader expectations honestly is part of the deliverable. As of 0.7.0:
+Setting reader expectations honestly is part of the deliverable. As of 0.9.0:
 
 **Likely wins**
 - Warm scalar arithmetic at ≥ 10M rows (GPU FLOPs + bandwidth ratio).
@@ -207,7 +207,7 @@ Setting reader expectations honestly is part of the deliverable. As of 0.7.0:
   `BETWEEN`, `CASE`, `NULLIF`, `COALESCE`, `CAST`, etc.) and what still
   rejects at the physical layer, see `SQL_REFERENCE.md` and `CHANGELOG.md`.
 
-**Likely losses (by design, as of 0.7.0)**
+**Likely losses (by design, as of 0.9.0)**
 - Streaming tables and larger-than-VRAM datasets — the whole table is
   uploaded eagerly today; lazy streaming and spill are 1.0-track work
   that has not landed yet (see [`ROADMAP.md`](../ROADMAP.md) and

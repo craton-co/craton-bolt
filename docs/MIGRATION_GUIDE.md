@@ -8,7 +8,7 @@ version jumps in Craton Bolt's history so far:
 - **0.5.0 -> 0.6.0** — M1 foundation finishing plus the M3-M8 milestone
   work.
 - **0.6.0 -> 0.7.0** — the v0.6 carry-overs become live GPU code paths.
-  `0.7.0` is the current series.
+  `0.9.0` is the current series.
 
 Each section follows the same shape:
 

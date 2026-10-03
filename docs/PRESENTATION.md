@@ -9,7 +9,7 @@
 - **What**: A SQL execution engine that compiles *each* query into a fresh NVIDIA PTX kernel at runtime, loads it via the CUDA driver, and runs it on the GPU.
 - **Language**: Rust (2021 edition, MSRV 1.74) on top of the raw CUDA driver API — no C++ shim, no precompiled kernel library, no third-party query-engine FFI.
 - **Pipeline**: parse → plan → codegen → launch, end to end in pure Rust.
-- **Status**: `0.7.0`, active development, pre-1.0 (public API unstable). Compiles clean on Windows MSVC and Linux against CUDA Toolkit ≥ 12; targets `sm_70` (Volta) and newer.
+- **Status**: `0.9.0`, active development, pre-1.0 (public API unstable). Compiles clean on Windows MSVC and Linux against CUDA Toolkit ≥ 12; targets `sm_70` (Volta) and newer.
 
 ---
 
@@ -129,17 +129,16 @@ h2o.ai db-benchmark spec.
 
 | Query                          | DuckDB | Polars | Craton Bolt | Notes                |
 |--------------------------------|--------|--------|-------------|----------------------|
-| q1 low-card SUM (100 groups)   | 6.9 ms | 19.0 ms| 51.4 ms     | DuckDB wins          |
-| q2 med-card 2-SUM (10 K groups)| 46.4 ms| 99.4 ms| 384 ms      | DuckDB wins          |
-| q3 two-key SUM (≈ 1 M groups)  | 498 ms | 385 ms | **219 ms** ⭐ | Craton Bolt fastest |
-| q4 low-card 3-AVG (100 groups) | 12.9 ms| 97.0 ms| 70.5 ms     | DuckDB wins          |
-| q5 high-card SUM (1 M groups)  | 623 ms | 358 ms | **237 ms** ⭐ | Craton Bolt fastest |
+| q1 low-card SUM (100 groups)   | 7.1 ms | 19.9 ms| **4.1 ms** ⭐ | Craton Bolt fastest |
+| q2 med-card 2-SUM (10 K groups)| 62.0 ms| 104.7 ms| 110.3 ms    | DuckDB wins          |
+| q3 two-key SUM (≈ 1 M groups)  | 496.9 ms| 459.9 ms| **126.7 ms** ⭐ | Craton Bolt fastest |
+| q4 low-card 3-AVG (100 groups) | 12.5 ms| 97.6 ms| 54.4 ms     | DuckDB wins          |
+| q5 high-card SUM (1 M groups)  | 508.7 ms| 363.2 ms| **213.3 ms** ⭐ | Craton Bolt fastest |
 
-Craton Bolt wins outright on the two highest-cardinality workloads (q3, q5), where
-GPU-parallel hash-partitioning outpaces CPU per-core hash tables. CPU-native engines win
-at low cardinality (q1, q4) where their per-thread L1-resident tables beat GPU atomic
-contention. This is the honest read — Craton Bolt is a *complement* to CPU engines, not a
-universal replacement.
+Craton Bolt wins outright on three workloads (q1, q3, q5), where GPU parallelism
+and hash-partitioning outpace CPU engines. CPU-native engines remain faster at
+medium-cardinality multi-SUM (q2) and low-cardinality AVG (q4). This is the honest read —
+Craton Bolt is a *complement* to CPU engines, not a universal replacement.
 
 ---
 
@@ -235,7 +234,7 @@ strokes before a stable 1.0:
 | **Codegen cost** | < 25 µs plan + lower + codegen per query, any dataset size |
 | **Stack** | Pure Rust on the raw CUDA driver API — no C++ shim, no FFI to a 3rd-party engine |
 | **Targets** | CUDA 12+, NVIDIA `sm_70`+ (Volta); Linux & Windows MSVC; `cuda-stub` type-checks anywhere |
-| **Status** | v0.7.0, active development, pre-1.0 — API unstable, not production-ready |
+| **Status** | v0.9.0, active development, pre-1.0 — API unstable, not production-ready |
 | **License** | Apache-2.0 |
 
 ---

@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Craton Bolt — Limitations
 
-**Crate:** `craton-bolt` v0.7.0 · **License:** Apache-2.0
+**Crate:** `craton-bolt` v0.9.0 · **License:** Apache-2.0
 
 This is the 30-second, honest read on what Craton Bolt **cannot** do yet, what
 it **requires**, and why it is **not production-ready**. It consolidates caveats
@@ -75,7 +75,7 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 ## Pre-1.0 API instability
 
-- The crate is `0.7.0`. Per [SemVer](https://semver.org/), pre-1.0 the public
+- The crate is `0.9.0`. Per [SemVer](https://semver.org/), pre-1.0 the public
   API may break on any minor (`0.x`) bump. The IR, `KernelSpec`, executor
   surface, and several `Engine` methods are still moving.
 - See [`docs/API_SURFACE.md`](API_SURFACE.md) for the per-item stability tiers

@@ -7,7 +7,7 @@ is the v0.6 / M7 staging ground for the public-API freeze that ships with
 contract. At 1.0 each entry in the **stable** tier becomes binding under
 the semver rules listed below.
 
-> Crate version: `0.7.0`. The exhaustive rustdoc-derived inventory is
+> Crate version: `0.9.0`. The exhaustive rustdoc-derived inventory is
 > committed in [`PUBLIC_API_SNAPSHOT.txt`](PUBLIC_API_SNAPSHOT.txt). CI
 > regenerates it with `cargo-public-api 0.52.0` and pinned
 > `nightly-2026-04-03`, then fails on additions, removals, signature/export
