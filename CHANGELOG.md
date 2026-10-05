@@ -4,6 +4,46 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
+### Fixed
+- **Lazy streams drain only the tables a query references.**
+  `register_table_stream_lazy` promised that a producer runs on the first query
+  that *references* its table, but every generic query drained every pending
+  lazy source. The compile pipeline now collects the plan's scans and
+  materialises exactly those (subqueries and host-orchestrated subplans drain
+  their own scans as they are compiled); `explain_sql` never drains.
+- **Lazy streams enforce the declared schema.** Batches drained from a lazy
+  producer are validated with the same check the eager `register_table_stream`
+  path uses (column count, names, plan dtypes); a mismatch fails every query
+  that references the table deterministically instead of letting planning see
+  one type while execution receives another.
+- **`run_logical_plan` / `DataFrame::collect` run user `PlanRewrite`s**, as
+  `sql()` always did.
+- **`explain_sql` renders the plan that executes.** It now runs the built-in
+  optimizer (constant folding, pushdown, join reorder, pruning) like `sql()`;
+  when a plan carries uncorrelated subqueries — which EXPLAIN does not execute —
+  the physical section is headed `Physical plan (pre-subquery-resolution ...)`
+  instead of silently differing from the executed plan.
+- **The dictionary plan rewrite runs once per plan**, not twice back-to-back.
+- **`QueriesFailed` counts every failure** of a top-level `sql()` /
+  `run_logical_plan` call — parse, rewrite, optimize, subquery resolution,
+  lowering — not only execution failures.
+
+### Changed
+- **One compile pipeline for every entry point.** `sql`, `explain_sql`,
+  `run_logical_plan` and the component subplans of host-orchestrated SQL shapes
+  (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`,
+  `DISTINCT ON`, `COUNT(DISTINCT)` + `GROUP BY`) share a single
+  dictionary-rewrite → optimizer → `PlanRewrite` → subquery-resolution →
+  lowering sequence (`exec::engine_query`). Behavioural consequence: user
+  `PlanRewrite`s now also see the component subplans of those host-orchestrated
+  shapes (once per compilation — e.g. per recursive iteration); an extracted
+  uncorrelated subquery is still only rewritten as part of its enclosing plan.
+  The full contract is documented on `PlanRewrite`.
+- **SQL is classified once.** A single frontend classifier replaces eight
+  independent detector calls that each re-parsed the statement; a statement
+  proven ordinary is memoised per schema version, so a repeated query skips
+  shape detection and hits the plan cache directly.
+
 ## [0.9.0] - 2026-10-02
 
 ### Changed

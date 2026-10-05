@@ -235,6 +235,8 @@ impl DictRegistry {
     /// `plan` (the rewriter is a no-op when `knows()` returns false for every
     /// column).
     pub fn rewrite_plan(&self, plan: &LogicalPlan) -> BoltResult<LogicalPlan> {
+        #[cfg(test)]
+        REWRITE_PLAN_CALLS.with(|c| c.set(c.get() + 1));
         let tables = collect_scan_tables(plan);
 
         // First pass: for each Utf8 column *name* present across the scanned
@@ -618,31 +620,20 @@ fn collect_projected_bare_columns(plan: &LogicalPlan) -> std::collections::HashS
     out
 }
 
-fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
-    fn walk(p: &LogicalPlan, out: &mut Vec<String>) {
-        match p {
-            LogicalPlan::Scan { table, .. } => out.push(table.clone()),
-            LogicalPlan::Filter { input, .. }
-            | LogicalPlan::Project { input, .. }
-            | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Distinct { input, .. }
-            | LogicalPlan::Limit { input, .. }
-            | LogicalPlan::Window { input, .. }
-            | LogicalPlan::Sort { input, .. } => walk(input, out),
-            LogicalPlan::Union { inputs } => {
-                for inp in inputs {
-                    walk(inp, out);
-                }
-            }
-            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
-                walk(left, out);
-                walk(right, out);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(plan, &mut out);
-    out
+use crate::plan::logical_plan::collect_scan_tables;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only telemetry: number of [`DictRegistry::rewrite_plan`] calls on
+    /// this thread. Lets the query-pipeline tests pin "exactly one dictionary
+    /// rewrite per compiled plan" without a GPU.
+    static REWRITE_PLAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: [`DictRegistry::rewrite_plan`] calls made on this thread so far.
+#[cfg(test)]
+pub(crate) fn rewrite_plan_calls() -> usize {
+    REWRITE_PLAN_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
