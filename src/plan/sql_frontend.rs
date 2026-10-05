@@ -801,9 +801,18 @@ fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<Logical
     guard_sql_size(sql)?;
 
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    lower_statements(stmts, provider)
+}
 
+/// Lower an already-parsed statement list through the ordinary
+/// (non-special-shape) frontend. Shared by [`parse_uncached`] and
+/// [`classify_query`], which parses once and only falls through to this
+/// after every host-orchestrated detector has declined.
+fn lower_statements(
+    mut stmts: Vec<Statement>,
+    provider: &dyn TableProvider,
+) -> BoltResult<LogicalPlan> {
     if stmts.len() != 1 {
         return Err(BoltError::Sql(format!(
             "expected exactly one statement, got {}",
@@ -1189,6 +1198,145 @@ pub fn plan_cache_stats() -> (usize, usize, usize) {
         PLAN_CACHE_MISSES.load(Ordering::Relaxed),
         PLAN_CACHE_EVICTIONS.load(Ordering::Relaxed),
     )
+}
+
+/// The frontend's classification of one SQL statement: either an ordinary
+/// query that lowers to a single [`LogicalPlan`], or one of the
+/// host-orchestrated shapes whose structure does not fit a single plan
+/// (recursive CTEs, correlated applies, inline relations, ...).
+///
+/// Produced by [`classify_query`], which is the ONE entry point the engine
+/// uses to recognise query shapes — `Engine::sql` and `Engine::explain_sql`
+/// both dispatch on it, so the two can never disagree about which path a
+/// statement takes. Every host-orchestrated shape is a descriptor of
+/// component [`LogicalPlan`]s that the engine compiles through the same
+/// rewrite / optimize / lower pipeline as an ordinary query.
+#[derive(Debug)]
+pub(crate) enum QueryShape {
+    /// `WITH RECURSIVE` (single or mutual).
+    Recursive(RecursiveQueryPlan),
+    /// `FROM <left>, LATERAL (<subquery>)`.
+    Lateral(LateralApplyPlan),
+    /// A correlated `EXISTS` / `NOT EXISTS` / scalar subquery in `WHERE`.
+    CorrelatedWhere(CorrelatedWherePlan),
+    /// A `VALUES` row source.
+    Values(ValuesQueryPlan),
+    /// A `generate_series(..)` row source.
+    GenerateSeries(GenerateSeriesQueryPlan),
+    /// `SELECT DISTINCT ON (..)`.
+    DistinctOn(DistinctOnPlan),
+    /// A sole `COUNT(DISTINCT col)` with `GROUP BY`.
+    CountDistinctGroupBy(CountDistinctGroupByPlan),
+    /// Mixed / multiple `COUNT(DISTINCT ..)` with `GROUP BY`.
+    MultiAggGroupBy(MultiAggGroupByPlan),
+    /// An ordinary query.
+    Generic(LogicalPlan),
+}
+
+/// Bounded FIFO set of `(sql, schema_version)` keys that [`classify_query`]
+/// has already proven to be ordinary queries.
+struct GenericVerdicts {
+    set: std::collections::HashSet<PlanCacheKey>,
+    order: VecDeque<PlanCacheKey>,
+}
+
+/// SQL texts (per provider `schema_version`) already classified as ordinary
+/// queries. A repeat of such a statement skips the host-orchestrated
+/// detectors and goes straight to the plan cache, so a steady-state
+/// dashboard query pays a cache probe instead of a full parse. Same capacity
+/// as the plan cache.
+static GENERIC_VERDICTS: Lazy<Mutex<GenericVerdicts>> = Lazy::new(|| {
+    Mutex::new(GenericVerdicts {
+        set: std::collections::HashSet::new(),
+        order: VecDeque::new(),
+    })
+});
+
+fn generic_verdict_known(key: &PlanCacheKey) -> bool {
+    GENERIC_VERDICTS.lock().set.contains(key)
+}
+
+fn generic_verdict_record(key: PlanCacheKey) {
+    let mut v = GENERIC_VERDICTS.lock();
+    if v.set.contains(&key) {
+        return;
+    }
+    while v.set.len() >= plan_cache_cap() {
+        match v.order.pop_front() {
+            Some(old) => {
+                v.set.remove(&old);
+            }
+            None => break,
+        }
+    }
+    v.order.push_back(key.clone());
+    v.set.insert(key);
+}
+
+/// Classify `sql` into a [`QueryShape`], parsing it at most once.
+///
+/// The detectors run in a fixed precedence order (recursive CTE, LATERAL,
+/// correlated WHERE, VALUES, generate_series, DISTINCT ON, sole
+/// COUNT(DISTINCT) GROUP BY, mixed COUNT(DISTINCT) GROUP BY); the first one
+/// that recognises the statement wins. A statement no detector claims is
+/// lowered by the ordinary frontend (through the plan cache) and its
+/// "ordinary" verdict is memoised, so repeats skip detection entirely.
+///
+/// Semantics match calling the individual `plan_*` detectors in that order
+/// followed by [`parse`] — including error precedence: a statement of a
+/// recognised shape that is malformed surfaces that detector's error.
+pub(crate) fn classify_query(sql: &str, provider: &dyn TableProvider) -> BoltResult<QueryShape> {
+    let key = PlanCacheKey {
+        sql: sql.to_string(),
+        version: provider.schema_version(),
+    };
+    if generic_verdict_known(&key) {
+        return parse(sql, provider).map(QueryShape::Generic);
+    }
+    guard_sql_size(sql)?;
+    let dialect = GenericDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    if let [Statement::Query(query)] = stmts.as_slice() {
+        let query = query.as_ref();
+        if matches!(&query.with, Some(with) if with.recursive) {
+            let plan = plan_recursive_query(query, provider, &CteScope::new(), 0)?;
+            return Ok(QueryShape::Recursive(plan));
+        }
+        if let Some(p) = plan_lateral_apply_query(query, provider)? {
+            return Ok(QueryShape::Lateral(p));
+        }
+        if let Some(p) = plan_correlated_where_query(query, provider)? {
+            return Ok(QueryShape::CorrelatedWhere(p));
+        }
+        if let Some(p) = plan_values_query_inner(query, provider)? {
+            return Ok(QueryShape::Values(p));
+        }
+        if let Some(p) = plan_generate_series_query_inner(query, provider)? {
+            return Ok(QueryShape::GenerateSeries(p));
+        }
+        if let Some(p) = plan_distinct_on_inner(query, provider)? {
+            return Ok(QueryShape::DistinctOn(p));
+        }
+        if let Some(p) = plan_count_distinct_groupby_inner(query, provider)? {
+            return Ok(QueryShape::CountDistinctGroupBy(p));
+        }
+        if let Some(p) = plan_multi_agg_groupby_inner(query, provider)? {
+            return Ok(QueryShape::MultiAggGroupBy(p));
+        }
+    }
+    // Ordinary query: reuse a cached lowering when one exists, otherwise
+    // lower the statements already parsed above and populate the plan cache
+    // exactly as `parse` would.
+    let plan = match plan_cache_lookup(sql, key.version) {
+        Some(plan) => (*plan).clone(),
+        None => {
+            let plan = lower_statements(stmts, provider)?;
+            plan_cache_insert(sql.to_string(), key.version, Arc::new(plan.clone()));
+            plan
+        }
+    };
+    generic_verdict_record(key);
+    Ok(QueryShape::Generic(plan))
 }
 
 /// A `WITH` common-table-expression scope: maps a (case-folded) CTE name to
@@ -2714,6 +2862,15 @@ pub fn plan_count_distinct_groupby(
         Statement::Query(q) => q,
         _ => return Ok(None),
     };
+    plan_count_distinct_groupby_inner(&query, provider)
+}
+
+/// Inner detector: see [`plan_count_distinct_groupby`]. Operates on a parsed
+/// `Query` so [`classify_query`] can run every detector over one parse.
+fn plan_count_distinct_groupby_inner(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<CountDistinctGroupByPlan>> {
     // No CTEs / set-ops / dialect tail clauses here — those route through the
     // ordinary pipeline (or the recursive-CTE hook).
     if query.with.is_some() {
@@ -2904,7 +3061,7 @@ pub fn plan_count_distinct_groupby(
     // ORDER BY can reference the count by its `COUNT(DISTINCT col)` call, by
     // alias, or a group key by name.
     let post = build_count_distinct_post_plan(
-        &query,
+        query,
         select,
         &distinct_arg,
         &count_alias,
@@ -3261,6 +3418,15 @@ pub fn plan_multi_agg_groupby(
         Statement::Query(q) => q,
         _ => return Ok(None),
     };
+    plan_multi_agg_groupby_inner(&query, provider)
+}
+
+/// Inner detector: see [`plan_multi_agg_groupby`]. Operates on a parsed
+/// `Query` so [`classify_query`] can run every detector over one parse.
+fn plan_multi_agg_groupby_inner(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<MultiAggGroupByPlan>> {
     if query.with.is_some() {
         return Ok(None);
     }
@@ -3463,7 +3629,7 @@ pub fn plan_multi_agg_groupby(
     }
     let result_schema = Schema::new(result_fields);
 
-    let post = build_multi_agg_post_plan(&query, select, &items, &result_schema, provider)?;
+    let post = build_multi_agg_post_plan(query, select, &items, &result_schema, provider)?;
 
     Ok(Some(MultiAggGroupByPlan {
         base,
@@ -16779,5 +16945,187 @@ mod values_and_distinct_on_tests {
         assert!(plan_distinct_on("SELECT DISTINCT a FROM t", &provider())
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod classify_query_tests {
+    //! [`classify_query`] must classify every statement exactly as the
+    //! per-shape `plan_*` detectors chained in precedence order followed by
+    //! [`parse`] (the sequence `Engine::sql` used to run, re-parsing the SQL
+    //! once per detector), errors included.
+
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    fn provider() -> MemTableProvider {
+        MemTableProvider::new()
+            .with_table(
+                "t",
+                Schema::new(vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("b", DataType::Utf8, true),
+                ]),
+            )
+            .with_table(
+                "edges",
+                Schema::new(vec![
+                    Field::new("src", DataType::Int64, false),
+                    Field::new("dst", DataType::Int64, false),
+                ]),
+            )
+            .with_table(
+                "u",
+                Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, false),
+                ]),
+            )
+    }
+
+    fn label(shape: &QueryShape) -> &'static str {
+        match shape {
+            QueryShape::Recursive(_) => "recursive",
+            QueryShape::Lateral(_) => "lateral",
+            QueryShape::CorrelatedWhere(_) => "correlated-where",
+            QueryShape::Values(_) => "values",
+            QueryShape::GenerateSeries(_) => "generate-series",
+            QueryShape::DistinctOn(_) => "distinct-on",
+            QueryShape::CountDistinctGroupBy(_) => "count-distinct",
+            QueryShape::MultiAggGroupBy(_) => "multi-agg",
+            QueryShape::Generic(_) => "generic",
+        }
+    }
+
+    /// The pre-`classify_query` dispatch sequence, verbatim.
+    fn legacy(sql: &str, p: &MemTableProvider) -> Result<&'static str, String> {
+        let e = |e: BoltError| e.to_string();
+        if plan_recursive_cte(sql, p).map_err(e)?.is_some() {
+            return Ok("recursive");
+        }
+        if plan_lateral_apply(sql, p).map_err(e)?.is_some() {
+            return Ok("lateral");
+        }
+        if plan_correlated_where(sql, p).map_err(e)?.is_some() {
+            return Ok("correlated-where");
+        }
+        if plan_values_query(sql, p).map_err(e)?.is_some() {
+            return Ok("values");
+        }
+        if plan_generate_series_query(sql, p).map_err(e)?.is_some() {
+            return Ok("generate-series");
+        }
+        if plan_distinct_on(sql, p).map_err(e)?.is_some() {
+            return Ok("distinct-on");
+        }
+        if plan_count_distinct_groupby(sql, p).map_err(e)?.is_some() {
+            return Ok("count-distinct");
+        }
+        if plan_multi_agg_groupby(sql, p).map_err(e)?.is_some() {
+            return Ok("multi-agg");
+        }
+        parse(sql, p).map_err(e)?;
+        Ok("generic")
+    }
+
+    const CORPUS: &[(&str, &str)] = &[
+        ("SELECT a FROM t WHERE a > 1", "generic"),
+        ("SELECT k, SUM(v) FROM u GROUP BY k", "generic"),
+        ("SELECT a FROM t WHERE a IN (SELECT k FROM u)", "generic"),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT src FROM edges WHERE src = 1 \
+             UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r",
+            "recursive",
+        ),
+        (
+            "SELECT t.a, x.v FROM t, LATERAL (SELECT v FROM u WHERE u.k = t.a) AS x",
+            "lateral",
+        ),
+        (
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.a)",
+            "correlated-where",
+        ),
+        ("VALUES (1, 'x'), (2, 'y')", "values"),
+        ("SELECT * FROM generate_series(1, 5)", "generate-series"),
+        (
+            "SELECT DISTINCT ON (k) k, v FROM u ORDER BY k, v",
+            "distinct-on",
+        ),
+        (
+            "SELECT k, COUNT(DISTINCT v) FROM u GROUP BY k",
+            "count-distinct",
+        ),
+        (
+            "SELECT k, COUNT(DISTINCT v), SUM(v) FROM u GROUP BY k",
+            "multi-agg",
+        ),
+    ];
+
+    #[test]
+    fn corpus_classifies_as_expected_and_matches_legacy_chain() {
+        let p = provider();
+        for (sql, want) in CORPUS {
+            let got = classify_query(sql, &p).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(label(&got), *want, "{sql}");
+            assert_eq!(legacy(sql, &p), Ok(*want), "{sql}");
+        }
+    }
+
+    #[test]
+    fn errors_match_legacy_chain() {
+        let p = provider();
+        for sql in [
+            "SELLECT broken",
+            "SELECT a FROM t; SELECT a FROM t",
+            "INSERT INTO t VALUES (1, 'x')",
+            "SELECT a FROM missing_table",
+        ] {
+            let got = classify_query(sql, &p)
+                .map(|s| label(&s))
+                .map_err(|e| e.to_string());
+            assert_eq!(got, legacy(sql, &p), "{sql}");
+            assert!(got.is_err(), "{sql} must fail");
+        }
+    }
+
+    /// An ordinary statement is remembered as such (per schema version), and
+    /// the memoised path returns the same plan.
+    #[test]
+    fn generic_verdict_is_memoised_per_schema_version() {
+        let p = provider();
+        let sql = "SELECT a FROM t WHERE a > 41 /* classify-memo */";
+        let first = match classify_query(sql, &p).unwrap() {
+            QueryShape::Generic(plan) => plan,
+            other => panic!("expected generic, got {other:?}"),
+        };
+        let key = PlanCacheKey {
+            sql: sql.to_string(),
+            version: p.schema_version(),
+        };
+        assert!(generic_verdict_known(&key));
+        let second = match classify_query(sql, &p).unwrap() {
+            QueryShape::Generic(plan) => plan,
+            other => panic!("expected generic, got {other:?}"),
+        };
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+        // A different provider (fresh schema version) is classified afresh.
+        let other = provider();
+        assert!(!generic_verdict_known(&PlanCacheKey {
+            sql: sql.to_string(),
+            version: other.schema_version(),
+        }));
+    }
+
+    /// Special shapes are never memoised as ordinary.
+    #[test]
+    fn special_shapes_are_not_memoised_as_generic() {
+        let p = provider();
+        let sql = "VALUES (7, 'memo')";
+        assert_eq!(label(&classify_query(sql, &p).unwrap()), "values");
+        assert!(!generic_verdict_known(&PlanCacheKey {
+            sql: sql.to_string(),
+            version: p.schema_version(),
+        }));
     }
 }

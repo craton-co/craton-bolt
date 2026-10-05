@@ -2907,6 +2907,39 @@ pub(crate) fn join_rename(name: &str, taken: &mut std::collections::HashSet<Stri
     out_name
 }
 
+/// Names of every base table scanned by `plan`'s relational tree, in
+/// depth-first order (duplicates preserved — a self-join lists its table
+/// twice).
+///
+/// Expression-nested subquery plans are not walked: they are compiled and
+/// executed as separate plans, each of which collects its own scans.
+pub(crate) fn collect_scan_tables(plan: &LogicalPlan) -> Vec<String> {
+    fn walk(p: &LogicalPlan, out: &mut Vec<String>) {
+        match p {
+            LogicalPlan::Scan { table, .. } => out.push(table.clone()),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Sort { input, .. } => walk(input, out),
+            LogicalPlan::Union { inputs } => {
+                for inp in inputs {
+                    walk(inp, out);
+                }
+            }
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(plan, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod scalar_fn_typecheck_tests {
     //! Direct type-check coverage for `Expr::ScalarFn` at the logical-plan

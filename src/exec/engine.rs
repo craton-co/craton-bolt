@@ -35,8 +35,7 @@ use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::n_rows_to_u32;
 use crate::jit::{compile_ptx, CudaModule};
 use crate::plan::{
-    parse_sql, DataType, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan, PlanRewrite,
-    Schema,
+    DataType, KernelSpec, LogicalPlan, MemTableProvider, PhysicalPlan, PlanRewrite, Schema,
 };
 
 // Items lifted out of this file into sibling modules (pure-reorg split).
@@ -46,7 +45,8 @@ use crate::exec::engine_cache_key::{
     ClonedHostRevision, HostRevisionSnapshot, HostTableRevision, ModuleCacheKey,
 };
 use crate::exec::engine_device_col::DeviceCol;
-use crate::exec::engine_provider::{EngineProvider, EngineTableStats};
+#[cfg(test)]
+use crate::exec::engine_provider::EngineProvider;
 use crate::exec::engine_support::{
     arrow_schema_to_plan_schema, build_count_rows_batch, column_storage_rows, concat_table_batches,
     debug_sync_check, host_column_to_arrow_array, install_persistent_cache_override,
@@ -121,6 +121,46 @@ fn max_recursive_rows() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(MAX_RECURSIVE_ROWS)
+}
+
+/// Validate one streamed batch against a table's declared plan schema
+/// (column count, names and plan-level dtypes, positionally).
+///
+/// Shared by the eager [`Engine::register_table_stream`] (per batch, at
+/// registration) and the lazy [`Engine::register_table_stream_lazy`] (per
+/// batch, when the producer is first drained) so both registration modes
+/// enforce the identical contract. The comparison goes through the plan
+/// schema rather than the raw Arrow schema so a caller-declared
+/// `nullable: true` doesn't clash with a batch whose Arrow schema marks the
+/// same column non-nullable — the engine treats per-row null counts as the
+/// truth and the declared `nullable` is informational only. `api` names the
+/// registering entry point in the error message.
+fn validate_stream_batch_schema(
+    api: &str,
+    declared: &Schema,
+    batch: &RecordBatch,
+    name: &str,
+    batch_idx: usize,
+) -> BoltResult<()> {
+    let actual = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
+    if actual.fields.len() != declared.fields.len() {
+        return Err(BoltError::Plan(format!(
+            "{api}: batch {batch_idx} for table '{name}' has {} columns but declared \
+             schema has {}",
+            actual.fields.len(),
+            declared.fields.len()
+        )));
+    }
+    for (i, (a, d)) in actual.fields.iter().zip(declared.fields.iter()).enumerate() {
+        if a.name != d.name || a.dtype != d.dtype {
+            return Err(BoltError::Plan(format!(
+                "{api}: batch {batch_idx} for table '{name}' column {i} mismatch — \
+                 declared {:?}:{:?}, got {:?}:{:?}",
+                d.name, d.dtype, a.name, a.dtype
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Count the `Scan`s of `table` in `plan`'s relational tree.
@@ -1026,9 +1066,9 @@ pub struct Engine {
     /// Name → Schema provider, kept in sync with `tables`. The schema is
     /// EXTENDED with `__idx_<col>` Int32 columns for every registered Utf8
     /// column so the SQL frontend resolves rewriter-produced column refs.
-    provider: MemTableProvider,
+    pub(crate) provider: MemTableProvider,
     /// Per-table Utf8 dictionaries; drives the string-literal predicate rewrite.
-    dict_registry: crate::exec::dict_registry::DictRegistry,
+    pub(crate) dict_registry: crate::exec::dict_registry::DictRegistry,
     /// GPU-resident copies of every registered table. Owns the device
     /// allocations; must drop BEFORE `_ctx`.
     ///
@@ -1121,7 +1161,7 @@ pub struct Engine {
     module_cache_loads: std::sync::atomic::AtomicUsize,
     /// v0.6 / M7 public optimizer extension surface: user-registered
     /// PlanRewrite implementations run in registration order before lower_physical.
-    rewrites: Vec<Box<dyn PlanRewrite>>,
+    pub(crate) rewrites: Vec<Box<dyn PlanRewrite>>,
     /// v0.6 builder: CUDA device ordinal this engine was constructed on.
     device_idx: i32,
     /// v0.6 builder: soft cap on device-memory pool allocations in bytes.
@@ -1137,7 +1177,7 @@ pub struct Engine {
     /// compare its results against the optimized path. Every production
     /// construction leaves this `true`, so the gate at the
     /// `run_to_fixpoint` call sites is a no-op for all stable callers.
-    optimize: bool,
+    pub(crate) optimize: bool,
     /// Owned CUDA context — declared after every context-bound resource so it
     /// drops after dictionaries, tables, and module handles.
     _ctx: CudaContext,
@@ -1480,16 +1520,13 @@ impl Engine {
 
     /// Register a user-supplied [`PlanRewrite`] on this engine.
     ///
-    /// Rewrites run in registration order, threading each rewriter's
-    /// output into the next, immediately **before**
-    /// [`crate::plan::lower_physical`] in [`Engine::sql`]. See the
-    /// [`PlanRewrite`](crate::plan::PlanRewrite) trait docs for the
-    /// contract implementations must uphold.
-    ///
-    /// This `with_rewrite` is the engine-direct entry point; the
-    /// forthcoming `Engine::Builder` (parallel agent) exposes the same
-    /// signature on the builder. Both ultimately push into the same
-    /// `rewrites` field, so the builder integration is a drop-in.
+    /// Rewrites run in registration order, threading each rewriter's output
+    /// into the next, after the built-in optimizer and before subquery
+    /// resolution and lowering — on every query path (`sql`,
+    /// `run_logical_plan` / `DataFrame::collect`, `explain_sql`, and the
+    /// component subplans of host-orchestrated SQL shapes). See the
+    /// [`PlanRewrite`](crate::plan::PlanRewrite) trait docs for the exact
+    /// semantics and the contract implementations must uphold.
     ///
     /// Takes `self` by value and returns it so the call can chain with
     /// the constructor: `Engine::new()?.with_rewrite(Box::new(MyRewrite))`.
@@ -1803,41 +1840,6 @@ impl Engine {
                  cannot append to an existing table; use register_batch instead"
             )));
         }
-        // Validate one batch against the declared plan schema (names +
-        // dtypes match positionally). We compare via the plan schema
-        // rather than the raw Arrow schema so a caller-declared
-        // `nullable: true` doesn't clash with a batch whose Arrow
-        // schema happens to mark the same column non-nullable — the
-        // engine treats per-row null counts as the truth and the
-        // declared `nullable` is informational only at registration
-        // time.
-        fn validate_batch_schema(
-            declared: &Schema,
-            batch: &RecordBatch,
-            name: &str,
-            batch_idx: usize,
-        ) -> BoltResult<()> {
-            let actual = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
-            if actual.fields.len() != declared.fields.len() {
-                return Err(BoltError::Plan(format!(
-                    "register_table_stream: batch {batch_idx} for table '{name}' \
-                     has {} columns but declared schema has {}",
-                    actual.fields.len(),
-                    declared.fields.len()
-                )));
-            }
-            for (i, (a, d)) in actual.fields.iter().zip(declared.fields.iter()).enumerate() {
-                if a.name != d.name || a.dtype != d.dtype {
-                    return Err(BoltError::Plan(format!(
-                        "register_table_stream: batch {batch_idx} for table '{name}' \
-                         column {i} mismatch — declared {:?}:{:?}, got {:?}:{:?}",
-                        d.name, d.dtype, a.name, a.dtype
-                    )));
-                }
-            }
-            Ok(())
-        }
-
         // Eagerly drain the iterator, threading errors out and rolling
         // back the (just-installed) table on any failure so the engine
         // never observes a partially-installed table from this call.
@@ -1852,7 +1854,7 @@ impl Engine {
                 )));
             }
         };
-        validate_batch_schema(&schema, &first, &name, 0)?;
+        validate_stream_batch_schema("register_table_stream", &schema, &first, &name, 0)?;
         // Install the first batch through the same path
         // `register_table` uses — dictionaries, provider, GpuTable,
         // host-revisions all set up in one place.
@@ -1870,7 +1872,13 @@ impl Engine {
                 }
                 None => break,
             };
-            if let Err(e) = validate_batch_schema(&schema, &next, &name, batch_idx) {
+            if let Err(e) = validate_stream_batch_schema(
+                "register_table_stream",
+                &schema,
+                &next,
+                &name,
+                batch_idx,
+            ) {
                 self.unregister_table_best_effort(&name);
                 return Err(e);
             }
@@ -1950,61 +1958,60 @@ impl Engine {
         Ok(())
     }
 
-    /// Collapse every still-streaming overlay entry into its materialised
-    /// batches by draining the producer once.
+    /// Materialise exactly the lazily-registered streaming sources that
+    /// `plan` scans, leaving every other producer un-invoked.
     ///
-    /// Called from [`Engine::sql`] / [`Engine::run_logical_plan`] before the
-    /// validity-probe provider is built. Idempotent: an entry that is already
+    /// Called by the shared compile pipeline (see `engine_query`) after
+    /// lowering and before the validity probes, so `execute`'s read paths
+    /// see real data for every table the plan touches. Idempotent: an entry
+    /// that is already
     /// [`TableSource::Materialized`](crate::exec::streaming::TableSource::Materialized)
-    /// is skipped, and a fully-eager engine pays only a single `RefCell::borrow`
-    /// + emptiness check.
-    ///
-    /// The drained batches are staged back into the overlay as
-    /// `Materialized` (not moved into `tables`), because `sql` only holds
-    /// `&self` and `tables` is not interior-mutable. The eager read paths
-    /// ([`Engine::materialize_table`] and [`EngineProvider`]) consult the
-    /// overlay as a fall-back, so a streaming table is fully queryable from
-    /// there. Dictionary `__idx_<col>` rewriting and the incremental GPU cache
-    /// are not wired for overlay tables in this cut — primitive columns query
-    /// end-to-end; string-literal predicates fall to the host filter path
-    /// rather than the dict-fold fast path. Promoting an overlay table into the
-    /// fully-wired `tables` store (dictionaries + revisions + GPU cache) is a
-    /// follow-up that needs a `&mut self` seam.
-    fn ensure_streaming_materialized(&self) -> BoltResult<()> {
-        // Fast path: nothing streaming.
-        let pending: Vec<String> = {
-            let overlay = self.streaming_sources.borrow();
-            overlay
-                .iter()
-                .filter(|(_, src)| src.is_streaming())
-                .map(|(name, _)| name.clone())
-                .collect()
-        };
-        if pending.is_empty() {
+    /// is skipped, and a fully-eager engine pays one overlay probe per
+    /// scanned table.
+    pub(crate) fn ensure_streaming_materialized_for(&self, plan: &LogicalPlan) -> BoltResult<()> {
+        if self.streaming_sources.borrow().is_empty() {
             return Ok(());
         }
-        // `register_table` needs `&mut self`, but `sql` only holds `&self`.
-        // We collapse the producer to concatenated host batches here (which
-        // only needs `&self` interior mutability on the overlay), then stage
-        // the materialised batch back into the overlay as `Materialized`. The
-        // eager read paths (`materialize_table`, `EngineProvider`) consult the
-        // overlay, so the table is fully queryable without ever touching
-        // `tables`. Dictionary / GPU-cache wiring is built lazily by
-        // `ensure_gpu_table` and the dict rewriter on demand, mirroring how
-        // `register_batch` defers GPU work.
-        for name in pending {
-            let batches = {
-                let overlay = self.streaming_sources.borrow();
-                match overlay.get(&name) {
-                    Some(src) => src.drain_to_batches(&name)?,
-                    None => continue,
-                }
-            };
-            self.streaming_sources.borrow_mut().insert(
-                name,
-                crate::exec::streaming::TableSource::Materialized(batches),
-            );
+        for table in crate::plan::logical_plan::collect_scan_tables(plan) {
+            self.materialize_streaming_source(&table)?;
         }
+        Ok(())
+    }
+
+    /// If `name` is a still-`Streaming` overlay entry, drain its producer,
+    /// validate every batch against the schema declared at
+    /// [`Engine::register_table_stream_lazy`] time, and collapse the entry
+    /// in place to `Materialized`. A no-op for any other name.
+    ///
+    /// Validation uses the same check as the eager
+    /// [`Engine::register_table_stream`] path (column count, names and
+    /// plan-level dtypes, positionally), so a producer whose batches drift
+    /// from the declared schema fails deterministically here instead of
+    /// letting planning see one type while execution receives another. On
+    /// failure the entry stays `Streaming`, so every later query referencing
+    /// the table reports the same error.
+    ///
+    /// The drained batches are staged in the overlay (not moved into
+    /// `tables`) because query paths hold only `&self`. The read paths
+    /// ([`Engine::materialize_table`], the validity-probe provider, `ensure_gpu_table`)
+    /// consult the overlay as a fall-back, so the table is fully queryable;
+    /// see [`Engine::register_table_stream_lazy`] for the dictionary caveat.
+    pub(crate) fn materialize_streaming_source(&self, name: &str) -> BoltResult<()> {
+        let drained = {
+            let overlay = self.streaming_sources.borrow();
+            match overlay.get(name) {
+                Some(src) if src.is_streaming() => src.drain_to_batches(name)?,
+                _ => return Ok(()),
+            }
+        };
+        let declared = crate::plan::TableProvider::schema(&self.provider, name)?;
+        for (i, batch) in drained.iter().enumerate() {
+            validate_stream_batch_schema("register_table_stream_lazy", &declared, batch, name, i)?;
+        }
+        self.streaming_sources.borrow_mut().insert(
+            name.to_string(),
+            crate::exec::streaming::TableSource::Materialized(drained),
+        );
         Ok(())
     }
 
@@ -2513,39 +2520,20 @@ impl Engine {
     /// Ensure the streaming source for `name` is drained, then run `f` over its
     /// materialised batches while holding the overlay borrow.
     ///
-    /// On first call for a `Streaming` entry this invokes the producer,
-    /// collapsing the entry in place to [`TableSource::Materialized`] so
-    /// subsequent reads skip the producer. Returns a `Plan` error if `name` is
-    /// not in the streaming overlay at all.
+    /// On first call for a `Streaming` entry this invokes the producer via
+    /// [`Engine::materialize_streaming_source`] (which also validates the
+    /// batches against the declared schema), collapsing the entry in place to
+    /// [`TableSource::Materialized`] so subsequent reads skip the producer.
+    /// Returns a `Plan` error if `name` is not in the streaming overlay at all.
     fn streaming_batches<R>(
         &self,
         name: &str,
         f: impl FnOnce(&[RecordBatch]) -> BoltResult<R>,
     ) -> BoltResult<R> {
         use crate::exec::streaming::TableSource;
-        // Phase 1: if the entry is still a producer, drain it (without holding
-        // a borrow across the producer call) and swap in the materialised
-        // form. Borrow is dropped before re-borrowing for the read.
-        let needs_drain = matches!(
-            self.streaming_sources.borrow().get(name),
-            Some(src) if src.is_streaming()
-        );
-        if needs_drain {
-            let drained = {
-                let overlay = self.streaming_sources.borrow();
-                match overlay.get(name) {
-                    Some(src) => src.drain_to_batches(name)?,
-                    None => {
-                        return Err(BoltError::Plan(format!(
-                            "table '{name}' is not registered with the engine"
-                        )))
-                    }
-                }
-            };
-            self.streaming_sources
-                .borrow_mut()
-                .insert(name.to_string(), TableSource::Materialized(drained));
-        }
+        // Phase 1: if the entry is still a producer, drain + validate it and
+        // swap in the materialised form (a no-op for any other entry).
+        self.materialize_streaming_source(name)?;
         // Phase 2: read the (now materialised) batches.
         let overlay = self.streaming_sources.borrow();
         match overlay.get(name) {
@@ -2560,596 +2548,6 @@ impl Engine {
                 "table '{name}' is not registered with the engine"
             ))),
         }
-    }
-
-    /// Compile and execute a SQL query string.
-    ///
-    /// Stage 7 (P1b): after the query completes, the engine emits a
-    /// periodic pool-stats log line at most once every
-    /// `BOLT_POOL_STATS_INTERVAL_SECS` (default 60s). The emit happens
-    /// AFTER the query's `QueryHandle` is fully materialised — the log
-    /// line is off the latency-critical path for the just-returned
-    /// query. Failures (query error, log throttled, no-op observer)
-    /// never affect the query result.
-    /// Snapshot the registered tables' row counts into an estimator the
-    /// cost-based optimizer can consume.
-    ///
-    /// Each base table's row count is the sum of its registered `RecordBatch`
-    /// row counts (eager `tables` store) plus any already-materialised
-    /// streaming source. Lazily-registered streaming tables that haven't been
-    /// drained yet are intentionally omitted — costing them would force
-    /// materialisation at plan time. Their absence simply leaves any join chain
-    /// touching them un-reordered (the conservative default).
-    ///
-    /// The result is an owned `Arc<dyn RowEstimator>` (a
-    /// [`crate::plan::optimizer::StatsEstimator`] over an [`EngineTableStats`]
-    /// snapshot) ready to hand to
-    /// [`crate::plan::default_passes_with_estimator`].
-    fn row_estimator(&self) -> Arc<dyn crate::plan::RowEstimator> {
-        let mut row_counts: HashMap<String, usize> = HashMap::new();
-        for (name, batches) in &self.tables {
-            let rows = batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .fold(0usize, |a, n| a.saturating_add(n));
-            row_counts.insert(name.clone(), rows);
-        }
-        // Fold in any streaming sources that have already been materialised
-        // (a still-streaming source is skipped — see the method docs).
-        for (name, src) in self.streaming_sources.borrow().iter() {
-            if let crate::exec::streaming::TableSource::Materialized(batches) = src {
-                let rows = batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .fold(0usize, |a, n| a.saturating_add(n));
-                row_counts.entry(name.clone()).or_insert(rows);
-            }
-        }
-        Arc::new(crate::plan::StatsEstimator::new(EngineTableStats {
-            row_counts,
-        }))
-    }
-
-    pub fn sql(&self, query: &str) -> BoltResult<QueryHandle> {
-        // **Stage 6 (M3L5)** — retry the pool-watcher's context capture.
-        // If the watcher spawned before any engine thread had a context
-        // bound, `CAPTURED_CTX` is still zero and every poll silently
-        // no-ops. This call is cheap (atomic load when already
-        // captured) and a no-op when no context is bound on the
-        // calling thread — so it's safe to invoke unconditionally.
-        crate::cuda::mem_pool::pool_watcher_retry_context_capture();
-
-        // M5 metrics: count every accepted query (success or failure). The
-        // matching `QueriesFailed` bump happens at the single error-return
-        // below so the `?`-chain stays intact.
-        crate::metrics::metrics().inc(crate::metrics::Counter::QueriesTotal);
-
-        // F1: a `WITH RECURSIVE` query is detected and orchestrated as a
-        // host-side fixpoint before the ordinary parse→optimize→lower→execute
-        // pipeline (the recursive structure does not fit a single LogicalPlan
-        // that flows through that pipeline). `plan_recursive_cte` returns
-        // `Ok(None)` for every non-recursive query, so the common path falls
-        // straight through. Failures bump `QueriesFailed` to mirror the
-        // ordinary error accounting below.
-        match crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider) {
-            Ok(Some(rec)) => {
-                use crate::plan::sql_frontend::RecursiveQueryPlan;
-                let result = match rec {
-                    RecursiveQueryPlan::Single(rec) => self.execute_recursive_cte(&rec),
-                    RecursiveQueryPlan::Mutual(rec) => self.execute_mutual_recursive_cte(&rec),
-                };
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // F3 (LATERAL): a `FROM <left>, LATERAL (<subquery>) AS a` query is
-        // detected and orchestrated host-side as a nested-loop Apply (dependent
-        // join) before the ordinary pipeline, mirroring the WITH RECURSIVE hook
-        // above (the correlated subquery has no single LogicalPlan). Returns
-        // `Ok(None)` for every non-LATERAL query, so the common path falls
-        // straight through. Failures bump `QueriesFailed` to mirror accounting.
-        match crate::plan::sql_frontend::plan_lateral_apply(query, &self.provider) {
-            Ok(Some(la)) => {
-                let result = self.execute_lateral_apply(&la);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // F4 (correlated WHERE subquery): a `SELECT ... WHERE <correlated
-        // EXISTS / NOT EXISTS / scalar subquery>` is detected and orchestrated
-        // host-side as a per-outer-row semi/anti/scalar Apply before the
-        // ordinary pipeline, mirroring the LATERAL hook above (the correlated
-        // subquery has no single LogicalPlan). Returns `Ok(None)` for every
-        // query without a correlated WHERE subquery, so the common path falls
-        // straight through. Failures bump `QueriesFailed` to mirror accounting.
-        match crate::plan::sql_frontend::plan_correlated_where(query, &self.provider) {
-            Ok(Some(cw)) => {
-                let result = self.execute_correlated_where(&cw);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // VALUES: a query whose row source is a `VALUES` clause (bare
-        // `VALUES (..),(..)` or `FROM (VALUES ..) AS t(a,b)`) is materialised
-        // host-side and either returned directly or bound as an ephemeral table
-        // the outer query scans — mirroring the WITH RECURSIVE hook above (an
-        // inline relation has no `LogicalPlan` variant). `Ok(None)` for every
-        // non-VALUES query falls straight through.
-        match crate::plan::sql_frontend::plan_values_query(query, &self.provider) {
-            Ok(Some(vp)) => {
-                let result = self.execute_values_query(&vp);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // GENERATE_SERIES: a `SELECT ... FROM generate_series(start, stop[, step])`
-        // is materialised host-side (a dense Int64 series bound as an ephemeral
-        // table the outer query scans) — mirroring the VALUES hook above (a
-        // table-valued row source has no `LogicalPlan` variant). `Ok(None)` for
-        // every non-generate_series query falls straight through (so an
-        // unhandled TVF still hits `lower_table_factor`'s rejection).
-        match crate::plan::sql_frontend::plan_generate_series_query(query, &self.provider) {
-            Ok(Some(gp)) => {
-                let result = self.execute_generate_series_query(&gp);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // DISTINCT ON: a `SELECT DISTINCT ON (keys) ... [ORDER BY ...]` is
-        // detected and orchestrated host-side (sort, then keep the first row per
-        // key) before the ordinary pipeline. `Ok(None)` for every other query
-        // falls straight through.
-        match crate::plan::sql_frontend::plan_distinct_on(query, &self.provider) {
-            Ok(Some(dp)) => {
-                let result = self.execute_distinct_on(&dp);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // F3-finish: a sole `COUNT(DISTINCT col)` with `GROUP BY` is detected
-        // and orchestrated host-side (per-group distinct counting) before the
-        // ordinary pipeline, mirroring the WITH RECURSIVE hook above. The
-        // per-group distinct count has no single LogicalPlan that flows through
-        // the normal lowering (the plan-node route is blocked — see
-        // `CountDistinctGroupByPlan`). `plan_count_distinct_groupby` returns
-        // `Ok(None)` for every other query, so the common path falls straight
-        // through. Failures bump `QueriesFailed` to mirror the accounting
-        // below.
-        match crate::plan::sql_frontend::plan_count_distinct_groupby(query, &self.provider) {
-            Ok(Some(cd)) => {
-                let result = self.execute_count_distinct_groupby(&cd);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // Generalized COUNT(DISTINCT) + GROUP BY (multiple distinct counts
-        // and/or a mix with plain aggregates). The single-sole-COUNT(DISTINCT)
-        // case above declines these (`Ok(None)`); this detector picks them up.
-        // `Ok(None)` for everything else falls through to the ordinary path.
-        match crate::plan::sql_frontend::plan_multi_agg_groupby(query, &self.provider) {
-            Ok(Some(cd)) => {
-                let result = self.execute_multi_agg_groupby(&cd);
-                if result.is_err() {
-                    crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                }
-                self.maybe_emit_pool_stats(Instant::now());
-                return result;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-                return Err(e);
-            }
-        }
-
-        // Time the parse phase (SQL text → LogicalPlan) into the Parse
-        // histogram; mirrors the `parse` tracing span in `observability`.
-        let parse_start = Instant::now();
-        let plan: LogicalPlan = parse_sql(query, &self.provider)?;
-        crate::metrics::metrics()
-            .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
-        // String-literal predicates against Utf8 columns are folded into
-        // integer equality against the corresponding __idx_<col> i32 column.
-        // Time the whole logical-planning stage (rewrites + optimizer +
-        // subquery resolution) into the `Plan` histogram.
-        let plan_start = Instant::now();
-        let plan =
-            tracing::info_span!("plan").in_scope(|| self.dict_registry.rewrite_plan(&plan))?;
-        let plan = self.dict_registry.rewrite_plan(&plan)?;
-        // Built-in logical optimizer: run the default pass pipeline
-        // (constant folding, predicate pushdown, filter-into-join, join
-        // reorder, projection pruning) BEFORE any user-registered rewrites.
-        // The join-reorder pass is driven by a statistics-backed row
-        // estimator snapshotted from the registered tables, so left-deep
-        // INNER chains are reordered smallest-input-first (it stays a no-op
-        // for chains whose leaves the snapshot can't cost). See
-        // `crate::plan::optimizer` for the pipeline and ordering. The
-        // pipeline is driven to a bounded fixpoint (re-running the same
-        // pass set/order until the plan stabilises or the iteration cap is
-        // hit) so a conjunct exposed by one sweep — e.g. a now-constant
-        // predicate moved by pushdown — gets folded/pushed on the next.
-        let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        // `self.optimize` is `true` for every production engine; the
-        // test-only `EngineBuilder::without_optimizer()` flips it to `false`
-        // so the optimizer-equivalence test can execute the plan as written.
-        let plan = if self.optimize {
-            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
-        } else {
-            plan
-        };
-        // v0.6 / M7: run user-registered PlanRewrite implementations in
-        // registration order, threading each rewriter's output into the
-        // next. This runs AFTER the built-in optimizer and the internal
-        // dict-rewrite (so user rewrites see the engine's normalised form
-        // with `__idx_<col>` refs already in place) and BEFORE
-        // `lower_physical` (so users can still target logical-plan
-        // structure). See `crate::plan::rewrite` for the contract.
-        let plan = self.rewrites.iter().try_fold(plan, |p, r| r.rewrite(p))?;
-        // Resolve uncorrelated scalar / IN subqueries to constants BEFORE
-        // lowering. Each subplan is uncorrelated (the frontend rejects
-        // correlation) and so independently executable; we run it here and
-        // fold the result into the enclosing plan as a literal (scalar) or a
-        // boolean OR/AND fold (IN). After this pass no `ScalarSubquery` /
-        // `InSubquery` node survives, so the physical reject-arms for them
-        // are unreachable for `sql()`-produced plans (they stay as a safety
-        // net for hand-built physical plans). See
-        // `crate::exec::subquery_resolve`.
-        let plan = self.resolve_subqueries(plan)?;
-        crate::metrics::metrics()
-            .observe_duration(crate::metrics::Phase::Plan, plan_start.elapsed());
-        // Time the lower phase (LogicalPlan → PhysicalPlan) into the Lower
-        // histogram; mirrors the `lower` tracing span in `observability`.
-        let lower_start = Instant::now();
-        let mut phys = crate::plan::lower_physical(&plan)?;
-        crate::metrics::metrics()
-            .observe_duration(crate::metrics::Phase::Lower, lower_start.elapsed());
-        // Collapse any lazily-registered streaming sources to materialised
-        // batches so the validity probes below (and `execute`'s
-        // `materialize_table`) see real data. Idempotent and a no-op when no
-        // streaming tables are registered.
-        self.ensure_streaming_materialized()?;
-        // PV-stage-d: populate `KernelSpec::input_has_validity` for every
-        // input column by consulting the engine-backed provider, which
-        // looks straight at `RecordBatch::column(col).null_count()` for
-        // each registered table. This is the plan-time signal that lets
-        // the codegen emit native-validity kernels instead of leaning on
-        // the run-time host-strip fallback in `groupby_with_pre` etc.
-        let nb = EngineProvider {
-            base: &self.provider,
-            tables: &self.tables,
-            streaming: self.streaming_sources.borrow(),
-        };
-        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
-        // Release the streaming-overlay borrow held by `nb` before `execute`,
-        // whose `ensure_gpu_table`/`materialize_table` path may re-borrow the
-        // overlay (immutably; mutably only for an un-collapsed source, which
-        // `ensure_streaming_materialized` above has already ruled out).
-        drop(nb);
-        let result = self.execute(&phys);
-        // M5 metrics: a failed execution bumps `QueriesFailed`. We only
-        // observe the bind here (no `?`-chain restructuring); the early
-        // parse/rewrite/lower `?`-returns above are rare developer-time
-        // errors, while `execute` is the latency-critical phase whose
-        // failures (OOM, kernel fault) are the ones worth a dashboard counter.
-        if result.is_err() {
-            crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-        }
-        // Stage 7: periodic pool-stats emit. Runs whether the query
-        // succeeded or failed (an OOM-failed query is itself a signal
-        // worth surfacing alongside the pool snapshot). Internal errors
-        // in the emit path are swallowed — they must never escalate to
-        // the query result.
-        self.maybe_emit_pool_stats(Instant::now());
-        result
-    }
-
-    /// Parse, plan, and *render* `query` without executing it — an
-    /// `EXPLAIN`-style introspection hook.
-    ///
-    /// Reuses the same logical-plan path as [`Engine::sql`] (parse +
-    /// dict-rewrite + user [`PlanRewrite`]s) but stops short of lowering to
-    /// GPU kernels or touching the device. The returned string contains the
-    /// tree-indented logical plan (via
-    /// [`crate::plan::format_logical`]); when the plan also lowers cleanly to
-    /// a physical plan it appends the physical rendering (via
-    /// [`crate::plan::format_physical`]). Plans that the GPU codegen does not
-    /// yet support (e.g. `CASE`, `CAST`) still return their logical plan, with
-    /// the lowering error noted in place of the physical section.
-    pub fn explain_sql(&self, query: &str) -> BoltResult<String> {
-        // F1: a `WITH RECURSIVE` query has no single LogicalPlan; render its
-        // three subplans via the dedicated formatter instead.
-        if let Some(rec) = crate::plan::sql_frontend::plan_recursive_cte(query, &self.provider)? {
-            use crate::plan::sql_frontend::RecursiveQueryPlan;
-            return Ok(match rec {
-                RecursiveQueryPlan::Single(rec) => format!(
-                    "Recursive CTE plan:\n{}",
-                    crate::plan::explain::format_recursive_cte(&rec)
-                ),
-                RecursiveQueryPlan::Mutual(rec) => format!(
-                    "Mutual recursive CTE plan:\n{}",
-                    crate::plan::explain::format_mutual_recursive_cte(&rec)
-                ),
-            });
-        }
-        // F3 (LATERAL): render the host-orchestrated LATERAL apply descriptor.
-        if let Some(la) = crate::plan::sql_frontend::plan_lateral_apply(query, &self.provider)? {
-            return Ok(format!(
-                "LATERAL apply plan:\n{}",
-                crate::plan::explain::format_lateral_apply(&la)
-            ));
-        }
-        // F4 (correlated WHERE subquery): render the host-orchestrated
-        // correlated semi/anti/scalar Apply descriptor.
-        if let Some(cw) = crate::plan::sql_frontend::plan_correlated_where(query, &self.provider)? {
-            return Ok(format!(
-                "Correlated WHERE plan:\n{}",
-                crate::plan::explain::format_correlated_where(&cw)
-            ));
-        }
-        // VALUES: render the host-materialised VALUES relation descriptor.
-        if let Some(vp) = crate::plan::sql_frontend::plan_values_query(query, &self.provider)? {
-            return Ok(format!(
-                "VALUES plan:\n{}",
-                crate::plan::explain::format_values_query(&vp)
-            ));
-        }
-        // GENERATE_SERIES: render the host-materialised series descriptor.
-        if let Some(gp) =
-            crate::plan::sql_frontend::plan_generate_series_query(query, &self.provider)?
-        {
-            return Ok(format!(
-                "generate_series plan:\n{}",
-                crate::plan::explain::format_generate_series_query(&gp)
-            ));
-        }
-        // DISTINCT ON: render the host-orchestrated DISTINCT ON descriptor.
-        if let Some(dp) = crate::plan::sql_frontend::plan_distinct_on(query, &self.provider)? {
-            return Ok(format!(
-                "DISTINCT ON plan:\n{}",
-                crate::plan::explain::format_distinct_on(&dp)
-            ));
-        }
-        // F3-finish: render the host-orchestrated COUNT(DISTINCT) + GROUP BY
-        // descriptor via its dedicated formatter.
-        if let Some(cd) =
-            crate::plan::sql_frontend::plan_count_distinct_groupby(query, &self.provider)?
-        {
-            return Ok(format!(
-                "COUNT(DISTINCT) GROUP BY plan:\n{}",
-                crate::plan::explain::format_count_distinct_groupby(&cd)
-            ));
-        }
-        // F3-finish (generalized): render the multi/mixed COUNT(DISTINCT) +
-        // GROUP BY descriptor.
-        if let Some(cd) = crate::plan::sql_frontend::plan_multi_agg_groupby(query, &self.provider)?
-        {
-            return Ok(format!(
-                "multi-agg GROUP BY plan:\n{}",
-                crate::plan::explain::format_multi_agg_groupby(&cd)
-            ));
-        }
-        let plan: LogicalPlan = parse_sql(query, &self.provider)?;
-        let plan = self.dict_registry.rewrite_plan(&plan)?;
-        let plan = self.rewrites.iter().try_fold(plan, |p, r| r.rewrite(p))?;
-
-        let mut out = String::from("Logical plan:\n");
-        out.push_str(&crate::plan::format_logical(&plan));
-        out.push_str("\nPhysical plan:\n");
-        match crate::plan::lower_physical(&plan) {
-            Ok(phys) => out.push_str(&crate::plan::format_physical(&phys)),
-            Err(e) => out.push_str(&format!("  <not lowered: {e}>\n")),
-        }
-        Ok(out)
-    }
-
-    /// Execute an already-built [`LogicalPlan`] and return a [`QueryHandle`].
-    ///
-    /// This is the post-parse half of [`Engine::sql`]: it skips SQL parsing
-    /// (so the input plan can come from the [`DataFrame`](crate::DataFrame)
-    /// builder, a test fixture, etc.) but still runs the full
-    /// rewrite → lower → validity-propagate → execute pipeline so the
-    /// physical plan reaching the kernels is shaped identically to the SQL
-    /// path. The pool-stats periodic emit is performed here too, mirroring
-    /// `sql()`'s book-keeping.
-    ///
-    /// `&mut self` matches the [`DataFrame::collect`](crate::DataFrame::collect)
-    /// signature; the engine state mutated here is bounded to the
-    /// pool-stats throttle and the (interior-mutable) GpuTable cache
-    /// already touched by `sql()`.
-    pub fn run_logical_plan(&mut self, plan: &LogicalPlan) -> BoltResult<QueryHandle> {
-        crate::cuda::mem_pool::pool_watcher_retry_context_capture();
-        // M5 metrics: the DataFrame `collect` path is a top-level query just
-        // like `sql()`, so count it identically — bump `QueriesTotal` here and
-        // `QueriesFailed` at the single error-observe below. This is the *only*
-        // place the DataFrame path is counted: nested sub-plans resolved during
-        // this call run through `run_subplan`, which deliberately does NOT bump
-        // the counters (so N subqueries inside one top-level plan still count as
-        // exactly one query, matching the `sql()` contract).
-        crate::metrics::metrics().inc(crate::metrics::Counter::QueriesTotal);
-        // String-literal predicates against Utf8 columns are folded into
-        // integer equality against the corresponding __idx_<col> i32 column —
-        // mirrors `sql()`.
-        let plan = self.dict_registry.rewrite_plan(plan)?;
-        // Built-in logical optimizer: mirror the `sql()` path so a plan built
-        // via the DataFrame builder gets the same default optimizations before
-        // lowering — including statistics-driven join reordering. See
-        // `crate::plan::optimizer`. Driven to a bounded fixpoint exactly as
-        // `sql()` does, so DataFrame-built plans get the same thorough
-        // fold/push convergence.
-        let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        // Gated by the test-only optimizer toggle; `true` in production.
-        // See `EngineBuilder::without_optimizer`.
-        let plan = if self.optimize {
-            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
-        } else {
-            plan
-        };
-        // Mirror `sql()`: resolve uncorrelated subqueries to constants before
-        // lowering so a DataFrame-built plan carrying a subquery executes too.
-        let plan = self.resolve_subqueries(plan)?;
-        let mut phys = crate::plan::lower_physical(&plan)?;
-        // Mirror `sql()`: collapse lazy streaming sources before probing.
-        self.ensure_streaming_materialized()?;
-        // PV-stage-d: thread per-column null-bearing into the kernel specs.
-        let nb = EngineProvider {
-            base: &self.provider,
-            tables: &self.tables,
-            streaming: self.streaming_sources.borrow(),
-        };
-        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
-        drop(nb);
-        let result = self.execute(&phys);
-        // M5 metrics: mirror `sql()` — a failed top-level execution bumps
-        // `QueriesFailed`. We only observe the `execute` bind (the rare early
-        // `?`-returns above are developer-time plan errors, while `execute` is
-        // the latency-critical phase whose OOM/kernel faults warrant a counter).
-        if result.is_err() {
-            crate::metrics::metrics().inc(crate::metrics::Counter::QueriesFailed);
-        }
-        self.maybe_emit_pool_stats(Instant::now());
-        result
-    }
-
-    /// Pre-lowering pass: resolve every uncorrelated scalar / IN subquery in
-    /// `plan` to a constant.
-    ///
-    /// Walks the plan's expressions (recursively, inner-subqueries-first via
-    /// [`crate::exec::subquery_resolve::resolve_plan`]) and:
-    ///
-    /// * `Expr::ScalarSubquery(subplan)` → executes `subplan`, requires
-    ///   exactly one output column, and folds the result to an
-    ///   `Expr::Literal` (0 rows → SQL `NULL`; >1 row → a clean error).
-    /// * `Expr::InSubquery { expr, subquery, negated }` → executes `subquery`,
-    ///   collects the distinct values, and rewrites to an OR-of-equalities
-    ///   (or AND-of-inequalities for `NOT IN`) over `expr`.
-    ///
-    /// The subplans are executed through [`Engine::run_subplan`], which routes
-    /// the full pipeline (dict-rewrite → optimizer → *this pass* → lower →
-    /// execute) over `&self` — so nested subqueries inside a subplan resolve
-    /// when that subplan runs. Correlation is impossible here (rejected at the
-    /// frontend), so each subplan is self-contained and independently
-    /// executable.
-    ///
-    /// Takes `&self` because [`Engine::sql`] is `&self`; the only state mutated
-    /// by executing a subplan is the interior-mutable GpuTable cache and the
-    /// pool-stats throttle, neither of which needs `&mut`.
-    fn resolve_subqueries(&self, plan: LogicalPlan) -> BoltResult<LogicalPlan> {
-        let mut exec =
-            |subplan: LogicalPlan| -> BoltResult<RecordBatch> { self.run_subplan(subplan) };
-        crate::exec::subquery_resolve::resolve_plan(plan, &mut exec)
-    }
-
-    /// Execute a self-contained (uncorrelated) subquery [`LogicalPlan`] over
-    /// `&self` and return its result `RecordBatch`.
-    ///
-    /// This is the `&self` twin of [`Engine::run_logical_plan`]: it runs the
-    /// same dict-rewrite → optimizer → subquery-resolve → lower →
-    /// validity-propagate → execute pipeline, but without the `&mut self`
-    /// receiver (so it can be called from inside [`Engine::resolve_subqueries`]
-    /// during the `&self` `sql()` path). Re-entering `resolve_subqueries` here
-    /// is what makes nested subqueries resolve inner-first.
-    ///
-    /// **Metrics contract (M5):** this path deliberately does NOT bump
-    /// `QueriesTotal` / `QueriesFailed`. The query counters count *top-level*
-    /// queries only — the enclosing `sql()` / `run_logical_plan` call has
-    /// already counted the whole statement once. A statement containing N
-    /// subqueries therefore counts as one query (and a subquery failure surfaces
-    /// as the top-level query's failure via the `?` below), keeping the
-    /// `sql()` and DataFrame paths symmetric.
-    // `pub(crate)` (was module-private): called from the agg/query-source
-    // method cluster split out into `engine_agg_impl`. Pure visibility widening.
-    pub(crate) fn run_subplan(&self, plan: LogicalPlan) -> BoltResult<RecordBatch> {
-        let plan = self.dict_registry.rewrite_plan(&plan)?;
-        // Bounded-fixpoint optimizer, mirroring the `sql()` / `run_logical_plan`
-        // paths so a subplan is optimized to the same convergence.
-        let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-        // Gated by the test-only optimizer toggle; `true` in production.
-        // See `EngineBuilder::without_optimizer`. Keeping the subplan path
-        // gated too means a query run on a `without_optimizer()` engine is
-        // un-optimized end to end (outer plan AND any subplans).
-        let plan = if self.optimize {
-            crate::plan::optimizer::run_to_fixpoint(&passes, plan)?
-        } else {
-            plan
-        };
-        let plan = self.resolve_subqueries(plan)?;
-        let mut phys = crate::plan::lower_physical(&plan)?;
-        // The outer `sql()` / `run_logical_plan` has already collapsed any
-        // lazy streaming sources before this point, but a subplan may be the
-        // first reader of one — collapse again (idempotent) to be safe.
-        self.ensure_streaming_materialized()?;
-        let nb = EngineProvider {
-            base: &self.provider,
-            tables: &self.tables,
-            streaming: self.streaming_sources.borrow(),
-        };
-        crate::plan::physical_plan::populate_input_validity(&mut phys, &nb);
-        drop(nb);
-        let handle = self.execute(&phys)?;
-        Ok(handle.into_record_batch())
     }
 
     /// Execute a `WITH RECURSIVE` query (feature F1) by orchestrating a
@@ -3183,7 +2581,7 @@ impl Engine {
     /// overlay (so this method can stay `&self`, matching [`Engine::sql`]); it
     /// is removed before returning. A name collision with a real registered
     /// table is rejected up front.
-    fn execute_recursive_cte(
+    pub(crate) fn execute_recursive_cte(
         &self,
         rec: &crate::plan::sql_frontend::RecursiveCtePlan,
     ) -> BoltResult<QueryHandle> {
@@ -3425,7 +2823,7 @@ impl Engine {
     /// An empty left input yields an empty applied relation (the OUTER template
     /// runs over zero rows). A name collision with a real registered table is
     /// rejected up front.
-    fn execute_lateral_apply(
+    pub(crate) fn execute_lateral_apply(
         &self,
         la: &crate::plan::sql_frontend::LateralApplyPlan,
     ) -> BoltResult<QueryHandle> {
@@ -3672,7 +3070,7 @@ impl Engine {
     ///
     /// An empty outer input yields an empty result. Name collisions with real
     /// tables under either reserved ephemeral name are rejected up front.
-    fn execute_correlated_where(
+    pub(crate) fn execute_correlated_where(
         &self,
         cw: &crate::plan::sql_frontend::CorrelatedWherePlan,
     ) -> BoltResult<QueryHandle> {
@@ -3877,7 +3275,7 @@ impl Engine {
     /// All ephemeral CTE tables live only in the interior-mutable streaming
     /// overlay and are removed before returning; a name collision with a real
     /// table is rejected up front.
-    fn execute_mutual_recursive_cte(
+    pub(crate) fn execute_mutual_recursive_cte(
         &self,
         rec: &crate::plan::sql_frontend::MutualRecursiveCtePlan,
     ) -> BoltResult<QueryHandle> {
@@ -4034,7 +3432,7 @@ impl Engine {
     /// and swallows any panic from the callback (logging it). A panicking
     /// pool-stats observer therefore cannot unwind out of a successful
     /// `Engine::sql` / `Engine::run_logical_plan`.
-    fn maybe_emit_pool_stats(&self, now: Instant) {
+    pub(crate) fn maybe_emit_pool_stats(&self, now: Instant) {
         if !should_emit_pool_stats(&self.pool_stats_last_emit, self.pool_stats_interval, now) {
             return;
         }

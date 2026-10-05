@@ -2,9 +2,9 @@
 
 //! Public optimizer extension surface: the [`PlanRewrite`] trait.
 //!
-//! v0.6 / M7 introduces a small extension point that lets out-of-tree code
-//! plug additional logical-plan rewrites into the engine without forking it.
-//! The motivating use case is predicate pushdown into a custom
+//! A small extension point that lets out-of-tree code plug additional
+//! logical-plan rewrites into the engine without forking it. The motivating
+//! use case is predicate pushdown into a custom
 //! [`TableProvider`](crate::plan::TableProvider): a user-provided rewriter
 //! can rewrite `Filter(Scan(custom_table), pred)` into a `Scan` whose
 //! `projection`/`filters` carry the pushed-down predicate, leaving the
@@ -12,14 +12,29 @@
 //!
 //! ## Where rewrites run
 //!
-//! Rewrites registered on the engine (via the forthcoming
-//! [`Engine`](crate::exec::Engine) builder's `with_rewrite` knob, currently
-//! exposed directly on `Engine`) execute in registration order, immediately
-//! **before** [`crate::plan::lower_physical`] in [`crate::exec::Engine::sql`].
-//! Each rewrite receives the [`LogicalPlan`] produced by the previous one,
-//! so the rewriters form a single linear pass — there is no fixpoint loop
-//! and no per-node visitor scaffolding; users that need either build them
-//! inside their own [`PlanRewrite::rewrite`] implementation.
+//! Rewrites are registered with
+//! [`Engine::with_rewrite`](crate::exec::Engine::with_rewrite) and run in
+//! registration order, each receiving the [`LogicalPlan`] produced by the
+//! previous one — a single linear pass with no fixpoint loop and no
+//! per-node visitor scaffolding (implementations that need either build it
+//! inside [`PlanRewrite::rewrite`]).
+//!
+//! Every plan the engine compiles goes through ONE pipeline (see
+//! `exec::engine_query`), and the hooks sit at the same point in it for
+//! every entry point:
+//!
+//! ```text
+//! dictionary rewrite → built-in optimizer (fixpoint) → PlanRewrite hooks
+//!     → subquery resolution → lower_physical → execute
+//! ```
+//!
+//! | Entry point | Hooks see |
+//! |---|---|
+//! | [`Engine::sql`](crate::exec::Engine::sql), ordinary query | the whole optimized plan, once |
+//! | [`Engine::run_logical_plan`](crate::exec::Engine::run_logical_plan) / [`DataFrame::collect`](crate::DataFrame::collect) | the whole optimized plan, once |
+//! | [`Engine::explain_sql`](crate::exec::Engine::explain_sql) | the whole optimized plan, once (the rendered plan includes the hooks' effect) |
+//! | Host-orchestrated SQL shapes (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`, `DISTINCT ON`, `COUNT(DISTINCT)` + `GROUP BY`) | each component subplan, every time it is compiled — e.g. a recursive term once per iteration, a LATERAL subquery once per left row |
+//! | An uncorrelated scalar / `IN` subquery | only as part of its enclosing plan — the extracted subplan is NOT re-submitted, so no hook is applied to it twice |
 //!
 //! ## Contract
 //!
@@ -34,7 +49,7 @@
 //!
 //! ## Identity-rewrite example
 //!
-//! ```ignore
+//! ```
 //! use craton_bolt::plan::{PlanRewrite, LogicalPlan};
 //! use craton_bolt::BoltResult;
 //!
@@ -45,6 +60,7 @@
 //!         Ok(plan)
 //!     }
 //! }
+//! # let _ = Noop.name();
 //! ```
 
 use crate::error::BoltResult;
@@ -53,32 +69,59 @@ use crate::plan::LogicalPlan;
 /// Public optimizer extension point.
 ///
 /// A `PlanRewrite` is a single-pass transformation over a [`LogicalPlan`].
-/// The engine runs every registered rewrite in registration order, threading
-/// each rewriter's output into the next, immediately before lowering to
-/// the [`PhysicalPlan`](crate::plan::PhysicalPlan) (see
-/// [`crate::exec::Engine::sql`]). The trait carries two methods:
+/// The trait carries two methods:
 ///
-/// * [`name`](PlanRewrite::name) — a stable identifier used in diagnostics
-///   and (in the future) in `EXPLAIN`-style output. Should be short and
-///   `kebab-case`.
+/// * [`name`](PlanRewrite::name) — a stable identifier used in diagnostics.
+///   Should be short and `kebab-case`.
 /// * [`rewrite`](PlanRewrite::rewrite) — the transformation itself. Takes
 ///   ownership of the plan so implementations can move sub-nodes out
 ///   without cloning.
 ///
+/// # Stability
+///
+/// Experimental until 1.0. The trait shape is small on purpose; the set of
+/// [`LogicalPlan`] / [`Expr`](crate::plan::Expr) variants a hook can observe
+/// grows between minor releases.
+///
+/// # Execution semantics
+///
+/// Runs after the dictionary rewrite and the built-in logical optimizer, and
+/// before subquery resolution and physical lowering — identically for
+/// `sql`, `run_logical_plan` / `DataFrame::collect`, `explain_sql`, and the
+/// component subplans of host-orchestrated SQL shapes. See the module docs
+/// for exactly which plans a hook is handed on each path.
+///
+/// # Threading
+///
+/// Called synchronously on the thread running the query (the `Engine` is
+/// `!Sync`, so at most one query per engine is compiling at a time). The
+/// `Send + Sync` bound lets a rewrite be shared across engines; per-rewrite
+/// mutable state needs interior mutability (`rewrite` takes `&self`).
+///
+/// # Errors
+///
+/// Returning `Err` aborts planning of the current statement; the error is
+/// returned from the entry point unchanged, and for `sql` /
+/// `run_logical_plan` the statement counts toward both `QueriesTotal` and
+/// `QueriesFailed`.
+///
+/// # Compatibility
+///
+/// Implementations must tolerate plan nodes and expressions they do not
+/// recognise — pass them through unchanged rather than erroring — so a new
+/// engine release that introduces a variant (or normalises a plan
+/// differently in the optimizer) does not break the hook.
+///
 /// ## Object-safety
 ///
-/// `PlanRewrite` is intentionally object-safe (`dyn PlanRewrite`) and
-/// `Send + Sync` so it can be stored alongside the engine, shared across
-/// threads, and registered from anywhere in the program. Implementations
-/// that need per-rewrite mutable state should wrap it in interior
-/// mutability (e.g. `Mutex<...>`) — `rewrite` takes `&self`.
+/// `PlanRewrite` is intentionally object-safe (`dyn PlanRewrite`) so it can
+/// be stored alongside the engine and registered from anywhere.
 ///
 /// ## Composition
 ///
 /// Multiple rewrites compose by registering them in the order they should
 /// run. The engine does not iterate to a fixpoint; rewrites that need a
-/// fixpoint (e.g. constant folding that exposes new constants on each
-/// pass) should loop internally inside `rewrite`.
+/// fixpoint should loop internally inside `rewrite`.
 pub trait PlanRewrite: Send + Sync {
     /// Stable identifier for this rewrite, used in diagnostics and future
     /// `EXPLAIN`-style output. Convention: lowercase `kebab-case`,
