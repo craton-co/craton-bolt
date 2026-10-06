@@ -79,7 +79,7 @@ pub struct Value {
     /// For 128-bit values (Decimal128) the high-half register. `None`
     /// for every other (single-register) dtype.
     ///
-    /// v0.7 sub-task B: representing a 128-bit value as a `(lo, hi)` pair
+    /// sub-task B: representing a 128-bit value as a `(lo, hi)` pair
     /// of u64 registers (rather than a hypothetical native 128-bit class)
     /// mirrors the dual-register IR ops added in sub-task A
     /// (`Op::LoadColumn128`, `Op::Add128`, etc.) and the PTX emitter's
@@ -220,7 +220,7 @@ pub enum Op {
     /// this to a per-dtype `selp.<ty>` after materialising `cond` as a `%p`
     /// predicate via `setp.ne.s32 cond, 0`.
     ///
-    /// v0.7 minimum: Bool / Int32 / Int64 / Float32 / Float64. Utf8 /
+    /// Minimum: Bool / Int32 / Int64 / Float32 / Float64. Utf8 /
     /// Decimal128 / Date / Timestamp values are rejected at
     /// `Codegen::emit_case`.
     Select {
@@ -257,7 +257,7 @@ pub enum Op {
         src: Reg,
     },
     // ---------------------------------------------------------------------
-    // Decimal128 / i128 dual-register ops (v0.7 Sub-task A).
+    // Decimal128 / i128 dual-register ops.
     //
     // The PTX side has no native 128-bit register class, so an i128 value
     // is represented in the IR as a *pair* of u64 registers (`_lo` / `_hi`,
@@ -269,7 +269,7 @@ pub enum Op {
     // exactly once — and lets the existing dataflow walker treat the
     // halves as independent values reachable through a single op.
     //
-    // v0.7 sub-task B: `Codegen::emit_column` / `emit_literal` /
+    // sub-task B: `Codegen::emit_column` / `emit_literal` /
     // `emit_binary` now emit these directly. Add / Sub / Mul on Decimal128
     // are reachable from `lower()`; Div / comparisons / mixed Decimal +
     // non-Decimal arithmetic stay on the host fallback (rejected with a
@@ -620,7 +620,7 @@ pub struct KernelSpec {
     pub output_has_validity: Vec<bool>,
 }
 
-/// v0.7: domain-separated planner IR for a scalar (no-GROUP-BY) GPU
+/// Domain-separated planner IR for a scalar (no-GROUP-BY) GPU
 /// reduction kernel.
 ///
 /// The scalar-aggregate executor in [`crate::exec::aggregate`] historically
@@ -661,7 +661,7 @@ pub struct ScalarAggSpec {
 /// Reduction family for a [`ScalarAggSpec`]. Mirrors the variants the
 /// scalar-aggregate executor actually dispatches into the JIT layer for —
 /// the broader `AggregateExpr` enum has additional variants (VAR_*, STDDEV_*)
-/// that the v0.5/v0.6 path handles host-side via
+/// that the host path handles via
 /// [`crate::exec::welford`], so they're absent here.
 ///
 /// `Avg` is its own variant rather than a (`Sum`, `Count`) decomposition
@@ -718,7 +718,7 @@ pub struct AggregateSpec {
 }
 
 // ---------------------------------------------------------------------------
-// v0.7: KernelSpec coverage for non-projection kernel kinds.
+// KernelSpec coverage for non-projection kernel kinds.
 //
 // Background. The original [`KernelSpec`] struct above models the
 // fused-projection (+ optional filter) kernel ONLY — its fields (`inputs`,
@@ -733,7 +733,7 @@ pub struct AggregateSpec {
 // Instead we introduce SIBLING spec types — one per non-projection kernel
 // kind — each independently cacheable through a per-kind wrapper around the
 // existing `crate::exec::module_cache::get_or_build_module` machinery
-// (wired in a follow-up; see #14 / v0.7). Each sibling type:
+// (wired in a follow-up; see #14). Each sibling type:
 //
 //   * `#[derive(Debug, Clone, PartialEq, Eq, Hash)]` so the existing
 //     `KernelSpecKey::new(spec, entry)` machinery in `exec::module_cache`
@@ -1484,7 +1484,7 @@ fn unify_numeric(a: DataType, b: DataType) -> BoltResult<DataType> {
         .map_err(|_| BoltError::Type(format!("cannot unify {:?} and {:?}", a, b)))
 }
 
-/// v0.7 sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
+/// sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
 /// per SQL convention. Only `Add` / `Sub` / `Mul` are wired.
 ///
 /// Thin wrapper over the single-source rule
@@ -1545,7 +1545,7 @@ fn decimal_arith_result_via_logical(
     }
 }
 
-/// Gate the source side of a CAST against the v0.7 GPU codegen surface.
+/// Gate the source side of a CAST against the GPU codegen surface.
 ///
 /// Accepted source dtypes: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`.
 /// Everything else surfaces a `BoltError::Plan` whose message names the
@@ -1621,7 +1621,7 @@ fn pow10_i128(exp: u32) -> BoltResult<i128> {
     Ok(acc)
 }
 
-/// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
+/// Result dtype for an arithmetic op on Date32 / Timestamp operands.
 ///
 /// Thin wrapper over the single-source rule
 /// [`logical_temporal_arith_result`] (`date_or_timestamp_arith_result` in
@@ -1753,7 +1753,7 @@ impl<'a> Codegen<'a> {
             Expr::Like { .. } => Err(BoltError::Plan(
                 "GPU codegen: LIKE requires host fallback".into(),
             )),
-            // v0.7: numeric ↔ numeric (and Bool ↔ Int) CASTs lower to a
+            // numeric ↔ numeric (and Bool ↔ Int) CASTs lower to a
             // PTX `cvt.*` instruction via `emit_cast` (which already exists
             // for arithmetic dtype unification). Non-numeric source/target
             // (Decimal128 / Date32 / Timestamp / Utf8) are still rejected
@@ -1764,7 +1764,7 @@ impl<'a> Codegen<'a> {
             // `expr_contains_safe_cast`). Plain CAST lowers to `cvt.*` exactly
             // as before; the `safe` flag is irrelevant on this path.
             Expr::Cast { expr, target, .. } => self.emit_cast_expr(expr, *target),
-            // v0.5/v0.7 surface: parser + type-check land, GPU execution
+            // Surface: parser + type-check land, GPU execution
             // wiring is blocked at the substrate level.
             //
             // The fused-projection GPU codegen consumes one device pointer
@@ -1774,7 +1774,7 @@ impl<'a> Codegen<'a> {
             // encoded (`GpuColumnData::DictUtf8` in
             // `crate::exec::gpu_table`): only the integer index column ever
             // crosses the kernel boundary, and the dictionary itself lives
-            // host-side. Every scalar string function in the v0.5 surface
+            // host-side. Every scalar string function
             // needs at least one of:
             //
             //   * UPPER / LOWER / SUBSTRING — a new output-string-buffer
@@ -1836,7 +1836,7 @@ impl<'a> Codegen<'a> {
                 )))
             }
             Expr::Alias(inner, _) => self.emit_expr(inner),
-            // v0.7: CASE WHEN ... THEN ... [ELSE ...] END is lowered to a
+            // CASE WHEN... THEN... [ELSE...] END is lowered to a
             // right-to-left fold of `Op::Select` ops. See `Codegen::emit_case`
             // for the fold and the supported dtype envelope (numeric / Bool
             // only — Utf8 and the wider numeric variants are rejected with a
@@ -1970,14 +1970,14 @@ impl<'a> Codegen<'a> {
         }
         let field = self.scan_schema.field(name)?;
         let dtype = field.dtype;
-        // v0.7: Date32 and Timestamp lower to integer registers (Date32 as
+        // Date32 and Timestamp lower to integer registers (Date32 as
         // i32 days-since-epoch, Timestamp as i64 ticks in the source unit).
         // The codegen treats them as their underlying integer type at the
         // PTX layer, but preserves the logical dtype on the `Value` so
         // downstream type-checks (e.g. binary subtraction yielding a plain
         // Int32/Int64) see the temporal type and reject mixed-type ops.
         //
-        // v0.7 sub-task B: Decimal128 lowers to a pair of u64 registers
+        // sub-task B: Decimal128 lowers to a pair of u64 registers
         // (low / high halves of the i128 value) via `Op::LoadColumn128`
         // and `RegAlloc::assign_pair`. The IR `Value` carries both
         // register handles so downstream `Op::Add128` / `Sub128` /
@@ -2018,10 +2018,10 @@ impl<'a> Codegen<'a> {
         let dtype = lit
             .dtype()
             .ok_or_else(|| BoltError::Type("untyped NULL literal".into()))?;
-        // v0.7: Date32 / Timestamp literals lower to integer constants on
+        // Date32 / Timestamp literals lower to integer constants on
         // the GPU side; ptx_gen emits the underlying i32/i64 bit pattern.
         //
-        // v0.7 sub-task B: Decimal128 literals lower to `Op::Const128`,
+        // sub-task B: Decimal128 literals lower to `Op::Const128`,
         // splitting the `i128` value into a `(lo: u64, hi: u64)` pair of
         // 64-bit halves (little-endian: the wrapping `u128` cast preserves
         // every bit, then we slice the low / high 64-bit windows).
@@ -2057,7 +2057,7 @@ impl<'a> Codegen<'a> {
     /// codegen verbatim; only the surrounding `Value`'s dtype is borrowed
     /// from the peer.
     fn emit_null_as(&mut self, dtype: DataType) -> Value {
-        // v0.7 sub-task B: a NULL typed as Decimal128 lowers to a pair
+        // sub-task B: a NULL typed as Decimal128 lowers to a pair
         // of zero-bit u64 registers. The PTX side has no NULL literal
         // for the 128-bit class anyway (the emitter rejects
         // `Op::Const { Literal::Null }`), and validity propagation is
@@ -2355,7 +2355,7 @@ impl<'a> Codegen<'a> {
             (l, r)
         };
 
-        // v0.7 sub-task B: Decimal128 arithmetic is handled BEFORE the
+        // sub-task B: Decimal128 arithmetic is handled BEFORE the
         // generic numeric path so the dual-register (lo/hi) ops can be
         // emitted directly. Only `Add`/`Sub`/`Mul` are wired; every other
         // op on Decimal128 surfaces a tighter "not yet lowered to GPU"
@@ -2367,7 +2367,7 @@ impl<'a> Codegen<'a> {
         {
             return self.emit_binary_decimal128(op, l, r);
         }
-        // v0.7 follow-up to sub-task B: Decimal128 comparisons (= != < >
+        // follow-up to sub-task B: Decimal128 comparisons (= != < >
         // <= >=) lower through `emit_binary_decimal128_cmp` to a single
         // `Op::Cmp128` that produces a Bool register. Both sides must be
         // `Decimal128(p, s)` with matching precision AND matching scale —
@@ -2398,7 +2398,7 @@ impl<'a> Codegen<'a> {
         }
 
         let (lhs_v, rhs_v, operand_dtype, result_dtype) = if op_is_arithmetic(op) {
-            // v0.7: Date32 / Timestamp arithmetic. Only `Date32 - Date32`
+            // Date32 / Timestamp arithmetic. Only `Date32 - Date32`
             // (→ Int32) and `Timestamp(u, tz) - Timestamp(u, tz)` (→ Int64
             // in the source unit) are wired. The operand_dtype handed to
             // ptx_gen is still the temporal type so the PTX layer knows
@@ -2906,7 +2906,7 @@ impl<'a> Codegen<'a> {
     ///    unifiable dtype). We re-derive it here by asking `Expr::dtype`
     ///    against the scan schema so the codegen knows what dtype to allocate
     ///    for the result register.
-    /// 2. v0.7 envelope: reject Utf8 / Decimal128 / Date / Timestamp result
+    /// 2. Envelope: reject Utf8 / Decimal128 / Date / Timestamp result
     ///    dtypes with a tighter, GPU-codegen-specific message. The PTX
     ///    `selp.*` mnemonic doesn't cover those classes, and string-typed
     ///    CASE in particular needs a heap-aware ABI we don't have yet.
@@ -2914,7 +2914,7 @@ impl<'a> Codegen<'a> {
     ///    materialise a zero literal of the result dtype as the "no WHEN
     ///    fired" sentinel. SQL semantics call for SQL NULL in that case;
     ///    full per-row validity propagation through the Select op is a
-    ///    v0.7 follow-up, so the v0.7 envelope settles for a deterministic
+    ///    follow-up, so the envelope settles for a deterministic
     ///    zero on the missed-every-WHEN path.
     /// 4. Fold backwards over the branches: `cur = Select(cond_i, then_i, cur)`.
     ///    Right-to-left iteration mirrors SQL's left-to-right WHEN priority:
@@ -2924,7 +2924,7 @@ impl<'a> Codegen<'a> {
     /// NULL propagation: an `Op::Const { Literal::Null }` register is allowed
     /// through `Op::Select` just like any other typed value — the kernel
     /// stores the bit-pattern unchanged. Per-row NULL propagation through
-    /// CASE branches is a follow-up; v0.7 emits the value with no
+    /// CASE branches is a follow-up; the lowering emits the value with no
     /// per-output validity AND-fold beyond what the input loads already
     /// contribute.
     fn emit_case(
@@ -2951,7 +2951,7 @@ impl<'a> Codegen<'a> {
         };
         let result_dtype = case_expr.dtype(self.scan_schema)?;
 
-        // (2) v0.7 dtype envelope. PTX `selp` supports the b32/b64 register
+        // (2) dtype envelope. PTX `selp` supports the b32/b64 register
         //     classes, so any fixed-width value that lives in those classes
         //     folds cleanly: Bool/Int32/Float32 + Date32 (i32 storage) in
         //     b32, Int64/Float64 + Timestamp (i64 storage) in b64. Date32 /
@@ -3142,7 +3142,7 @@ impl<'a> Codegen<'a> {
 
     /// Append a Store op for column `col_idx`.
     ///
-    /// v0.7 sub-task B: Decimal128 values route through `Op::Store128`
+    /// sub-task B: Decimal128 values route through `Op::Store128`
     /// (two `st.global.u64` writes for the low / high halves) — the
     /// `Value` carries both register handles via `hi_reg`.
     fn emit_store(&mut self, value: Value, col_idx: usize) -> BoltResult<()> {
@@ -4258,7 +4258,7 @@ fn lower_aggregate(
 ///   * an `Expr::Unary` whose operand is something other than a bare
 ///     column reference (with any number of transparent `Alias` wrappers
 ///     around it), or
-///   * any `Expr::Like` (v0.5 has no GPU codegen for `LIKE` — every
+///   * any `Expr::Like` (the fused kernel has no codegen for `LIKE` — every
 ///     LIKE forces the host fallback). The function name is kept
 ///     historic for grep-stability; callers care only about "does this
 ///     need the host path?".
@@ -6047,7 +6047,7 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
 
 #[tracing::instrument(name = "lower", level = "info", skip_all)]
 pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
-    // v0.7: CASE is now lowered through the GPU codegen path via
+    // CASE is now lowered through the GPU codegen path via
     // `Op::Select` (see `Codegen::emit_case`). Scan-chain Project /
     // Filter / pre-aggregation kernels accept CASE; host-side positions
     // (HAVING, post-aggregate SELECT, sort keys) surface a clear
@@ -6056,7 +6056,7 @@ pub fn lower(plan: &LogicalPlan) -> BoltResult<PhysicalPlan> {
     // therefore been retired — the codegen and host evaluator each carry
     // their own targeted message.
     //
-    // v0.7: numeric ↔ numeric CASTs lower to a PTX `cvt.*` instruction via
+    // numeric ↔ numeric CASTs lower to a PTX `cvt.*` instruction via
     // `Codegen::emit_cast_expr` (which routes through the existing
     // `emit_cast` helper for binary-op dtype unification). What remains
     // rejected here is any CAST whose declared TARGET is non-numeric —
@@ -6445,7 +6445,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     output_schema,
                 });
             }
-            // v0.5: SQL `||` (BinaryOp::Concat) is Utf8-valued and lives
+            // SQL `||` (BinaryOp::Concat) is Utf8-valued and lives
             // host-side. If any SELECT-list expression contains Concat —
             // or any chain Filter does — we cannot fold the Project into
             // the GPU codegen kernel. Instead, lower the inner plan (which
@@ -6734,7 +6734,7 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
                     predicate: predicate.clone(),
                 });
             }
-            // v0.7: `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
+            // `||` in a WHERE predicate (e.g. `WHERE a || b = 'foo'`)
             // routes through the host-side `PhysicalPlan::Filter` executor,
             // mirroring how compound `IS NULL` and `LIKE` are handled. The
             // GPU codegen has no Utf8 register class or string-compare ops
@@ -7470,7 +7470,7 @@ mod tests {
         }
     }
 
-    // ---- v0.7: WHERE `||` (BinaryOp::Concat) lowers to host-side filter ----
+    // ---- WHERE `||` (BinaryOp::Concat) lowers to host-side filter ----
 
     /// Schema fixture: two Utf8 columns `a`, `b` plus an Int64 `v`. Mirrors
     /// the realistic shape of a `WHERE name || surname = 'JohnDoe'`
@@ -7656,7 +7656,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // v0.7: KernelSpec coverage for non-projection kernel kinds.
+    // KernelSpec coverage for non-projection kernel kinds.
     //
     // These tests pin the cache-key roundtrip invariant for each new sibling
     // spec type: distinct knob values must produce distinct `Debug` outputs

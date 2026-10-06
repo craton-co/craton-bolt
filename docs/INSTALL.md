@@ -1,3 +1,10 @@
+<!--
+applies-to: main
+owner: maintainers
+checked-by: tests/doc_consistency_test.rs (MSRV)
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # Installing Craton Bolt
 
 How to install the prerequisites, build the crate in each of its supported

@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: maintainers
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # User Guide
 
 A narrative walk through Craton Bolt from `cargo add` to a working `GROUP BY`.
@@ -149,9 +155,11 @@ O(1) and stores a replayable producer. The producer runs only when a query
 first references the table (unrelated lazy tables are never drained, and
 `explain_sql` never drains); its batches are validated against `schema` — a
 mismatch fails every query on the table — and coalesced. Under
-`EngineBuilder::memory_budget`, row-wise scans and distributive aggregates
-over such a table run in bounded morsels. Lazy tables carry no string
-dictionaries, so their string predicates are evaluated on the host. See
+`EngineBuilder::memory_budget`, row-wise scans and aggregates (including `AVG` / variance / stddev)
+over such a table run in bounded morsels. Without a budget the drain also
+builds the table's string dictionaries, so string predicates fold to GPU
+index comparisons as for an eager table; under a budget they are evaluated
+on the host. See
 [`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
 
 ---

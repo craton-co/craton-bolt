@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: api
+historical: per-release sections describe the release they name
+-->
+
 # Craton Bolt Migration Guide
 
 This guide covers the user-visible API deltas across the non-trivial

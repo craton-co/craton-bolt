@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: performance
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # Competitive Benchmarking Guide
 
 How to compare Craton Bolt against other SQL engines without lying to yourself or
@@ -32,7 +38,7 @@ Be specific about the contest before you measure. Craton Bolt is:
 - **In-memory** (a table is registered from one or many `RecordBatch`es,
   coalesced at ingest; lazily-registered tables are drained on first
   reference; morsels bound the device working set for row-wise scans and
-  distributive aggregates, but there is no spill).
+  aggregates, but there is no spill).
 - **JIT-compiled**, but with caching: a plan cache (`plan_cache_stats`),
   a `KernelSpec`-keyed module cache, and the PTX text cache all skip
   redundant work on repeated query shapes.
@@ -212,7 +218,7 @@ current `main` (re-check [`LIMITATIONS.md`](./LIMITATIONS.md) before publishing)
 **Likely losses (by design)**
 - Larger-than-memory datasets — tables are host-resident; lazy registration
   defers the producer to first reference and morsels bound the device
-  working set for row-wise scans and distributive aggregates, but there is
+  working set for row-wise scans and aggregates, but there is
   no spill for sorts / joins / windows yet (see [`LIMITATIONS.md`](./LIMITATIONS.md),
   [`ROADMAP.md`](../ROADMAP.md) and [`PATH_TO_1.0.md`](./PATH_TO_1.0.md)).
 - Distributed queries — single-node by design; distributed execution is

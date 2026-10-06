@@ -727,6 +727,19 @@ pub fn craton_bolt::exec::partition_offsets::compute_partition_offsets(&craton_b
 pub fn craton_bolt::exec::partition_offsets::invalidate_pinned_scratch_on_context_teardown()
 pub fn craton_bolt::exec::partition_offsets::upload_offsets(&[u32]) -> craton_bolt::BoltResult<craton_bolt::cuda::smart_ptrs::GpuVec<u32>>
 pub mod craton_bolt::exec::streaming
+pub enum craton_bolt::exec::streaming::AlgebraicMerge
+pub craton_bolt::exec::streaming::AlgebraicMerge::Avg
+pub craton_bolt::exec::streaming::AlgebraicMerge::Avg::count: usize
+pub craton_bolt::exec::streaming::AlgebraicMerge::Avg::sum: usize
+pub craton_bolt::exec::streaming::AlgebraicMerge::Distributive
+pub craton_bolt::exec::streaming::AlgebraicMerge::Distributive::col: usize
+pub craton_bolt::exec::streaming::AlgebraicMerge::Distributive::fold: craton_bolt::exec::streaming::GroupedFold
+pub craton_bolt::exec::streaming::AlgebraicMerge::Variance
+pub craton_bolt::exec::streaming::AlgebraicMerge::Variance::count: usize
+pub craton_bolt::exec::streaming::AlgebraicMerge::Variance::sample: bool
+pub craton_bolt::exec::streaming::AlgebraicMerge::Variance::sqrt: bool
+pub craton_bolt::exec::streaming::AlgebraicMerge::Variance::sum: usize
+pub craton_bolt::exec::streaming::AlgebraicMerge::Variance::var_pop: usize
 pub enum craton_bolt::exec::streaming::GroupedFold
 pub craton_bolt::exec::streaming::GroupedFold::Add
 pub craton_bolt::exec::streaming::GroupedFold::Max
@@ -791,6 +804,7 @@ pub fn craton_bolt::exec::streaming::PinnedBudget::reserve(&mut self, usize) -> 
 pub fn craton_bolt::exec::streaming::classify_operator(craton_bolt::exec::streaming::OperatorKind) -> craton_bolt::exec::streaming::StreamCapability
 pub fn craton_bolt::exec::streaming::estimate_batch_bytes(&arrow_array::record_batch::RecordBatch) -> usize
 pub fn craton_bolt::exec::streaming::estimate_batches_bytes(&[arrow_array::record_batch::RecordBatch]) -> usize
+pub fn craton_bolt::exec::streaming::merge_algebraic_partials(&[arrow_array::record_batch::RecordBatch], usize, &[craton_bolt::exec::streaming::AlgebraicMerge], arrow_schema::schema::SchemaRef) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::exec::streaming::merge_grouped_partials(&[arrow_array::record_batch::RecordBatch], usize, &[craton_bolt::exec::streaming::GroupedFold]) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::exec::streaming::plan_upload(usize, usize, core::option::Option<usize>) -> craton_bolt::exec::streaming::MorselPlan
 pub type craton_bolt::exec::streaming::BatchProducer = alloc::boxed::Box<(dyn core::ops::function::Fn() -> alloc::boxed::Box<dyn core::iter::traits::iterator::Iterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>> + core::marker::Send + core::marker::Sync)>
@@ -1335,6 +1349,8 @@ pub const craton_bolt::jit::shmem_count_kernel::BLOCK_GROUPS: u32
 pub const craton_bolt::jit::shmem_count_kernel::BLOCK_THREADS: u32
 pub const craton_bolt::jit::shmem_count_kernel::KERNEL_ENTRY: &str
 pub fn craton_bolt::jit::shmem_count_kernel::compile_shmem_count_kernel() -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::jit::shmem_count_kernel::compile_shmem_count_kernel_typed(craton_bolt::jit::shmem_sum_kernel::ShmemKey) -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::jit::shmem_count_kernel::kernel_entry(craton_bolt::jit::shmem_sum_kernel::ShmemKey) -> &'static str
 pub mod craton_bolt::jit::shmem_minmax_kernel
 pub const craton_bolt::jit::shmem_minmax_kernel::BLOCK_GROUPS: u32
 pub const craton_bolt::jit::shmem_minmax_kernel::BLOCK_THREADS: u32
@@ -1347,10 +1363,19 @@ pub const craton_bolt::jit::shmem_multi_sum_kernel::MAX_VALS: u32
 pub fn craton_bolt::jit::shmem_multi_sum_kernel::compile_shmem_multi_sum_kernel(u32) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::jit::shmem_multi_sum_kernel::kernel_entry(u32) -> alloc::string::String
 pub mod craton_bolt::jit::shmem_sum_kernel
+pub enum craton_bolt::jit::shmem_sum_kernel::ShmemKey
+pub craton_bolt::jit::shmem_sum_kernel::ShmemKey::I32
+pub craton_bolt::jit::shmem_sum_kernel::ShmemKey::I64
+pub enum craton_bolt::jit::shmem_sum_kernel::ShmemValue
+pub craton_bolt::jit::shmem_sum_kernel::ShmemValue::F64
+pub craton_bolt::jit::shmem_sum_kernel::ShmemValue::I32Widened
+pub craton_bolt::jit::shmem_sum_kernel::ShmemValue::I64
 pub const craton_bolt::jit::shmem_sum_kernel::BLOCK_GROUPS: u32
 pub const craton_bolt::jit::shmem_sum_kernel::BLOCK_THREADS: u32
 pub const craton_bolt::jit::shmem_sum_kernel::KERNEL_ENTRY: &str
 pub fn craton_bolt::jit::shmem_sum_kernel::compile_shmem_sum_kernel() -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::jit::shmem_sum_kernel::compile_shmem_sum_kernel_typed(craton_bolt::jit::shmem_sum_kernel::ShmemKey, craton_bolt::jit::shmem_sum_kernel::ShmemValue) -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::jit::shmem_sum_kernel::kernel_entry(craton_bolt::jit::shmem_sum_kernel::ShmemKey, craton_bolt::jit::shmem_sum_kernel::ShmemValue) -> alloc::string::String
 pub mod craton_bolt::jit::sort_kernel
 pub enum craton_bolt::jit::sort_kernel::SortDirection
 pub craton_bolt::jit::sort_kernel::SortDirection::Asc

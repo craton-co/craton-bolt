@@ -1,3 +1,10 @@
+<!--
+applies-to: main
+owner: maintainers
+generated-fields: ci-matrix (tests/doc_consistency_test.rs)
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # Development
 
 How to build, test, benchmark, and extend Craton Bolt.

@@ -2,7 +2,7 @@
 
 //! Host-side SQL `LIKE` evaluator.
 //!
-//! v0.5 (M2 SQL scalar completeness) ships LIKE with a **constant pattern**
+//! LIKE is supported with a **constant pattern**
 //! only: the SQL frontend captures `expr LIKE 'pattern'` as
 //! [`crate::plan::logical_plan::Expr::Like`] with `pattern: String`. The
 //! physical-plan lowerer routes every LIKE predicate through the host-side
@@ -39,7 +39,7 @@
 //!
 //! ## ESCAPE
 //!
-//! `expr LIKE 'pat' ESCAPE '<c>'` is supported as of v0.7. The escape
+//! `expr LIKE 'pat' ESCAPE '<c>'` is supported. The escape
 //! character is a single-codepoint literal known at compile time (the SQL
 //! frontend enforces single-char). When the matcher encounters the escape
 //! character in the pattern, the *following* character is interpreted
@@ -632,7 +632,7 @@ mod tests {
         assert!(out.value(2));
     }
 
-    // ─── ESCAPE clause (v0.7) ────────────────────────────────────────────
+    // ─── ESCAPE clause ────────────────────────────────────────────
 
     /// Canonical task example: `'a\%b' ESCAPE '\'` matches literal
     /// `'a%b'` and does NOT match `'a_b'` (the escaped `%` no longer acts

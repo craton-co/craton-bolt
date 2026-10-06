@@ -92,7 +92,7 @@ pub enum GpuColumnData {
         /// Host-side dictionary, `dictionary[i - 1]` decodes index `i` (slot 0 is NULL).
         dictionary: Vec<String>,
     },
-    /// v0.7 sub-task B: 128-bit fixed-point column. Stored as a single
+    /// sub-task B: 128-bit fixed-point column. Stored as a single
     /// contiguous `GpuVec<u64>` of length `2 * n_rows`, interleaved
     /// little-endian `[lo0, hi0, lo1, hi1, ...]` so the PTX-side
     /// `Op::LoadColumn128` / `Op::Store128` (which read 16 bytes per row
@@ -188,7 +188,7 @@ impl GpuColumnData {
             GpuColumnData::Utf8 { indices, .. } => indices.device_ptr(),
             // Stage 5 — DictUtf8's primary buffer is its keys array.
             GpuColumnData::DictUtf8 { keys, .. } => keys.device_ptr(),
-            // v0.7 sub-task B: Decimal128's primary buffer is the
+            // sub-task B: Decimal128's primary buffer is the
             // interleaved 16-bytes-per-row u64 array; the PTX side
             // computes per-row offsets as `tid * 16` from this base.
             GpuColumnData::Decimal128 { values, .. } => values.device_ptr(),
@@ -543,7 +543,7 @@ impl GpuColumn {
                 }
             }
             DataType::Decimal128(precision, scale) => {
-                // v0.7 sub-task B: ingest a `Decimal128Array` as the
+                // sub-task B: ingest a `Decimal128Array` as the
                 // interleaved [lo0, hi0, lo1, hi1, ...] u64 buffer that
                 // PTX `Op::LoadColumn128` expects. Each row's `i128`
                 // value is split into the low / high 64-bit halves via
@@ -849,7 +849,7 @@ impl GpuTable {
                     })?;
                 GpuColumn::upload_dict_utf8(field.name().clone(), dict_arr)?
             }
-            // v0.7 sub-task B: route `Decimal128(p, s)` through the
+            // sub-task B: route `Decimal128(p, s)` through the
             // canonical `GpuColumn::upload` path, which packs the i128
             // values into the interleaved `[lo, hi]` u64 buffer that
             // PTX `Op::LoadColumn128` reads.

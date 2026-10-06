@@ -454,4 +454,204 @@ impl Engine {
         };
         Ok(QueryHandle::from_record_batch(batch))
     }
+
+    /// If `phys` is an aggregate (scalar or grouped) that includes at least
+    /// one **algebraic** aggregate — `AVG`, `VAR_*`, `STDDEV_*` — whose every
+    /// aggregate can be rebuilt from distributive per-morsel partials, return
+    /// `(table, partial plan, merges)`.
+    ///
+    /// The partial plan is `phys` with each algebraic aggregate decomposed into
+    /// distributive ones the per-batch executors already compute:
+    /// `AVG(e)` → `SUM(e), COUNT(e)`; `VAR_*/STDDEV_*(e)` → `COUNT(e),
+    /// SUM(e), VAR_POP(e)`. [`crate::exec::streaming::merge_algebraic_partials`]
+    /// recombines them exactly (AVG = Σsum/Σcount; variance via the two-pass
+    /// parallel update). Plans with only distributive aggregates are left to
+    /// the cheaper distributive hooks.
+    pub(crate) fn streamable_algebraic_aggregate(
+        phys: &PhysicalPlan,
+    ) -> Option<(
+        &str,
+        PhysicalPlan,
+        Vec<crate::exec::streaming::AlgebraicMerge>,
+    )> {
+        use crate::exec::streaming::{AlgebraicMerge, GroupedFold};
+        use crate::plan::logical_plan::{AggregateExpr, Field};
+        let PhysicalPlan::Aggregate {
+            table, aggregate, ..
+        } = phys
+        else {
+            return None;
+        };
+        let n_group = aggregate.group_by.len();
+        if aggregate.aggregates.is_empty()
+            || aggregate.output_schema.fields.len() != n_group + aggregate.aggregates.len()
+        {
+            return None;
+        }
+        let input_schema = Schema::new(
+            aggregate
+                .inputs
+                .iter()
+                .map(|io| Field::new(io.name.clone(), io.dtype, true))
+                .collect(),
+        );
+        let numeric = |d: DataType| {
+            matches!(
+                d,
+                DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+            )
+        };
+        let mut partial_aggs: Vec<AggregateExpr> = Vec::new();
+        let mut partial_fields: Vec<Field> = aggregate.output_schema.fields[..n_group].to_vec();
+        let mut merges: Vec<AlgebraicMerge> = Vec::new();
+        let mut any_algebraic = false;
+        let push = |agg: AggregateExpr,
+                    aggs: &mut Vec<AggregateExpr>,
+                    fields: &mut Vec<Field>|
+         -> Option<usize> {
+            let dtype = agg.output_dtype(&input_schema).ok()?;
+            if !numeric(dtype) {
+                return None;
+            }
+            fields.push(Field::new(format!("__partial_{}", aggs.len()), dtype, true));
+            aggs.push(agg);
+            Some(aggs.len() - 1)
+        };
+        for (i, agg) in aggregate.aggregates.iter().enumerate() {
+            if !numeric(aggregate.output_schema.fields[n_group + i].dtype) {
+                return None;
+            }
+            let merge = match agg {
+                AggregateExpr::Count(_) | AggregateExpr::Sum(_) => AlgebraicMerge::Distributive {
+                    col: push(agg.clone(), &mut partial_aggs, &mut partial_fields)?,
+                    fold: GroupedFold::Add,
+                },
+                AggregateExpr::Min(_) => AlgebraicMerge::Distributive {
+                    col: push(agg.clone(), &mut partial_aggs, &mut partial_fields)?,
+                    fold: GroupedFold::Min,
+                },
+                AggregateExpr::Max(_) => AlgebraicMerge::Distributive {
+                    col: push(agg.clone(), &mut partial_aggs, &mut partial_fields)?,
+                    fold: GroupedFold::Max,
+                },
+                AggregateExpr::Avg(e) => {
+                    any_algebraic = true;
+                    AlgebraicMerge::Avg {
+                        sum: push(
+                            AggregateExpr::Sum(e.clone()),
+                            &mut partial_aggs,
+                            &mut partial_fields,
+                        )?,
+                        count: push(
+                            AggregateExpr::Count(e.clone()),
+                            &mut partial_aggs,
+                            &mut partial_fields,
+                        )?,
+                    }
+                }
+                AggregateExpr::VarPop(e)
+                | AggregateExpr::VarSamp(e)
+                | AggregateExpr::StddevPop(e)
+                | AggregateExpr::StddevSamp(e) => {
+                    any_algebraic = true;
+                    let sample = matches!(
+                        agg,
+                        AggregateExpr::VarSamp(_) | AggregateExpr::StddevSamp(_)
+                    );
+                    let sqrt = matches!(
+                        agg,
+                        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_)
+                    );
+                    let inner = (**e).clone();
+                    AlgebraicMerge::Variance {
+                        count: push(
+                            AggregateExpr::Count(inner.clone()),
+                            &mut partial_aggs,
+                            &mut partial_fields,
+                        )?,
+                        sum: push(
+                            AggregateExpr::Sum(inner.clone()),
+                            &mut partial_aggs,
+                            &mut partial_fields,
+                        )?,
+                        var_pop: push(
+                            AggregateExpr::VarPop(Box::new(inner)),
+                            &mut partial_aggs,
+                            &mut partial_fields,
+                        )?,
+                        sample,
+                        sqrt,
+                    }
+                }
+            };
+            merges.push(merge);
+        }
+        if !any_algebraic {
+            return None;
+        }
+        let mut partial = phys.clone();
+        if let PhysicalPlan::Aggregate {
+            aggregate: spec, ..
+        } = &mut partial
+        {
+            spec.aggregates = partial_aggs;
+            spec.output_schema = Schema::new(partial_fields);
+        }
+        Some((table.as_str(), partial, merges))
+    }
+
+    /// Drive an aggregate admitted by [`Engine::streamable_algebraic_aggregate`]
+    /// morsel-by-morsel: run the decomposed `partial` plan on each morsel
+    /// (`run_partial`, same overlay-swap discipline as the other streaming
+    /// drivers), then recombine with
+    /// [`crate::exec::streaming::merge_algebraic_partials`] into the original
+    /// `aggregate`'s output schema.
+    pub(crate) fn execute_streaming_algebraic_aggregate(
+        &self,
+        table: &str,
+        morsel_rows: usize,
+        run_partial: impl Fn() -> BoltResult<QueryHandle>,
+        aggregate: &crate::plan::physical_plan::AggregateSpec,
+        merges: &[crate::exec::streaming::AlgebraicMerge],
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::{merge_algebraic_partials, BatchStream, TableSource};
+
+        let whole: Vec<RecordBatch> = {
+            let overlay = self.streaming_sources.borrow();
+            match overlay.get(table) {
+                Some(TableSource::Materialized(b)) => b.clone(),
+                _ => {
+                    return Err(BoltError::Other(format!(
+                        "execute_streaming_algebraic_aggregate: table '{table}' is not a \
+                         materialised streaming-overlay table"
+                    )))
+                }
+            }
+        };
+        let mut partials: Vec<RecordBatch> = Vec::new();
+        let mut run_all = || -> BoltResult<()> {
+            let stream = BatchStream::new(&whole, morsel_rows)?;
+            for morsel in stream.morsels() {
+                self.streaming_sources
+                    .borrow_mut()
+                    .insert(table.to_string(), TableSource::Materialized(vec![morsel]));
+                partials.push(run_partial()?.batch);
+            }
+            Ok(())
+        };
+        let loop_result = run_all();
+        // Always restore the whole-table view.
+        self.streaming_sources
+            .borrow_mut()
+            .insert(table.to_string(), TableSource::Materialized(whole));
+        loop_result?;
+
+        let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+        let batch = if partials.is_empty() {
+            RecordBatch::new_empty(arrow_schema)
+        } else {
+            merge_algebraic_partials(&partials, aggregate.group_by.len(), merges, arrow_schema)?
+        };
+        Ok(QueryHandle::from_record_batch(batch))
+    }
 }

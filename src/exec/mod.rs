@@ -26,7 +26,7 @@ mod engine_query;
 mod engine_streaming_impl;
 mod engine_string_impl;
 /// Shared async-memcpy / pinned-host-buffer helpers for executors.
-/// Lifted out of `exec::aggregate` (v0.6 pilot) so filter, GROUP BY, joins
+/// Lifted out of `exec::aggregate` so filter, GROUP BY, joins
 /// and friends can adopt the same `(slice, &stream) -> GpuVec<T>` shape
 /// without each rolling their own `cfg(feature = "cuda-stub")` branch.
 #[doc(hidden)]
@@ -92,10 +92,9 @@ pub mod streaming;
 pub mod string_ops_extended;
 pub mod subquery_resolve;
 /// Welford's online algorithm for variance, shared by the `VAR_POP` /
-/// `VAR_SAMP` scalar-aggregate path. The GROUP BY path is intentionally
-/// rejected by the executors below in v0.5.
+/// `VAR_SAMP` / `STDDEV_*` aggregates (scalar and per-group).
 /// Welford's one-pass algorithm for numerically-stable mean / variance.
-/// Shared between STDDEV_* (this crate's v0.5 surface) and the upcoming
+/// Shared between STDDEV_* (this crate's surface) and the upcoming
 /// VAR_* aggregates.
 pub mod welford;
 // dedup (tier2/shmem): single home for the genuinely-identical host-side
@@ -150,7 +149,7 @@ pub mod sort;
 /// `LogicalPlan::Window` / `PhysicalPlan::Window`. Host-only for now.
 #[doc(hidden)]
 pub mod window;
-// v0.5: host-side SQL `LIKE` evaluator (`Expr::Like` lowering target).
+// host-side SQL `LIKE` evaluator (`Expr::Like` lowering target).
 // Exposed `pub` so the host filter executor and the expression evaluator
 // both reach the `PatternMatcher` API through one source-of-truth module.
 pub mod like;

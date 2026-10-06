@@ -608,7 +608,7 @@ fn run_reduce_phase_i64(
 // `ScatterI32ToI64` kernel is now exact across the full i64 range, so the
 // gate is no longer load-bearing.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

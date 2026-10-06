@@ -678,7 +678,7 @@ fn build_one_aggregate(
             scalar_to_array(Scalar::I64(count), out_field.dtype)
         }
         AggregateExpr::StddevPop(expr) | AggregateExpr::StddevSamp(expr) => {
-            // STDDEV with a pre-aggregation (Project/Filter) stage. v0.5
+            // STDDEV with a pre-aggregation (Project/Filter) stage.
             // cut: the pre-aggregated scalar path is still in scope (a
             // SELECT/WHERE feeding STDDEV doesn't involve GROUP BY), so
             // we resolve the value column through the same expression
@@ -735,7 +735,7 @@ fn build_one_aggregate(
             ))
         }
         AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
-            // v0.5 host-side Welford reduction over the slow-path
+            // host-side Welford reduction over the slow-path
             // pre-aggregation column, materialised at Float64. Matches
             // the scalar-aggregate path in `aggregate.rs` so the two
             // entry points produce identical results for a given input.

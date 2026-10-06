@@ -63,7 +63,7 @@ impl RegAlloc {
 
     /// Allocate a pair of adjacent `b64` registers for a 128-bit (Decimal128 /
     /// i128) value split into `lo` / `hi` halves. The PTX side has no native
-    /// 128-bit register class, so v0.7 represents an i128 value as two SSA
+    /// 128-bit register class, so the codegen represents an i128 value as two SSA
     /// `Reg`s in the `rl` class; `assign_pair` issues both at once so the
     /// `(lo_index, hi_index)` pair stays contiguous in the emitted `.reg`
     /// block (helps SASS see the temporary as a single live range without
@@ -123,7 +123,7 @@ impl RegAlloc {
             DataType::Int64 => "rl",
             DataType::Float32 => "f",
             DataType::Float64 => "fd",
-            // v0.7: Date32 / Timestamp lower to their underlying integer
+            // Date32 / Timestamp lower to their underlying integer
             // register classes. Date32 is i32 days-since-epoch (`r` class);
             // Timestamp is i64 ticks-since-epoch in the source unit (`rl`
             // class). The logical dtype is preserved on the IR `Value` so
@@ -452,7 +452,7 @@ pub fn compile(spec: &KernelSpec, kernel_name: &str) -> BoltResult<String> {
     // -------- Split ops into "compute" and "store" so the predicate gate
     //          sits between them. `Store128` joins `Store` in the sink
     //          partition so the predicate gate also masks Decimal128 row
-    //          writes (v0.7 Sub-task A).
+    //          writes.
     let mut compute_ops: Vec<&Op> = Vec::with_capacity(spec.ops.len());
     let mut store_ops: Vec<&Op> = Vec::with_capacity(spec.outputs.len());
     for op in &spec.ops {
@@ -591,8 +591,8 @@ fn emit_op(
         } => emit_select(b, *dst, *cond, *then_val, *else_val, *dtype),
         // Logical NOT over a Bool register — `xor.b32 dst, src, 1`.
         Op::Not { dst, src } => emit_not(b, *dst, *src),
-        // ---- Decimal128 / i128 dual-register ops (v0.7 Sub-task A) ----
-        // v0.7 Sub-task B wired these through `Codegen::emit_column` /
+        // ---- Decimal128 / i128 dual-register ops ----
+        // Sub-task B wired these through `Codegen::emit_column` /
         // `emit_literal` / `emit_binary` (Add/Sub/Mul only) — see
         // `physical_plan.rs`. Div / comparisons / CAST involving
         // Decimal128 stay on the host fallback (rejected with a tighter
@@ -1681,7 +1681,7 @@ fn emit_is_null_check(
 /// The materialisation uses `setp.ne.s32 cond, 0` so any nonzero Bool
 /// register (defensively wider than {0, 1}) still picks the THEN branch.
 ///
-/// Supported value dtypes (v0.7 envelope):
+/// Supported value dtypes:
 ///
 /// * `Bool` / `Int32` -> `selp.s32`
 /// * `Int64`          -> `selp.s64`
@@ -1710,7 +1710,7 @@ fn emit_select(
         DataType::Int64 => "s64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
-        // v0.7: Date32 (i32 storage) and Timestamp (i64 storage) are plain
+        // Date32 (i32 storage) and Timestamp (i64 storage) are plain
         // fixed-width integers. `selp` just copies the chosen operand's bits,
         // so the untyped bit-class suffixes `b32` / `b64` are the natural fit
         // — no arithmetic interpretation of the value is needed. They live in
@@ -1887,7 +1887,7 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
             emit_fmt!(b, "mov.u64 {}, 0x{:016X};", lo_name, lo)?;
             emit_fmt!(b, "mov.u64 {}, 0x{:016X};", hi_name, hi)
         }
-        // v0.7: Date32 / Timestamp literals lower to integer constants.
+        // Date32 / Timestamp literals lower to integer constants.
         // Date32 is i32 days-since-epoch; Timestamp is i64 ticks-since-epoch
         // in the source unit. Same hex-bit-pattern emission convention as
         // the Int32 / Int64 paths (no codegen-injection surface).
@@ -2030,7 +2030,7 @@ fn emit_cast(
                 Int64 => "s64",
                 Float32 => "f32",
                 Float64 => "f64",
-                // v0.7: identity-cast on Date32 / Timestamp is a typed mov
+                // identity-cast on Date32 / Timestamp is a typed mov
                 // on the underlying integer width. Same logical dtype on
                 // both sides so the register class stays consistent.
                 Date32 => "s32",
@@ -2151,7 +2151,7 @@ fn emit_binary(
     use BinaryOp::*;
     match op {
         Add | Sub | Mul | Div => {
-            // Arithmetic preserves the operand dtype for numerics. v0.7
+            // Arithmetic preserves the operand dtype for numerics.
             // adds two temporal-Sub shapes that differ from numeric arith:
             //   * Date32  - Date32          → Int32 (days count)
             //   * Timestamp - Timestamp     → Int64 (tick count in source unit)
@@ -2348,7 +2348,7 @@ fn emit_binary(
             // that has no variable-width output-buffer allocation, so it stays
             // host-routed: the physical-plan lowerer routes any expression that
             // contains `BinaryOp::Concat` through `PhysicalPlan::Project` (SELECT
-            // list, v0.5) or `PhysicalPlan::Filter` (WHERE predicate, v0.7) —
+            // list) or `PhysicalPlan::Filter` (WHERE predicate) —
             // both backed by `expr_agg::eval_expr`. Reaching this arm therefore
             // indicates a missing route; surface a clear error rather than
             // emitting nonsense PTX.
@@ -2566,7 +2566,7 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         (Div, Int64) => "div.s64",
         (Div, Float32) => "div.rn.f32",
         (Div, Float64) => "div.rn.f64",
-        // v0.7: Date32 / Timestamp arithmetic. The physical-plan lowerer
+        // Date32 / Timestamp arithmetic. The physical-plan lowerer
         // only emits `Sub` for these types (Date32 - Date32 → Int32 days;
         // Timestamp(u, tz) - Timestamp(u, tz) → Int64 ticks); any other
         // op surfaces here as an "unsupported" error below.
@@ -2606,7 +2606,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         Int64 => "s64",
         Float32 => "f32",
         Float64 => "f64",
-        // v0.7: Date32 / Timestamp comparisons fall through to integer
+        // Date32 / Timestamp comparisons fall through to integer
         // setp on the underlying days / ticks. The logical type-checker
         // already enforces matching unit / tz on Timestamp operands; at
         // the PTX level it's identical to the corresponding integer cmp.
@@ -2638,7 +2638,7 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         DataType::Int64 => "s64",
         DataType::Float32 => "f32",
         DataType::Float64 => "f64",
-        // v0.7: Date32 is i32 days; Timestamp is i64 ticks. Storage layout
+        // Date32 is i32 days; Timestamp is i64 ticks. Storage layout
         // matches the underlying integer type bit-for-bit.
         DataType::Date32 => "s32",
         DataType::Timestamp(_, _) => "s64",
@@ -3151,7 +3151,7 @@ mod validity_emission_tests {
         );
     }
 
-    // ---- v0.7: BinaryOp::Concat in a kernel spec must reject at PTX-gen ----
+    // ---- BinaryOp::Concat in a kernel spec must reject at PTX-gen ----
     //
     // The physical-plan lowerer routes every Concat-bearing expression
     // through a host-side executor (`PhysicalPlan::Project` for SELECT lists,
@@ -3285,7 +3285,7 @@ mod validity_emission_tests {
         );
     }
 
-    /// The v0.7 lowering contract: `WHERE a || b = 'foo'` must NOT raise an
+    /// The lowering contract: `WHERE a || b = 'foo'` must NOT raise an
     /// error from the physical-plan lowerer. The route lives in
     /// `physical_plan::lower_depth`'s Filter arm, which detects
     /// `BinaryOp::Concat` in the predicate and routes the whole Filter
@@ -3397,7 +3397,7 @@ mod validity_emission_tests {
 
     // ---- Op::Select (CASE WHEN) -------------------------------------------
 
-    /// v0.7 CASE WHEN lowering: a single-WHEN `Op::Select` must materialise
+    /// CASE WHEN lowering: a single-WHEN `Op::Select` must materialise
     /// the chosen value via `setp.ne.s32` (Bool 0/1 -> predicate) followed
     /// by `selp.<ty>` on the value class. Mirrors the contract documented
     /// on `Op::Select` in physical_plan.rs and `emit_select` above.
@@ -3917,13 +3917,11 @@ mod scalar_string_fn_substrate_tests {
 
 #[cfg(test)]
 mod decimal128_ir_tests {
-    //! PTX shape tests for the dual-register Decimal128 / i128 ops
-    //! (v0.7 Sub-task A). These cover the *IR-emission* layer only —
-    //! `Codegen::emit_column` / `emit_literal` / `emit_binary` still
-    //! reject Decimal128 with a `Plan` error, so the end-to-end SQL
-    //! reject tests in `tests/decimal_type_test.rs` continue to pass
-    //! unchanged. The tests here build a `KernelSpec` by hand to drive
-    //! `compile` directly.
+    //! PTX shape tests for the dual-register Decimal128 / i128 ops. These
+    //! cover the *IR-emission* layer only: they build a `KernelSpec` by hand
+    //! to drive `compile` directly. The end-to-end SQL path (through
+    //! `Codegen::emit_column` / `emit_literal` / `emit_binary`) is covered by
+    //! `tests/decimal_type_test.rs`.
     use super::*;
     use crate::plan::logical_plan::DataType;
     use crate::plan::physical_plan::{ColumnIO, KernelSpec, Op, Reg};
@@ -4296,7 +4294,7 @@ mod decimal128_ir_tests {
         assert_eq!(alloc.count("rl"), 2);
     }
 
-    // -------- Op::Cmp128 PTX shape tests (v0.7 follow-up to Sub-task B) ----
+    // -------- Op::Cmp128 PTX shape tests ----
     //
     // Each test below builds a 6-op kernel:
     //
@@ -5605,9 +5603,9 @@ mod cast_emission_tests {
     //! Per-pair coverage for the `Op::Cast` PTX emission table in
     //! [`emit_cast`].
     //!
-    //! v0.7 wires `CAST(<numeric> AS <numeric>)` (plus `Bool ↔ Int`)
+    //! The codegen wires `CAST(<numeric> AS <numeric>)` (plus `Bool ↔ Int`)
     //! through the existing `emit_cast` helper, which the codegen has
-    //! used since v0.5 for binary-op dtype unification. These tests pin
+    //! used for binary-op dtype unification. These tests pin
     //! the emitted `cvt.*` mnemonic for each accepted source/target
     //! pair so future relaxations (e.g. `Bool -> Float` going through a
     //! different code path) regress visibly rather than silently
@@ -5770,9 +5768,9 @@ mod cast_emission_tests {
 
 #[cfg(test)]
 mod temporal_arith_tests {
-    //! v0.7: PTX-shape coverage for Date32 / Timestamp arithmetic.
+    //! PTX-shape coverage for Date32 / Timestamp arithmetic.
     //!
-    //! The supported v0.7 surface is:
+    //! The supported surface is:
     //!   * `Date32 - Date32` → `Int32` (number of days)
     //!   * `Timestamp(unit, tz) - Timestamp(unit, tz)` → `Int64` (ticks
     //!     in the source unit; matching unit + tz enforced upstream)
@@ -6246,7 +6244,7 @@ mod modulo_bitwise_tests {
 
 #[cfg(test)]
 mod temporal_plan_tests {
-    //! v0.7: logical / physical plan type-check coverage for the Date32 /
+    //! logical / physical plan type-check coverage for the Date32 /
     //! Timestamp subtraction surface.
     //!
     //! These tests construct the plan directly (no SQL frontend) so they
@@ -6304,7 +6302,7 @@ mod temporal_plan_tests {
     }
 
     /// Mixed Timestamp units must be rejected with a message naming
-    /// "TimeUnit" — coercion is out of scope for v0.7.
+    /// "TimeUnit" — coercion is out of scope.
     #[test]
     fn timestamp_minus_timestamp_mismatched_units_rejected() {
         let schema = Schema::new(vec![
@@ -6326,7 +6324,7 @@ mod temporal_plan_tests {
 
     /// `Date32 + Date32` is not a meaningful operation (adding two days-
     /// since-epoch values is nonsense). Must be rejected with the
-    /// v0.7-tightened message rather than the generic "requires numeric
+    /// tightened message rather than the generic "requires numeric
     /// operands".
     #[test]
     fn date_plus_date_rejected() {

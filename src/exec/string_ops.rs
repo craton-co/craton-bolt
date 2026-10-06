@@ -351,7 +351,7 @@ fn remap_and_upload(
 //
 // `string_ops_extended::concat` operates on `DictionaryColumn`s (device-side
 // inputs / outputs) and is the right tool when the engine is already holding
-// dictionary-encoded columns. The v0.5 SQL frontend lowers `a || b` to
+// dictionary-encoded columns. The SQL frontend lowers `a || b` to
 // `BinaryOp::Concat`, which the executor's host-side projection path
 // evaluates over `StringArray` cells lifted from the input batch — see
 // `exec::expr_agg::eval_binary` / `exec::engine.rs::execute` Project arm.

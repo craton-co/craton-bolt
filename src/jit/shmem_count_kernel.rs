@@ -88,10 +88,27 @@ pub const KERNEL_ENTRY: &str = "bolt_groupby_shmem_count_u64";
 /// )
 /// ```
 ///
-/// Pure / deterministic: same input -> same output.
+/// Pure / deterministic: same input -> same output. This is the `Int32`-key
+/// instance of [`compile_shmem_count_kernel_typed`].
 pub fn compile_shmem_count_kernel() -> BoltResult<String> {
+    compile_shmem_count_kernel_typed(crate::jit::shmem_sum_kernel::ShmemKey::I32)
+}
+
+/// PTX entry name of a key-typed COUNT instance; `Int32` is [`KERNEL_ENTRY`].
+pub fn kernel_entry(key: crate::jit::shmem_sum_kernel::ShmemKey) -> &'static str {
+    match key {
+        crate::jit::shmem_sum_kernel::ShmemKey::I32 => KERNEL_ENTRY,
+        crate::jit::shmem_sum_kernel::ShmemKey::I64 => "bolt_groupby_shmem_count_u64_ki64",
+    }
+}
+
+/// The COUNT kernel for an `Int32` or `Int64` key column (`Int64` keys must
+/// be pre-validated to `[0, BLOCK_GROUPS)`; see the SUM kernel's `ShmemKey`).
+pub fn compile_shmem_count_kernel_typed(
+    key: crate::jit::shmem_sum_kernel::ShmemKey,
+) -> BoltResult<String> {
     let mut ptx = String::new();
-    let entry = KERNEL_ENTRY;
+    let entry = kernel_entry(key);
     let block_groups = BLOCK_GROUPS;
     let acc_bytes = BLOCK_GROUPS * 8; // u64
     let set_bytes = BLOCK_GROUPS;
@@ -195,14 +212,32 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     // constant pool, and the SASS optimiser folds it anyway. We mov-into a
     // register per-iteration for clarity; the SASS compiler hoists it.
     // ----------------------------------------------------------------------
+    // Run-length pre-aggregate (see `shmem_sum_kernel`): %r14 = current run
+    // key (-1 = none), %rd5 = the run's row count. Consecutive same-key rows
+    // in this thread's stride cost one shared atomic per run, not per row.
+    writeln!(ptx, "\tmov.u32 %r14, -1;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd5, 0;").map_err(write_err)?;
     writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p1, %r3, %r6;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
 
     // key = keys[i] (i32 -> s32 register %r12)
-    writeln!(ptx, "\tmul.wide.u32 %rd14, %r3, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s32 %r12, [%rd15];").map_err(write_err)?;
+    match key {
+        crate::jit::shmem_sum_kernel::ShmemKey::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd14, %r3, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.s32 %r12, [%rd15];").map_err(write_err)?;
+        }
+        crate::jit::shmem_sum_kernel::ShmemKey::I64 => {
+            // Clamp out-of-range (negative / huge) keys to -1, which the
+            // overflow path drops; validated keys pass through exactly.
+            writeln!(ptx, "\tmul.wide.u32 %rd14, %r3, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.u64 %rd6, [%rd15];").map_err(write_err)?;
+            writeln!(ptx, "\tmin.u64 %rd6, %rd6, 4294967295;").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u64 %r12, %rd6;").map_err(write_err)?;
+        }
+    }
 
     // Overflow check: unsigned compare so a (defensively-allowed) negative
     // key is routed to the global path instead of corrupting a shared slot.
@@ -212,16 +247,19 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
-    // Shared increment.  block_count[key] += 1
-    writeln!(ptx, "\tmul.wide.s32 %rd18, %r12, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd19, %rd0, %rd18;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u64 %rd30, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.shared.add.u64 %rd31, [%rd19], %rd30;").map_err(write_err)?;
-    //   block_set[key] = 1  (unsynchronised; benign race)
-    writeln!(ptx, "\tcvt.s64.s32 %rd20, %r12;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd1, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r13, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u8 [%rd21], %r13;").map_err(write_err)?;
+    // Same key as the current run: count it in a register.
+    writeln!(ptx, "\tsetp.eq.s32 %p6, %r12, %r14;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra RUN_ADD;").map_err(write_err)?;
+    // Key changed: flush the previous run (if any), then start a new one.
+    writeln!(ptx, "\tsetp.lt.s32 %p7, %r14, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra RUN_START;").map_err(write_err)?;
+    emit_run_flush(&mut ptx)?;
+    writeln!(ptx, "RUN_START:").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r14, %r12;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u64 %rd5, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+    writeln!(ptx, "RUN_ADD:").map_err(write_err)?;
+    writeln!(ptx, "\tadd.u64 %rd5, %rd5, 1;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
     // Overflow path: hit out_count directly with a global u64 atomic add.
@@ -247,6 +285,11 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tadd.u32 %r3, %r3, %r5;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_TOP;").map_err(write_err)?;
     writeln!(ptx, "LOOP_DONE:").map_err(write_err)?;
+    // Flush the thread's last run before the block-wide merge.
+    writeln!(ptx, "\tsetp.lt.s32 %p7, %r14, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra FINAL_FLUSH_DONE;").map_err(write_err)?;
+    emit_run_flush(&mut ptx)?;
+    writeln!(ptx, "FINAL_FLUSH_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
@@ -284,6 +327,20 @@ pub fn compile_shmem_count_kernel() -> BoltResult<String> {
     writeln!(ptx, "}}").map_err(write_err)?;
 
     Ok(ptx)
+}
+
+/// Emit the run flush: `block_count[%r14] += %rd5; block_set[%r14] = 1`.
+/// `%r14` is a valid in-range slot whenever this is reached.
+fn emit_run_flush(ptx: &mut String) -> BoltResult<()> {
+    writeln!(ptx, "\tmul.wide.s32 %rd18, %r14, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd19, %rd0, %rd18;").map_err(write_err)?;
+    writeln!(ptx, "\tatom.shared.add.u64 %rd31, [%rd19], %rd5;").map_err(write_err)?;
+    // block_set[slot] = 1 (unsynchronised; benign race).
+    writeln!(ptx, "\tcvt.s64.s32 %rd20, %r14;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd1, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r13, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u8 [%rd21], %r13;").map_err(write_err)?;
+    Ok(())
 }
 
 /// `std::fmt::Error` -> `BoltError`; matches `shmem_sum_kernel`.

@@ -86,7 +86,7 @@ const MAX_CROSS_ROWS: u64 = u32::MAX as u64;
 /// the per-outer-row scan is cheap and surface a clear "rewrite as equi if
 /// possible" hint past that.
 ///
-/// Sized for the v0.6 stretch goal: small-side non-equi joins (e.g. a
+/// Sized for the stretch goal: small-side non-equi joins (e.g. a
 /// dimension table of buckets / ranges against a fact table) work cleanly,
 /// while accidental cartesian explosions are caught early. The cap is a
 /// `const` so it's easy to find and tune.
@@ -114,7 +114,7 @@ const NESTED_LOOP_CHUNK_CELLS: u64 = 1 << 20;
 ///   * `execute_outer_join` — LEFT / RIGHT / FULL (build side is fixed
 ///      by the join kind so unmatched-row tracking is straightforward).
 ///   * `execute_cross_join` — cartesian product with a row-count cap.
-///   * `execute_nested_loop_join` — v0.6 non-equi fallback. Activated when
+///   * `execute_nested_loop_join` — non-equi fallback. Activated when
 ///     `filter` is `Some(_)`: the larger side is STREAMED in chunks (the
 ///     EXEC-M3 fix), each chunk crossed against the held-whole smaller side
 ///     and filtered host-side via [`crate::exec::filter::execute_filter`],
@@ -147,7 +147,7 @@ pub fn execute_join(
 
     // Non-equi fast-bail: any filter present routes through the nested-loop
     // executor regardless of join_type, since the existing equi-join
-    // executors can't honour the residual predicate. v0.6 supports the
+    // executors can't honour the residual predicate. The engine supports the
     // INNER and CROSS shapes for non-equi; LEFT/RIGHT/FULL with a non-equi
     // predicate is a future extension (current behaviour: reject with a
     // clear message rather than silently produce wrong results).
@@ -524,7 +524,7 @@ fn execute_cross_join(
     )
 }
 
-// ---------- NESTED-LOOP (v0.6 non-equi fallback) -------------------------
+// ---------- NESTED-LOOP -------------------------
 
 /// Nested-loop join with a host-side residual predicate.
 ///
@@ -554,14 +554,14 @@ fn execute_cross_join(
 ///      [`crate::exec::filter::execute_filter`], which evaluates the
 ///      expression against the combined-schema columns and drops rows
 ///      where the predicate is `false` or NULL (standard SQL WHERE
-///      semantics — matches the v0.6 INNER-non-equi contract). Identical
+///      semantics — matches the INNER-non-equi contract). Identical
 ///      to the pre-fix post-cross filter, just applied per block; the
 ///      matched blocks are concatenated with `concat_batches`, preserving
 ///      output schema and column order exactly.
 ///   4. For OUTER variants (LEFT/RIGHT/FULL), the nested-loop path with
 ///      a non-equi predicate would need to track unmatched preserved-side
-///      rows and emit them NULL-padded. v0.6 ships the INNER-non-equi
-///      surface only; OUTER + non-equi rejects with a clear message
+///      rows and emit them NULL-padded. Only the INNER-non-equi
+///      surface ships; OUTER + non-equi rejects with a clear message
 ///      pointing at the future extension.
 ///
 /// `on` (equi pairs) can be non-empty alongside a `filter`: the SQL
@@ -574,7 +574,7 @@ fn execute_cross_join(
 /// thing host-side — that way both the equi and non-equi constraints are
 /// enforced in one pass. A future optimisation could run the equi join
 /// first (hash) and then post-filter, but the mixed shape is rare enough
-/// in v0.6 that the simpler approach is preferred.
+/// that the simpler approach is preferred.
 fn execute_nested_loop_join(
     lhs: RecordBatch,
     rhs: RecordBatch,
@@ -644,7 +644,7 @@ fn execute_nested_loop_join_chunked(
 
     // If the SQL frontend extracted equi pairs alongside a residual filter,
     // fold them into one composite predicate so they're enforced too. This
-    // arm isn't reachable from v0.6's `lower_join_on` (which puts the whole
+    // arm isn't reachable from `lower_join_on` (which puts the whole
     // equality into the filter when any non-equi sibling is present), but
     // future planner improvements (e.g. extracting equi pairs even when a
     // non-equi sibling exists) need not change this executor. Computed once
@@ -730,7 +730,7 @@ fn execute_nested_loop_join_chunked(
 /// Conjunct every equi pair (lowered as `l = r`) into `predicate` with AND
 /// so the host-side filter can enforce both the equi pairs and the
 /// residual non-equi predicate in one pass. See the dispatch logic in
-/// [`execute_nested_loop_join`] for why this exists despite v0.6's planner
+/// [`execute_nested_loop_join`] for why this exists despite the planner
 /// never producing mixed shapes.
 fn fold_equi_into_predicate(on: &[(Expr, Expr)], predicate: &Expr) -> Expr {
     let mut acc: Expr = predicate.clone();

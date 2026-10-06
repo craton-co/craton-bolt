@@ -15,7 +15,7 @@
 //! (one row per group), so a host-side pass is the right cost trade-off
 //! for 0.3 — pushing HAVING down to GPU kernels would buy nothing here.
 //!
-//! # v0.7 async-memcpy plumbing
+//! # async-memcpy plumbing
 //!
 //! `execute_filter` itself is host-only — it never crosses the host/device
 //! boundary, so there is no `from_slice` / `to_vec` pair to migrate to the
@@ -26,7 +26,7 @@
 //!
 //! What this module DOES import is the shared
 //! [`crate::exec::gpu_upload::upload_primitive_values_async`] helper —
-//! promoted out of `exec::aggregate` for v0.7. Holding the import here
+//! promoted out of `exec::aggregate`. Holding the import here
 //! (rather than re-introducing a local shim) means that when the
 //! WHERE→host fallback path inside `execute_filter` grows a GPU fast
 //! path for a primitive column (e.g. lifting predicate evaluation onto
@@ -47,7 +47,7 @@ use arrow_schema::DataType as ArrowDataType;
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg::{self, ColumnEnv, HostColumn};
-// v0.7: re-exported shared helper for the async-memcpy + pinned-buffer
+// re-exported shared helper for the async-memcpy + pinned-buffer
 // pattern. Used today only by the `cuda-stub` graceful-fallback test
 // below; pre-positioned here so a future GPU-lifted predicate path can
 // adopt it without re-importing the shim everywhere.
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(ids, vec![1, 3, 5]);
     }
 
-    /// v0.7 async-memcpy plumbing: the shared
+    /// async-memcpy plumbing: the shared
     /// `upload_primitive_values_async` helper is importable and callable
     /// from this module without panic under `--features cuda-stub`. The
     /// helper itself surfaces `CUDA_ERROR_STUB` for any non-empty upload

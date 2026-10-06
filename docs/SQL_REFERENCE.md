@@ -1,8 +1,13 @@
+<!--
+applies-to: main
+owner: frontend
+checked-by: tests/doc_consistency_test.rs (execution-tier markers)
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # SQL Reference
 
 The exact subset of SQL Craton Bolt's frontend accepts. The grammar is built on top of [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs); anything outside this surface produces a clear `BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported construct.
-
-<!-- applies-to: main · owner: frontend · version-neutral (the crate version lives in Cargo.toml) -->
 
 This document describes the current `main` frontend. For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the gap to 1.0, see [`../ROADMAP.md`](../ROADMAP.md).
 

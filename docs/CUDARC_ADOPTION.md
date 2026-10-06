@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: cuda
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # cudarc backend
 
 `cudarc` is Craton Bolt's supported, default CUDA context/driver adapter

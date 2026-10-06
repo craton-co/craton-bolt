@@ -288,6 +288,20 @@ cargo bench --bench cost_model --no-default-features --features cuda-stub   # ho
 BOLT_BENCH_GPU=1 BOLT_COST_ROWS=4000000 cargo bench --bench cost_model      # all groups
 ```
 
+Device-memory pressure (a working set below and above free VRAM) is the
+`BOLT_VRAM_PRESSURE_ROWS` point of the scaling bench (below). Concurrent
+queries / sessions are not benchmarked: the engine runs one query at a time
+per process by design (see `LIMITATIONS.md`).
+
+**What it surfaced.** Besides fragmentation (below), the first GPU run
+exposed two GROUP BY gaps that are now fixed: a single-key `SUM ... GROUP BY`
+was 7× slower than 100 keys (every thread contending for one shared slot —
+fixed by per-thread run-length + warp pre-aggregation: 23.8 → 3.8 ms at 4 M
+rows), and any `Int64` key or integer `SUM` missed the resident fast path
+entirely (145–280 ms → 3.6–5.3 ms after typing the Tier-1 kernel). The
+remaining gap — high-cardinality `Int64` / integer shapes — is listed in
+`LIMITATIONS.md`.
+
 **What it already decided.** The `fragmentation` group measured the cost
 the multi-batch representation used to impose on *every* query: concatenating
 a 2 M-row (16 MB) table held in 2–1024 batches took **7–10 ms per query**,

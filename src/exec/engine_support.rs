@@ -35,7 +35,7 @@ pub(crate) fn column_storage_rows(data: &crate::exec::gpu_table::GpuColumnData) 
         BoolNullable { values, .. } => values.len(),
         Utf8 { indices, .. } => indices.len(),
         DictUtf8 { keys, .. } => keys.len(),
-        // v0.7 sub-task B: Decimal128 stores `2 * n_rows` u64 values
+        // sub-task B: Decimal128 stores `2 * n_rows` u64 values
         // (interleaved [lo, hi] pairs); divide back to get the logical
         // row count.
         Decimal128 { values, .. } => values.len() / 2,
@@ -231,7 +231,7 @@ pub(crate) fn try_extend_column(
         GpuColumnData::Utf8 { .. } | GpuColumnData::DictUtf8 { .. } => {
             return Ok(None);
         }
-        // v0.7 sub-task B: Decimal128 prefix-extend isn't wired yet —
+        // sub-task B: Decimal128 prefix-extend isn't wired yet —
         // the tail would need a slice-and-pack helper paralleling
         // `Decimal128Array::value(i)`. Punt to a full re-upload for now;
         // every existing Decimal column test exercises the full-upload

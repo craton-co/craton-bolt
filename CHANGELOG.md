@@ -51,6 +51,27 @@ All notable changes to this project will be documented here. The format follows 
   `GROUP BY <utf8 key>` under a predicate, execute (see `AggregateOverInput`).
 
 ### Added
+- **Typed Tier-1 shared-memory GROUP BY SUM.** The resident on-device path
+  now covers `Int64` keys and `SUM(Int64)` / `SUM(Int32)` values (≤ 1024
+  groups), not only `Int32` keys × `SUM(Float64)`. Integer sums stay exact:
+  `SUM(Int32)` cannot overflow there, and `SUM(Int64)` takes the path only when
+  a device-computed `max|v| × n_rows` fits `i64` (otherwise the guarded path
+  still reports `SUM(integer) overflow`). Measured 40–70× faster for those
+  shapes at 4 M rows on an RTX 2060 (145–280 ms → 3.6–5.3 ms).
+- **Algebraic aggregates stream.** `AVG`, `VAR_*` and `STDDEV_*` (scalar and
+  grouped, mixed with distributive aggregates) run morsel-by-morsel under a
+  memory budget: each is decomposed into `SUM` / `COUNT` / `VAR_POP` partials
+  and recombined exactly (two-pass parallel variance), instead of draining the
+  whole table.
+- **Lazy tables get string dictionaries.** Without a memory budget, a lazy
+  table's dictionaries are built when it is drained — before the statement is
+  compiled — so its string predicates fold to GPU index comparisons like an
+  eager table's.
+- **Compiled-plan cache.** Repeated top-level SQL reuses the prepared physical
+  plan (skipping classification, rewrite, optimizer, subquery execution and
+  lowering), keyed by `(SQL, schema version, data epoch)`; every registration,
+  append, replace and lazy drain bumps the epoch, and the cache is bypassed
+  while `PlanRewrite` hooks are registered. 1.5–2.1× on small repeated queries.
 - **`GROUP BY` / aggregates over a non-fusable input.** Aggregates over a
   join, union, distinct, or a filter the fused GPU kernel cannot evaluate
   used to be rejected at lowering (`unsupported aggregate over non-scan-chain
@@ -82,6 +103,12 @@ All notable changes to this project will be documented here. The format follows 
   and `tests/string_eq_aggregate_test.rs`.
 
 ### Changed
+- **Low-cardinality GROUP BY no longer serialises on one shared atomic.** The
+  Tier-1 SUM and COUNT kernels pre-aggregate per-thread runs of equal keys in
+  registers (and warp-reduce the final runs) before touching shared memory:
+  a single-key `SUM ... GROUP BY` went from 23.8 ms to 3.8 ms (4 M rows).
+- **Obsolete milestone labels removed from source comments** (`v0.5` … `v0.7`
+  tags and stale "rejected in v0.5" claims about per-group variance).
 - **Multi-batch tables are coalesced at ingest.** `register_batch` stores the
   coalesced batch it already built for the dictionary union,
   `register_table_stream` validates and coalesces once before a single atomic

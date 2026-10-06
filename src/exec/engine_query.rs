@@ -16,8 +16,13 @@
 //! 3. user [`PlanRewrite`](crate::plan::PlanRewrite) hooks,
 //! 4. uncorrelated subquery resolution (or, for `EXPLAIN`, an explicit
 //!    "deferred" marker),
-//! 5. physical lowering, lazy-source materialisation of the tables the plan
-//!    actually scans, and validity propagation.
+//! 5. physical lowering and validity propagation.
+//!
+//! Before step 1, every lazily-registered table the statement reads —
+//! including inside its subqueries — is drained, validated and (without a
+//! memory budget) given string dictionaries, so the dictionary rewrite sees
+//! them. Repeated top-level SQL reuses the prepared physical plan from the
+//! per-engine [`CompiledPlanCache`] until the data changes.
 //!
 //! Before this module existed each entry point carried its own copy of that
 //! sequence and they had drifted: `run_logical_plan` skipped the user hooks,
@@ -129,6 +134,28 @@ impl QueryCompiler<'_> {
     }
 }
 
+/// Every base table `plan` scans, including inside its (nested) uncorrelated
+/// subqueries. Uses the subquery resolver's own walker with a recording
+/// executor (returning an empty one-column batch), so what counts as a
+/// subquery cannot drift from what the execution path resolves; the folded
+/// plan is discarded.
+fn deep_scan_tables(plan: &LogicalPlan) -> Vec<String> {
+    let mut nested: Vec<String> = Vec::new();
+    let mut record = |subplan: LogicalPlan| -> BoltResult<RecordBatch> {
+        nested.extend(deep_scan_tables(&subplan));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "probe",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        Ok(RecordBatch::new_empty(schema))
+    };
+    let _ = crate::exec::subquery_resolve::resolve_plan(plan.clone(), &mut record);
+    let mut out = crate::plan::logical_plan::collect_scan_tables(plan);
+    out.extend(nested);
+    out
+}
+
 /// `true` if `plan` still carries a scalar / IN subquery anywhere.
 ///
 /// Reuses the resolver's own walker (so "what counts as a subquery" cannot
@@ -145,10 +172,12 @@ fn plan_has_subqueries(plan: &LogicalPlan) -> bool {
 }
 
 impl Engine {
-    /// Borrow this engine's [`QueryCompiler`].
-    pub(crate) fn compiler(&self) -> QueryCompiler<'_> {
+    /// This engine's [`QueryCompiler`] over a borrowed dictionary registry
+    /// (`let registry = self.dict_registry.borrow();` at the call site, held
+    /// for the duration of the compile).
+    pub(crate) fn compiler<'a>(&'a self, dict: &'a DictRegistry) -> QueryCompiler<'a> {
         QueryCompiler {
-            dict: &self.dict_registry,
+            dict,
             rewrites: &self.rewrites,
             optimize: self.optimize,
             estimator: self.row_estimator(),
@@ -225,6 +254,18 @@ impl Engine {
         user_rewrites: bool,
         top_level: bool,
     ) -> BoltResult<QueryHandle> {
+        let phys = self.prepare_physical(plan, user_rewrites, top_level)?;
+        self.execute(&phys)
+    }
+
+    /// Everything [`Engine::execute_logical`] does before execution: drain the
+    /// lazy tables the statement reads, compile, lower, populate validity.
+    fn prepare_physical(
+        &self,
+        plan: &LogicalPlan,
+        user_rewrites: bool,
+        top_level: bool,
+    ) -> BoltResult<PhysicalPlan> {
         let plan_start = Instant::now();
         let mut resolve = |subplan: LogicalPlan| -> BoltResult<RecordBatch> {
             // A subquery was already seen by the user hooks as part of the
@@ -232,9 +273,21 @@ impl Engine {
             self.execute_logical(&subplan, false, false)
                 .map(QueryHandle::into_record_batch)
         };
-        let compiled =
-            self.compiler()
-                .compile(plan, user_rewrites, Subqueries::Resolve(&mut resolve))?;
+        // Drain (and build dictionaries for) every lazy table the statement
+        // reads — including inside its subqueries — BEFORE compiling, so the
+        // dictionary rewrite already sees their dictionaries and no drain has
+        // to mutate the registry while a compile holds it.
+        for table in deep_scan_tables(plan) {
+            self.materialize_streaming_source(&table)?;
+        }
+        let registry = self.dict_registry.borrow();
+        let compiled = self.compiler(&registry).compile(
+            plan,
+            user_rewrites,
+            Subqueries::Resolve(&mut resolve),
+        );
+        drop(registry);
+        let compiled = compiled?;
         if top_level {
             crate::metrics::metrics()
                 .observe_duration(crate::metrics::Phase::Plan, plan_start.elapsed());
@@ -245,7 +298,7 @@ impl Engine {
             crate::metrics::metrics()
                 .observe_duration(crate::metrics::Phase::Lower, lower_start.elapsed());
         }
-        self.execute(&phys)
+        Ok(phys)
     }
 
     /// Lower a compiled logical plan and prepare it for [`Engine::execute`]:
@@ -290,12 +343,31 @@ impl Engine {
     }
 
     fn sql_inner(&self, query: &str) -> BoltResult<QueryHandle> {
+        // User hooks may be stateful or nondeterministic, so their presence
+        // disables plan reuse (the contract runs them on every compile).
+        let cacheable = self.rewrites.is_empty();
+        if cacheable {
+            let key = self.compiled_plan_key(query);
+            let cached = self.compiled_plans.borrow_mut().get(&key);
+            if let Some(phys) = cached {
+                return self.execute(&phys);
+            }
+        }
         let parse_start = Instant::now();
         let shape = classify_query(query, &self.provider)?;
         crate::metrics::metrics()
             .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
         match shape {
-            QueryShape::Generic(plan) => self.execute_logical(&plan, true, true),
+            QueryShape::Generic(plan) => {
+                let phys = self.prepare_physical(&plan, true, true)?;
+                if cacheable {
+                    // Keyed AFTER preparing: a first query may drain lazy
+                    // tables, which bumps the epoch the plan derives from.
+                    let key = self.compiled_plan_key(query);
+                    self.compiled_plans.borrow_mut().insert(key, phys.clone());
+                }
+                self.execute(&phys)
+            }
             QueryShape::Recursive(RecursiveQueryPlan::Single(rec)) => {
                 self.execute_recursive_cte(&rec)
             }
@@ -388,7 +460,10 @@ impl Engine {
                 ))
             }
         };
-        let compiled = self.compiler().compile(&plan, true, Subqueries::Defer)?;
+        let registry = self.dict_registry.borrow();
+        let compiled = self
+            .compiler(&registry)
+            .compile(&plan, true, Subqueries::Defer)?;
         Ok(render_explain(&compiled))
     }
 
@@ -420,6 +495,65 @@ impl Engine {
     pub(crate) fn run_subplan(&self, plan: LogicalPlan) -> BoltResult<RecordBatch> {
         self.execute_logical(&plan, true, false)
             .map(QueryHandle::into_record_batch)
+    }
+}
+
+/// Bound on cached compiled plans per engine (FIFO eviction).
+const COMPILED_PLAN_CACHE_CAP: usize = 64;
+
+/// `(SQL text, provider schema version, data epoch)`.
+pub(crate) type CompiledPlanKey = (String, u64, u64);
+
+/// Per-engine cache of fully prepared physical plans for repeated top-level
+/// ordinary SQL. A hit skips classification, the dictionary rewrite, the
+/// optimizer, subquery execution and lowering; the key's data epoch makes
+/// any data or schema change a miss (see the engine's `data_epoch`).
+#[derive(Default)]
+pub(crate) struct CompiledPlanCache {
+    map: std::collections::HashMap<CompiledPlanKey, PhysicalPlan>,
+    order: std::collections::VecDeque<CompiledPlanKey>,
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+}
+
+impl CompiledPlanCache {
+    fn get(&mut self, key: &CompiledPlanKey) -> Option<PhysicalPlan> {
+        match self.map.get(key) {
+            Some(p) => {
+                self.hits += 1;
+                Some(p.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, key: CompiledPlanKey, plan: PhysicalPlan) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        while self.map.len() >= COMPILED_PLAN_CACHE_CAP {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, plan);
+    }
+}
+
+impl Engine {
+    fn compiled_plan_key(&self, sql: &str) -> CompiledPlanKey {
+        (
+            sql.to_string(),
+            crate::plan::TableProvider::schema_version(&self.provider),
+            self.data_epoch.get(),
+        )
     }
 }
 

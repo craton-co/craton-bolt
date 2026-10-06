@@ -1064,7 +1064,7 @@ impl Drop for ActiveEnginePermit {
 ///
 /// The legacy [`Engine::new`] and [`Engine::new_with_device`] entry points are
 /// thin wrappers around the builder, kept for source-compatibility with
-/// pre-v0.6 callers.
+/// older callers.
 ///
 /// # `#[non_exhaustive]`
 ///
@@ -1118,7 +1118,11 @@ pub struct Engine {
     /// column so the SQL frontend resolves rewriter-produced column refs.
     pub(crate) provider: MemTableProvider,
     /// Per-table Utf8 dictionaries; drives the string-literal predicate rewrite.
-    pub(crate) dict_registry: crate::exec::dict_registry::DictRegistry,
+    ///
+    /// `RefCell` because a lazily-registered table's dictionaries are built
+    /// when its producer is first drained, which happens on the `&self` query
+    /// path (see `Engine::materialize_streaming_source`).
+    pub(crate) dict_registry: RefCell<crate::exec::dict_registry::DictRegistry>,
     /// GPU-resident copies of every registered table. Owns the device
     /// allocations; must drop BEFORE `_ctx`.
     ///
@@ -1209,16 +1213,16 @@ pub struct Engine {
     /// `SeqCst` so the test's load/store interleaves cleanly with the
     /// engine's increment.
     module_cache_loads: std::sync::atomic::AtomicUsize,
-    /// v0.6 / M7 public optimizer extension surface: user-registered
+    /// Public optimizer extension surface: user-registered
     /// PlanRewrite implementations run in registration order before lower_physical.
     pub(crate) rewrites: Vec<Box<dyn PlanRewrite>>,
-    /// v0.6 builder: CUDA device ordinal this engine was constructed on.
+    /// Builder knob: CUDA device ordinal this engine was constructed on.
     device_idx: i32,
-    /// v0.6 builder: soft cap on device-memory pool allocations in bytes.
+    /// Builder knob: soft cap on device-memory pool allocations in bytes.
     memory_budget_bytes: Option<usize>,
-    /// v0.6 builder: optional disk-backed PTX cache directory.
+    /// Builder knob: optional disk-backed PTX cache directory.
     persistent_cache_path: Option<std::path::PathBuf>,
-    /// v0.6 builder: whether tracing was enabled by the builder.
+    /// Builder knob: whether tracing was enabled by the builder.
     tracing_enabled: bool,
     /// Test-only: run the built-in logical optimizer before lowering.
     /// Defaults to `true` (the production behaviour); flipped to `false`
@@ -1228,6 +1232,16 @@ pub struct Engine {
     /// construction leaves this `true`, so the gate at the
     /// `run_to_fixpoint` call sites is a no-op for all stable callers.
     pub(crate) optimize: bool,
+    /// Monotone counter bumped by every change to the data or schemas a query
+    /// can observe (table registration / append / replace, lazy drains). Part
+    /// of the compiled-plan cache key, so a cached physical plan — whose
+    /// optimizer statistics, dictionary folds, validity flags and folded
+    /// subquery constants all derive from that data — is never reused after
+    /// the data changes.
+    pub(crate) data_epoch: std::cell::Cell<u64>,
+    /// Compiled physical plans for repeated top-level SQL (see
+    /// `engine_query::CompiledPlanCache`). Host-only data; no device handles.
+    pub(crate) compiled_plans: RefCell<crate::exec::engine_query::CompiledPlanCache>,
     /// Owned CUDA context — declared after every context-bound resource so it
     /// drops after dictionaries, tables, and module handles.
     _ctx: CudaContext,
@@ -1235,7 +1249,7 @@ pub struct Engine {
     _active_engine_permit: ActiveEnginePermit,
 }
 
-/// v0.6 builder for [`Engine`]. Use [`Engine::builder`] to start one.
+/// Builder for [`Engine`]. Use [`Engine::builder`] to start one.
 ///
 /// Every knob is optional; un-set knobs land on the same defaults that the
 /// legacy [`Engine::new`] / [`Engine::new_with_device`] paths produce. The
@@ -1421,7 +1435,7 @@ impl EngineBuilder {
         let ctx = CudaContext::new(device_idx)?;
         let pool_stats_interval = pool_stats_interval_from_env();
 
-        // v0.6 / M6: thread the builder's `persistent_cache(path)` knob
+        // thread the builder's `persistent_cache(path)` knob
         // into the process-wide disk PTX cache so the JIT compile path
         // (`get_or_build_module` → `disk_cache::disk_cache()`) reads and
         // writes cubins at the configured directory — not only when the
@@ -1447,7 +1461,7 @@ impl EngineBuilder {
             log::set_max_level(log::LevelFilter::Info);
         }
 
-        // v0.7: wire the builder-supplied `persistent_cache(path)` knob
+        // wire the builder-supplied `persistent_cache(path)` knob
         // into the process-wide disk PTX cache (see `jit::disk_cache`).
         // When `persistent_cache_path` is `Some`, install it as a
         // builder override — `disk_cache::resolve_cache_dir` prefers an
@@ -1470,7 +1484,7 @@ impl EngineBuilder {
             tables: HashMap::new(),
             streaming_sources: RefCell::new(HashMap::new()),
             provider: MemTableProvider::new(),
-            dict_registry: crate::exec::dict_registry::DictRegistry::new(),
+            dict_registry: RefCell::new(crate::exec::dict_registry::DictRegistry::new()),
             gpu_tables: RefCell::new(HashMap::new()),
             host_revisions: HashMap::new(),
             #[cfg(test)]
@@ -1488,6 +1502,8 @@ impl EngineBuilder {
             // flipped it. Every production path leaves `disable_optimizer`
             // false, so this is `true` for all stable callers.
             optimize: !self.disable_optimizer,
+            data_epoch: std::cell::Cell::new(0),
+            compiled_plans: RefCell::new(crate::exec::engine_query::CompiledPlanCache::default()),
             _ctx: ctx,
             _active_engine_permit: active_engine_permit,
         };
@@ -1499,8 +1515,8 @@ impl EngineBuilder {
 impl Engine {
     /// Create an engine on the default CUDA device (ordinal 0).
     ///
-    /// v0.6 legacy entry point: thin wrapper around [`Engine::builder`] kept
-    /// so pre-v0.6 callers continue to compile. New code should prefer the
+    /// Legacy entry point: thin wrapper around [`Engine::builder`] kept
+    /// so older callers continue to compile. New code should prefer the
     /// builder for forward-compatible knobs.
     pub fn new() -> BoltResult<Self> {
         Self::builder().build()
@@ -1508,7 +1524,7 @@ impl Engine {
 
     /// Create an engine bound to the CUDA device at ordinal `device_idx`.
     ///
-    /// v0.6 legacy entry point: thin wrapper around
+    /// Legacy entry point: thin wrapper around
     /// [`Engine::builder`]`.device(device_idx).build()`. The error contract is
     /// preserved verbatim — see [`EngineBuilder::build`] for the failure
     /// modes (out-of-range index, driver init failure, context create).
@@ -1518,7 +1534,7 @@ impl Engine {
 
     /// Start a fresh [`EngineBuilder`] with all knobs at their defaults.
     ///
-    /// This is the recommended construction entry point as of v0.6. Set only
+    /// This is the recommended construction entry point. Set only
     /// the knobs you need; everything else picks up the same default that
     /// the legacy [`Engine::new`] / [`Engine::new_with_device`] paths use:
     ///
@@ -1606,7 +1622,7 @@ impl Engine {
     /// The closure-based loader keeps us from re-spelling the projection vs
     /// predicate compile path at every call site.
     ///
-    /// # v0.7: process-wide KernelSpec cache layer
+    /// # process-wide KernelSpec cache layer
     ///
     /// Before consulting the per-`Engine` cache we now check the
     /// process-wide KernelSpec-keyed cache in
@@ -1623,7 +1639,7 @@ impl Engine {
     ///    falls through to the per-engine path below via the closure.
     /// 2. **Per-engine KernelSpec cache** — fast path for repeat calls on
     ///    the same engine; bumps `module_cache_loads` on a miss.
-    /// 3. **Disk-backed PTX cache** (v0.6 / M6) — skips codegen if
+    /// 3. **Disk-backed PTX cache** — skips codegen if
     ///    `BOLT_PTX_CACHE_DIR` or the builder's `persistent_cache` was
     ///    set and the PTX text is on disk from a previous process.
     /// 4. **`compile(spec)` + `CudaModule::from_ptx`** — the latter
@@ -1638,7 +1654,7 @@ impl Engine {
     where
         F: FnOnce(&KernelSpec) -> BoltResult<String>,
     {
-        // v0.7 layer 1: process-wide KernelSpec cache. On a hit this is a
+        // layer 1: process-wide KernelSpec cache. On a hit this is a
         // sub-µs Arc-clone that skips every layer below. On a miss the
         // closure runs `compile` and routes the resulting PTX through
         // `CudaModule::from_ptx` itself — so we must NOT call back into
@@ -1783,6 +1799,7 @@ impl Engine {
         name: impl Into<String>,
         batch: RecordBatch,
     ) -> BoltResult<()> {
+        self.bump_data_epoch();
         let name = name.into();
         if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
             return Err(BoltError::Plan(format!(
@@ -1800,9 +1817,14 @@ impl Engine {
         //
         // Build Utf8 dictionaries first (may fail — surface before we mutate
         // tables/provider).
-        self.dict_registry.register_table(name.clone(), &batch)?;
+        self.dict_registry
+            .get_mut()
+            .register_table(name.clone(), &batch)?;
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
-        let extended = self.dict_registry.extended_schema(&name, &base_schema);
+        let extended = self
+            .dict_registry
+            .get_mut()
+            .extended_schema(&name, &base_schema);
         self.provider.register(name.clone(), extended);
         // Stage 6: surface per-column runtime nullability so the engine's
         // null-aware paths can short-circuit the validity bitmap upload
@@ -1929,11 +1951,14 @@ impl Engine {
     /// batches into one, and stages it in the overlay; later queries reuse it.
     ///
     /// **What the table gets.** The overlay table is queryable by every
-    /// executor. Under [`Engine::memory_budget_bytes`], row-wise scans and
-    /// distributive aggregates over it run in bounded morsels (the budget
-    /// hook is [`Engine::morsel_plan_for_table`]). It is *not* promoted into
-    /// the eager store, so it gets no string dictionaries: string predicates
-    /// over it stay real string comparisons, evaluated on the host.
+    /// executor. Without a memory budget it also gets string dictionaries at
+    /// drain time, exactly as an eager table does at registration, so string
+    /// predicates over it fold to GPU index comparisons. Under
+    /// [`Engine::memory_budget_bytes`], row-wise scans and aggregates over it
+    /// run in bounded morsels instead (the budget hook is
+    /// [`Engine::morsel_plan_for_table`]); dictionaries are then skipped —
+    /// per-morsel rows would not match whole-table index columns — and string
+    /// predicates are evaluated on the host.
     ///
     /// `producer` is a factory: each call must return a fresh iterator over
     /// the same logical batch sequence. Producer-side errors surface as `Err`
@@ -1952,6 +1977,7 @@ impl Engine {
         schema: Schema,
         producer: crate::exec::streaming::BatchProducer,
     ) -> BoltResult<()> {
+        self.bump_data_epoch();
         let name = name.into();
         if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
             return Err(BoltError::Plan(format!(
@@ -1961,9 +1987,10 @@ impl Engine {
         }
         // Register the declared schema with the SQL frontend so planning can
         // resolve column references before the producer is ever drained. It
-        // is NOT extended with dictionary `__idx_<col>` columns: overlay tables
-        // never get dictionaries (see the method docs), so the dictionary
-        // rewrite leaves their string predicates as string comparisons.
+        // is not extended with dictionary `__idx_<col>` columns: those exist
+        // only once the drain has built dictionaries, and the dictionary
+        // rewrite adds them to the scan schema itself when it folds a
+        // predicate.
         self.provider.register(name.clone(), schema);
         self.streaming_sources.borrow_mut().insert(
             name,
@@ -2009,8 +2036,9 @@ impl Engine {
     /// overlay (not moved into `tables`) because query paths hold only
     /// `&self`. The read paths
     /// ([`Engine::materialize_table`], the validity-probe provider, `ensure_gpu_table`)
-    /// consult the overlay as a fall-back, so the table is fully queryable;
-    /// see [`Engine::register_table_stream_lazy`] for the dictionary caveat.
+    /// consult the overlay as a fall-back, so the table is fully queryable.
+    /// Without a memory budget the drain also registers the table's string
+    /// dictionaries (see [`Engine::register_table_stream_lazy`]).
     pub(crate) fn materialize_streaming_source(&self, name: &str) -> BoltResult<()> {
         let drained = {
             let overlay = self.streaming_sources.borrow();
@@ -2028,11 +2056,34 @@ impl Engine {
         // instead of re-concatenating the producer's batches per query.
         let coalesced = concat_table_batches(name, &drained)?;
         drop(drained);
+        // Give the table string dictionaries exactly as an eager registration
+        // would, so its string predicates fold to GPU index comparisons. Skipped
+        // when a memory budget is configured: the morsel path then swaps the
+        // overlay rows per morsel, which whole-table index columns would not
+        // match. Best effort — a busy registry or an unsupported dictionary
+        // only leaves the table on the (correct) host string path.
+        if self.memory_budget_bytes.is_none() {
+            match self.dict_registry.try_borrow_mut() {
+                Ok(mut registry) => {
+                    if let Err(e) = registry.register_table(name.to_string(), &coalesced) {
+                        log::debug!("lazy table '{name}': no string dictionaries ({e})");
+                    }
+                }
+                Err(_) => log::debug!("lazy table '{name}': registry busy; no dictionaries"),
+            }
+        }
         self.streaming_sources.borrow_mut().insert(
             name.to_string(),
             crate::exec::streaming::TableSource::Materialized(vec![coalesced]),
         );
+        self.bump_data_epoch();
         Ok(())
+    }
+
+    /// Invalidate every compiled plan derived from the current data (see the
+    /// `data_epoch` field).
+    pub(crate) fn bump_data_epoch(&self) {
+        self.data_epoch.set(self.data_epoch.get().wrapping_add(1));
     }
 
     /// Budget hook: decide whether the table named `name` can be uploaded to
@@ -2088,6 +2139,7 @@ impl Engine {
     /// The previous `GpuTable`'s device allocations are returned to the
     /// memory pool, where the new upload can recycle them.
     pub fn replace_table(&mut self, name: impl Into<String>, batch: RecordBatch) -> BoltResult<()> {
+        self.bump_data_epoch();
         let name = name.into();
 
         // ---- STAGE (fallible): compute the entire replacement into locals.
@@ -2121,12 +2173,17 @@ impl Engine {
         //     were already gone with no replacement. Dropping that call closes
         //     the window: the live registry only changes once, infallibly,
         //     when this overwrite commits.
-        self.dict_registry.register_table(name.clone(), &batch)?;
+        self.dict_registry
+            .get_mut()
+            .register_table(name.clone(), &batch)?;
         // `extended_schema` is an infallible read against the now-installed
         // dicts. It is computed here (still before the engine-state mutations
         // below) but cannot fail, so it does not affect the transactional
         // guarantee.
-        let extended = self.dict_registry.extended_schema(&name, &base_schema);
+        let extended = self
+            .dict_registry
+            .get_mut()
+            .extended_schema(&name, &base_schema);
 
         // ---- SWAP (infallible): from here on nothing can fail, so the
         // remaining engine fields are mutated only after every fallible step
@@ -2218,6 +2275,7 @@ impl Engine {
     /// With the incremental cache, the same workload pays N batches'
     /// worth — one HtoD copy of the new tail per append.
     pub fn register_batch(&mut self, name: &str, batch: RecordBatch) -> BoltResult<()> {
+        self.bump_data_epoch();
         // Stage 6: dict-encoded columns are ingested natively now, so no
         // flatten-to-StringArray is needed for the schema check below to
         // line up — batch 0 and any appended batch both carry the Arrow
@@ -2254,11 +2312,11 @@ impl Engine {
             // per-column nullability against the same concatenated view — a
             // previously null-free column may have just gained a null.
             let concatenated = self.materialize_table(name)?;
-            self.dict_registry.unregister_table(name);
-            self.dict_registry
-                .register_table(name.to_string(), &concatenated)?;
+            let registry = self.dict_registry.get_mut();
+            registry.unregister_table(name);
+            registry.register_table(name.to_string(), &concatenated)?;
             let base_schema = arrow_schema_to_plan_schema(concatenated.schema().as_ref())?;
-            let extended = self.dict_registry.extended_schema(name, &base_schema);
+            let extended = registry.extended_schema(name, &base_schema);
             self.provider.register(name.to_string(), extended);
             propagate_column_nullability(&mut self.provider, name, &concatenated);
             // Batch 5: bump per-column host revisions for an append. Every
@@ -2646,21 +2704,20 @@ impl Engine {
                      dictionary in registry"
                 ))
             };
+            let registry = self.dict_registry.borrow();
             let array: ArrayRef = if let Some(original) = name.strip_prefix("__idx_") {
-                let dict = self
-                    .dict_registry
+                let dict = registry
                     .dictionary(table, original)
                     .ok_or_else(|| no_dict(original))?;
                 host_dict_indices(dict)?
             } else {
                 let original = name.strip_prefix("__rank_").unwrap_or(name);
-                let rank_table = self.dict_registry.rank_table(name).ok_or_else(|| {
+                let rank_table = registry.rank_table(name).ok_or_else(|| {
                     BoltError::Plan(format!(
                         "rewriter-emitted rank column '{name}' has no rank table in registry"
                     ))
                 })?;
-                let dict = self
-                    .dict_registry
+                let dict = registry
                     .dictionary(table, original)
                     .ok_or_else(|| no_dict(original))?;
                 Arc::new(Int64Array::from(host_rank_values(
@@ -3716,6 +3773,28 @@ impl Engine {
                     }
                 }
             }
+            // Algebraic aggregates (AVG / VAR_* / STDDEV_*, scalar or grouped,
+            // possibly mixed with distributive ones): run a decomposed partial
+            // plan per morsel and recombine exactly. Same gating as above.
+            if let Some((table, partial, merges)) = Self::streamable_algebraic_aggregate(phys) {
+                let is_overlay_only = !self.tables.contains_key(table)
+                    && self.streaming_sources.borrow().contains_key(table);
+                if is_overlay_only {
+                    if let Some(morsel_rows) = self.morsel_plan_for_table(table)?.morsel_rows() {
+                        if let PhysicalPlan::Aggregate { aggregate, .. } = phys {
+                            return self
+                                .execute_streaming_algebraic_aggregate(
+                                    table,
+                                    morsel_rows,
+                                    || self.execute_leaf_whole(&partial),
+                                    aggregate,
+                                    &merges,
+                                )
+                                .map(|h| h.with_planned_execution_tier(planned_tier));
+                        }
+                    }
+                }
+            }
         }
         self.execute_leaf_whole(phys)
             .map(|h| h.with_planned_execution_tier(planned_tier))
@@ -3770,7 +3849,7 @@ impl Engine {
                 pre,
                 aggregate,
             } => {
-                // v0.7: GROUP BY VAR_POP / VAR_SAMP / STDDEV_POP /
+                // GROUP BY VAR_POP / VAR_SAMP / STDDEV_POP /
                 // STDDEV_SAMP are lowered to a per-group Welford pass in
                 // the downstream executors (`crate::exec::groupby`,
                 // `crate::exec::groupby_valid`, `crate::exec::groupby_with_pre`,
@@ -3824,7 +3903,8 @@ impl Engine {
                         // re-borrow `gpu_tables` via `materialize_table`.
                         let synthetic = |name: &str| {
                             let original = name.strip_prefix("__idx_")?;
-                            let dict = self.dict_registry.dictionary(table, original)?;
+                            let registry = self.dict_registry.borrow();
+                            let dict = registry.dictionary(table, original)?;
                             let ptr = match dict {
                                 crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
                                     d.indices.device_ptr()
@@ -4169,7 +4249,8 @@ impl Engine {
                         io.name, io.dtype
                     )));
                 }
-                let rank_table = self.dict_registry.rank_table(&io.name).ok_or_else(|| {
+                let registry = self.dict_registry.borrow();
+                let rank_table = registry.rank_table(&io.name).ok_or_else(|| {
                     BoltError::Plan(format!(
                         "rewriter-emitted rank column '{}' has no rank table in registry \
                          (was the plan rewritten by DictRegistry::rewrite_plan?)",
@@ -4181,15 +4262,12 @@ impl Engine {
                 // rank table maps each index to its rank. NULL rows carry index
                 // 0, which the rank table maps to the `-1` sentinel — the
                 // rewriter's `(__rank_ >= 0)` guard then drops them (SQL 3VL).
-                let dict = self
-                    .dict_registry
-                    .dictionary(table, original)
-                    .ok_or_else(|| {
-                        BoltError::Plan(format!(
+                let dict = registry.dictionary(table, original).ok_or_else(|| {
+                    BoltError::Plan(format!(
                         "rank column '{}' references column '{}' with no dictionary in registry",
                         io.name, original
                     ))
-                    })?;
+                })?;
                 // Gather host-side: download the index column once, map each
                 // index through the rank table, upload the i64 rank column. This
                 // is per-query setup cost (one D2H + one H2D of the index/rank
@@ -4209,15 +4287,13 @@ impl Engine {
                 continue;
             }
             if let Some(original) = io.name.strip_prefix("__idx_") {
-                let dict = self
-                    .dict_registry
-                    .dictionary(table, original)
-                    .ok_or_else(|| {
-                        BoltError::Plan(format!(
-                            "rewriter-emitted column '{}' has no dictionary in registry",
-                            io.name
-                        ))
-                    })?;
+                let registry = self.dict_registry.borrow();
+                let dict = registry.dictionary(table, original).ok_or_else(|| {
+                    BoltError::Plan(format!(
+                        "rewriter-emitted column '{}' has no dictionary in registry",
+                        io.name
+                    ))
+                })?;
                 // Fail fast on plan/dict dtype mismatch BEFORE doing any I/O —
                 // this catches a stale plan that names __idx_X with the wrong
                 // width without paying the cost of touching the device.
@@ -6304,7 +6380,7 @@ mod tests {
         }
     }
 
-    // ---- v0.7: `EngineBuilder::persistent_cache` wires into disk PTX cache ----
+    // ---- `EngineBuilder::persistent_cache` wires into disk PTX cache ----
 
     /// `EngineBuilder::persistent_cache(path).build()` must install
     /// `path` as the process-wide disk PTX cache override, so a later
@@ -7188,11 +7264,10 @@ mod tests {
         assert_eq!(max.value(0), total as i64 - 1, "streamed filtered MAX");
     }
 
-    /// The drain-fallback path: a NON-distributive aggregate (`AVG`) is NOT
-    /// streamable (an average of per-morsel averages is not the whole-table
-    /// average), so `streamable_scalar_aggregate` returns `None` and the whole
-    /// table is drained and folded — the correct result even under a tiny
-    /// budget. Documents "anything not safely combinable drains".
+    /// `AVG` is not distributive over finalised per-morsel outputs (an average
+    /// of per-morsel averages is not the whole-table average), so the
+    /// distributive gate rejects it; the algebraic hook decomposes it into
+    /// per-morsel `SUM` + `COUNT` partials and recombines them exactly.
     ///
     /// GPU-gated: builds an `Engine` and runs the aggregate kernel.
     #[test]
@@ -7409,6 +7484,7 @@ mod tests {
     #[test]
     #[ignore = "gpu:aggregate — grouped AVG drains over streaming source"]
     fn streaming_drain_fallback_grouped_avg() {
+        // (Now served by the algebraic hook: per-morsel SUM + COUNT per group.)
         use arrow_array::Float64Array;
         let total = 700usize;
         let n_groups = 5i64;
@@ -7441,6 +7517,194 @@ mod tests {
                 "group {key} AVG over drained stream"
             );
         }
+    }
+
+    /// Algebraic streaming: `VAR_*` / `STDDEV_*` (and `AVG` mixed with
+    /// distributive aggregates) over a morsel-chunked lazy stream equal the
+    /// whole-table result, scalar and grouped.
+    #[test]
+    #[ignore = "gpu:aggregate — streaming variance equals whole-table variance"]
+    fn streaming_algebraic_aggregates_match_whole_table() {
+        use arrow_array::Float64Array;
+        let total = 900usize;
+        let n_groups = 4i64;
+        let queries = [
+            "SELECT VAR_POP(x), VAR_SAMP(x), STDDEV_POP(x), STDDEV_SAMP(x), AVG(x), SUM(x), MIN(x) FROM t",
+            "SELECT g, VAR_SAMP(x) AS v, STDDEV_POP(x) AS s, AVG(x) AS a, COUNT(x) AS c FROM t GROUP BY g ORDER BY g",
+        ];
+        let run = |budget: Option<usize>, q: &str| -> RecordBatch {
+            let mut b = Engine::builder();
+            if let Some(bytes) = budget {
+                b = b.memory_budget(bytes);
+            }
+            let mut engine = b.build().expect("ctx");
+            engine
+                .register_table_stream_lazy("t", gx_schema(), gx_producer(total, n_groups))
+                .expect("register stream");
+            engine.sql(q).expect(q).into_record_batch()
+        };
+        for q in queries {
+            let whole = run(None, q);
+            let streamed = run(Some(4096), q);
+            assert_eq!(whole.num_rows(), streamed.num_rows(), "{q}");
+            for c in 0..whole.num_columns() {
+                let (w, s) = (whole.column(c), streamed.column(c));
+                if let (Some(w), Some(s)) = (
+                    w.as_any().downcast_ref::<Float64Array>(),
+                    s.as_any().downcast_ref::<Float64Array>(),
+                ) {
+                    for r in 0..w.len() {
+                        let tol = 1e-9 * w.value(r).abs().max(1.0);
+                        assert!(
+                            (w.value(r) - s.value(r)).abs() <= tol,
+                            "{q}: col {c} row {r}: whole {} vs streamed {}",
+                            w.value(r),
+                            s.value(r)
+                        );
+                    }
+                } else {
+                    assert_eq!(w.as_ref(), s.as_ref(), "{q}: col {c}");
+                }
+            }
+        }
+    }
+
+    /// The algebraic gate decomposes AVG / VAR / STDDEV into distributive
+    /// partials and leaves distributive-only plans to the cheaper hooks.
+    #[test]
+    fn streamable_algebraic_aggregate_decomposes() {
+        use crate::exec::streaming::AlgebraicMerge;
+        let schema = gx_schema();
+        let plan = |aggs: Vec<AggregateExpr>| -> PhysicalPlan {
+            let n = aggs.len();
+            let mut fields = vec![crate::plan::Field::new("g", DataType::Int64, true)];
+            for i in 0..n {
+                let dtype = match &aggs[i] {
+                    AggregateExpr::Count(_) | AggregateExpr::Sum(_) => DataType::Int64,
+                    _ => DataType::Float64,
+                };
+                fields.push(crate::plan::Field::new(format!("a{i}"), dtype, true));
+            }
+            PhysicalPlan::Aggregate {
+                table: "t".into(),
+                pre: None,
+                aggregate: crate::plan::physical_plan::AggregateSpec {
+                    inputs: schema
+                        .fields
+                        .iter()
+                        .map(|f| crate::plan::ColumnIO {
+                            name: f.name.clone(),
+                            dtype: f.dtype,
+                        })
+                        .collect(),
+                    group_by: vec![0],
+                    aggregates: aggs,
+                    output_schema: Schema::new(fields),
+                    input_has_validity: Vec::new(),
+                },
+            }
+        };
+        let x = || crate::plan::Expr::Column("x".into());
+        assert!(
+            Engine::streamable_algebraic_aggregate(&plan(vec![AggregateExpr::Sum(x())])).is_none()
+        );
+        let mixed = plan(vec![
+            AggregateExpr::Avg(x()),
+            AggregateExpr::StddevSamp(Box::new(x())),
+        ]);
+        let (table, partial, merges) =
+            Engine::streamable_algebraic_aggregate(&mixed).expect("algebraic plan");
+        assert_eq!(table, "t");
+        let PhysicalPlan::Aggregate { aggregate, .. } = &partial else {
+            panic!("partial must stay an Aggregate");
+        };
+        // AVG → SUM, COUNT; STDDEV_SAMP → COUNT, SUM, VAR_POP.
+        assert_eq!(aggregate.aggregates.len(), 5);
+        assert_eq!(aggregate.output_schema.fields.len(), 1 + 5);
+        assert_eq!(merges[0], AlgebraicMerge::Avg { sum: 0, count: 1 });
+        assert_eq!(
+            merges[1],
+            AlgebraicMerge::Variance {
+                count: 2,
+                sum: 3,
+                var_pop: 4,
+                sample: true,
+                sqrt: true,
+            }
+        );
+    }
+
+    /// Repeated top-level SQL reuses the compiled physical plan; any data
+    /// change (append, replace, lazy drain) invalidates it, so results always
+    /// reflect current data — including subquery constants folded into the
+    /// cached plan.
+    #[test]
+    #[ignore = "gpu:e2e — compiled-plan cache hits and invalidation"]
+    fn compiled_plan_cache_reuses_and_invalidates() {
+        let sum = |engine: &Engine, sql: &str| -> i64 {
+            let out = engine.sql(sql).expect(sql).into_record_batch();
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64")
+                .value(0)
+        };
+        let hits = |engine: &Engine| engine.compiled_plans.borrow().hits;
+        let mut engine = Engine::new().expect("ctx");
+        engine.register_table("t", int64_batch(0, 10)).unwrap();
+        let q = "SELECT SUM(x) FROM t WHERE x > (SELECT MIN(x) FROM t)";
+        assert_eq!(sum(&engine, q), 45);
+        assert_eq!(hits(&engine), 0, "first run compiles");
+        assert_eq!(sum(&engine, q), 45);
+        assert_eq!(hits(&engine), 1, "repeat reuses the plan");
+
+        // Append: the cached plan (and its folded MIN subquery) is stale.
+        engine.register_batch("t", int64_batch(-5, 1)).unwrap();
+        assert_eq!(sum(&engine, q), 45, "MIN is now -5, so x > -5 keeps 0..10");
+        assert_eq!(hits(&engine), 1, "append forced a recompile");
+        assert_eq!(sum(&engine, q), 45);
+        assert_eq!(hits(&engine), 2);
+
+        engine.replace_table("t", int64_batch(100, 3)).unwrap();
+        assert_eq!(sum(&engine, q), 101 + 102);
+
+        // A registered rewrite hook disables reuse (hooks run every compile).
+        struct Noop;
+        impl PlanRewrite for Noop {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn rewrite(&self, plan: LogicalPlan) -> BoltResult<LogicalPlan> {
+                Ok(plan)
+            }
+        }
+        drop(engine);
+        let mut engine = Engine::new().expect("ctx").with_rewrite(Box::new(Noop));
+        engine.register_table("t", int64_batch(0, 4)).unwrap();
+        for _ in 0..3 {
+            assert_eq!(sum(&engine, "SELECT SUM(x) FROM t"), 6);
+        }
+        assert_eq!(hits(&engine), 0);
+    }
+
+    /// A lazy table's first query drains it (bumping the epoch); the plan is
+    /// cached under the post-drain epoch, so the second query hits.
+    #[test]
+    #[ignore = "gpu:e2e — compiled-plan cache with lazy tables"]
+    fn compiled_plan_cache_after_lazy_drain() {
+        let mut engine = Engine::new().expect("ctx");
+        engine
+            .register_table_stream_lazy("t", x_schema(), int64_producer(0, 8))
+            .unwrap();
+        for _ in 0..3 {
+            let out = engine
+                .sql("SELECT SUM(x) FROM t")
+                .unwrap()
+                .into_record_batch();
+            let v = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(v.value(0), 28);
+        }
+        assert_eq!(engine.compiled_plans.borrow().hits, 2);
     }
 
     // -----------------------------------------------------------------------

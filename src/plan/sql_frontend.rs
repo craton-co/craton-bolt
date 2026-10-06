@@ -145,7 +145,7 @@ fn guard_sql_size(sql: &str) -> BoltResult<()> {
     Ok(())
 }
 
-/// SQL-standard identifier folding (v0.5 / M2).
+/// SQL-standard identifier folding.
 ///
 /// Unquoted SQL identifiers are case-insensitive in the standard. We
 /// implement the Postgres convention: unquoted identifiers fold to ASCII
@@ -756,7 +756,7 @@ impl MemTableProvider {
 impl TableProvider for MemTableProvider {
     /// Resolve a table name to its schema.
     ///
-    /// # SQL-standard case folding (v0.5)
+    /// # SQL-standard case folding
     ///
     /// Tries an exact match first. If that misses *and* `name` is
     /// all-ASCII-lowercase, falls back to a case-insensitive scan.
@@ -888,7 +888,7 @@ fn is_set_op_root(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// v0.6 / M5: convert a `sqlparser` [`ParserError`] into a [`BoltError`],
+/// Convert a `sqlparser` [`ParserError`] into a [`BoltError`],
 /// preserving the location information that sqlparser appends to its
 /// `Display` output (`"... at Line: <L>, Column: <C>"`) as a byte-offset
 /// span on [`BoltError::SqlWithSpan`].
@@ -7267,7 +7267,7 @@ fn plan_select(
     // itself be a bare table. Equi conjuncts (`left.col = right.col`)
     // route to the hash-join fast path; non-equi conjuncts (`<`, `>`,
     // `BETWEEN`, …) populate the residual `filter` slot and switch the
-    // executor to the nested-loop fallback (v0.6). See
+    // executor to the nested-loop fallback. See
     // `crate::exec::join` for both paths.
     // Flatten the FROM list into an ordered sequence of join "steps". Each
     // step carries the right-side relation plus the join kind/constraint to
@@ -8583,7 +8583,7 @@ enum JoinSide {
 ///   already carries the renamed names), so the executor can evaluate it
 ///   directly against the join's output via [`crate::exec::filter`].
 ///
-/// v0.6 routing rule: if `filter` is `Some(_)`, the planner emits a
+/// Routing rule: if `filter` is `Some(_)`, the planner emits a
 /// `LogicalPlan::Join` with the residual carried in
 /// [`LogicalPlan::Join::filter`], and the executor switches to the
 /// nested-loop path (see [`crate::exec::join`]).
@@ -8685,7 +8685,7 @@ fn collect_join_eq(
                     // clarity (same-side equality on a JOIN ON is almost
                     // always a user typo and should be in WHERE). `Unknown`
                     // (bare identifier) is treated as cross-table per the
-                    // lenient pre-v0.6 contract.
+                    // lenient legacy contract.
                     if lside != JoinSide::Unknown && lside == rside {
                         return Err(BoltError::Sql(format!(
                             "JOIN ON ... both sides reference the same table; \
@@ -8801,7 +8801,7 @@ fn lower_join_side(
         SqlExpr::Identifier(ident) => {
             // Bare column reference — no qualifier to verify. Leave the
             // side undetermined so the caller doesn't accidentally treat
-            // it as same-side. SQL-standard case folding (v0.5): the
+            // it as same-side. SQL-standard case folding: the
             // lowered column name is the folded form (lowercase unless
             // the user quoted the identifier).
             Ok((Expr::Column(ident_to_name(ident)), JoinSide::Unknown))
@@ -8826,7 +8826,7 @@ fn lower_join_side(
                     "unsupported: deeply qualified column reference '{full}' in JOIN ON"
                 )));
             }
-            // SQL-standard case folding (v0.5): qualifier and column are
+            // SQL-standard case folding: qualifier and column are
             // folded independently. The qualifier match against the
             // resolver is ASCII case-insensitive so a folded `t1` still
             // matches a table the host registered as `T1`.
@@ -8983,7 +8983,7 @@ fn reject_unsupported_select(select: &Select) -> BoltResult<()> {
 /// one-part case. Three or more parts (`catalog.schema.table`) are still
 /// rejected: there is no second level of namespacing to collapse them into.
 ///
-/// SQL-standard case folding (v0.5): unquoted table names are folded to
+/// SQL-standard case folding: unquoted table names are folded to
 /// lowercase; quoted names (`"MyTable"`) keep their case verbatim. See
 /// [`ident_to_name`] for the rule. Folding applies to the trailing (table)
 /// part only — the discarded qualifier never reaches the lowered IR.
@@ -10726,7 +10726,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
     }
     match e {
         SqlExpr::Identifier(ident) => {
-            // SQL-standard case folding (v0.5): unquoted column refs fold to
+            // SQL-standard case folding: unquoted column refs fold to
             // lowercase, quoted refs stay verbatim. The resolver and
             // downstream `Schema::index_of` apply a case-insensitive fallback
             // when the verbatim name is not present, so a folded `name`
@@ -11058,7 +11058,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 )))
             }
         }
-        // `CAST(<expr> AS <type>)`. v0.5 accepts the standard SQL spelling
+        // `CAST(<expr> AS <type>)`. The frontend accepts the standard SQL spelling
         // and the Postgres `expr::type` shortcut (both surface as
         // `CastKind::Cast` / `CastKind::DoubleColon`). `TRY_CAST` and
         // `SAFE_CAST` (synonyms) carry NULL-on-failure semantics: a
@@ -11180,7 +11180,7 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             }
             Ok(Expr::ScalarFn { kind, args })
         }
-        // v0.6 / M4: typed-string literals — `DATE '2024-01-01'`,
+        // typed-string literals — `DATE '2024-01-01'`,
         // `TIMESTAMP '2024-01-01 00:00:00'`. Other typed strings (TIME,
         // INTERVAL, ...) are not yet supported and surface the generic
         // "unsupported expression" error below.
@@ -11526,9 +11526,9 @@ fn lower_value(v: &Value) -> BoltResult<Expr> {
 }
 
 /// Map a parsed `sqlparser::ast::DataType` into the engine's internal
-/// [`DataType`] for the v0.5 CAST surface.
+/// [`DataType`] for `CAST`.
 ///
-/// Only the primitive types the executor will plausibly lower in v0.6 are
+/// Only the primitive types the executor will plausibly lower are
 /// accepted — anything else (CHAR(n), DECIMAL, DATE/TIME, structured types,
 /// etc.) surfaces a clear `BoltError::Sql` so the user knows the parser
 /// understood the type name but the engine doesn't support converting to it
@@ -12559,7 +12559,7 @@ mod plan_cache_tests {
 
 #[cfg(test)]
 mod parse_error_span_tests {
-    //! v0.6 / M5: unit tests for `parse_error_to_bolt_error` and the
+    //! unit tests for `parse_error_to_bolt_error` and the
     //! supporting line/column → byte-offset helpers. We deliberately
     //! exercise the pure helpers in isolation so the location-extraction
     //! rule stays decoupled from the rest of the frontend pipeline; a
@@ -13133,7 +13133,7 @@ mod wave7_tests {
 
     #[test]
     fn non_equi_join_lowers_to_join_with_filter() {
-        // v0.6: non-equi predicates no longer error at the planner. They
+        // non-equi predicates no longer error at the planner. They
         // route through the residual `filter` slot on `LogicalPlan::Join`,
         // and the executor switches to the nested-loop fallback.
         let plan = parse("SELECT * FROM t1 INNER JOIN t2 ON t1.a > t2.a", &provider())
@@ -14526,7 +14526,7 @@ mod wave7_tests {
     }
 }
 
-/// v0.5 LIKE parse-shape tests. Lock the SQL frontend surface for
+/// LIKE parse-shape tests. Lock the SQL frontend surface for
 /// `expr LIKE 'pat'` and `expr NOT LIKE 'pat'`: pattern must be a string
 /// literal, ESCAPE is rejected as a follow-up, the typed Expr::Like
 /// captures pattern verbatim. Execution is covered by
@@ -14646,7 +14646,7 @@ mod like_tests {
 
     #[test]
     fn parse_like_with_escape_captured_on_expr() {
-        // v0.7: ESCAPE is now supported. The frontend captures both the
+        // ESCAPE is now supported. The frontend captures both the
         // pattern (verbatim) and the escape character on Expr::Like.
         let plan = parse(
             r"SELECT s FROM t WHERE s LIKE 'a\_b' ESCAPE '\'",

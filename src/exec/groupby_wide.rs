@@ -1013,7 +1013,7 @@ fn finalize_agg_column(
             // the (possibly narrowing) cast to `pack_typed_array`.
             collect_sum_min_max(sorted, i, out_field.dtype)
         }
-        // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP. Output is
+        // VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP. Output is
         // always a nullable Float64 array — empty / single-observation
         // groups produce SQL NULL via the matching `WelfordState`
         // finaliser (see `crate::exec::welford` for the canonical
@@ -1302,7 +1302,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // ---------------------------------------------------------------------------
 // Tests — host-only, no GPU.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
@@ -1498,7 +1498,7 @@ mod tests {
         }
     }
 
-    /// v0.7: per-group VAR_POP / STDDEV_POP / VAR_SAMP / STDDEV_SAMP via
+    /// per-group VAR_POP / STDDEV_POP / VAR_SAMP / STDDEV_SAMP via
     /// the wide host-side path. Constructs a 2-key GROUP BY where each
     /// group has a different sample shape — empty (no rows reach it),
     /// single-observation, and multi-observation — to cover the NULL

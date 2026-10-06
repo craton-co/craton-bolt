@@ -825,3 +825,24 @@ fn living_docs_have_no_version_applicability_markers() {
         problems.join("\n")
     );
 }
+
+/// (14) Every long-lived document carries the metadata header
+/// (`applies-to:` / `owner:`) so a reader can tell what a page describes and
+/// who keeps it current.
+#[test]
+fn docs_carry_metadata_headers() {
+    let root = repo_root();
+    for entry in fs::read_dir(root.join("docs")).expect("read docs") {
+        let p = entry.expect("entry").path();
+        if p.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let text = read_to_string(&p);
+        let head: String = text.chars().take(800).collect();
+        assert!(
+            head.contains("applies-to:") && head.contains("owner:"),
+            "{} is missing the `<!-- applies-to: ... owner: ... -->` metadata header",
+            p.display()
+        );
+    }
+}

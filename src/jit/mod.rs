@@ -11,7 +11,7 @@ pub mod date_scalar;
 /// PTX codegen for the `SUM(Decimal128)` reduction kernel (atomic-free
 /// two-stage block reduce over `i128` hi/lo halves). See [`decimal_agg`].
 pub mod decimal_agg;
-/// Optional disk-backed PTX cache (v0.6 / M6). Opt-in via the
+/// Optional disk-backed PTX cache. Opt-in via the
 /// `BOLT_PTX_CACHE_DIR` env var or `Engine::Builder::persistent_cache`.
 /// See [`disk_cache`] module docs for the path-resolution rules.
 pub mod disk_cache;

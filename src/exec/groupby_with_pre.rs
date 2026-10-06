@@ -1123,7 +1123,7 @@ enum AccDownload {
     /// AVG: a SUM accumulator (downloaded as f64) and a COUNT accumulator
     /// (downloaded as i64), both length `k`.
     Avg { sum: Vec<f64>, count: Vec<i64> },
-    /// v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
+    /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
     /// Welford state, indexed by GPU slot (length `k`). See the matching
     /// variant in `crate::exec::groupby::AccDownload::Welford` for the
     /// rationale — the (count, mean, M2) triple doesn't fit a single
@@ -1226,7 +1226,7 @@ fn run_one_aggregate(
         | AggregateExpr::VarSamp(_)
         | AggregateExpr::StddevPop(_)
         | AggregateExpr::StddevSamp(_) => {
-            // v0.7: per-group Welford via the pre-stage path. Same
+            // per-group Welford via the pre-stage path. Same
             // strategy as `crate::exec::groupby::run_welford_aggregate`:
             // download `keys_table` host-side, build a key -> slot map,
             // fold (value, key) pairs into `WelfordState[slot]`. The
@@ -2196,7 +2196,7 @@ fn build_agg_array(
             }
             Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
         }
-        // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
+        // VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
         // finalisation from the host-side Welford state. Output is always
         // a nullable Float64 array. See
         // `crate::exec::groupby::finalize_welford_array` for the matching
@@ -2732,7 +2732,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
     )
 }
 
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
@@ -2956,7 +2956,7 @@ mod null_propagation_tests {
         assert!(!chose, "no mask -> no native dispatch");
     }
 
-    // ---- v0.7 async-memcpy migration smoke -------------------------------
+    // ---- async-memcpy migration smoke -------------------------------
     //
     // Exercise the migrated `download_pinned_*` helpers under both stub
     // and real CUDA. The helpers wrap `to_pinned_async` +

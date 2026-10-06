@@ -209,7 +209,7 @@ fn run_u8_scan(
     n_rows: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    // v0.7: route through the `CompactionKernelSpec`-keyed cache.
+    // route through the `CompactionKernelSpec`-keyed cache.
     // Both this call site and `gpu_compact::prefix_scan_mask` build a
     // `PrefixScan(HillisSteele)` spec with entry `SCAN_KERNEL_ENTRY`,
     // so the spec hashes to the same cache slot — neither call site
@@ -275,7 +275,7 @@ fn run_u32_scan(
     n: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    // v0.7: `PrefixScanU32` owns its own `CompactionKernelKind`
+    // `PrefixScanU32` owns its own `CompactionKernelKind`
     // variant so the recursive u32-scan kernel doesn't collide with
     // the u8-mask scan in the cache.
     let spec = CompactionKernelSpec {
@@ -330,7 +330,7 @@ fn run_add_block_bases(
     n: usize,
     stream: &CudaStream,
 ) -> BoltResult<()> {
-    // v0.7: `AddBlockBases` owns its own `CompactionKernelKind`
+    // `AddBlockBases` owns its own `CompactionKernelKind`
     // variant. Each recursion level launches this once to fold the
     // parent bases into the child indices; the second and subsequent
     // launches hit the warm cache slot.

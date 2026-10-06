@@ -1,3 +1,8 @@
+<!--
+applies-to: main
+owner: maintainers
+-->
+
 # Path to 1.0
 
 The current pre-1.0 milestones and open work live in

@@ -2,8 +2,8 @@
 
 //! Shared async-memcpy / pinned-host-buffer helpers for executors.
 //!
-//! v0.7 promotion: the scalar-aggregate executor (`exec::aggregate`) shipped a
-//! local `upload_primitive_values_async` helper as the v0.6 async-memcpy
+//! Promotion: the scalar-aggregate executor (`exec::aggregate`) shipped a
+//! local `upload_primitive_values_async` helper as the async-memcpy
 //! pilot. As subsequent executors (filter, GROUP BY, joins, …) migrate off
 //! the synchronous `GpuVec::from_slice` / `GpuVec::to_vec` calls, every site
 //! wants the same `(slice, &CudaStream) -> GpuVec<T>` shape with the same

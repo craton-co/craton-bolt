@@ -395,7 +395,7 @@ fn execute_inner(
 // boundary explicitly so a future refactor doesn't accidentally widen the
 // scope and shadow the single-agg path.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

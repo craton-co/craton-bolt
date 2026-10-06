@@ -758,7 +758,7 @@ pub struct GpuSortKey<'a> {
 }
 
 // =============================================================================
-// v0.7: GPU radix-sort path. Single-key (#15) and multi-key + DESC (#19).
+// GPU radix-sort path. Single-key (#15) and multi-key + DESC (#19).
 // =============================================================================
 //
 // Pairs with [`crate::jit::sort_kernel_radix`]. The single-key flow:
@@ -1331,7 +1331,7 @@ fn run_radix_pipeline_i32(
 
     // ----- modules + entry points -------------------------------------
     //
-    // Each radix kernel goes through the v0.7 `RadixSortKernelSpec`-keyed
+    // Each radix kernel goes through the `RadixSortKernelSpec`-keyed
     // process-wide cache (see `module_cache::get_or_build_module_for_radix_sort`).
     // On a warm hit the entire codegen + PTX-load round-trip is skipped —
     // the cached `CudaModule` clone is returned in sub-microsecond time.
@@ -3464,7 +3464,7 @@ mod tests {
         }
     }
 
-    // -- v0.7 GPU radix sort round-trips (single-key Int32/Int64 ASC). --
+    // -- GPU radix sort round-trips (single-key Int32/Int64 ASC). --
     //
     // These mirror the bitonic round-trip tests above but go through
     // `sort_indices_on_gpu_radix` instead of the bitonic multi-key

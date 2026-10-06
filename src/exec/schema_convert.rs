@@ -4,7 +4,7 @@
 //!
 //! ## Why this module exists
 //!
-//! Prior to the v0.7 consolidation these converters (`plan_dtype_to_arrow`,
+//! Prior to the consolidation these converters (`plan_dtype_to_arrow`,
 //! `arrow_dtype_to_plan`, `plan_schema_to_arrow_schema`, and the `TimeUnit`
 //! mappers) were copy-pasted into ~25 executor files. The copies had already
 //! drifted: the engine path mapped `Date32`/`Timestamp` through to Arrow,
@@ -72,7 +72,7 @@ pub(crate) fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
         DataType::Bool => Ok(ArrowDataType::Boolean),
         DataType::Utf8 => Ok(ArrowDataType::Utf8),
         DataType::Decimal128(p, s) => Ok(ArrowDataType::Decimal128(p, s)),
-        // v0.6 / M4: Date32 maps to Arrow `Date32`; Timestamp carries unit + tz.
+        // Date32 maps to Arrow `Date32`; Timestamp carries unit + tz.
         DataType::Date32 => Ok(ArrowDataType::Date32),
         DataType::Timestamp(unit, tz) => Ok(ArrowDataType::Timestamp(
             plan_time_unit_to_arrow(unit),

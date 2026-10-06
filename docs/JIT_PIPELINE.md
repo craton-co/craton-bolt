@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: jit
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # JIT Pipeline
 
 This document is the deep dive into Craton Bolt's distinctive technical bet: **compile each SQL query into a fresh NVIDIA PTX kernel at runtime**, rather than chaining precompiled kernels. If you only read one design doc, read this one.

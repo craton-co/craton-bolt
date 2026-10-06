@@ -294,15 +294,27 @@ fn run_shmem_sum_core(
     })
 }
 
-/// Resident on-device variant of [`try_execute`]: identical eligibility, but
-/// the kernel reads keys/values straight from the already-uploaded `GpuTable`
-/// (zero per-query H2D — the dominant per-query cost, ~24 ms of q1's ~31 ms at
-/// 10M rows). Falls back (`None`) to the host-upload path whenever the
-/// resident columns aren't present as plain non-null I32/F64 of the expected
-/// length. `batch` is still consulted for the transfer-free host scans
+/// Resident on-device variant of [`try_execute`]: the kernel reads keys/values
+/// straight from the already-uploaded `GpuTable`. Besides the original
+/// `(Int32 key, SUM(Float64))` shape it covers `Int64` keys and
+/// `SUM(Int64)` / `SUM(Int32)` values (see `try_execute_resident_typed`).
+/// Reading resident buffers means zero per-query H2D — the dominant
+/// per-query cost, ~24 ms of q1's ~31 ms at 10M rows. Falls back (`None`) to
+/// the host-upload path whenever the resident columns aren't present as plain
+/// non-null columns of a supported dtype and the expected length. `batch` is still consulted for the transfer-free host scans
 /// (max-key range check + presence map); for a singly-registered table
 /// `materialize_table` is an Arc clone, so this adds no copy.
 pub fn try_execute_resident(
+    plan: &PhysicalPlan,
+    resident: &GpuTable,
+    batch: &RecordBatch,
+) -> Option<BoltResult<RecordBatch>> {
+    try_execute_resident_i32_f64(plan, resident, batch)
+        .or_else(|| try_execute_resident_typed(plan, resident, batch))
+}
+
+/// The original `(Int32 key, SUM(Float64))` resident path.
+fn try_execute_resident_i32_f64(
     plan: &PhysicalPlan,
     resident: &GpuTable,
     batch: &RecordBatch,
@@ -399,6 +411,355 @@ pub fn try_execute_resident(
     Some(run_shmem_sum_core(
         plan, keys_gpu, vals_gpu, &present, n_groups, &stream,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Typed resident Tier-1 SUM: Int32 / Int64 keys × Float64 / Int64 / Int32
+// values. The (Int32, Float64) shape keeps its original path above; every
+// other combination used to fall through to the global-atomic path, which
+// for integer values also re-folds every row on the host to detect overflow
+// (~40-140x slower than this kernel). Here the overflow guarantee comes from
+// a device-side magnitude bound instead: `SUM(Int32)` cannot leave i64 range
+// for any row count this path accepts, and `SUM(Int64)` is only taken when
+// `max|v| * n_rows <= i64::MAX` — otherwise the guarded path still runs.
+// ---------------------------------------------------------------------------
+
+/// A resident key column of either supported width.
+enum ResidentKeys<'a> {
+    I32(&'a GpuVec<i32>),
+    I64(&'a GpuVec<i64>),
+}
+
+/// A resident value column of any supported dtype.
+enum ResidentVals<'a> {
+    F64(&'a GpuVec<f64>),
+    I64(&'a GpuVec<i64>),
+    I32(&'a GpuVec<i32>),
+}
+
+fn resident_i64<'a>(rt: &'a GpuTable, name: &str) -> Option<&'a GpuVec<i64>> {
+    let col = rt.columns.iter().find(|c| c.name == name)?;
+    if col.data.validity_ptr().is_some() {
+        return None;
+    }
+    match &col.data {
+        GpuColumnData::I64 { values, .. } => Some(values),
+        _ => None,
+    }
+}
+
+fn resident_keys<'a>(rt: &'a GpuTable, name: &str) -> Option<ResidentKeys<'a>> {
+    resident_i32(rt, name)
+        .map(ResidentKeys::I32)
+        .or_else(|| resident_i64(rt, name).map(ResidentKeys::I64))
+}
+
+fn resident_vals<'a>(rt: &'a GpuTable, name: &str) -> Option<ResidentVals<'a>> {
+    resident_f64(rt, name)
+        .map(ResidentVals::F64)
+        .or_else(|| resident_i64(rt, name).map(ResidentVals::I64))
+        .or_else(|| resident_i32(rt, name).map(ResidentVals::I32))
+}
+
+/// On-device `i64` MIN/MAX (the `Int64` twin of [`reduce_i32_device`]).
+fn reduce_i64_device(vals: &GpuVec<i64>, op: ReduceOp, stream: &CudaStream) -> BoltResult<i64> {
+    let n_rows = vals.len();
+    let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
+    let block = REDUCE_BLOCK_SIZE;
+    let grid_x = n_rows_u32.div_ceil(block).max(1);
+    let partials = GpuVec::<i64>::zeros_async(grid_x as usize, stream.raw())?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("groupby_shmem_reduce:{:?}:Int64", op),
+        None,
+        || compile_reduction_kernel(op, DataType::Int64),
+    )?;
+    let function = module.function(REDUCTION_KERNEL_ENTRY)?;
+    let mut input_ptr: CUdeviceptr = vals.device_ptr();
+    let mut output_ptr: CUdeviceptr = partials.device_ptr();
+    let mut kernel_params: [*mut std::ffi::c_void; 3] = [
+        &mut input_ptr as *mut CUdeviceptr as *mut std::ffi::c_void,
+        &mut output_ptr as *mut CUdeviceptr as *mut std::ffi::c_void,
+        &mut n_rows_u32 as *mut u32 as *mut std::ffi::c_void,
+    ];
+    // SAFETY: `function` is borrowed from a live module; every param slot
+    // points to a stack local (or the resident `vals` / owned `partials`
+    // buffers) that outlives the synchronize below.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        ))?;
+    }
+    stream.synchronize()?;
+    let _ = (input_ptr, output_ptr);
+    let host_partials = partials.to_vec()?;
+    let folded = match op {
+        ReduceOp::Max => host_partials.iter().copied().max(),
+        ReduceOp::Min => host_partials.iter().copied().min(),
+        other => {
+            return Err(BoltError::Other(format!(
+                "reduce_i64_device: only MIN/MAX supported, got {other:?}"
+            )))
+        }
+    };
+    folded.ok_or_else(|| BoltError::Other("reduce_i64_device: kernel produced no partials".into()))
+}
+
+/// Resident Tier-1 SUM for every supported (key, value) pair except
+/// `(Int32, Float64)`, which [`try_execute_resident`] handles itself. Returns
+/// `None` (fall back to the guarded general path) whenever a precondition
+/// fails, never an error for an ineligible shape.
+fn try_execute_resident_typed(
+    plan: &PhysicalPlan,
+    resident: &GpuTable,
+    batch: &RecordBatch,
+) -> Option<BoltResult<RecordBatch>> {
+    use crate::exec::groupby_shmem_dispatch::{SHARED_MEM_MAX_GROUPS, SHARED_MEM_MIN_ROWS};
+    use crate::jit::shmem_sum_kernel::{
+        compile_shmem_sum_kernel_typed, kernel_entry, ShmemKey, ShmemValue,
+    };
+
+    let (pre, aggregate) = match plan {
+        PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+        _ => return None,
+    };
+    if pre.is_some() || aggregate.group_by.len() != 1 || aggregate.aggregates.len() != 1 {
+        return None;
+    }
+    let key_name = &aggregate.inputs.get(aggregate.group_by[0])?.name;
+    let sum_name = match &aggregate.aggregates[0] {
+        AggregateExpr::Sum(Expr::Column(name)) => name.as_str(),
+        _ => return None,
+    };
+    if aggregate.output_schema.fields.len() != 2 {
+        return None;
+    }
+    // NULL-bearing columns keep the validity-aware general path.
+    let host_nulls = |name: &str| batch.column_by_name(name).map(|c| c.null_count());
+    if host_nulls(key_name)? > 0 || host_nulls(sum_name)? > 0 {
+        return None;
+    }
+    let keys = resident_keys(resident, key_name)?;
+    let vals = resident_vals(resident, sum_name)?;
+    let (key_t, n_rows) = match &keys {
+        ResidentKeys::I32(k) => (ShmemKey::I32, k.len()),
+        ResidentKeys::I64(k) => (ShmemKey::I64, k.len()),
+    };
+    let (val_t, n_vals) = match &vals {
+        ResidentVals::F64(v) => (ShmemValue::F64, v.len()),
+        ResidentVals::I64(v) => (ShmemValue::I64, v.len()),
+        ResidentVals::I32(v) => (ShmemValue::I32Widened, v.len()),
+    };
+    if (key_t, val_t) == (ShmemKey::I32, ShmemValue::F64) {
+        return None; // the original path owns this shape
+    }
+    if n_rows != n_vals || n_rows != batch.num_rows() || n_rows < SHARED_MEM_MIN_ROWS as usize {
+        return None;
+    }
+    let n_rows_u32 = u32::try_from(n_rows).ok()?;
+    // The output schema must be what this kernel produces.
+    let want_sum = if val_t == ShmemValue::F64 {
+        DataType::Float64
+    } else {
+        DataType::Int64
+    };
+    let want_key = if key_t == ShmemKey::I32 {
+        DataType::Int32
+    } else {
+        DataType::Int64
+    };
+    if aggregate.output_schema.fields[0].dtype != want_key
+        || aggregate.output_schema.fields[1].dtype != want_sum
+    {
+        return None;
+    }
+
+    let stream = CudaStream::null_or_default();
+    // Key range → slot count; negative or too-wide keys decline.
+    let (min_key, max_key) = match &keys {
+        ResidentKeys::I32(k) => (
+            i64::from(reduce_i32_device(k, ReduceOp::Min, &stream).ok()?),
+            i64::from(reduce_i32_device(k, ReduceOp::Max, &stream).ok()?),
+        ),
+        ResidentKeys::I64(k) => (
+            reduce_i64_device(k, ReduceOp::Min, &stream).ok()?,
+            reduce_i64_device(k, ReduceOp::Max, &stream).ok()?,
+        ),
+    };
+    if min_key < 0 || max_key >= i64::from(SHARED_MEM_MAX_GROUPS.min(BLOCK_GROUPS)) {
+        return None;
+    }
+    let n_groups = (max_key + 1) as u32;
+    // Overflow bound for Int64 values (Int32 values cannot overflow: at most
+    // 2^32 rows of |v| <= 2^31 stay below 2^63).
+    if let ResidentVals::I64(v) = &vals {
+        let lo = reduce_i64_device(v, ReduceOp::Min, &stream).ok()?;
+        let hi = reduce_i64_device(v, ReduceOp::Max, &stream).ok()?;
+        let bound = u128::from(lo.unsigned_abs().max(hi.unsigned_abs()));
+        if bound * n_rows as u128 > i64::MAX as u128 {
+            return None;
+        }
+    }
+
+    let run = || -> BoltResult<RecordBatch> {
+        // Presence: count > 0 per slot.
+        let present = present_via_count_typed(&keys, key_t, n_rows_u32, n_groups, &stream)?;
+        let key_ptr = match &keys {
+            ResidentKeys::I32(k) => k.device_ptr(),
+            ResidentKeys::I64(k) => k.device_ptr(),
+        };
+        let val_ptr = match &vals {
+            ResidentVals::F64(v) => v.device_ptr(),
+            ResidentVals::I64(v) => v.device_ptr(),
+            ResidentVals::I32(v) => v.device_ptr(),
+        };
+        // Both accumulators are 8 bytes; zero bits are 0.0 / 0.
+        let out = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
+        let entry = kernel_entry(key_t, val_t);
+        let module = module_cache::get_or_build_module(
+            module_path!(),
+            format!("shmem_sum_typed:{key_t:?}:{val_t:?}"),
+            None,
+            || compile_shmem_sum_kernel_typed(key_t, val_t),
+        )?;
+        let function = module.function(&entry)?;
+        let params = tune(TuneInputs {
+            n_rows: n_rows_u32,
+            n_groups: BLOCK_GROUPS,
+            bytes_per_acc_slot: 8,
+            max_shared_per_block: None,
+        })
+        .map_err(|e| BoltError::Other(format!("shmem typed SUM tuner refused: {e}")))?;
+        let mut keys_p = key_ptr;
+        let mut vals_p = val_ptr;
+        let mut out_p = out.device_ptr();
+        let mut rows_p = n_rows_u32;
+        let mut groups_p = n_groups;
+        let mut kernel_params: [*mut std::ffi::c_void; 5] = [
+            &mut keys_p as *mut CUdeviceptr as *mut std::ffi::c_void,
+            &mut vals_p as *mut CUdeviceptr as *mut std::ffi::c_void,
+            &mut out_p as *mut CUdeviceptr as *mut std::ffi::c_void,
+            &mut rows_p as *mut u32 as *mut std::ffi::c_void,
+            &mut groups_p as *mut u32 as *mut std::ffi::c_void,
+        ];
+        // SAFETY: every param points at a stack local; the resident key /
+        // value buffers and the owned `out` buffer outlive the synchronize.
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                params.grid_blocks,
+                1,
+                1,
+                params.block_threads,
+                1,
+                1,
+                0,
+                stream.raw(),
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            ))?;
+        }
+        let pinned = out.to_pinned_async(stream.raw())?;
+        stream.synchronize()?;
+        let bits: Vec<u64> = pinned.as_slice().to_vec();
+
+        let slots: Vec<usize> = (0..n_groups as usize).filter(|&s| present[s]).collect();
+        let key_array: arrow_array::ArrayRef = match key_t {
+            ShmemKey::I32 => Arc::new(Int32Array::from(
+                slots.iter().map(|&s| s as i32).collect::<Vec<_>>(),
+            )),
+            ShmemKey::I64 => Arc::new(arrow_array::Int64Array::from(
+                slots.iter().map(|&s| s as i64).collect::<Vec<_>>(),
+            )),
+        };
+        let sum_array: arrow_array::ArrayRef = if val_t == ShmemValue::F64 {
+            Arc::new(Float64Array::from(
+                slots
+                    .iter()
+                    .map(|&s| f64::from_bits(bits[s]))
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            Arc::new(arrow_array::Int64Array::from(
+                slots.iter().map(|&s| bits[s] as i64).collect::<Vec<_>>(),
+            ))
+        };
+        let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+        RecordBatch::try_new(arrow_schema, vec![key_array, sum_array])
+            .map_err(|e| BoltError::Other(format!("shmem typed SUM: output build failed: {e}")))
+    };
+    Some(run())
+}
+
+/// [`present_via_count`] over either key width.
+fn present_via_count_typed(
+    keys: &ResidentKeys<'_>,
+    key_t: crate::jit::shmem_sum_kernel::ShmemKey,
+    n_rows: u32,
+    n_groups: u32,
+    stream: &CudaStream,
+) -> BoltResult<Vec<bool>> {
+    if let ResidentKeys::I32(k) = keys {
+        return present_via_count(k, n_groups, stream);
+    }
+    let key_ptr = match keys {
+        ResidentKeys::I32(k) => k.device_ptr(),
+        ResidentKeys::I64(k) => k.device_ptr(),
+    };
+    let out_counts: GpuVec<u64> = GpuVec::<u64>::zeros_async(n_groups as usize, stream.raw())?;
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        format!("shmem_count_for_presence:{key_t:?}"),
+        None,
+        || crate::jit::shmem_count_kernel::compile_shmem_count_kernel_typed(key_t),
+    )?;
+    let function = module.function(crate::jit::shmem_count_kernel::kernel_entry(key_t))?;
+    let params = tune(TuneInputs {
+        n_rows,
+        n_groups: BLOCK_GROUPS,
+        bytes_per_acc_slot: 8,
+        max_shared_per_block: None,
+    })
+    .map_err(|e| BoltError::Other(format!("shmem presence-count tuner refused: {e}")))?;
+    let mut keys_p = key_ptr;
+    let mut out_p = out_counts.device_ptr();
+    let mut rows_p = n_rows;
+    let mut groups_p = n_groups;
+    let mut kernel_params: [*mut std::ffi::c_void; 4] = [
+        &mut keys_p as *mut CUdeviceptr as *mut std::ffi::c_void,
+        &mut out_p as *mut CUdeviceptr as *mut std::ffi::c_void,
+        &mut rows_p as *mut u32 as *mut std::ffi::c_void,
+        &mut groups_p as *mut u32 as *mut std::ffi::c_void,
+    ];
+    // SAFETY: as above — stack-local params, buffers outlive the sync.
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            params.grid_blocks,
+            1,
+            1,
+            params.block_threads,
+            1,
+            1,
+            0,
+            stream.raw(),
+            kernel_params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        ))?;
+    }
+    let pinned = out_counts.to_pinned_async(stream.raw())?;
+    stream.synchronize()?;
+    Ok(pinned.as_slice().iter().map(|&c| c > 0).collect())
 }
 
 /// On-device presence bitmap for the resident path: launches the shared-mem
@@ -584,7 +945,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // ---------------------------------------------------------------------------
 // Stage-4 (P1b) async round-trip smoke test.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

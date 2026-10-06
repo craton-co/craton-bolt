@@ -1,3 +1,10 @@
+<!--
+applies-to: main
+owner: maintainers
+checked-by: tests/doc_consistency_test.rs (env-var parity)
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # Environment variables
 
 craton-bolt honours several env vars to switch experimental code paths on or

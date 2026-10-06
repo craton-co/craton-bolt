@@ -134,22 +134,34 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   references the table — and coalesced into one host batch.
 - **Host memory bounds the data set.** Every registered table — eager or
   drained lazy — lives in host memory as one coalesced Arrow batch. The
-  morsel path bounds *device* working sets for projection / filter / scalar
-  and distributive grouped aggregates under a memory budget; sorts, joins,
-  windows, distinct, set operations and non-distributive aggregates
+  morsel path bounds *device* working sets for projection / filter and for
+  scalar and grouped aggregates — `COUNT` / `SUM` / `MIN` / `MAX` fold
+  directly, `AVG` / `VAR_*` / `STDDEV_*` recombine exact per-morsel partials —
+  under a memory budget; sorts, joins, windows, distinct and set operations
   materialise their whole input.
 - **Appends rebuild the dictionary union.** Each `register_batch` append
   coalesces the table and rebuilds string dictionaries over all rows, so N
   appends cost O(N × table). Bulk-load with one `register_table_stream` call
   (a single coalesce) instead.
-- **Lazy tables have no string dictionaries.** String predicates over a lazy
-  table are evaluated host-side (correct, but without the dictionary-index
-  GPU fold an eager table gets).
+- **Lazy tables and string dictionaries.** A lazy table gets string
+  dictionaries when it is drained, like an eager table — except under a
+  memory budget (morsel execution), where its string predicates are evaluated
+  host-side (correct, but without the dictionary-index GPU fold).
 - **Aggregates over a non-fusable input are materialised.** `GROUP BY` /
   aggregates over a join, union, distinct, or a filter the fused GPU kernel
   cannot evaluate (e.g. a raw `Utf8` comparison) run the input first, bind
   its rows as an ephemeral table, and aggregate that (GPU where the
   aggregate shape allows). Correct, at the cost of materialising the input.
+
+## Known performance gaps
+
+- **High-cardinality GROUP BY over `Int64` keys or integer sums.** The
+  resident Tier-1 path covers ≤ 1024 groups for `Int32` / `Int64` keys and
+  `Float64` / `Int64` / `Int32` sums; the partitioned Tier-2 paths for larger
+  group counts are specialised to `Int32` keys with `Float64` sums. Other
+  high-cardinality shapes take the general global-atomic path, measured
+  roughly 4–7× slower at 10 K groups (`benches/cost_model.rs`,
+  `groupby_cardinality`).
 
 ## Known semantic gaps
 

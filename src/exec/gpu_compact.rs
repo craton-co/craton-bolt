@@ -466,7 +466,7 @@ pub fn prefix_scan_mask(
     let local_indices = GpuVec::<u32>::zeros(n_rows)?;
     let block_sums = GpuVec::<u32>::zeros(n_blocks)?;
 
-    // JIT-compile and load the scan kernel via the v0.7
+    // JIT-compile and load the scan kernel via the
     // `CompactionKernelSpec`-keyed cache. On a warm hit the codegen +
     // PTX-load round-trip is skipped — the cached `CudaModule` clone
     // returns in sub-microsecond time. Algorithm selected by
@@ -636,7 +636,7 @@ fn prefix_scan_mask_lookback(
     // as a stale AGGREGATE/INCLUSIVE by a peer block.
     let partial_status = GpuVec::<u32>::zeros(n_blocks)?;
 
-    // v0.7: route through the `CompactionKernelSpec`-keyed cache.
+    // route through the `CompactionKernelSpec`-keyed cache.
     // Lookback owns its own `PrefixScanAlgoTag::Lookback` slot so
     // re-entering this function on the warm path skips codegen
     // entirely.
@@ -808,7 +808,7 @@ pub fn gather_one_async(
     }
 
     // JIT-compile + load the gather kernel for this dtype via the
-    // v0.7 `CompactionKernelSpec`-keyed cache. The PTX is keyed by
+    // `CompactionKernelSpec`-keyed cache. The PTX is keyed by
     // `dtype` only; the `Gather(dtype)` variant of
     // `CompactionKernelKind` owns one cache slot per supported
     // dtype so back-to-back gather launches over a wide projection

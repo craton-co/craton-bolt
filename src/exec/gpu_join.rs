@@ -1324,7 +1324,7 @@ pub fn hash_join_indices_on_gpu_aos(
     let build_keys_host = encode_keys_i64(build_keys_col, dtype)?;
     let probe_keys_host = encode_keys_i64(probe_keys_col, dtype)?;
 
-    // v0.7 async-memcpy: per-call stream + async H2D for the key columns,
+    // async-memcpy: per-call stream + async H2D for the key columns,
     // matching the SoA INNER path above. The AoS slots buffer keeps its
     // dedicated allocator (it's the device-side initialiser, not a host
     // upload, so the async wrappers don't apply directly).
@@ -1386,7 +1386,7 @@ pub fn hash_join_indices_on_gpu_aos(
     }
     // Safe narrow: n_matches_raw <= out_capacity_u32 < 2^32 past the gate above.
     let n_matches = n_matches_raw as usize;
-    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the SoA
+    // async-memcpy: pinned-host D2H + per-call sync, matching the SoA
     // INNER path. `download_to_host_pinned` falls back to `to_vec()` under
     // `--features cuda-stub` for byte-stable failure mode.
     let probe_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
@@ -1779,7 +1779,7 @@ pub fn hash_join_indices_on_gpu_with_shape(
     let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
     let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
 
-    // v0.7 async-memcpy migration: mint a per-call stream, async H2D every
+    // async-memcpy migration: mint a per-call stream, async H2D every
     // host-side init buffer, async D2H index outputs. See `aggregate.rs`
     // for the pilot rationale; under `--features cuda-stub` the helpers
     // fall back to the synchronous `from_slice` / `to_vec` shape for
@@ -1870,7 +1870,7 @@ pub fn hash_join_indices_on_gpu_with_shape(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the SoA
+    // async-memcpy: pinned-host D2H + per-call sync, matching the SoA
     // INNER path. `download_to_host_pinned` falls back to `to_vec()` under
     // `--features cuda-stub` for byte-stable failure mode.
     let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
@@ -1949,7 +1949,7 @@ pub fn execute_outer_join_indices_on_gpu(
     let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
     let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
 
-    // v0.7 async-memcpy migration: per-call stream + async H2D for every
+    // async-memcpy migration: per-call stream + async H2D for every
     // host-side init buffer. Mirrors the INNER collision-list path above.
     let stream = CudaStream::null_or_default();
 
@@ -2036,7 +2036,7 @@ pub fn execute_outer_join_indices_on_gpu(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    // v0.7 async-memcpy: pinned-host D2H + per-call sync for the candidate
+    // async-memcpy: pinned-host D2H + per-call sync for the candidate
     // index pairs. The `matched` bitmap stays on the device until the
     // unmatched-build emission pass needs it.
     let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
@@ -2163,7 +2163,7 @@ pub fn execute_outer_join_indices_on_gpu(
                 )));
             }
             let n_unmatched = n_unmatched as usize;
-            // v0.7 async-memcpy: pinned-host D2H for the unmatched-build
+            // async-memcpy: pinned-host D2H for the unmatched-build
             // index stream. The `launch_unmatched_build_kernel` call already
             // synchronized `stream` to read its counter back, so the kernel's
             // writes are visible; this D2H is the final readback before
@@ -2909,7 +2909,7 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
     let offsets: &[i32] = arr.value_offsets();
     let values: &[u8] = arr.value_data();
 
-    // v0.7 async-memcpy: per-call stream + async H2D for both the offsets
+    // async-memcpy: per-call stream + async H2D for both the offsets
     // and the values buffer (these are the Utf8 join key column's raw
     // Arrow backing storage). The values slice can be empty if the entire
     // StringArray is empty strings — we still need a valid device pointer
@@ -2973,7 +2973,7 @@ pub fn compute_device_string_hashes(arr: &StringArray) -> BoltResult<Vec<u64>> {
         ))?;
     }
 
-    // v0.7 async-memcpy: pinned-host D2H + per-call sync, replacing the
+    // async-memcpy: pinned-host D2H + per-call sync, replacing the
     // legacy `sync + to_vec()` pair.
     download_to_host_pinned::<u64>(&out_dev, &stream)
 }
@@ -3005,7 +3005,7 @@ pub fn compute_device_string_hashes_large(
     let offsets: &[i64] = arr.value_offsets();
     let values: &[u8] = arr.value_data();
 
-    // v0.7 async-memcpy: per-call stream + async H2D for both the i64
+    // async-memcpy: per-call stream + async H2D for both the i64
     // offsets and the values buffer (the LargeUtf8 join key column's raw
     // Arrow backing storage). Symmetric with the Utf8 path above.
     let stream = CudaStream::null_or_default();
@@ -3071,7 +3071,7 @@ pub fn compute_device_string_hashes_large(
         ))?;
     }
 
-    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the
+    // async-memcpy: pinned-host D2H + per-call sync, matching the
     // Utf8 path. Hashes flow into the streaming-intern dict.
     download_to_host_pinned::<u64>(&out_dev, &stream)
 }
@@ -3533,7 +3533,7 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
     let build_keys_host = encode_keys_for_shape(build_key_columns, shape)?;
     let probe_keys_host = encode_keys_for_shape(probe_key_columns, shape)?;
 
-    // v0.7 async-memcpy migration: per-call stream + async H2D for every
+    // async-memcpy migration: per-call stream + async H2D for every
     // host-side init buffer. Mirrors the exact-shape INNER path.
     let stream = CudaStream::null_or_default();
 
@@ -3608,7 +3608,7 @@ fn hash_join_indices_on_gpu_with_shape_unverified(
         )));
     }
     let n_matches = n_matches_raw as usize;
-    // v0.7 async-memcpy: pinned-host D2H + per-call sync, matching the
+    // async-memcpy: pinned-host D2H + per-call sync, matching the
     // verified collision-list path. The candidate indices flow into the
     // host post-verify pipeline.
     let probe_idx_full = download_to_host_pinned::<u32>(&out_probe_idx_dev, &stream)?;
@@ -5023,7 +5023,7 @@ mod tests {
     }
 
     // =========================================================================
-    // v0.7: async memcpy + pinned host buffers wired through the hash-join
+    // async memcpy + pinned host buffers wired through the hash-join
     // build/probe paths. Under `--features cuda-stub` the async FFI shims
     // return `CUDA_ERROR_STUB`; the helper falls back to the synchronous
     // `from_slice` wrapper which also returns `CUDA_ERROR_STUB`. Both paths
@@ -5035,7 +5035,7 @@ mod tests {
     /// Under `--features cuda-stub` the hash-join entry point must NOT
     /// panic when the async H2D shim returns `CUDA_ERROR_STUB`. The
     /// previous (synchronous) path also returned `Err(_)` here; this test
-    /// pins that the v0.7 async rewrite preserves that contract.
+    /// pins that the async rewrite preserves that contract.
     ///
     /// On a real-CUDA host the same call succeeds; the test is split into
     /// the "stub returns Err" case (gated on the feature) and the

@@ -7,7 +7,7 @@
 //! to obtain an `UInt32Array` of permutation indices, then `take` each
 //! column to produce the sorted RecordBatch.
 //!
-//! ## Dispatch (planner-driven, since the v0.7 sort rework)
+//! ## Dispatch (planner-driven)
 //!
 //! The GPU path is now chosen by [`should_use_gpu_sort`] — a pure decision
 //! function over `(n_rows, key_dtypes, directions)` — rather than the legacy
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(as_i32(&result, 0), vec![Some(1), Some(2)]);
     }
 
-    // ----- v0.7 radix-sort dispatch tests -----
+    // ----- radix-sort dispatch tests -----
     //
     // These verify the pure host-side gates in `try_gpu_sort_radix` /
     // `gpu_sort::radix_dispatch_predicate` without ever touching a CUDA
@@ -875,7 +875,7 @@ mod tests {
             SortDirection::Asc,
             false,
         ));
-        // #19: Int32 DESC no-nulls now accepted (was rejected by the v0.7
+        // #19: Int32 DESC no-nulls now accepted (was rejected by the
         // gate; the multi-key driver applies the direction transform
         // host-side).
         assert!(radix_dispatch_predicate(
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(before, after, "small-input gate must short-circuit");
     }
 
-    /// #19: single-key DESC engages the radix path (the v0.7 gate would
+    /// #19: single-key DESC engages the radix path (the gate would
     /// have falled through). Same observability hook as the ASC test:
     /// counter delta proves the dispatch decision committed.
     #[test]

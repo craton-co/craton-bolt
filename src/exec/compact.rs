@@ -41,7 +41,7 @@ const PREDICATE_BLOCK_SIZE: u32 = 256;
 /// treated as `true` to be tolerant of mask kernels that emit other truthy
 /// values.
 ///
-/// v0.7 async-D2H wiring: the copy runs through
+/// async-D2H wiring: the copy runs through
 /// [`PinnedHostBuffer<u8>`] + `memcpy_d2h_async` on the caller's
 /// `stream`, then a single `stream.synchronize()` fences before the
 /// pinned buffer is converted to `Vec<bool>`. Routing the WHERE-filter

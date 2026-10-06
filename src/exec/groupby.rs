@@ -1297,7 +1297,7 @@ enum AccDownload {
     /// Per-group accumulation is computed on the host: the GPU keys kernel
     /// is responsible for hash-table layout, but the (count, mean, M2)
     /// triple does not fit a single atomic; emitting a CAS-loop kernel over
-    /// a packed 24-byte slot is a v0.7+ follow-up. The host pass walks one
+    /// a packed 24-byte slot is a follow-up. The host pass walks one
     /// value column with one slot lookup per row and folds via
     /// [`crate::exec::welford::WelfordState::push`]. Numerically stable by
     /// construction (single-pass Welford, no `sum_sq - n*mean^2`
@@ -1409,7 +1409,7 @@ fn run_one_aggregate(
         | AggregateExpr::VarSamp(expr)
         | AggregateExpr::StddevPop(expr)
         | AggregateExpr::StddevSamp(expr) => {
-            // v0.7: per-group Welford. The GPU hash-aggregate kernel can
+            // per-group Welford. The GPU hash-aggregate kernel can
             // only atomically update a single scalar slot per group, but
             // numerically-stable Welford requires the coupled
             // `(count, mean, M2)` triple to evolve together. We sidestep
@@ -1751,9 +1751,11 @@ impl<'a> FilteredKeys<'a> {
 //     by `collect_filtered_primitive`, so the re-fold is free of an extra D2H);
 //   - grouped SUM, native-validity path: guarded via
 //     `checked_group_sum_native_validity` in `run_typed_agg_native_validity`;
-//   - the grouped shared-mem fast path is gated to (Sum, Float64) at
-//     `groupby_shmem_dispatch.rs:~149`, so integer grouped SUM never reaches an
-//     on-device-only finalize and always falls through to the guarded paths
+//   - the resident Tier-1 shared-mem path finalizes integer grouped SUM on
+//     the device (`groupby_shmem_exec::try_execute_resident_typed`) only when
+//     overflow is impossible: `SUM(Int32)` always (≤ 2^32 rows of |v| ≤ 2^31),
+//     `SUM(Int64)` only when a device-computed `max|v| * n_rows <= i64::MAX`;
+//     every other integer grouped SUM falls through to the guarded paths
 //     above;
 //   - scalar (non-grouped) integer SUM: `aggregate.rs`'s and `agg_with_pre.rs`'s
 //     `ReduceScalar for {i32,i64}` finalize the device partials with
@@ -1854,7 +1856,7 @@ fn checked_group_sum_native_validity(
 /// (i.e. `execute_groupby`'s post-key-filter `host_keys`); it is therefore
 /// length `n_rows` and bit-identical to what a D2H of `group_col` would yield.
 ///
-/// v0.7 async-memcpy: the HtoD of the freshly-filtered keys still rides
+/// async-memcpy: the HtoD of the freshly-filtered keys still rides
 /// `stream` via `from_slice_async`, mirroring the per-aggregate buffer
 /// plumbing in `run_typed_agg`, so the upload chains behind the previous
 /// kernel's D2H and overlaps with unrelated stream activity.
@@ -1906,7 +1908,7 @@ fn prepare_filtered_keys<'a>(
         .filter_map(|(&k, &v)| if v { Some(k) } else { None })
         .collect();
     let filtered_n = filtered.len();
-    // v0.7 async HtoD of the freshly-filtered key column on the caller's
+    // async HtoD of the freshly-filtered key column on the caller's
     // stream so the subsequent agg-kernel launch is automatically ordered
     // after this upload without a separate barrier. Replaces the prior
     // synchronous `GpuVec::from_slice` here.
@@ -2960,7 +2962,7 @@ fn build_agg_array(
             };
             pack_array(out_field.dtype, scalars)
         }
-        // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
+        // VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
         // finalisation from the host-side Welford state. Output is always
         // a nullable Float64 array:
         //   - VAR_POP / STDDEV_POP:  NULL when count == 0, M2/count
@@ -4329,7 +4331,7 @@ pub(crate) mod utf8_groupby {
 // ---------------------------------------------------------------------------
 // Host-only tests for `pack_keys` / `decode_key` (no GPU required).
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
@@ -4572,12 +4574,12 @@ mod tests {
         );
     }
 
-    // -------- v0.7 async-memcpy: prepare_filtered_keys round-trips --------
+    // -------- async-memcpy: prepare_filtered_keys round-trips --------
 
     /// GROUP BY AVG over a Float64 column with NULLs: exercises the
     /// `prepare_filtered_keys` value-validity branch end-to-end. The
     /// downloaded key column is rebuilt for the filtered row set via the
-    /// async DtoH+HtoD pair added in v0.7. NULL value rows are dropped
+    /// async DtoH+HtoD pair added. NULL value rows are dropped
     /// before they reach the GPU (matching the SUM/COUNT pair feeding
     /// AVG).
     #[test]
@@ -4648,7 +4650,7 @@ mod tests {
     }
 
     /// GROUP BY COUNT(col) with NULL values: same `prepare_filtered_keys`
-    /// path as AVG but only the COUNT half. Pins that the v0.7 async
+    /// path as AVG but only the COUNT half. Pins that the async
     /// keys upload still produces the right per-group non-null counts.
     #[test]
     #[ignore = "gpu:tier1"]
@@ -4695,7 +4697,7 @@ mod tests {
         }
     }
 
-    // ----- v0.7: GROUP BY VAR/STDDEV finaliser (host-only) ---------------
+    // ----- GROUP BY VAR/STDDEV finaliser (host-only) ---------------
     //
     // `finalize_welford_array` is the host-side join between the per-group
     // `WelfordState` table and the post-sort group order. These tests cover

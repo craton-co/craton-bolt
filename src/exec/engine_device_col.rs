@@ -41,7 +41,7 @@ pub(crate) enum DeviceCol {
     Bool(GpuVec<u8>),
     /// Utf8 stored as i32 dictionary indices; host dictionary lives alongside.
     Utf8(DictionaryColumn),
-    /// v0.7 sub-task B: 128-bit fixed-point output column. Stored as the
+    /// sub-task B: 128-bit fixed-point output column. Stored as the
     /// same interleaved `[lo0, hi0, lo1, hi1, ...]` u64 buffer the input
     /// `GpuColumnData::Decimal128` uses, so the PTX `Op::Store128` can
     /// write 16 bytes per row at offset `tid * 16` with no per-row
@@ -85,7 +85,7 @@ impl DeviceCol {
                 indices: GpuVec::<i32>::zeros(n)?,
                 n_rows: n,
             })),
-            // v0.7 sub-task B: allocate the interleaved [lo, hi] u64 buffer
+            // sub-task B: allocate the interleaved [lo, hi] u64 buffer
             // (length `2 * n`) that `Op::Store128` writes into. Plan-level
             // `(precision, scale)` rides on the variant so the download path
             // can rebuild a `Decimal128Array` with the correct dtype.
@@ -98,7 +98,7 @@ impl DeviceCol {
                 // (see the output-allocation loop in `run_kernel`).
                 valid_mask: None,
             }),
-            // v0.7: PTX codegen for Date32 / Timestamp arithmetic is wired
+            // PTX codegen for Date32 / Timestamp arithmetic is wired
             // (see `crate::jit::ptx_gen`), but the device-side download
             // path is dtype-blind — `DeviceCol::I32::download` always
             // emits an `Int32Array`, which would silently downgrade a
@@ -126,7 +126,7 @@ impl DeviceCol {
             DeviceCol::F64(v) => v.device_ptr(),
             DeviceCol::Bool(v) => v.device_ptr(),
             DeviceCol::Utf8(d) => d.indices.device_ptr(),
-            // v0.7 sub-task B: the interleaved [lo, hi] u64 buffer is
+            // sub-task B: the interleaved [lo, hi] u64 buffer is
             // the column's single base pointer — PTX `Op::Store128`
             // computes per-row offsets as `tid * 16`.
             DeviceCol::Decimal128 { values, .. } => values.device_ptr(),
@@ -217,7 +217,7 @@ impl DeviceCol {
                 let arr = d.to_string_array()?;
                 Ok(Arc::new(arr) as ArrayRef)
             }
-            // v0.7 sub-task B: reassemble the interleaved [lo, hi] u64
+            // sub-task B: reassemble the interleaved [lo, hi] u64
             // buffer back into a `Decimal128Array`. Each pair of u64s
             // reconstitutes one i128 via
             //   `lo | ((hi as u128) << 64)` then `as i128`
@@ -305,7 +305,7 @@ impl DeviceCol {
                 // is safe to invoke regardless.
                 self.download(n_rows)
             }
-            // v0.7 sub-task B: Decimal128's pinned path mirrors the
+            // sub-task B: Decimal128's pinned path mirrors the
             // primitive pattern (u64 element type, length `2 * n_rows`).
             // The check_len guard catches a buffer that didn't get sized
             // correctly at alloc time.

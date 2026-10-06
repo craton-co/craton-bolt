@@ -345,7 +345,7 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
 // reach the GPU. Anything that would require a CUDA context is left to the
 // dedicated e2e test files (see `tests/tier2_*_e2e.rs`).
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
