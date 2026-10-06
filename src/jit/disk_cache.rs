@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Optional disk-backed PTX cache (v0.6 / M6).
+//! Optional disk-backed PTX cache.
 //!
 //! # Why this exists
 //!

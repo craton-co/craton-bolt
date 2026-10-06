@@ -203,6 +203,33 @@ fn ident_to_name(ident: &Ident) -> String {
 /// when the registered Arrow batch carries nulls. The plan-time signal is
 /// preferred when available because it lets the JIT cache key reflect
 /// per-column nullability — but correctness does not depend on it.
+///
+/// # Stability
+///
+/// Stable intent for 1.0 (see `docs/API_SURFACE.md`): new methods are only
+/// ever added with defaults.
+///
+/// # Execution semantics
+///
+/// Consulted at plan time only — by the SQL frontend to resolve and
+/// type-check columns, and by `populate_input_validity` for the null hints.
+/// A provider never supplies rows; registered `RecordBatch`es do.
+///
+/// # Threading
+///
+/// Called synchronously on the thread planning the query. Not required to be
+/// `Send` / `Sync`.
+///
+/// # Errors
+///
+/// `schema` returning `Err` fails planning of the statement with that error
+/// (counted in `QueriesFailed` when it surfaces from `Engine::sql`).
+///
+/// # Compatibility
+///
+/// [`TableProvider::schema_version`] must change whenever any schema it
+/// serves changes, or cached plans (and memoised shape classifications)
+/// keyed on the old version would be reused against the new schema.
 pub trait TableProvider {
     /// Return the schema for `name`, or a `Plan` error if the table is unknown.
     fn schema(&self, name: &str) -> BoltResult<Schema>;

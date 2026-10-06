@@ -60,7 +60,7 @@ use crate::jit::agg_kernels::{
     REDUCTION_KERNEL_ENTRY,
 };
 use crate::jit::compile_ptx;
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Literal, Schema};
 use crate::plan::physical_plan::{AggregateSpec, KernelSpec, PhysicalPlan};
 
 /// PTX entry-point name for the pre-projection kernel.
@@ -151,12 +151,18 @@ pub fn execute_aggregate_with_pre(
 /// falls back to the host path, preserving behaviour) whenever a precondition
 /// isn't met — any input carries NULLs, an input/output dtype isn't a plain
 /// numeric, the resident row count disagrees, an aggregate isn't a
-/// bare-column `SUM`/`MIN`/`MAX`/`COUNT`, or a `SUM`/`MIN`/`MAX` would require
-/// accumulator widening (output dtype ≠ pre-output dtype). `AVG`/`STDDEV`
-/// stay on the host route for now.
+/// bare-column `SUM`/`MIN`/`MAX`/`COUNT` (or `COUNT(*)`), or a
+/// `SUM`/`MIN`/`MAX` would require accumulator widening (output dtype ≠
+/// pre-output dtype). `AVG`/`STDDEV` stay on the host route for now.
+///
+/// `synthetic` resolves a pre-kernel input that is not a [`GpuTable`] column
+/// — the rewriter-emitted `__idx_<col>` dictionary-index columns, which live
+/// in the engine's dictionary registry — to its `(dtype, device pointer)`.
+/// The pointer must stay valid for the duration of this call.
 pub fn try_execute_resident(
     plan: &PhysicalPlan,
     resident: &GpuTable,
+    synthetic: &dyn Fn(&str) -> Option<(DataType, CUdeviceptr)>,
 ) -> BoltResult<Option<RecordBatch>> {
     let (pre, aggregate) = match plan {
         PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
@@ -179,7 +185,15 @@ pub fn try_execute_resident(
     let mut input_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(pre_spec.inputs.len());
     for io in &pre_spec.inputs {
         let Some(col) = resident.columns.iter().find(|c| c.name == io.name) else {
-            return Ok(None);
+            // Not a table column: a registry-resident dictionary index column
+            // (no NULL bitmap — NULL rows carry index 0) or bail to the host.
+            match synthetic(&io.name) {
+                Some((dtype, ptr)) if dtype == io.dtype => {
+                    input_ptrs.push(ptr);
+                    continue;
+                }
+                _ => return Ok(None),
+            }
         };
         if col.dtype != io.dtype {
             return Ok(None);
@@ -228,8 +242,11 @@ pub fn try_execute_resident(
                 FastAgg::Reduce(idx, ReduceOp::from_agg(agg)?)
             }
             AggregateExpr::Count(e) => {
-                // Bare-column COUNT over a no-NULL input is just the row count.
-                if out_ordinal(e).is_none() {
+                // Bare-column COUNT over a no-NULL input — and COUNT(*), which
+                // the frontend lowers to COUNT(<non-NULL literal>) — is just
+                // the (surviving) row count.
+                let counts_rows = matches!(e, Expr::Literal(l) if !matches!(l, Literal::Null));
+                if !counts_rows && out_ordinal(e).is_none() {
                     return Ok(None);
                 }
                 FastAgg::Count

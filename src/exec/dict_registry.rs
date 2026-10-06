@@ -295,6 +295,16 @@ impl DictRegistry {
             // Both i32- and i64-indexed variants go through the same path; the
             // rewriter inspects the variant when it resolves a literal.
             rewriter.register(col_name.to_string(), dict);
+            // Every registry dictionary is built from the table's FULL data in
+            // one pass — `register_table` sees the whole batch, `register_batch`
+            // rebuilds from the coalesced union of every batch, and
+            // `from_dictionary_array` keeps every non-null Arrow value (deduped)
+            // — so it observed every distinct value the column holds. That is
+            // exactly the completeness invariant (finding PL-M6) under which an
+            // absent literal may fold: `s = 'absent'` → FALSE, `<>` → TRUE.
+            // Without this, an absent literal stayed a raw string comparison
+            // that the fused GPU kernels cannot evaluate.
+            rewriter.mark_complete(col_name.to_string());
         }
         // Protect any string predicate (`LIKE`, `=`, `<>`) over a column the
         // query projects as a bare Utf8 output from the integer-index fold, so
@@ -313,9 +323,9 @@ impl DictRegistry {
         // `__rank_<col>` name so the engine's `execute_projection` can
         // materialise the per-row rank columns.
         //
-        // Replace-on-non-empty: the engine calls `rewrite_plan` more than once
-        // per query (an idempotent re-run over the already-rewritten plan, plus
-        // optimizer-driven re-walks — see `Engine::query`). The FIRST pass over
+        // Replace-on-non-empty: `rewrite_plan` runs once per compiled plan, but
+        // one statement can compile several plans (each subquery / component
+        // subplan) and a plan may arrive already rewritten. The FIRST pass over
         // the still-`col_a OP col_b` plan records the rank plans; subsequent
         // passes see only the lowered `__rank_a OP __rank_b` integer compare
         // (the col-vs-col Utf8 shape is gone) and record NOTHING. Blindly

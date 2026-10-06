@@ -33,10 +33,11 @@ pub(crate) struct EngineProvider<'a> {
     pub(crate) base: &'a MemTableProvider,
     pub(crate) tables: &'a HashMap<String, Vec<RecordBatch>>,
     /// Borrow of the lazy streaming overlay. By the time an `EngineProvider`
-    /// is built, any streaming source referenced by the plan has already been
+    /// is built, every streaming source the plan scans has already been
     /// collapsed to [`TableSource::Materialized`] (see
-    /// [`Engine::ensure_streaming_materialized`]), so the null probes below
-    /// can read its batches the same way they read `tables`.
+    /// [`Engine::ensure_streaming_materialized_for`]), so the null probes
+    /// below can read its batches the same way they read `tables`; a source
+    /// the plan does not scan may still be streaming and is treated as absent.
     pub(crate) streaming: Ref<'a, HashMap<String, crate::exec::streaming::TableSource>>,
 }
 

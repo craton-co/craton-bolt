@@ -8,6 +8,9 @@
 //! near-capacity point chosen for the installed GPU. No device work runs
 //! unless `BOLT_BENCH_GPU=1`.
 
+#[path = "support/manifest.rs"]
+mod manifest;
+
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,5 +96,27 @@ fn scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, scaling);
+/// Record the build / hardware context of this run (see
+/// `benches/support/manifest.rs` and `docs/BENCHMARKS.md`).
+fn write_manifest(_: &mut Criterion) {
+    manifest::write(
+        "scaling_benchmarks",
+        &[
+            manifest::Axis {
+                name: "workload",
+                value: "fused filter/projection row sweep".into(),
+            },
+            manifest::Axis {
+                name: "rows",
+                value: "BOLT_SCALING_ROWS / BOLT_VRAM_PRESSURE_ROWS".into(),
+            },
+            manifest::Axis {
+                name: "transfer_included",
+                value: "true".into(),
+            },
+        ],
+    );
+}
+
+criterion_group!(benches, write_manifest, scaling);
 criterion_main!(benches);

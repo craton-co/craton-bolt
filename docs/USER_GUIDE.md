@@ -22,7 +22,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-craton-bolt = "0.7"
+craton-bolt = "0.9"
 arrow-array  = "53"
 arrow-schema = "53"
 ```
@@ -136,16 +136,23 @@ Dictionaries are **unioned across all registered batches**: a string
 literal that appears only in batch 2 still resolves correctly in
 `WHERE col = 'literal'`.
 
-### Streaming — `register_table_stream`
+### Streaming — `register_table_stream` / `register_table_stream_lazy`
 
-`Engine::register_table_stream(name, schema, iter)` accepts a
-`RecordBatch` iterator (0.6). The current implementation is **eager** —
-it drains the iterator into the existing in-memory table representation
-— but the signature is future-compatible with a truly-lazy / out-of-core
-executor, so callers won't need to rewrite when the lazy path lands (see
-[`PATH_TO_1.0.md`](PATH_TO_1.0.md)). The per-column delta-upload path
-behind `register_batch` still applies, so you only pay for new rows on
-each subsequent query.
+`Engine::register_table_stream(name, schema, iter)` drains a `RecordBatch`
+iterator **eagerly**: every batch is validated against `schema`, the batches
+are coalesced into one, and the table is installed atomically (nothing is
+installed if a batch fails). Prefer it over many `register_batch` calls for
+bulk loads — each append rebuilds the table's string dictionaries.
+
+`Engine::register_table_stream_lazy(name, schema, producer)` registers in
+O(1) and stores a replayable producer. The producer runs only when a query
+first references the table (unrelated lazy tables are never drained, and
+`explain_sql` never drains); its batches are validated against `schema` — a
+mismatch fails every query on the table — and coalesced. Under
+`EngineBuilder::memory_budget`, row-wise scans and distributive aggregates
+over such a table run in bounded morsels. Lazy tables carry no string
+dictionaries, so their string predicates are evaluated on the host. See
+[`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
 
 ---
 
@@ -163,11 +170,10 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   kernels) and the grouped path (a per-slot-locked 128-bit accumulator).
   `SUM(Int32)` widens to `Int64`
   to prevent silent wraparound. `COUNT(DISTINCT col)` is supported as the sole
-  SELECT item — and, as of the 0.7 wave, also with a surrounding
-  `SELECT DISTINCT`, a `HAVING` over the count (no `GROUP BY`), and as the
-  **sole aggregate combined with `GROUP BY`**; `COUNT(DISTINCT)` under
-  `GROUP BY` *alongside another aggregate* (or more than one) is still
-  rejected. `COUNT`, **`MIN`, and `MAX`** over a
+  SELECT item — also with a surrounding `SELECT DISTINCT` and a `HAVING`
+  over the count (no `GROUP BY`) — and combined with `GROUP BY`, including
+  several `COUNT(DISTINCT ...)` and a mix with `COUNT` / `SUM` / `MIN` /
+  `MAX` / `AVG`. Aggregates over joins are supported too. `COUNT`, **`MIN`, and `MAX`** over a
   `Date32` / `Timestamp` column all work end-to-end now (GPU reduction;
   the date type / timestamp unit + timezone is preserved), in both the
   scalar and `GROUP BY` paths; `SUM` over a temporal column is rejected by
@@ -235,7 +241,7 @@ in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
   to integer comparisons on the dictionary index at plan time, GPU),
   `LIKE` (dictionary columns fold to GPU integer membership; supported
   non-dictionary shapes use the hardware-validated device matcher by default,
-  with `BOLT_GPU_STRING=0` as force-host), and — as of v0.7 —
+  with `BOLT_GPU_STRING=0` as force-host), and
   **ordering comparisons against a string literal** (`WHERE name < 'M'`,
   GPU via byte/binary collation; not locale/ICU), and **ordering of two Utf8
   columns** (`a < b`, GPU via a cross-dictionary rank compare — a NULL on
@@ -355,7 +361,7 @@ install_pool_stats_observer(Box::new(|s: PoolStats| {
 ```
 
 Structured per-phase tracing spans (parse / plan / lower / codegen /
-ptx_load / launch / transfer / materialize) shipped in 0.6 via the
+ptx_load / launch / transfer / materialize) are emitted via the
 [`tracing`](https://crates.io/crates/tracing) crate. They are off by
 default and opt-in: install a `tracing_subscriber` in your binary and
 the spans appear automatically (span names are catalogued in
@@ -400,7 +406,7 @@ lifetime; setting them mid-run has no effect.
 
 ```toml
 [dependencies]
-craton-bolt = { version = "0.7", features = ["pool-sharded"] }
+craton-bolt = { version = "0.9", features = ["pool-sharded"] }
 ```
 
 | Feature        | Default | What it does                                                            |
@@ -415,13 +421,13 @@ craton-bolt = { version = "0.7", features = ["pool-sharded"] }
 Every distinct `KernelSpec` Craton Bolt emits is JIT-compiled exactly
 once per process: the emitted PTX text is hashed and the loaded
 `CudaModule` is reused on subsequent queries with the same kernel
-shape. The cache is in-process, FIFO, capped at
+shape. The cache is in-process, LRU, capped at
 `CRATON_BOLT_PTX_CACHE_CAP` entries (default 256). On a long-running
 workload that cycles through a bounded set of query shapes, every
 query after the first warm-up issues zero PTX compiles.
 
 A **disk-backed** persistent PTX cache (so cold-start is fast after the
-first run of a process) shipped in 0.6. It is opt-in via the
+first run of a process) is opt-in via the
 `BOLT_PTX_CACHE_DIR=/path` env var (or the
 `Engine::Builder::persistent_cache(path)` hook); on a miss in the
 in-process cache the engine reads a `.ptx` entry from disk before

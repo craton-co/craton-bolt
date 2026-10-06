@@ -111,6 +111,31 @@ fn registry() -> &'static Mutex<Option<ObserverHandle>> {
 /// trait object (rather than the crate-internal `PoolStatsObserver`
 /// alias) to keep the public signature self-describing and avoid
 /// leaking an alias through a `pub(crate)` module boundary.
+///
+/// # Stability
+///
+/// Experimental until 1.0 (single-slot semantics; `PoolStats` may gain
+/// fields).
+///
+/// # Execution semantics
+///
+/// Invoked at most once per `BOLT_POOL_STATS_INTERVAL_SECS` (default 60 s),
+/// after a top-level query completes — success or failure — and after the
+/// default log line.
+///
+/// # Threading
+///
+/// Called on the thread that ran the query, outside any engine lock; the
+/// observer must be `Send + Sync`.
+///
+/// # Errors
+///
+/// A panicking observer is caught and logged; it never affects the query
+/// result or disables later notifications.
+///
+/// # Compatibility
+///
+/// Destructure `PoolStats` with `..` so new fields do not break the observer.
 pub fn install_pool_stats_observer(f: Box<dyn Fn(PoolStats) + Send + Sync + 'static>) {
     // `Box<dyn Fn>` → `Arc<dyn Fn>` so `notify_observers` can clone the
     // handle out of the slot and release the lock before invoking it.

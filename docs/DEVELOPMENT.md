@@ -59,8 +59,32 @@ BOLT_BENCH_GPU=1 cargo test -- --ignored --test-threads=1
 
 ## Continuous integration
 
-The repository has one workflow, `.github/workflows/ci.yml`, and one faithful
-local rehearsal, `../ci_local.sh`.
+The blocking workflow is `.github/workflows/ci.yml`, with one faithful local
+rehearsal, `../ci_local.sh`. `dco.yml` checks sign-offs on pull requests, and
+`bench-history.yml` records scheduled GPU benchmark history (informational,
+never blocking — see [`BENCHMARKS.md`](BENCHMARKS.md#scheduled-benchmark-history)).
+
+### Workflow and job matrix
+
+Generated from `.github/workflows/*.yml` by `tests/doc_consistency_test.rs`
+(`ci_matrix_doc_is_current`); refresh with `BOLT_REGENERATE_DOCS=1 cargo test
+--test doc_consistency_test --no-default-features --features cuda-stub`.
+
+<!-- ci-matrix:begin (generated — do not edit by hand) -->
+| Workflow | Triggers | Job | Name | Runs on |
+|---|---|---|---|---|
+| `bench-history.yml` | schedule, workflow_dispatch | `gpu-bench` | gpu benchmark history (self-hosted NVIDIA GPU) | `[self-hosted, gpu]` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `build` | build (${{ matrix.os }}, ${{ matrix.toolchain }}) | `${{ matrix.os }}` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `feature-build` | feature build (flight + substrait) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `public-api` | public API snapshot | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `doc` | doc (docs.rs parity) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `package` | package (cargo publish --dry-run) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `coverage` | coverage (host, >=50% lines) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `cargo-deny` | cargo deny (advisories + licenses + bans) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `cargo-deny-all-features` | cargo deny (all-features, blocking) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `gpu-integration` | gpu integration (self-hosted NVIDIA GPU) | `[self-hosted, gpu]` |
+| `dco.yml` | pull_request | `dco-check` | DCO Sign-off Check | `ubuntu-latest` |
+<!-- ci-matrix:end -->
 
 ### CI truth table
 

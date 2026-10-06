@@ -32,6 +32,9 @@
 //! <https://duckdblabs.github.io/db-benchmark/> — DuckDB Labs fork (current
 //! maintained version with up-to-date numbers).
 
+#[path = "support/manifest.rs"]
+mod manifest;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -583,5 +586,31 @@ fn bench_entry(c: &mut Criterion) {
     bench_bolt_group(c);
 }
 
-criterion_group!(benches, bench_entry);
+/// Record the build / hardware context of this run (see
+/// `benches/support/manifest.rs` and `docs/BENCHMARKS.md`).
+fn write_manifest(_: &mut Criterion) {
+    manifest::write(
+        "olap_benchmarks",
+        &[
+            manifest::Axis {
+                name: "workload",
+                value: "h2o.ai groupby subset q1-q5".into(),
+            },
+            manifest::Axis {
+                name: "rows",
+                value: "10_000_000 timed / 100_000 verification".into(),
+            },
+            manifest::Axis {
+                name: "correctness_reference",
+                value: "DuckDB + Polars, 1e-9 relative".into(),
+            },
+            manifest::Axis {
+                name: "transfer_included",
+                value: "true".into(),
+            },
+        ],
+    );
+}
+
+criterion_group!(benches, write_manifest, bench_entry);
 criterion_main!(benches);

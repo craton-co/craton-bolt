@@ -1,5 +1,7 @@
 ﻿// SPDX-License-Identifier: Apache-2.0
 
+//! The engine-wide error type, [`BoltError`], and its [`BoltResult`] alias.
+
 use std::ops::Range;
 
 use thiserror::Error;

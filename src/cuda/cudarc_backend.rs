@@ -1,25 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! **cudarc-backed CUDA Driver API spike** (Stage 1).
+//! The supported CUDA driver backend, built on `cudarc` (the default
+//! `cudarc` feature).
 //!
-//! This module is gated on the `cudarc` feature. When the feature is
-//! enabled, a handful of low-level memory primitives in `cuda_sys.rs`
-//! delegate here instead of into the hand-rolled `extern "C"` FFI.
-//! Everything else (context create, kernel launch, module load, …)
-//! continues to use the existing path during Stage 1 — the goal of
-//! this spike is to **prove a feature-flagged cudarc backend builds
-//! and runs** without yet committing to a full migration. See
-//! [`docs/CUDARC_ADOPTION.md`](../../docs/CUDARC_ADOPTION.md) for the
-//! end-state plan.
+//! cudarc owns the process's primary CUDA context (see the process-lifetime
+//! retention invariant on the device cache below); the memory primitives in `cuda_sys.rs` —
+//! synchronous and async allocation, copies and memsets — delegate here,
+//! while the narrow set of driver calls cudarc does not expose (module load,
+//! kernel launch, ...) still go through the raw FFI on that same context.
+//! [`docs/CUDARC_ADOPTION.md`](../../docs/CUDARC_ADOPTION.md) defines the
+//! supported backend boundary.
 //!
 //! ## Surface area covered
 //!
-//! Stage 1 routes these four functions through cudarc:
-//!
-//!   * `mem_alloc(bytes)` — allocates `bytes` bytes of device memory.
-//!   * `mem_free(ptr)` — frees a previously-allocated pointer.
-//!   * `memcpy_h2d::<T>(dst, src, count)` — host → device copy.
-//!   * `memcpy_d2h::<T>(dst, src, count)` — device → host copy.
+//!   * `mem_alloc(bytes)` / `mem_free(ptr)` — device allocation.
+//!   * `memcpy_h2d::<T>` / `memcpy_d2h::<T>` — synchronous copies.
+//!   * `memcpy_h2d_async::<T>` / `memcpy_d2h_async::<T>` /
+//!     `memset_d8_async` — stream-ordered copies and memsets.
 //!
 //! cudarc 0.13's API differs from our raw FFI in one important way:
 //! cudarc *owns* its allocations via `CudaSlice<T>`, which `Drop`s
@@ -29,8 +26,8 @@
 //! `result::malloc_sync` / `result::free_sync` — which returns / takes
 //! a raw `CUdeviceptr` exactly like our FFI does.
 //!
-//! When Stage 2 lands we'll switch to `CudaSlice<T>` ownership and
-//! delete the raw-pointer helpers.
+//! Moving to `CudaSlice<T>` ownership (and deleting the raw-pointer
+//! helpers) is tracked in `docs/CUDARC_ADOPTION.md`.
 
 use cudarc::driver::{result, CudaDevice};
 use std::sync::Arc;

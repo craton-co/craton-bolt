@@ -2,7 +2,9 @@
 
 The exact subset of SQL Craton Bolt's frontend accepts. The grammar is built on top of [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs); anything outside this surface produces a clear `BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported construct.
 
-This document tracks the 0.9.0 release. For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the gap to 1.0, see [`../ROADMAP.md`](../ROADMAP.md).
+<!-- applies-to: main · owner: frontend · version-neutral (the crate version lives in Cargo.toml) -->
+
+This document describes the current `main` frontend. For the JIT pipeline that lowers and executes these queries, see [`JIT_PIPELINE.md`](JIT_PIPELINE.md). For the gap to 1.0, see [`../ROADMAP.md`](../ROADMAP.md).
 
 ### Execution tier
 
@@ -16,6 +18,30 @@ Every prepared query exposes its planned execution tier through
 The classifier is a stable, machine-readable API (`ExecutionTier`) rather than
 an inference from documentation labels. Unsupported expressions still fail
 with a precise lowering error; they are never silently reported as `Gpu`.
+
+### Feature matrix: tier, complexity, limits
+
+The planned tier of a concrete query is always the one
+`planned_execution_tier()` reports; this table is the per-feature summary.
+`n` / `m` are input row counts, `k` the number of groups / distinct values.
+
+| Feature | Planned tier | Complexity | Limits / notes |
+|---|---|---|---|
+| Projection / arithmetic over primitive columns | `Gpu` | O(n), PCIe-bound for cheap expressions | fused into one PTX kernel |
+| `WHERE` over primitive / dictionary columns | `Gpu` | O(n) + compaction O(n) | output size drives D2H cost |
+| Projection of `Utf8` columns, raw `Utf8` comparisons, `||`, `SUBSTRING` / `TRIM` | `Host` / `Hybrid` | O(n) | host evaluator; dictionary-folded predicates stay GPU |
+| Scalar aggregates | `Hybrid` | O(n) device reduce + O(1) finalise | `VAR_*` / `STDDEV_*` host Welford |
+| `GROUP BY` aggregates | `Hybrid` | expected O(n) hash; atomics contend at low `k` | high `k` uses partitioned (Tier-2) kernels |
+| Aggregate over a join / union / distinct / host-only filter | `Hybrid` | cost of the input + O(n) aggregate | input materialised and bound as an ephemeral table |
+| Hash join (INNER / LEFT / RIGHT / FULL) | `Hybrid` | expected O(n + m) | non-equi INNER: capped host nested loop |
+| `ORDER BY` | `Hybrid` | O(n log n); radix O(n·key-bytes) for Int32/Int64 | other key types sort on the host |
+| `DISTINCT`, `UNION` / `EXCEPT` / `INTERSECT` | `Hybrid` / `Host` | expected O(n) hash | host row caps `CRATON_DISTINCT_HOST_MAX_ROWS`, `CRATON_SETOP_HOST_MAX_ROWS` |
+| Window functions | `Host` (wrapping the input's tier) | O(n log n) (sort within partitions) | default frame only |
+| Uncorrelated scalar / `IN` subquery | tier of the subquery + its consumer | subquery cost + O(set) fold | `IN` set capped by `CRATON_IN_SET_MAX_ROWS` |
+| Correlated `WHERE` subquery, `LATERAL` | `Host` orchestration of subplans | O(outer × subquery) | outer rows capped by `CRATON_MAX_APPLY_ROWS` |
+| `WITH RECURSIVE` | `Host` orchestration of subplans | O(iterations × term cost) | `CRATON_MAX_RECURSIVE_ITERATIONS` / `_ROWS` |
+| `COUNT(DISTINCT)` + `GROUP BY`, `DISTINCT ON` | `Host` fold over a compiled subplan | O(n) hash / O(n log n) sort | — |
+| `VALUES`, `generate_series` | `Host` | O(rows) | `CRATON_VALUES_MAX_ROWS`, `CRATON_GENERATE_SERIES_MAX_ROWS` |
 
 ## Supported query shape
 
@@ -40,12 +66,12 @@ Two queries can be combined with `UNION` / `UNION ALL` / `EXCEPT [ALL]` / `INTER
 **Hard restrictions** (everything else returns a `BoltError`):
 
 - Exactly one base table in `FROM`, optionally widened by one or more JOINs per `SELECT`: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, or `FULL [OUTER]` with an `ON` / `USING (...)` / `NATURAL` constraint, or `CROSS JOIN` (no constraint). Every shape has a gated GPU fast path with a host-side fallback (see the [JOIN](#join) section). `JOIN ... USING (...)` and `NATURAL JOIN` desugar to equi `<left.col> = <right.col>` pairs; computed join keys are still rejected. The equi `ON` predicate must be a conjunction of `<left.col> = <right.col>` equalities (a small-cardinality non-equi INNER predicate is handled by a capped host nested-loop).
-- **Uncorrelated** scalar (`(SELECT ...)`) and `[NOT] IN (SELECT ...)` subqueries in `SELECT` / `WHERE` are supported (resolved to constants before lowering). An uncorrelated **scalar subquery** is also accepted in `ORDER BY`. **Correlated** scalar and `EXISTS` / `NOT EXISTS` subqueries are rejected. **Derived tables** (a subquery in `FROM`, `(SELECT ...) AS alias`) are supported as of 0.7, with restrictions: the alias is **required** and a column-list alias (`AS d(x, y)`) is rejected. **`LATERAL`** derived tables (correlated, may reference earlier FROM items) are also supported as of the 0.7 feature waves — executed as a host nested-loop apply (see [Subqueries](#subqueries)).
+- **Uncorrelated** scalar (`(SELECT ...)`) and `[NOT] IN (SELECT ...)` subqueries in `SELECT` / `WHERE` are supported (resolved to constants before lowering). An uncorrelated **scalar subquery** is also accepted in `ORDER BY`. **Correlated** subqueries are supported as a **single** correlated scalar / `EXISTS` / `NOT EXISTS` conjunct of a top-level `WHERE` (host nested-loop apply — see [Correlated WHERE subqueries](#correlated-where-subqueries)); correlated subqueries anywhere else are rejected. **Derived tables** (a subquery in `FROM`, `(SELECT ...) AS alias`) are supported, with restrictions: the alias is **required** and a column-list alias (`AS d(x, y)`) is rejected. **`LATERAL`** derived tables (correlated, may reference earlier FROM items) are also supported — executed as a host nested-loop apply (see [Subqueries](#subqueries)).
 - Non-recursive CTEs (`WITH name AS (...)`) are supported. `WITH RECURSIVE` is supported (linear, non-linear, and mutual recursion — see [Recursive CTEs](#recursive-ctes-with-recursive)), including an optional recursive-CTE column-list alias (`WITH RECURSIVE c (a, b) AS ...`). The materialization hint and a column-list alias on a *non-recursive* CTE are rejected.
 - `EXCEPT [ALL]` and `INTERSECT [ALL]` are supported (host-side). `UNION BY NAME` (and `EXCEPT`/`INTERSECT BY NAME`) are rejected.
 - Window functions (`OVER`) are supported host-side for a fixed function set under the default frame only (see the [Window functions](#window-functions) section). `QUALIFY`, the named `WINDOW` clause, and `OVER <named_window>` are now **supported**; explicit/non-default frames are still rejected. `FETCH` / T-SQL `TOP` fold into `LIMIT`, `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, and `PREWHERE` (ClickHouse-ism) is folded into `WHERE`. `VALUES` as a row source, `DISTINCT ON (...)`, and the `generate_series(start, stop[, step])` table-valued function in `FROM` are also **supported** (see the sections below). Other table-valued functions, `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, and `INTO` remain rejected. (`LATERAL` derived tables are now **supported** — see [Subqueries](#subqueries).)
 - `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` / `ALL`, the trailing `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` modifiers, and the `GROUPING()` / `GROUPING_ID()` indicators are supported (host-expanded to a UNION-ALL of the per-set plans; max 12 grouping columns) — see [GROUP BY](#group-by). A bare `FROM a, b [WHERE ...]` comma list is supported and desugars to a `CROSS JOIN` chain.
-- No schema-qualified *table* names in `FROM`. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates; the qualifier must match a FROM table and only the resolved column name survives lowering. In a `JOIN ... ON` predicate the **schema-qualified `schema.table.col`** form is also accepted (the leading single-catalog segment is dropped, so it resolves to `table.col`). Four-or-more-segment references (`catalog.db.t.col`) and struct-field access are rejected.
+- No schema-qualified *table* names in `FROM`. Single-level qualified column references (`t.col`) are supported in SELECT, WHERE, GROUP BY, HAVING, and `JOIN ... ON` predicates — not in `ORDER BY`, which runs after projection (order by the output column name or its alias instead); the qualifier must match a FROM table and only the resolved column name survives lowering. In a `JOIN ... ON` predicate the **schema-qualified `schema.table.col`** form is also accepted (the leading single-catalog segment is dropped, so it resolves to `table.col`). Four-or-more-segment references (`catalog.db.t.col`) and struct-field access are rejected.
 - `LIMIT` and `OFFSET` must be integer literals; expressions and parameters are rejected.
 
 ## Data types
@@ -64,11 +90,10 @@ The plan's `DataType` enum is intentionally small.
 | `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; CAST to/from Date32 (string, etc.): parses; GPU lowering pending. |
 | `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. CAST to/from Timestamp: parses; GPU lowering pending. |
 
-`Decimal128`, `Date32`, and `Timestamp` arrived in 0.6 (plan + parser +
-type-check) and gained their GPU lowering in 0.7 (see the per-type notes
-above; mixed Decimal/integer arithmetic, integer↔decimal
-and decimal-rescale CAST, scale-aligned Decimal comparison, and temporal
-`MIN`/`MAX` routing all landed in the 0.7 wave). Interval (beyond
+`Decimal128`, `Date32`, and `Timestamp` parse, type-check and lower to the GPU
+as described in the per-type notes above (mixed Decimal/integer arithmetic,
+integer↔decimal and decimal-rescale CAST, scale-aligned Decimal comparison,
+and temporal `MIN`/`MAX`). Interval (beyond
 Day-INTERVAL on dates), time-of-day, list, struct, and map are still not
 modelled.
 
@@ -104,7 +129,7 @@ division follows IEEE-754: `1.0 / 0.0 = +inf`, `0.0 / 0.0 = NaN`.
 
 #### Decimal128 arithmetic
 
-As of 0.7 `+`, `-`, and `*` over `Decimal128(p, s)` lower to the **GPU** via the dual-register (lo/hi) 128-bit IR (`Op::Add128` / `Sub128` / `Mul128`). **Mixed Decimal/integer** arithmetic is supported: an `Int32` / `Int64` peer is auto-coerced to `Decimal128(_, 0)` (Float peers are rejected — CAST explicitly to avoid losing exactness). Result-dtype rules follow the SQL convention (`logical_plan::decimal128_arith_result`):
+`+`, `-`, and `*` over `Decimal128(p, s)` lower to the **GPU** via the dual-register (lo/hi) 128-bit IR (`Op::Add128` / `Sub128` / `Mul128`). **Mixed Decimal/integer** arithmetic is supported: an `Int32` / `Int64` peer is auto-coerced to `Decimal128(_, 0)` (Float peers are rejected — CAST explicitly to avoid losing exactness). Result-dtype rules follow the SQL convention (`logical_plan::decimal128_arith_result`):
 
 - **`+` / `-`**: operands rescaled to a common scale `s = max(s_l, s_r)`; result `Decimal128(min(max(p_l, p_r) + 1, 38), s)`.
 - **`*`**: result `Decimal128(min(p_l + p_r, 38), s_l + s_s)` (the raw i128 product carries the summed scale; no operand rescale).
@@ -126,13 +151,13 @@ SELECT CAST(price AS DECIMAL(10, 2)) FROM line_items;      -- Decimal rescale (G
 
 ### Comparison
 
-`=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** (`Op::Cmp128`) as of 0.7 and are **scale-aligned**: two decimals with *differing* scales are rescaled to the common scale `max(s_l, s_r)` (the smaller-scale side is multiplied by `10^Δ`) before the i128 compare, and an **integer peer** is auto-coerced (`WHERE dec_col > 5` works). Precision need not match. Float/Bool/temporal peers are rejected — CAST explicitly.
+`=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** (`Op::Cmp128`) and are **scale-aligned**: two decimals with *differing* scales are rescaled to the common scale `max(s_l, s_r)` (the smaller-scale side is multiplied by `10^Δ`) before the i128 compare, and an **integer peer** is auto-coerced (`WHERE dec_col > 5` works). Precision need not match. Float/Bool/temporal peers are rejected — CAST explicitly.
 
-For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). As of 0.7, **ordering comparisons** (`<`, `>`, `<=`, `>=`) of a `Utf8` column against a string *literal* (`WHERE name < 'M'`, either operand order) are **also** supported (**GPU**): because dictionary indices reflect insertion order rather than lex order, the rewriter partitions the dictionary entries by the literal under **binary (UTF-8 byte) collation** at plan time and emits an OR-of-equalities over the matching dictionary indices (the same index-membership form `LIKE` uses). This is byte/binary collation, **not** locale-aware / ICU collation, and a `NULL` row never satisfies an ordering predicate (correct SQL 3VL). **Column-vs-column** Utf8 ordering (`WHERE a < b`, two string columns) **also** folds to the **GPU** as of 0.7 (finding F12): since each column has its own dictionary, the rewriter ranks both columns against the de-duplicated **union** of their dictionaries under binary collation (`unified_rank_maps_of`), materialises a per-row rank column for each side, and emits the NULL-safe integer predicate `(rank_a >= 0) AND (rank_b >= 0) AND (rank_a OP rank_b)`. The `>= 0` guards drop NULL rows (correct SQL 3VL — in a projection context this is the "NULL → no row passes" / NULL→false behaviour). Shapes the rank path can't cover (a non-dict or protected column) fall back to a host string comparison. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
+For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). **Ordering comparisons** (`<`, `>`, `<=`, `>=`) of a `Utf8` column against a string *literal* (`WHERE name < 'M'`, either operand order) are **also** supported (**GPU**): because dictionary indices reflect insertion order rather than lex order, the rewriter partitions the dictionary entries by the literal under **binary (UTF-8 byte) collation** at plan time and emits an OR-of-equalities over the matching dictionary indices (the same index-membership form `LIKE` uses). This is byte/binary collation, **not** locale-aware / ICU collation, and a `NULL` row never satisfies an ordering predicate (correct SQL 3VL). **Column-vs-column** Utf8 ordering (`WHERE a < b`, two string columns) **also** folds to the **GPU** (finding F12): since each column has its own dictionary, the rewriter ranks both columns against the de-duplicated **union** of their dictionaries under binary collation (`unified_rank_maps_of`), materialises a per-row rank column for each side, and emits the NULL-safe integer predicate `(rank_a >= 0) AND (rank_b >= 0) AND (rank_a OP rank_b)`. The `>= 0` guards drop NULL rows (correct SQL 3VL — in a projection context this is the "NULL → no row passes" / NULL→false behaviour). Shapes the rank path can't cover (a non-dict or protected column) fall back to a host string comparison. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
 
 ### IN and BETWEEN
 
-`<expr> [NOT] IN (v1, v2, …)` is supported (0.5). Literal lists lower to
+`<expr> [NOT] IN (v1, v2, …)` is supported. Literal lists lower to
 an explicit `CASE` over an OR/AND comparison chain so SQL three-valued logic
 is preserved: a NULL left operand or unmatched list containing NULL yields
 NULL, including the `NOT IN` form. The expression executes wherever the
@@ -140,32 +165,32 @@ underlying comparisons do. Lists are capped at 64 values. `IN` against a
 `Utf8` column is not wired through the dictionary rewriter; use an explicit
 `OR` chain of literal equalities.
 
-`<expr> [NOT] BETWEEN low AND high` is supported (0.5), desugared to `(expr >= low) AND (expr <= high)` (or the DeMorgan inverse), and likewise runs on the **GPU** for numeric operands.
+`<expr> [NOT] BETWEEN low AND high` is supported, desugared to `(expr >= low) AND (expr <= high)` (or the DeMorgan inverse), and likewise runs on the **GPU** for numeric operands.
 
 ### Logical
 
 `AND`, `OR`. Both operands must be `Bool`. Result is `Bool`. **GPU**.
 
-`NOT <bool-expr>` is supported (0.5) via `UnaryOp::Not`, routed through the **host-side** filter path. GPU lowering of `NOT` is pending (it is rejected with `"NOT not yet lowered to GPU; requires host fallback"` on the GPU path).
+`NOT <bool-expr>` is supported via `UnaryOp::Not`, routed through the **host-side** filter path. GPU lowering of `NOT` is pending (it is rejected with `"NOT not yet lowered to GPU; requires host fallback"` on the GPU path).
 
 ### String concatenation
 
-`a || b` (`BinaryOp::Concat`) is supported (0.5). In a SELECT position it runs through the **host-side** `Project` executor. In a `WHERE` predicate the whole filter is routed to the **host-side** filter path.
+`a || b` (`BinaryOp::Concat`) is supported. In a SELECT position it runs through the **host-side** `Project` executor. In a `WHERE` predicate the whole filter is routed to the **host-side** filter path.
 
 ### CASE / CAST / COALESCE / NULLIF
 
-- `CASE WHEN cond THEN val [WHEN…] [ELSE val] END` (both the plain and simple/with-operand forms) is supported (0.5). Execution tier by result dtype:
+- `CASE WHEN cond THEN val [WHEN…] [ELSE val] END` (both the plain and simple/with-operand forms) is supported. Execution tier by result dtype:
   - **GPU** when the unified result dtype is numeric, `Bool`, `Date32`, or `Timestamp` (emitted as a fold of PTX `selp.b32` / `selp.b64`; Date32/Timestamp ride along as plain bit-copies on their i32/i64 storage).
   - **host-side** when the result dtype is `Utf8`: a bare-`Scan` SELECT-list Utf8 `CASE` lowers to the host-realized `PhysicalPlan::StringProject` (`CaseUtf8` output, evaluated by `string_project::eval_case_utf8`). It follows SQL three-valued logic — **only a TRUE `WHEN` fires**; a `FALSE` or `NULL` condition falls through, and a row that matches no `WHEN` with no `ELSE` yields SQL `NULL`. A *nested* `CASE` inside a branch is out of scope and falls back / errors. (Utf8 CASE under a Filter/Project chain, or feeding an aggregate, is not on this host path.)
-  - A `CASE` whose result dtype is **`Decimal128`** lowers to the **GPU** as of 0.7 (F5): the `selp` register classes have no `b128`, so the i128 result is selected as a **pair of `selp.b64`** via `Op::Select128`. The same SQL-NULL safety guard as the numeric path applies (a CASE that can yield SQL NULL — no `ELSE`, or a bare-`NULL` arm — is routed to the host fallback or rejected rather than emitting a wrong zero).
-- `CAST(expr AS type)` is supported (0.5) for primitive numeric and `Bool` pairs, lowered to a PTX `cvt.*` on the **GPU**. As of 0.7 **integer↔`Decimal128`**, **`Decimal128`↔`Decimal128`** (rescale), and **Float↔`Decimal128`** all lower to the **GPU**: integer/rescale via the 128-bit widen / rescale (`Mul128`) / truncating-divide (`Div128`) path (integer→`Date32` rides the same i128 widen), and Float↔Decimal via `F64ToI128` (round half away from zero) / `I128ToF64` plus a float scale multiply/divide. Note the asymmetry: a **plain** `CAST` of Float⇄Decimal128 lowers to GPU, but a `TRY_CAST` / `SAFE_CAST` of the same pair is **rejected at type-check** (the host evaluator that realises NULL-on-failure has no `Decimal128` column representation). Still pending: CAST to/from `Timestamp` / `String` (parses; GPU lowering pending).
-- `TRY_CAST(expr AS type)` / `SAFE_CAST(expr AS type)` (synonyms) are supported (0.7, F4): they carry **NULL-on-failure** semantics — a non-parseable / out-of-range conversion yields SQL `NULL` instead of erroring — and are evaluated **host-side** (`expr_agg::safe_cast_column`). The accepted envelope is every plain-cast pair *plus* the runtime-fallible string parses `Utf8 -> {Int32, Int64, Float32, Float64, Bool}`; Float⇄`Decimal128` is excluded (see above) and a `TRY_CAST`/`SAFE_CAST` with a `FORMAT` clause is rejected.
-- `CAST(expr AS {VARCHAR|TEXT|temporal} FORMAT '<pattern>')` is supported (0.7) and **host-evaluated** (`Expr::CastFormat`): a bounded temporal⇄string conversion over a fixed pattern vocabulary (`YYYY` / `MM` / `DD` / `HH` / `HH24` / `MI` / `SS` plus separators). Unknown pattern tokens, a non-literal pattern, and `... FORMAT ... AT TIME ZONE ...` are rejected with a clear message.
-- `COALESCE(a, b, …)` and `NULLIF(a, b)` are supported (0.5), desugared to `CASE`, so they execute on the **GPU** under the same numeric/Bool result-dtype rule as CASE.
+  - A `CASE` whose result dtype is **`Decimal128`** lowers to the **GPU** (F5): the `selp` register classes have no `b128`, so the i128 result is selected as a **pair of `selp.b64`** via `Op::Select128`. The same SQL-NULL safety guard as the numeric path applies (a CASE that can yield SQL NULL — no `ELSE`, or a bare-`NULL` arm — is routed to the host fallback or rejected rather than emitting a wrong zero).
+- `CAST(expr AS type)` is supported for primitive numeric and `Bool` pairs, lowered to a PTX `cvt.*` on the **GPU**. **Integer↔`Decimal128`**, **`Decimal128`↔`Decimal128`** (rescale), and **Float↔`Decimal128`** all lower to the **GPU**: integer/rescale via the 128-bit widen / rescale (`Mul128`) / truncating-divide (`Div128`) path (integer→`Date32` rides the same i128 widen), and Float↔Decimal via `F64ToI128` (round half away from zero) / `I128ToF64` plus a float scale multiply/divide. Note the asymmetry: a **plain** `CAST` of Float⇄Decimal128 lowers to GPU, but a `TRY_CAST` / `SAFE_CAST` of the same pair is **rejected at type-check** (the host evaluator that realises NULL-on-failure has no `Decimal128` column representation). Still pending: CAST to/from `Timestamp` / `String` (parses; GPU lowering pending).
+- `TRY_CAST(expr AS type)` / `SAFE_CAST(expr AS type)` (synonyms) are supported (F4): they carry **NULL-on-failure** semantics — a non-parseable / out-of-range conversion yields SQL `NULL` instead of erroring — and are evaluated **host-side** (`expr_agg::safe_cast_column`). The accepted envelope is every plain-cast pair *plus* the runtime-fallible string parses `Utf8 -> {Int32, Int64, Float32, Float64, Bool}`; Float⇄`Decimal128` is excluded (see above) and a `TRY_CAST`/`SAFE_CAST` with a `FORMAT` clause is rejected.
+- `CAST(expr AS {VARCHAR|TEXT|temporal} FORMAT '<pattern>')` is supported and **host-evaluated** (`Expr::CastFormat`): a bounded temporal⇄string conversion over a fixed pattern vocabulary (`YYYY` / `MM` / `DD` / `HH` / `HH24` / `MI` / `SS` plus separators). Unknown pattern tokens, a non-literal pattern, and `... FORMAT ... AT TIME ZONE ...` are rejected with a clear message.
+- `COALESCE(a, b, …)` and `NULLIF(a, b)` are supported, desugared to `CASE`, so they execute on the **GPU** under the same numeric/Bool result-dtype rule as CASE.
 
 ### LIKE
 
-`<expr> [NOT] LIKE 'pattern'` is supported (0.5) for constant patterns with
+`<expr> [NOT] LIKE 'pattern'` is supported for constant patterns with
 `%` and `_` wildcards. Dictionary inputs fold to a GPU integer-membership
 predicate. Non-dictionary inputs use the hardware-validated
 `StringLikeFilter` device kernel by default, with host fallback on an
@@ -200,14 +225,14 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 
 - Every non-aggregate SELECT item must appear in `GROUP BY` (verified via structural equality).
 - Aggregate inputs that aren't bare columns are routed through the `pre` kernel (which materialises the expression) then the standard reduction.
-- Post-aggregate scalar expressions are accepted by the SQL frontend (0.5): `SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`, and `SUM(x) + 1 AS total` (alias). The aggregates nested inside the expression are extracted as feed inputs (deduplicated by output name across the SELECT list), and the surface expression is rewritten with `Column("<aggregate_output_name>")` at each aggregate position — then evaluated by the post-Aggregate `Project`.
+- Post-aggregate scalar expressions are accepted by the SQL frontend: `SUM(price) + 1`, `AVG(qty) * 2`, `(SUM(a) + SUM(b)) / 2`, and `SUM(x) + 1 AS total` (alias). The aggregates nested inside the expression are extracted as feed inputs (deduplicated by output name across the SELECT list), and the surface expression is rewritten with `Column("<aggregate_output_name>")` at each aggregate position — then evaluated by the post-Aggregate `Project`.
 
 ## Aggregate functions
 
 | Function       | Output dtype                  | Notes                                                      |
 |----------------|-------------------------------|------------------------------------------------------------|
 | `COUNT(*)`     | `Int64`                       | Counts every row.                                          |
-| `COUNT(expr)`  | `Int64`                       | Excludes NULLs via the validity bitmap (0.5).              |
+| `COUNT(expr)`  | `Int64`                       | Excludes NULLs via the validity bitmap.                    |
 | `COUNT(bool)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `COUNT(utf8)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `COUNT(date32 \| timestamp)` | `Int64`         | Counts non-NULL temporal rows; works end-to-end (dtype-agnostic count path). |
@@ -225,11 +250,11 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `MAX(decimal)` | `Decimal128(p, s)`            | **GPU** i128 reduce — scalar block-reduce + **grouped** per-slot-locked accumulator. Preserves input `(p, s)`. |
 | `AVG(numeric)` | `Float64`                     | Single fused kernel (on-device `SUM` + `COUNT` reduced together, divided on finalise); no longer split into separate host passes. |
 | `AVG(bool)`    | `Float64`                     | Fraction of `TRUE` rows. NULL if all-null group.           |
-| `SUM(decimal)` | `Decimal128`                  | **GPU** i128 reduce — scalar block-reduce (0.7; host-fold fallback inside) + **grouped** per-slot-locked 128-bit accumulator. Overflow raises a hard error. |
-| `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP` | `Float64`  | **Host-side** Welford (0.5 scalar; 0.7 adds `GROUP BY` via per-group Welford). |
-| `VARIANCE`, `VAR_POP`, `VAR_SAMP`     | `Float64`  | **Host-side** Welford, shared state with STDDEV. Scalar (0.5) + grouped (0.7). |
+| `SUM(decimal)` | `Decimal128`                  | **GPU** i128 reduce — scalar block-reduce (host-fold fallback inside) + **grouped** per-slot-locked 128-bit accumulator. Overflow raises a hard error. |
+| `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP` | `Float64`  | **Host-side** Welford — scalar and `GROUP BY` (per-group Welford). |
+| `VARIANCE`, `VAR_POP`, `VAR_SAMP`     | `Float64`  | **Host-side** Welford, shared state with STDDEV. Scalar and grouped. |
 
-**Temporal MIN / MAX status.** `COUNT`, `MIN`, and `MAX` over a `Date32` / `Timestamp` column **all work end-to-end** as of the 0.7 wave. The reduction runs on the **GPU** over the normalised integer storage (`Date32 → Int32`, `Timestamp → Int64`), and the result is rebuilt as the original temporal type — a `Date32` for dates, and a `Timestamp` **preserving the unit and timezone** for timestamps (`src/exec/aggregate.rs`, `src/exec/groupby.rs`, and the temporal-output schema builder in `src/exec/schema_convert.rs` were all wired through). This holds in both the scalar and `GROUP BY` paths. `SUM` over a temporal column is undefined SQL and is **rejected by design** (`"SUM over Date32/Timestamp is not supported"`). (`SUM`/`MIN`/`MAX` over `Decimal128` are likewise supported, preserving the input precision/scale — **scalar** on the GPU via i128 block-reduce kernels, **grouped** on the host.)
+**Temporal MIN / MAX status.** `COUNT`, `MIN`, and `MAX` over a `Date32` / `Timestamp` column **all work end-to-end**. The reduction runs on the **GPU** over the normalised integer storage (`Date32 → Int32`, `Timestamp → Int64`), and the result is rebuilt as the original temporal type — a `Date32` for dates, and a `Timestamp` **preserving the unit and timezone** for timestamps (`src/exec/aggregate.rs`, `src/exec/groupby.rs`, and the temporal-output schema builder in `src/exec/schema_convert.rs` were all wired through). This holds in both the scalar and `GROUP BY` paths. `SUM` over a temporal column is undefined SQL and is **rejected by design** (`"SUM over Date32/Timestamp is not supported"`). (`SUM`/`MIN`/`MAX` over `Decimal128` are likewise supported, preserving the input precision/scale — **scalar** on the GPU via i128 block-reduce kernels, **grouped** on the GPU via the per-slot-locked 128-bit accumulator.)
 
 **NULL / empty-input semantics.** `MIN` / `MAX` / `SUM` / `AVG` over
 an all-NULL group or empty input return SQL `NULL`; `COUNT` returns `0`.
@@ -246,14 +271,14 @@ partial merges use checked arithmetic, so materialized and streaming grouped
 inputs both fail with `BoltError::Type("SUM(integer) overflow")`. The same
 applies to `SUM(Decimal128)`; Float `SUM` follows IEEE-754.
 
-`COUNT(DISTINCT col)` is supported as the **sole SELECT item** (no other columns or aggregates alongside it). It lowers to `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` (NULL-excluding distinct count, executed via the host-side `Distinct` executor). As of the 0.7 wave (F3), two combined forms over the bare sole-item distinct-count are now accepted and lower on top of the same base plan:
+`COUNT(DISTINCT col)` is supported as the **sole SELECT item** (no other columns or aggregates alongside it). It lowers to `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` (NULL-excluding distinct count, executed via the host-side `Distinct` executor). Two combined forms over the bare sole-item distinct-count are now accepted and lower on top of the same base plan:
 
 - **`SELECT DISTINCT COUNT(DISTINCT col)`** — the surrounding `DISTINCT` over a single-row result is a (correct) no-op, lowered to the existing `Distinct` node for plan uniformity.
 - **`... HAVING <pred over COUNT(DISTINCT col)>`** with **no `GROUP BY`** — the whole table is one implicit group, so `HAVING` filters that single result row (standard SQL). The predicate may reference the distinct-count via the same `COUNT(DISTINCT col)` call it was written with (comparison / boolean / `IS [NOT] NULL` shapes).
 
-As of the 0.7 wave (F3-finish), **`COUNT(DISTINCT col)` combined with `GROUP BY`** is also supported when it is the **sole aggregate**: `SELECT keys..., COUNT(DISTINCT col) FROM t [WHERE ...] GROUP BY keys [HAVING ...] [ORDER BY ...] [LIMIT ...]`. It runs as a host-orchestrated special-case — the engine materializes the WHERE-filtered `(keys..., col)` rows and counts the distinct non-NULL values of `col` per group-key tuple (NULL keys form their own group; an all-NULL group yields 0), then applies HAVING/ORDER BY/LIMIT. The count must be the last SELECT item and every GROUP BY key must be projected.
+**`COUNT(DISTINCT col)` combined with `GROUP BY`** is also supported: `SELECT keys..., COUNT(DISTINCT col) FROM t [WHERE ...] GROUP BY keys [HAVING ...] [ORDER BY ...] [LIMIT ...]`. It runs as a host-orchestrated shape — the engine materializes the WHERE-filtered `(keys..., col)` rows and counts the distinct non-NULL values of `col` per group-key tuple (NULL keys form their own group; an all-NULL group yields 0), then applies HAVING/ORDER BY/LIMIT. **Several** `COUNT(DISTINCT ...)` aggregates, and a mix with plain `COUNT(*)` / `COUNT(col)` / `SUM` / `MIN` / `MAX` / `AVG`, are supported the same way (group keys and aggregates in any SELECT order); `VAR_*` / `STDDEV_*` alongside a `COUNT(DISTINCT)` under `GROUP BY` are rejected with a precise error.
 
-Still **rejected**: `COUNT(DISTINCT col)` with `GROUP BY` *alongside another aggregate* or with more than one `COUNT(DISTINCT)`, `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `COUNT(DISTINCT col) OVER (...)`, and `DISTINCT` inside any other aggregate. Aggregate aliasing (`SUM(price) AS total`) is supported in v0.5: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
+Still **rejected**: `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `COUNT(DISTINCT col) OVER (...)`, and `DISTINCT` inside any other aggregate. Aggregate aliasing (`SUM(price) AS total`) is supported: the alias renames the aggregate's plan-assigned name (e.g. `sum_price`) in a post-Aggregate Project, and the alias is visible to `HAVING` and `ORDER BY`.
 
 ## GROUP BY
 
@@ -276,7 +301,7 @@ Output ordering: groups are sorted by encoded key for determinism. (Float bit-pa
 
 ### Super-aggregates: ROLLUP / CUBE / GROUPING SETS / GROUP BY ALL
 
-As of the 0.7 wave (F1 / F2) the following super-aggregate GROUP BY shapes are supported. They are **expanded host-side** at plan time into one grouping set per row of the result, and the whole query is rewritten as a `UNION ALL` of the per-set sub-plans (each grouping a different column subset, with the dropped columns projected as `NULL`):
+The following super-aggregate GROUP BY shapes are supported. They are **expanded host-side** at plan time into one grouping set per row of the result, and the whole query is rewritten as a `UNION ALL` of the per-set sub-plans (each grouping a different column subset, with the dropped columns projected as `NULL`):
 
 - `GROUP BY ROLLUP(c1, …, cn)` — the `n+1` prefixes `(c1..cn), (c1..c(n-1)), …, ()`.
 - `GROUP BY CUBE(c1, …, cn)` — all `2^n` subsets.
@@ -314,7 +339,7 @@ Rejected residuals: a grouping construct with **more than 12 distinct grouping c
 - Direction defaults to `ASC`.
 - NULL placement defaults to `NULLS FIRST` for `ASC` and `NULLS LAST` for `DESC` (SQL convention).
 
-`ORDER BY ... WITH FILL` is rejected. As of 0.7 a **GPU** radix sort backs single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`); other key shapes and dtypes fall back to the **host-side** sort executor (`src/exec/sort.rs`).
+`ORDER BY ... WITH FILL` is rejected. A **GPU** radix sort backs single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`); other key shapes and dtypes fall back to the **host-side** sort executor (`src/exec/sort.rs`).
 
 ## LIMIT and OFFSET
 
@@ -338,7 +363,7 @@ Rejected for a **non-recursive** CTE: a CTE column-list alias (`WITH c (a, b) AS
 
 ## Recursive CTEs (WITH RECURSIVE)
 
-`WITH RECURSIVE` is supported as of the 0.7 wave (F1), orchestrated host-side by the engine (`execute_recursive_cte` / `execute_mutual_recursive_cte`). The recursive body must be `<anchor> UNION [ALL] <recursive term>`; the anchor is evaluated once to seed the working set, then the recursive term is re-evaluated to a fixpoint, accumulating rows each iteration. Supported shapes:
+`WITH RECURSIVE` is supported (F1), orchestrated host-side by the engine (`execute_recursive_cte` / `execute_mutual_recursive_cte`). The recursive body must be `<anchor> UNION [ALL] <recursive term>`; the anchor is evaluated once to seed the working set, then the recursive term is re-evaluated to a fixpoint, accumulating rows each iteration. Supported shapes:
 
 - **Linear** recursion — the recursive term references the CTE once.
 - **Non-linear** recursion — a self-join in the recursive term (naive bottom-up evaluation).
@@ -395,7 +420,7 @@ Nested subqueries resolve inner-first. A **single correlated subquery in a top-l
 
 ### Correlated WHERE subqueries
 
-As of the LATERAL feature wave, the frontend detects a **single** correlated subquery in a top-level `WHERE` `AND`-conjunct (`plan_correlated_where` in `src/plan/sql_frontend.rs`) and the engine executes it as a **host nested-loop apply** (`execute_correlated_where` in `src/exec/engine.rs`), reusing the LATERAL machinery: the outer relation (with the ordinary non-correlated conjuncts applied as a `Filter`) is materialised, then for each outer row the correlated subquery is re-evaluated and the row is kept iff —
+The frontend detects a **single** correlated subquery in a top-level `WHERE` `AND`-conjunct (`plan_correlated_where` in `src/plan/sql_frontend.rs`) and the engine executes it as a **host nested-loop apply** (`execute_correlated_where` in `src/exec/engine.rs`), reusing the LATERAL machinery: the outer relation (with the ordinary non-correlated conjuncts applied as a `Filter`) is materialised, then for each outer row the correlated subquery is re-evaluated and the row is kept iff —
 
 - `EXISTS (...)` — the subquery returns ≥ 1 row (a semi-join);
 - `NOT EXISTS (...)` — the subquery returns 0 rows (an anti-join);
@@ -418,12 +443,12 @@ Residual rejections: **more than one** correlated subquery in `WHERE`, a correla
 
 ### Derived tables (subquery in FROM)
 
-A subquery may appear as a FROM item — `FROM (SELECT ...) AS alias` — as of 0.7. The subquery is planned recursively as a self-contained subtree and exposed under the alias (the same pipeline a CTE reference uses; a CTE is just a named, pre-lowered derived table), so qualified `alias.col` references resolve. Restrictions:
+A subquery may appear as a FROM item — `FROM (SELECT ...) AS alias`. The subquery is planned recursively as a self-contained subtree and exposed under the alias (the same pipeline a CTE reference uses; a CTE is just a named, pre-lowered derived table), so qualified `alias.col` references resolve. Restrictions:
 
 - The **alias is required** (standard SQL — `(SELECT ...)` with no alias is rejected).
 - A **column-list alias** (`AS d(x, y)`) is rejected.
 
-**`LATERAL`** derived tables (`FROM left, LATERAL (SELECT ... WHERE x = left.col) AS d`) **are supported** as of the 0.7 feature waves. They are correlated — the lateral subquery may reference columns of earlier FROM items — and execute as a **host nested-loop apply** (dependent join): for each left row the correlated references are bound to that row's values, the subquery is evaluated, and the results are cross-joined with the left row. Both the comma / `CROSS JOIN LATERAL` / `INNER JOIN LATERAL ... ON true` form (INNER — a left row with no subquery rows is dropped) and `LEFT JOIN LATERAL ... ON true` (the left row is kept once with the subquery columns NULL-filled) are supported. The per-left-row apply is `O(left_rows × subquery)`, so it is bounded by a safety cap (`CRATON_MAX_APPLY_ROWS`, default 100k) that errors cleanly if exceeded. Rejected residuals: a leading or non-trailing LATERAL, more than one LATERAL, a `JOIN LATERAL` with a predicate other than `ON true`, `RIGHT`/`FULL JOIN LATERAL`, and a column-list alias.
+**`LATERAL`** derived tables (`FROM left, LATERAL (SELECT ... WHERE x = left.col) AS d`) **are supported**. They are correlated — the lateral subquery may reference columns of earlier FROM items — and execute as a **host nested-loop apply** (dependent join): for each left row the correlated references are bound to that row's values, the subquery is evaluated, and the results are cross-joined with the left row. Both the comma / `CROSS JOIN LATERAL` / `INNER JOIN LATERAL ... ON true` form (INNER — a left row with no subquery rows is dropped) and `LEFT JOIN LATERAL ... ON true` (the left row is kept once with the subquery columns NULL-filled) are supported. The per-left-row apply is `O(left_rows × subquery)`, so it is bounded by a safety cap (`CRATON_MAX_APPLY_ROWS`, default 100k) that errors cleanly if exceeded. Rejected residuals: a leading or non-trailing LATERAL, more than one LATERAL, a `JOIN LATERAL` with a predicate other than `ON true`, `RIGHT`/`FULL JOIN LATERAL`, and a column-list alias.
 
 ## INNER JOIN
 
@@ -700,9 +725,9 @@ Still rejected (or only partially lowered):
 
 These type-check but the physical layer rejects them at the GPU lowering boundary (a clear `"… not yet lowered to GPU"` error, not a silent fallback):
 
-- `CAST` to or from `Timestamp` / `String`. (`CAST` integer↔`Decimal128`, `Decimal128`↔`Decimal128` rescale, integer→`Date32`, and — as of 0.7 — **plain** Float↔`Decimal128` all **do** lower to GPU; only a `TRY_CAST`/`SAFE_CAST` of Float⇄`Decimal128` is rejected, at type-check, not at the GPU boundary — see the CASE / CAST section.)
+- `CAST` to or from `Timestamp` / `String`. (`CAST` integer↔`Decimal128`, `Decimal128`↔`Decimal128` rescale, integer→`Date32`, and **plain** Float↔`Decimal128` all **do** lower to GPU; only a `TRY_CAST`/`SAFE_CAST` of Float⇄`Decimal128` is rejected, at type-check, not at the GPU boundary — see the CASE / CAST section.)
 - GPU lowering of `NOT` in a predicate (runs host-side instead).
-- `SUBSTRING`, single-arg `TRIM`, and the `CONCAT` scalar function: these **execute end-to-end** but on a **host-side** projection rather than the GPU (so this is a host-execution tier, not a hard rejection). As of the 0.7 wave, `SUBSTRING(col FROM start [FOR len])` (literal start/length) and the single-argument `TRIM` / `LTRIM` / `RTRIM` (default-whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer; a custom trim-character set (`TRIM(chars FROM col)`) or computed `SUBSTRING` arguments fall back to the host `Project` evaluator. `CONCAT`'s dedicated GPU two-pass kernels exist and are PTX-shape-tested, but the executor uses the byte-identical host mirror for now (device launch wiring pending). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU as of 0.7 — see "String functions" below.)
+- `SUBSTRING`, single-arg `TRIM`, and the `CONCAT` scalar function: these **execute end-to-end** but on a **host-side** projection rather than the GPU (so this is a host-execution tier, not a hard rejection). `SUBSTRING(col FROM start [FOR len])` (literal start/length) and the single-argument `TRIM` / `LTRIM` / `RTRIM` (default-whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer; a custom trim-character set (`TRIM(chars FROM col)`) or computed `SUBSTRING` arguments fall back to the host `Project` evaluator. `CONCAT`'s dedicated GPU two-pass kernels exist and are PTX-shape-tested, but the executor uses the byte-identical host mirror for now (device launch wiring pending). The `||` concat operator likewise runs host-side. (`UPPER` / `LOWER` / `LENGTH` *do* lower to GPU — see "String functions" below.)
 - `Decimal128` division (`/`) is rejected by default; the historical
   non-standard GPU behavior requires `BOLT_LEGACY_ARITHMETIC=1`.
 
@@ -726,7 +751,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 
 ## String functions
 
-`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`, and `TRIM` are surfaced through the SQL frontend via `Expr::ScalarFn` and **execute end-to-end** as of 0.7 (see also the "Additional scalar string functions" table below for `CHAR_LENGTH` / `OCTET_LENGTH` / `POSITION` / `REPLACE` / `LEFT` / `RIGHT` / `LPAD` / `RPAD` / `REVERSE` / `INITCAP`).
+`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`, and `TRIM` are surfaced through the SQL frontend via `Expr::ScalarFn` and **execute end-to-end** (see also the "Additional scalar string functions" table below for `CHAR_LENGTH` / `OCTET_LENGTH` / `POSITION` / `REPLACE` / `LEFT` / `RIGHT` / `LPAD` / `RPAD` / `REVERSE` / `INITCAP`).
 
 A note on the GPU string device path. `LIKE`, ASCII `UPPER`/`LOWER`, and
 `LENGTH` have been exercised on CUDA hardware and their supported shapes run
@@ -739,7 +764,7 @@ these mixed plans as `Hybrid` rather than implying device-only execution.
   inputs by default and the Unicode-correct host producer for unsupported
   shapes.
 - **`LENGTH`** lowers to the **GPU** via `PhysicalPlan::StringLength` (dictionary-gather, `Int64` output).
-- **`SUBSTRING` / `TRIM`** execute **host-side** end-to-end. As of the 0.7 wave, `SUBSTRING(col FROM start [FOR len])` (with **integer-literal** start/length) and the **single-argument** `TRIM` / `LTRIM` / `RTRIM` (`TRIM BOTH` / `LEADING` / `TRAILING`, default whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer (one device-shaped pass mirrored on the host). A **custom trim-character set** (`TRIM(chars FROM col)`) or a computed (non-literal) `SUBSTRING` argument falls back to the host `Project` evaluator. Both are byte/character-correct and NULL-propagating.
+- **`SUBSTRING` / `TRIM`** execute **host-side** end-to-end. `SUBSTRING(col FROM start [FOR len])` (with **integer-literal** start/length) and the **single-argument** `TRIM` / `LTRIM` / `RTRIM` (`TRIM BOTH` / `LEADING` / `TRAILING`, default whitespace) over a **bare `Utf8` scan** lower to the host-realized two-pass `PhysicalPlan::StringProject` producer (one device-shaped pass mirrored on the host). A **custom trim-character set** (`TRIM(chars FROM col)`) or a computed (non-literal) `SUBSTRING` argument falls back to the host `Project` evaluator. Both are byte/character-correct and NULL-propagating.
 - **`CONCAT(a, b, ...)`** of `Utf8` columns executes end-to-end with **NULL-if-any-argument-NULL** semantics (standard SQL — a NULL in any source row makes the output row NULL). The dedicated N-input two-pass GPU producer kernels (`compile_concat_len_pass` / `compile_concat_write_pass`, supporting up to `CONCAT_MAX_INPUTS = 8` source columns) are implemented and PTX-shape-tested; the executor currently realises the result via the **byte-identical host mirror** (`string_project::host_concat_strings`), so results are correct and the device launch wiring is a follow-up. Arities beyond 8 source columns, computed/literal arguments, and non-Utf8 arguments take the host fallback (`string_ops_extended::concat`). The `||` concat operator likewise runs host-side.
 
 ### Additional scalar string functions
@@ -770,6 +795,6 @@ The underlying transformations live in `src/exec/string_ops` / `src/exec/string_
 
 ### Wider GPU sort coverage
 
-As of 0.7 a GPU radix sort backs `ORDER BY` for single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`). Other key dtypes — and the dedup step of `UNION` / `DISTINCT` — still round-trip through the host-side executors. Extending the radix path to more dtypes and backing DISTINCT/UNION dedup with it is the natural next step.
+A GPU radix sort backs `ORDER BY` for single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`). Other key dtypes — and the dedup step of `UNION` / `DISTINCT` — still round-trip through the host-side executors. Extending the radix path to more dtypes and backing DISTINCT/UNION dedup with it is the natural next step.
 
 If you need any of the above for your use case, please open an issue describing the query and the use case.

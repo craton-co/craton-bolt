@@ -292,7 +292,16 @@ impl Engine {
     ) -> BoltResult<QueryHandle> {
         use crate::plan::physical_plan::StringProjectOutput;
 
-        let src_batch = self.materialize_table(table)?;
+        // Passthrough sources may name rewriter-synthesised dictionary
+        // columns (`__idx_<col>` / `__rank_<col>`) that a downstream host
+        // Filter evaluates; materialise those alongside the user columns.
+        let src_batch = self.materialize_table_for_inputs(
+            table,
+            outputs.iter().filter_map(|o| match o {
+                StringProjectOutput::Passthrough { source } => Some(source.as_str()),
+                _ => None,
+            }),
+        )?;
         let src_schema = src_batch.schema();
         let n_rows = src_batch.num_rows();
 

@@ -100,7 +100,7 @@ impl Engine {
                 Some(TableSource::Materialized(b)) => b.clone(),
                 // The caller guarantees an overlay table; a still-`Streaming`
                 // entry should have been collapsed by
-                // `ensure_streaming_materialized` before `execute`.
+                // `ensure_streaming_materialized_for` before `execute`.
                 _ => {
                     return Err(BoltError::Other(format!(
                         "execute_streaming_leaf: table '{table}' is not a \

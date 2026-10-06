@@ -1290,14 +1290,37 @@ pub enum PhysicalPlan {
     /// (the Distinct executor materialises the deduped rows) and emits a
     /// single-row `Int64` batch holding `input`'s row count.
     ///
-    /// Scope: only the no-GROUP-BY, single-`COUNT` shape lowers here. Any
-    /// GROUP BY or additional aggregates over a non-scan-chain input are
-    /// rejected at lowering time (out of scope).
+    /// Scope: only the no-GROUP-BY, single-`COUNT` shape lowers here; every
+    /// other aggregate over a non-scan-chain input lowers to
+    /// [`PhysicalPlan::AggregateOverInput`].
     CountRows {
         /// Already-lowered child plan whose output rows are counted.
         input: Box<PhysicalPlan>,
         /// Output schema: a single `Int64` column (the count).
         output_schema: Schema,
+    },
+    /// An aggregate whose input the fused aggregate path cannot read
+    /// directly: a non-scan-chain input (a `Join`, `Union`, `Distinct`, ...),
+    /// or a scan chain whose predicate / feed needs host evaluation (a `Utf8`
+    /// string comparison that survived the dictionary rewrite, strict
+    /// three-valued logic over a NULL literal, or a `Utf8`/`Bool` group key
+    /// under a predicate).
+    ///
+    /// The executor runs `input`, binds its rows as the ephemeral table
+    /// `table` (with the column names of `input_schema`), and runs
+    /// `aggregate` — an ordinary [`PhysicalPlan::Aggregate`] lowered against
+    /// a plain scan of `table` — through the normal GPU/host aggregate
+    /// dispatch. The ephemeral binding is removed before returning.
+    AggregateOverInput {
+        /// Already-lowered child plan producing the rows to aggregate.
+        input: Box<PhysicalPlan>,
+        /// Reserved ephemeral table name the child's rows are bound under.
+        table: String,
+        /// Logical schema of the bound rows (the aggregate's input schema);
+        /// the child batch's columns are conformed to these names.
+        input_schema: Schema,
+        /// The aggregate, lowered against a scan of `table`.
+        aggregate: Box<PhysicalPlan>,
     },
 }
 
@@ -1343,6 +1366,12 @@ impl PhysicalPlan {
             PhysicalPlan::SetOp { left, right, .. } => left
                 .planned_execution_tier()
                 .combine(right.planned_execution_tier())
+                .with_host_stage(),
+            PhysicalPlan::AggregateOverInput {
+                input, aggregate, ..
+            } => input
+                .planned_execution_tier()
+                .combine(aggregate.planned_execution_tier())
                 .with_host_stage(),
         }
     }
@@ -1420,6 +1449,7 @@ impl PhysicalPlan {
             }
             PhysicalPlan::Project { output_schema, .. } => output_schema,
             PhysicalPlan::CountRows { output_schema, .. } => output_schema,
+            PhysicalPlan::AggregateOverInput { aggregate, .. } => aggregate.output_schema(),
             PhysicalPlan::Window { output_schema, .. } => output_schema,
             PhysicalPlan::StringLength { output_schema, .. } => output_schema,
             PhysicalPlan::StringProject { output_schema, .. } => output_schema,
@@ -3633,6 +3663,18 @@ fn build_projection_kernel(
         }
     }
 
+    // The same constraint WITH a predicate (`SELECT s, v FROM t WHERE v > 0`):
+    // the fused kernel cannot carry the Utf8 column, so evaluate on the host — a passthrough `StringProject` of every column
+    // the predicate and the SELECT list read, a host `Filter`, then a host
+    // `Project` producing the SELECT list. Rewriter-synthesised
+    // `__idx_<col>` / `__rank_<col>` columns a dictionary-folded predicate
+    // reads are materialised by the `StringProject` executor.
+    if let Some(pred) = predicate {
+        if projection_needs_host_columns(scan_schema, projected) {
+            return lower_host_filtered_projection(table, scan_schema, pred, projected);
+        }
+    }
+
     let mut cg = Codegen::new(scan_schema);
 
     let predicate_reg = if let Some(pred) = predicate {
@@ -3665,6 +3707,78 @@ fn build_projection_kernel(
         table: table.to_string(),
         kernel,
         output_schema: Schema::new(output_fields),
+    })
+}
+
+/// `true` when a projection reads a `Utf8` column, which the fused GPU
+/// kernel has no register class for.
+fn projection_needs_host_columns(scan_schema: &Schema, projected: &[(String, Expr)]) -> bool {
+    projected.iter().any(|(_, e)| {
+        let mut cols = Vec::new();
+        crate::plan::optimizer::expr_util::collect_columns(e, &mut cols);
+        cols.iter().any(|c| {
+            scan_schema
+                .field(c)
+                .is_ok_and(|f| f.dtype == DataType::Utf8)
+        })
+    })
+}
+
+/// Host lowering of a predicated projection over a `Utf8` column:
+/// `Project(SELECT list) <- Filter(predicate) <- StringProject(passthrough of
+/// every referenced column)`.
+fn lower_host_filtered_projection(
+    table: &str,
+    scan_schema: &Schema,
+    predicate: &Expr,
+    projected: &[(String, Expr)],
+) -> BoltResult<PhysicalPlan> {
+    let mut referenced = Vec::new();
+    crate::plan::optimizer::expr_util::collect_columns(predicate, &mut referenced);
+    for (_, e) in projected {
+        crate::plan::optimizer::expr_util::collect_columns(e, &mut referenced);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut outputs = Vec::new();
+    let mut fields = Vec::new();
+    for name in referenced {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let field = scan_schema.field(&name)?;
+        fields.push(Field::new(name.clone(), field.dtype, field.nullable));
+        outputs.push(StringProjectOutput::Passthrough { source: name });
+    }
+    let base = PhysicalPlan::StringProject {
+        table: table.to_string(),
+        outputs,
+        output_schema: Schema::new(fields),
+    };
+    let filtered = PhysicalPlan::Filter {
+        input: Box::new(base),
+        predicate: predicate.clone(),
+    };
+    let mut exprs = Vec::with_capacity(projected.len());
+    let mut out_fields = Vec::with_capacity(projected.len());
+    for (name, e) in projected {
+        let body = peel_aliases(e).clone();
+        let (dtype, nullable) = match &body {
+            Expr::Column(c) => {
+                let f = scan_schema.field(c)?;
+                (f.dtype, f.nullable)
+            }
+            other => (other.dtype(scan_schema)?, true),
+        };
+        out_fields.push(Field::new(name.clone(), dtype, nullable));
+        exprs.push(match &body {
+            Expr::Column(c) if c == name => body,
+            _ => Expr::Alias(Box::new(body), name.clone()),
+        });
+    }
+    Ok(PhysicalPlan::Project {
+        input: Box::new(filtered),
+        exprs,
+        output_schema: Schema::new(out_fields),
     })
 }
 
@@ -3742,6 +3856,152 @@ fn lower_projection(
     build_projection_kernel(table, scan_schema, predicate.as_ref(), projected)
 }
 
+/// Reserved name prefix for [`PhysicalPlan::AggregateOverInput`] ephemeral
+/// tables; the lowering depth is appended so nested materialised aggregates
+/// never share a binding.
+pub(crate) const AGGREGATE_INPUT_TABLE_PREFIX: &str = "__bolt_agg_input_";
+
+/// `true` when a scan-chain aggregate input carries work the fused
+/// aggregate pre-kernel cannot do, so the input must be lowered (and
+/// materialised) on its own — see [`PhysicalPlan::AggregateOverInput`].
+///
+/// A bare `Scan` never qualifies: lowering it on its own would produce the
+/// same aggregate again.
+fn aggregate_needs_materialized_input(
+    input: &LogicalPlan,
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+) -> BoltResult<bool> {
+    if matches!(input, LogicalPlan::Scan { .. }) {
+        return Ok(false);
+    }
+    let resolved = resolve_source(input)?;
+    let host_only_predicate = resolved.predicate.as_ref().is_some_and(|p| {
+        expr_contains_utf8_literal(p) || expr_contains_null_literal_under_logic(p)
+    });
+    if host_only_predicate {
+        return Ok(true);
+    }
+    // A `Utf8` / `Bool` group key or aggregate argument cannot be a
+    // pre-kernel output; with a predicate (or projection) in the chain a
+    // pre-kernel is required, so bind the filtered rows instead and let the
+    // aggregate read the columns directly.
+    let input_schema = input.schema()?;
+    let feeds_non_numeric = group_by
+        .iter()
+        .chain(aggregates.iter().map(aggregate_input_expr))
+        .any(|e| {
+            matches!(
+                e.dtype(&input_schema),
+                Ok(DataType::Utf8) | Ok(DataType::Bool)
+            )
+        });
+    Ok(feeds_non_numeric && resolved.predicate.is_some())
+}
+
+/// The input expression an aggregate folds (`COUNT(*)` is `COUNT(1)`).
+fn aggregate_input_expr(agg: &AggregateExpr) -> &Expr {
+    match agg {
+        AggregateExpr::Count(e)
+        | AggregateExpr::Sum(e)
+        | AggregateExpr::Min(e)
+        | AggregateExpr::Max(e)
+        | AggregateExpr::Avg(e) => e,
+        AggregateExpr::VarPop(e)
+        | AggregateExpr::VarSamp(e)
+        | AggregateExpr::StddevPop(e)
+        | AggregateExpr::StddevSamp(e) => e,
+    }
+}
+
+/// Lower `Aggregate(input)` as [`PhysicalPlan::AggregateOverInput`]: lower
+/// `input` on its own, then lower the same aggregate against a plain scan of
+/// an ephemeral table holding `input`'s rows.
+fn lower_aggregate_over_input(
+    input: &LogicalPlan,
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    depth: usize,
+) -> BoltResult<PhysicalPlan> {
+    let input_schema = input.schema()?;
+    // The child is lowered as an explicit `SELECT <every input column>` over
+    // `input`, so it yields exactly the aggregate's input columns, by name,
+    // in order — the same projection path an ordinary SELECT takes. Lowering
+    // `input` bare is not equivalent: a physical scan/join may carry columns
+    // the (projection-pruned) logical schema does not, and a bare Filter/Scan
+    // lowering rejects Utf8 outputs.
+    let select_all = LogicalPlan::Project {
+        input: Box::new(input.clone()),
+        exprs: input_schema
+            .fields
+            .iter()
+            .map(|f| Expr::Column(f.name.clone()))
+            .collect(),
+    };
+    let child = lower_depth(&select_all, depth + 1)?;
+    let table = format!("{AGGREGATE_INPUT_TABLE_PREFIX}{depth}");
+    let scan = LogicalPlan::Scan {
+        table: table.clone(),
+        projection: None,
+        schema: input_schema.clone(),
+    };
+    let original_schema = LogicalPlan::Aggregate {
+        input: Box::new(scan.clone()),
+        group_by: group_by.to_vec(),
+        aggregates: aggregates.to_vec(),
+    }
+    .schema()?;
+    // `COUNT(*)` (the frontend's `COUNT(<non-NULL literal>)`) counts the same
+    // rows as `COUNT(c)` over any non-nullable column `c`. Counting through a
+    // column keeps the aggregate free of computed feeds, so it needs no
+    // pre-kernel — which matters here because the bound table has no
+    // dictionaries, and a `Utf8` group key cannot be a pre-kernel output.
+    let row_count_column = input_schema
+        .fields
+        .iter()
+        .find(|f| !f.nullable && f.dtype != DataType::Utf8)
+        .or_else(|| input_schema.fields.iter().find(|f| !f.nullable))
+        .map(|f| f.name.clone());
+    let aggregates: Vec<AggregateExpr> = aggregates
+        .iter()
+        .map(|a| match (a, &row_count_column) {
+            (AggregateExpr::Count(Expr::Literal(l)), Some(c)) if !matches!(l, Literal::Null) => {
+                AggregateExpr::Count(Expr::Column(c.clone()))
+            }
+            _ => a.clone(),
+        })
+        .collect();
+    let over_scan = LogicalPlan::Aggregate {
+        input: Box::new(scan.clone()),
+        group_by: group_by.to_vec(),
+        aggregates: aggregates.clone(),
+    };
+    let mut aggregate = lower_aggregate(&over_scan, &scan, group_by, &aggregates, depth + 1)?;
+    // Keep the output column names the enclosing plan references (the
+    // `COUNT(*)` → `COUNT(c)` substitution would otherwise rename them).
+    if let PhysicalPlan::Aggregate {
+        aggregate: spec, ..
+    } = &mut aggregate
+    {
+        if spec.output_schema.fields.len() == original_schema.fields.len() {
+            for (f, want) in spec
+                .output_schema
+                .fields
+                .iter_mut()
+                .zip(&original_schema.fields)
+            {
+                f.name = want.name.clone();
+            }
+        }
+    }
+    Ok(PhysicalPlan::AggregateOverInput {
+        input: Box::new(child),
+        table,
+        input_schema,
+        aggregate: Box::new(aggregate),
+    })
+}
+
 /// Build an aggregate plan over `input` with the given group keys and aggregates.
 fn lower_aggregate(
     plan: &LogicalPlan,
@@ -3774,13 +4034,10 @@ fn lower_aggregate(
                 output_schema,
             });
         }
-        return Err(BoltError::Plan(format!(
-            "unsupported aggregate over non-scan-chain input: only \
-             scalar COUNT(...) (e.g. COUNT(DISTINCT col)) is supported here, \
-             got group_by={} aggregates={}",
-            group_by.len(),
-            aggregates.len(),
-        )));
+        return lower_aggregate_over_input(input, group_by, aggregates, depth);
+    }
+    if aggregate_needs_materialized_input(input, group_by, aggregates)? {
+        return lower_aggregate_over_input(input, group_by, aggregates, depth);
     }
     let resolved = resolve_source(input)?;
     let table = resolved.table;
@@ -5372,6 +5629,11 @@ pub fn populate_input_validity(
         | PhysicalPlan::Filter { input, .. } => {
             populate_input_validity(input.as_mut(), provider);
         }
+        // The inner aggregate reads an ephemeral table that only exists once
+        // `input` has run; the executor populates its validity then.
+        PhysicalPlan::AggregateOverInput { input, .. } => {
+            populate_input_validity(input.as_mut(), provider);
+        }
         PhysicalPlan::Union { inputs } => {
             for branch in inputs {
                 populate_input_validity(branch, provider);
@@ -5755,6 +6017,9 @@ fn warn_if_eager_shortcircuit_unsafe(plan: &PhysicalPlan) {
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::CountRows { input, .. }
             | PhysicalPlan::Window { input, .. } => walk(input),
+            PhysicalPlan::AggregateOverInput {
+                input, aggregate, ..
+            } => walk(input) || walk(aggregate),
             PhysicalPlan::Union { inputs } => inputs.iter().any(walk),
             PhysicalPlan::SetOp { left, right, .. } => walk(left) || walk(right),
             PhysicalPlan::Join {
@@ -8201,12 +8466,11 @@ mod tests {
         }
     }
 
-    /// A non-COUNT aggregate (or any GROUP BY) over a non-scan-chain input is
-    /// out of scope and must be rejected cleanly (a `BoltError::Plan`), not
-    /// reach `resolve_source` and emit its generic "expected Scan/Filter/
-    /// Project chain" message.
+    /// A non-COUNT aggregate (or any GROUP BY) over a non-scan-chain input
+    /// lowers to `AggregateOverInput`: the child is lowered on its own and the
+    /// aggregate is lowered against a plain scan of the reserved binding.
     #[test]
-    fn non_count_aggregate_over_distinct_is_rejected() {
+    fn non_count_aggregate_over_distinct_lowers_over_materialized_input() {
         let scan = LogicalPlan::Scan {
             table: "t".into(),
             projection: None,
@@ -8220,11 +8484,92 @@ mod tests {
             group_by: Vec::new(),
             aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
         };
-        let err = lower(&agg).expect_err("SUM over Distinct must be rejected");
+        match lower(&agg).expect("SUM over Distinct lowers") {
+            PhysicalPlan::AggregateOverInput {
+                input,
+                table,
+                input_schema,
+                aggregate,
+            } => {
+                assert!(matches!(*input, PhysicalPlan::Distinct { .. }));
+                assert!(table.starts_with(AGGREGATE_INPUT_TABLE_PREFIX));
+                assert_eq!(input_schema.fields.len(), 1);
+                match *aggregate {
+                    PhysicalPlan::Aggregate { table: t, .. } => assert_eq!(t, table),
+                    other => panic!("expected inner Aggregate, got {other:?}"),
+                }
+            }
+            other => panic!("expected AggregateOverInput, got {other:?}"),
+        }
+    }
+
+    fn two_table_provider() -> crate::plan::MemTableProvider {
+        crate::plan::MemTableProvider::new()
+            .with_table(
+                "a",
+                Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("s", DataType::Utf8, false),
+                    Field::new("v", DataType::Int64, false),
+                ]),
+            )
+            .with_table(
+                "b",
+                Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("w", DataType::Int64, false),
+                ]),
+            )
+    }
+
+    fn lower_sql(sql: &str) -> PhysicalPlan {
+        let plan = crate::plan::parse_sql(sql, &two_table_provider()).expect("parse");
+        lower(&plan).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    fn contains_aggregate_over_input(p: &PhysicalPlan) -> bool {
+        match p {
+            PhysicalPlan::AggregateOverInput { .. } => true,
+            PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Limit { input, .. } => contains_aggregate_over_input(input),
+            _ => false,
+        }
+    }
+
+    /// GROUP BY over a JOIN used to be rejected at lowering time.
+    #[test]
+    fn group_by_over_join_lowers() {
+        let p = lower_sql("SELECT a.k, SUM(b.w) FROM a JOIN b ON a.k = b.k GROUP BY a.k");
+        assert!(contains_aggregate_over_input(&p), "{p:?}");
+    }
+
+    /// A Utf8 string comparison the dictionary rewrite left in place cannot
+    /// run in the fused aggregate pre-kernel: the filtered rows are bound and
+    /// aggregated instead.
+    #[test]
+    fn aggregate_with_utf8_predicate_materializes_input() {
+        let p = lower_sql("SELECT COUNT(*) FROM a WHERE s = 'x'");
+        assert!(contains_aggregate_over_input(&p), "{p:?}");
+        let p = lower_sql("SELECT s, COUNT(*) FROM a WHERE v > 3 GROUP BY s");
         assert!(
-            matches!(err, BoltError::Plan(_)),
-            "expected BoltError::Plan, got {err:?}"
+            contains_aggregate_over_input(&p),
+            "Utf8 key + predicate: {p:?}"
         );
+    }
+
+    /// Fusable shapes keep the single fused aggregate.
+    #[test]
+    fn fusable_aggregates_do_not_materialize_input() {
+        for sql in [
+            "SELECT SUM(v) FROM a WHERE v > 3",
+            "SELECT k, SUM(v) FROM a GROUP BY k",
+            "SELECT s, COUNT(*) FROM a GROUP BY s",
+        ] {
+            let p = lower_sql(sql);
+            assert!(!contains_aggregate_over_input(&p), "{sql}: {p:?}");
+        }
     }
 
     /// Regression guards for the `InSubquery`-probe folding fix.

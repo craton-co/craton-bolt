@@ -8,7 +8,27 @@ version jumps in Craton Bolt's history so far:
 - **0.5.0 -> 0.6.0** — M1 foundation finishing plus the M3-M8 milestone
   work.
 - **0.6.0 -> 0.7.0** — the v0.6 carry-overs become live GPU code paths.
-  `0.9.0` is the current series.
+- **0.7.0 -> 0.8.0** — hardening (Flight SQL defaults, Substrait strictness,
+  context-epoched caches); no Rust API moved — see `CHANGELOG.md`.
+- **0.8.0 -> 0.9.0** — SQL semantics become the default; one live `Engine`
+  per process is enforced.
+- **0.9.0 -> next** — the unified query pipeline (behavioural deltas only).
+
+## Public API diffs from the snapshot
+
+Since 0.9.0 the complete rustdoc-derived public API is committed in
+[`PUBLIC_API_SNAPSHOT.txt`](PUBLIC_API_SNAPSHOT.txt) and CI fails on any
+undocumented drift, so the exact API delta between two revisions is a diff of
+that file:
+
+```bash
+git diff v0.9.0..main -- docs/PUBLIC_API_SNAPSHOT.txt    # since the 0.9.0 release
+git diff <old-tag>..<new-tag> -- docs/PUBLIC_API_SNAPSHOT.txt
+```
+
+On GitHub: <https://github.com/craton-co/craton-bolt/compare/v0.9.0...main>
+(open the `docs/PUBLIC_API_SNAPSHOT.txt` file in the diff). Releases before
+0.9.0 predate the snapshot; use the per-release sections below.
 
 Each section follows the same shape:
 
@@ -613,6 +633,39 @@ SELECT * FROM events WHERE latency_ms LIKE '1%';   -- type error
 ```
 
 ---
+
+## 0.8.0 -> 0.9.0 migration
+
+**What changed.** SQL semantics became the default and the runtime contract
+was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
+
+| Change | Classification | Action |
+|---|---|---|
+| Integer `/` and `%` by zero, and `MIN / -1`, return `NULL`; `Decimal128` division by zero is rejected | Breaking (result) | Expect `NULL`; `BOLT_LEGACY_ARITHMETIC=1` restores the old convention temporarily |
+| Grouped `AVG` over an empty / all-NULL group returns `NULL` (nullable `Float64`) | Breaking (result) | Handle `NULL` instead of `0.0` |
+| Literal-list `IN` / `NOT IN` follows three-valued logic | Breaking (result) | A `NULL` list member makes a non-match UNKNOWN |
+| A second concurrent `Engine` is an error | Breaking | Keep one live `Engine` per process; drop it before building another |
+| `rust-cuda` feature removed; DuckDB / Polars moved behind `reference-tests` / `reference-benches` | Breaking (build) | Remove the feature; enable the reference features only for parity targets |
+| MSRV 1.85 | Breaking (build) | Upgrade the toolchain |
+| `ExecutionTier` / `planned_execution_tier()` | Additive | Inspect placement instead of inferring it |
+
+## 0.9.0 -> next (unreleased) migration
+
+**What changed.** Every query path now runs one compile pipeline
+(`exec::engine_query`). No signature of `Engine::sql` / `explain_sql` /
+`run_logical_plan` / `with_rewrite` changed; the deltas are behavioural.
+
+| Change | Classification | Action |
+|---|---|---|
+| `run_logical_plan` / `DataFrame::collect` apply registered `PlanRewrite`s | Behavioural | Hooks that assumed SQL-only invocation now also see DataFrame plans |
+| Host-orchestrated SQL shapes (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`, `DISTINCT ON`, `COUNT(DISTINCT)` + `GROUP BY`) hand hooks their component subplans | Behavioural | A hook may run several times per statement (e.g. per recursive iteration); keep hooks idempotent and side-effect free |
+| `explain_sql` renders the optimized plan; plans with uncorrelated subqueries get a `Physical plan (pre-subquery-resolution ...)` header | Behavioural (output) | Update any test that snapshots `explain_sql` text |
+| `QueriesFailed` counts parse / plan / lowering failures | Behavioural (metrics) | Dashboards see planning failures that were previously uncounted |
+| Lazy streams: only referenced tables are drained; drained batches are validated against the declared schema | Behavioural | A producer whose batches drift from the declared schema now fails every query on that table |
+| `register_table_stream` installs atomically after a single coalesce and requires every batch's Arrow schema to equal batch 0's | Behavioural | Same rule `register_batch` already applied |
+| Multi-batch tables are coalesced at ingest | Performance | No action; repeated queries no longer concatenate |
+| `GROUP BY` / aggregates over joins, unions, distinct, and host-only filters execute (previously rejected) | Additive | — |
+| `exec::agg_with_pre::try_execute_resident` takes a synthetic-column resolver | Breaking (expert API, outside the 1.0 freeze scope) | Pass `&|_| None` to keep the previous behaviour |
 
 ## Quick upgrade checklist
 

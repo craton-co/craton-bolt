@@ -27,8 +27,81 @@ All notable changes to this project will be documented here. The format follows 
 - **`QueriesFailed` counts every failure** of a top-level `sql()` /
   `run_logical_plan` call — parse, rewrite, optimize, subquery resolution,
   lowering — not only execution failures.
+- **`SELECT <utf8 col>, ... WHERE <non-string predicate>` executes.** A
+  projection of a `Utf8` column under a numeric or dictionary-folded
+  predicate fell into the fused GPU kernel, which has no `Utf8` register class
+  (`Utf8 not supported in PTX codegen yet`) — including the published
+  `examples/quickstart.rs` query. It now lowers to a host passthrough → filter
+  → project, with rewriter-synthesised `__idx_` / `__rank_` columns
+  materialised for the filter.
+- **Aggregates filtered by a string predicate execute.** `COUNT(*) / SUM(..)
+  ... WHERE s = 'lit'` failed (`pre kernel input column '__idx_s' not present`):
+  the host pre-stage fallback now materialises the dictionary-index columns,
+  and the resident on-device path reads them straight from the registry (and
+  accepts `COUNT(*)`), so the common case stays on the GPU.
+- **An absent string literal folds to a constant.** Engine dictionaries are
+  built from the full table, so they are now marked complete: `s = 'absent'`
+  folds to `FALSE` (and `<>` to `TRUE`) instead of surviving as a raw string
+  comparison the fused kernels cannot evaluate.
+- **Duplicate Arrow dictionary values no longer drop rows.** A
+  `Dictionary<Int32, Utf8>` column whose values array repeats a string gave
+  the string two device indices, so `s = 'x'` matched only one of them; each
+  distinct string now owns exactly one index.
+- **Aggregates over string predicates on lazy (dictionary-less) tables**, and
+  `GROUP BY <utf8 key>` under a predicate, execute (see `AggregateOverInput`).
+
+### Added
+- **`GROUP BY` / aggregates over a non-fusable input.** Aggregates over a
+  join, union, distinct, or a filter the fused GPU kernel cannot evaluate
+  used to be rejected at lowering (`unsupported aggregate over non-scan-chain
+  input`). The new `PhysicalPlan::AggregateOverInput` runs the input, binds its
+  rows as an ephemeral table and aggregates that through the ordinary
+  (GPU where possible) aggregate path.
+- **Cost-model benchmark suite** (`benches/cost_model.rs`): one independent
+  variable per group — plan-pipeline stages, dictionary rewrite, batch
+  fragmentation, ingest, filter selectivity, GROUP BY cardinality / skew,
+  NULL density, JIT cold/warm, residency, join shape, string width, morsel
+  size, recursion depth. Configure with `BOLT_COST_ROWS`.
+- **Reproducibility manifests.** Every bench writes
+  `target/bench-manifests/<bench>-<unix>.json` (commit, dirty flag, crate
+  version, rustc, profile, features, GPU model / CC / VRAM, driver, power
+  limit, CUDA toolkit, experimental axes).
+- **Scheduled GPU benchmark history** (`.github/workflows/bench-history.yml`,
+  self-hosted, informational) archiving estimates + manifests per commit.
+- **Example gates.** CI compiles every example and runs the quickstart
+  (host: graceful no-GPU exit; GPU lane: real execution of `quickstart` and
+  `groupby`).
+- **Generated documentation.** `docs/ARCHITECTURE.md` carries a module
+  inventory generated from each file's `//!` summary, `docs/DEVELOPMENT.md` a
+  CI workflow/job matrix generated from `.github/workflows/`; both are
+  verified by `tests/doc_consistency_test.rs` (`BOLT_REGENERATE_DOCS=1`
+  refreshes). A new guard rejects version applicability markers, retired MSRV
+  claims and stale `craton-bolt = "x.y"` snippets in living docs.
+- **Engine-level regression suites** `tests/query_pipeline_parity_test.rs`
+  (incl. a sequential-engine context-lifetime soak, `BOLT_SEQUENTIAL_ENGINE_ITERS`)
+  and `tests/string_eq_aggregate_test.rs`.
 
 ### Changed
+- **Multi-batch tables are coalesced at ingest.** `register_batch` stores the
+  coalesced batch it already built for the dictionary union,
+  `register_table_stream` validates and coalesces once before a single atomic
+  install (no per-batch dictionary rebuild, no partial install on a late
+  error), and a drained lazy stream is coalesced once. Queries over a
+  fragmented table no longer concatenate it per query — measured 7–10 ms per
+  query on a 2 M-row table in 2–1024 batches, now an Arc clone.
+- **Documentation is version-neutral.** README status/compatibility block,
+  `LIMITATIONS.md` (new query-pipeline and streaming sections),
+  `ARCHITECTURE.md` (pipeline, optimizer, streaming — it claimed there was no
+  optimizer), `SQL_REFERENCE.md` (per-feature tier / complexity / limits
+  matrix; corrected `COUNT(DISTINCT)`+`GROUP BY` and correlated-subquery
+  claims), `API_SURFACE.md` (snapshot is authoritative; corrected
+  `#[non_exhaustive]` claims), `BENCHMARKS.md` (provenance, manifest,
+  cost-model matrix, publication template), `MIGRATION_GUIDE.md` (0.8 → 0.9,
+  unreleased deltas, snapshot API-diff links), `CONTRIBUTING.md` (test
+  matrix, CI commands), and the extension points (`PlanRewrite`,
+  `TableProvider`, `RowEstimator`, `BatchProducer`, pool-stats observer)
+  document stability, execution semantics, threading, errors and
+  compatibility.
 - **One compile pipeline for every entry point.** `sql`, `explain_sql`,
   `run_logical_plan` and the component subplans of host-orchestrated SQL shapes
   (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`,

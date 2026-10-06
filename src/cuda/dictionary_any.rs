@@ -264,9 +264,18 @@ impl DictionaryColumnAny {
         // `slot_to_gpu[arrow_slot]` = compacted 1-based GPU index, or 0 if the
         // Arrow slot's value is null (treated as SQL NULL).
         let mut slot_to_gpu: Vec<i32> = Vec::with_capacity(dict_vals.len());
+        // Arrow permits duplicate dictionary values (e.g. after concatenating
+        // dictionary arrays without merging). Every distinct string must own
+        // exactly ONE GPU index: the string-literal rewrite folds `s = 'x'` to
+        // a single `__idx_s = k`, so a second index for the same string would
+        // silently drop its rows. Duplicate slots share the first slot's index.
+        let mut seen: std::collections::HashMap<&str, i32> =
+            std::collections::HashMap::with_capacity(dict_vals.len());
         for i in 0..dict_vals.len() {
             if dict_vals.is_null(i) {
                 slot_to_gpu.push(0);
+            } else if let Some(&gpu) = seen.get(dict_vals.value(i)) {
+                slot_to_gpu.push(gpu);
             } else {
                 // i32 ceiling guard — mirrors `DictionaryColumn::from_string_array`.
                 let next_len = dictionary.len() + 1;
@@ -278,6 +287,7 @@ impl DictionaryColumnAny {
                 }
                 dictionary.push(dict_vals.value(i).to_string());
                 slot_to_gpu.push(next_len as i32);
+                seen.insert(dict_vals.value(i), next_len as i32);
             }
         }
 

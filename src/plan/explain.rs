@@ -807,6 +807,16 @@ fn format_physical_into(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "CountRows");
             format_physical_into(input, depth + 1, out);
         }
+        PhysicalPlan::AggregateOverInput {
+            input,
+            table,
+            aggregate,
+            ..
+        } => {
+            let _ = writeln!(out, "AggregateOverInput: bind={table}");
+            format_physical_into(aggregate, depth + 1, out);
+            format_physical_into(input, depth + 1, out);
+        }
         PhysicalPlan::Limit {
             input,
             limit,

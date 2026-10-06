@@ -99,6 +99,10 @@ echo "========================================"
   _step 'cargo test (doctests)'
   cargo test --doc --features cuda-stub --no-default-features
 
+  _step 'examples (compile + host run)'
+  cargo build --examples --features cuda-stub --no-default-features
+  cargo run --example quickstart --features cuda-stub --no-default-features
+
   rm -f /ci_tmp/tests_failed_step
 " 2>&1 | sed 's/^/[TESTS] /'
     echo "${PIPESTATUS[0]}" > "$TMP_DIR/tests.exit"
@@ -215,6 +219,9 @@ if [[ "${BOLT_LOCAL_GPU:-0}" == "1" ]]; then
         --test flight_e2e -- --ignored --test-threads=1
     BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,substrait \
         --test substrait_e2e -- --ignored --test-threads=1
+    # The published examples must run on real hardware, not just compile.
+    cargo run --example quickstart --no-default-features --features cudarc
+    cargo run --example groupby --no-default-features --features cudarc
 else
     echo "GPU lane skipped. Set BOLT_LOCAL_GPU=1 on a CUDA host for full CI parity."
 fi

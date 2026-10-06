@@ -99,7 +99,7 @@
 //!
 //! 1. **Scalar aggregate** — `SELECT COUNT(*), SUM(price), AVG(price) FROM t`
 //! 2. **GROUP BY**         — `SELECT region, SUM(price) FROM t GROUP BY region`
-//!                           (10 distinct groups)
+//!    (10 distinct groups)
 //! 3. **Filter**           — `SELECT price FROM t WHERE price > 50`
 //!
 //! Each query is timed at three pipeline stages: `parse`, `lower`, and
@@ -107,6 +107,9 @@
 //! the Criterion group is `regression/<stage>` and the per-query parameter
 //! is the query name) so future tooling — including the opt-in guard below —
 //! can diff a single key over time.
+
+#[path = "support/manifest.rs"]
+mod manifest;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -221,6 +224,9 @@ fn bench_lower(c: &mut Criterion) {
 /// Aggregate/GROUP BY plans are multi-stage and don't fit a single-kernel
 /// codegen call; for those, the regression signal lives in `bench_parse`
 /// and `bench_lower` above.
+// Shaped as a loop so further kernel-bearing queries slot in like the other
+// stages; today only the filter query lowers to a leaf Projection.
+#[allow(clippy::single_element_loop)]
 fn bench_ptx_gen(c: &mut Criterion) {
     let p = provider();
     let mut g = c.benchmark_group("regression/ptx_gen");
@@ -443,7 +449,6 @@ fn parse_flat_json(input: &str) -> Result<BTreeMap<String, f64>, String> {
             return Err("unexpected end of input (unterminated object)".into());
         }
         if bytes[i] == b'}' {
-            i += 1;
             break;
         }
 
@@ -674,8 +679,27 @@ fn regression_guard(_c: &mut Criterion) {
     }
 }
 
+/// Record the build / hardware context of this run (see
+/// `benches/support/manifest.rs` and `docs/BENCHMARKS.md`).
+fn write_manifest(_: &mut Criterion) {
+    manifest::write(
+        "regression",
+        &[
+            manifest::Axis {
+                name: "workload",
+                value: "parse / lower / ptx_gen regression tripwire".into(),
+            },
+            manifest::Axis {
+                name: "transfer_included",
+                value: "false (host-only)".into(),
+            },
+        ],
+    );
+}
+
 criterion_group!(
     benches,
+    write_manifest,
     bench_parse,
     bench_lower,
     bench_ptx_gen,

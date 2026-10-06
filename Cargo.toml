@@ -221,6 +221,14 @@ harness = false
 name = "scaling_benchmarks"
 harness = false
 
+# Cost-model response surfaces (see docs/BENCHMARKS.md, "Cost-model matrix"):
+# one independent variable per group. Host groups (plan pipeline, dictionary
+# rewrite, batch fragmentation) run on any host incl. `cuda-stub`; GPU groups
+# need `BOLT_BENCH_GPU=1`. Writes a reproducibility manifest per run.
+[[bench]]
+name = "cost_model"
+harness = false
+
 [[example]]
 name = "quickstart"
 path = "examples/quickstart.rs"

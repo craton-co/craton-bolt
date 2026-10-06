@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lightweight, dependency-free metrics registry (M5).
+//! Lightweight, dependency-free metrics registry.
 //!
 //! The [`observability`](crate::observability) module wraps each query phase
 //! in a `tracing` span so a subscriber can attribute *latency* to the right

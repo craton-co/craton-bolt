@@ -19,6 +19,9 @@
 //! `measurement_time` per benchmark, criterion collects enough samples for
 //! a tight (<5 % CI) reported median.
 
+#[path = "support/manifest.rs"]
+mod manifest;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -344,8 +347,35 @@ fn bench_engine_execute(c: &mut Criterion) {
     g.finish();
 }
 
+/// Record the build / hardware context of this run (see
+/// `benches/support/manifest.rs` and `docs/BENCHMARKS.md`).
+fn write_manifest(_: &mut Criterion) {
+    manifest::write(
+        "query_benchmarks",
+        &[
+            manifest::Axis {
+                name: "workload",
+                value: "proj / arith / filtered".into(),
+            },
+            manifest::Axis {
+                name: "rows",
+                value: "50_000_000".into(),
+            },
+            manifest::Axis {
+                name: "correctness_reference",
+                value: "CPU reference loop + Polars".into(),
+            },
+            manifest::Axis {
+                name: "transfer_included",
+                value: "true".into(),
+            },
+        ],
+    );
+}
+
 criterion_group!(
     benches,
+    write_manifest,
     bench_plan,
     bench_lower,
     bench_ptx_gen,

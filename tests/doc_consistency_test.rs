@@ -426,6 +426,8 @@ fn local_and_hosted_ci_commands_stay_in_sync() {
     for command in [
         "cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings",
         "cargo test --lib --tests --no-default-features --features cuda-stub,flight",
+        "cargo build --examples --features cuda-stub --no-default-features",
+        "cargo run --example quickstart --features cuda-stub --no-default-features",
         "cargo test --lib --tests --no-default-features --features cuda-stub,substrait",
         "--ignore-filename-regex 'src/cuda/'",
         "--fail-under-lines 50",
@@ -537,4 +539,289 @@ fn msrv_is_consistent_across_repo() {
             "{doc} still claims the retired 1.74 MSRV"
         );
     }
+}
+
+// ---- generated documentation blocks ------------------------------------------
+//
+// Some documentation facts are pure functions of the repository (the module
+// tree, the CI job list). Instead of hand-maintaining them — and letting them
+// drift — the docs carry a marker-delimited block that these tests regenerate
+// and compare. On a mismatch the test fails with the expected block; running
+// the doc-consistency tests with `BOLT_REGENERATE_DOCS=1` rewrites the block
+// in place instead.
+
+/// Replace (or verify) the block between `<!-- {marker}:begin` and
+/// `<!-- {marker}:end -->` in `doc` with `body`.
+fn check_generated_block(doc: &Path, marker: &str, body: &str) {
+    let text = read_to_string(doc);
+    let begin_tag = format!("<!-- {marker}:begin");
+    let end_tag = format!("<!-- {marker}:end -->");
+    let begin = text
+        .find(&begin_tag)
+        .unwrap_or_else(|| panic!("{} has no `{begin_tag} ... -->` marker", doc.display()));
+    let after_begin = begin
+        + text[begin..]
+            .find("-->")
+            .unwrap_or_else(|| panic!("unterminated `{begin_tag}` marker"))
+        + 3;
+    let end = text
+        .find(&end_tag)
+        .unwrap_or_else(|| panic!("{} has no `{end_tag}` marker", doc.display()));
+    assert!(
+        end > after_begin,
+        "{marker}: end marker precedes begin marker"
+    );
+    let current = text[after_begin..end].replace("\r\n", "\n");
+    let expected = format!("\n{}\n", body.trim_end());
+    if current == expected {
+        return;
+    }
+    if std::env::var("BOLT_REGENERATE_DOCS").as_deref() == Ok("1") {
+        let updated = format!("{}{}{}", &text[..after_begin], expected, &text[end..]);
+        fs::write(doc, updated).expect("rewrite generated doc block");
+        return;
+    }
+    panic!(
+        "{} block `{marker}` is stale. Re-run with BOLT_REGENERATE_DOCS=1 to refresh it, \
+         or apply:\n{expected}",
+        doc.display()
+    );
+}
+
+/// A Rust source file's module summary: the first sentence of the first
+/// paragraph of its `//!` docs.
+fn module_summary(path: &Path) -> Option<String> {
+    let text = read_to_string(path);
+    let mut paragraph: Vec<&str> = Vec::new();
+    for line in text
+        .lines()
+        .map(|l| l.trim_start_matches('\u{feff}').trim())
+    {
+        match line.strip_prefix("//!").map(str::trim) {
+            Some("") if paragraph.is_empty() => continue,
+            Some("") => break,
+            Some(t) => paragraph.push(t),
+            None if paragraph.is_empty() => continue,
+            None => break,
+        }
+    }
+    if paragraph.is_empty() {
+        return None;
+    }
+    let joined = paragraph.join(" ");
+    let sentence = match joined.find(". ") {
+        Some(i) => &joined[..=i],
+        None => joined.as_str(),
+    };
+    Some(sentence.to_string())
+}
+
+/// (11) `docs/ARCHITECTURE.md` carries a generated inventory of every module
+/// under `src/`, one row per file with its `//!` summary line. A new module
+/// without a summary, or a stale inventory, fails here.
+#[test]
+fn architecture_module_inventory_is_current() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("src"), &mut files);
+    let mut rows: Vec<(String, String)> = files
+        .iter()
+        .map(|p| {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let summary = module_summary(p).unwrap_or_else(|| {
+                panic!("{rel} has no `//!` module summary line; add one (it feeds docs/ARCHITECTURE.md)")
+            });
+            (rel, summary.replace('|', "\\|"))
+        })
+        .collect();
+    rows.sort();
+    let mut body = String::from("| Module | Summary |\n|---|---|\n");
+    for (rel, summary) in rows {
+        body.push_str(&format!("| `{rel}` | {summary} |\n"));
+    }
+    check_generated_block(
+        &root.join("docs").join("ARCHITECTURE.md"),
+        "module-inventory",
+        &body,
+    );
+}
+
+/// Parse `(trigger list, [(job id, name, runs-on)])` out of a GitHub
+/// workflow with the line-oriented shape this repository uses (two-space
+/// indentation; `name:` / `runs-on:` directly under each job).
+fn workflow_jobs(text: &str) -> (Vec<String>, Vec<(String, String, String)>) {
+    #[derive(PartialEq)]
+    enum Section {
+        Other,
+        On,
+        Jobs,
+    }
+    let mut section = Section::Other;
+    let mut triggers = Vec::new();
+    let mut jobs: Vec<(String, String, String)> = Vec::new();
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() && !line.starts_with('#') {
+            section = match line.trim_end() {
+                "on:" => Section::On,
+                "jobs:" => Section::Jobs,
+                _ => Section::Other,
+            };
+            continue;
+        }
+        let two = line.strip_prefix("  ").filter(|r| !r.starts_with(' '));
+        let four = line.strip_prefix("    ").filter(|r| !r.starts_with(' '));
+        match section {
+            Section::On => {
+                if let Some(key) = two.and_then(|r| r.split(':').next()) {
+                    if !key.starts_with('#') && !key.is_empty() {
+                        triggers.push(key.trim().to_string());
+                    }
+                }
+            }
+            Section::Jobs => {
+                if let Some(r) = two {
+                    if let Some(id) = r.trim_end().strip_suffix(':') {
+                        if !id.starts_with('#') {
+                            jobs.push((id.to_string(), String::new(), String::new()));
+                        }
+                    }
+                } else if let (Some(r), Some(job)) = (four, jobs.last_mut()) {
+                    if let Some(v) = r.strip_prefix("name:") {
+                        job.1 = v.trim().to_string();
+                    } else if let Some(v) = r.strip_prefix("runs-on:") {
+                        job.2 = v.trim().to_string();
+                    }
+                }
+            }
+            Section::Other => {}
+        }
+    }
+    (triggers, jobs)
+}
+
+/// (12) `docs/DEVELOPMENT.md` carries a generated CI matrix — every workflow,
+/// its triggers, and every job with its runner — so the documented CI never
+/// drifts from `.github/workflows/`.
+#[test]
+fn ci_matrix_doc_is_current() {
+    let root = repo_root();
+    let dir = root.join(".github").join("workflows");
+    let mut workflows: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("read workflows")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yml" | "yaml")))
+        .collect();
+    workflows.sort();
+    let mut body =
+        String::from("| Workflow | Triggers | Job | Name | Runs on |\n|---|---|---|---|---|\n");
+    for wf in workflows {
+        let file = wf.file_name().unwrap().to_string_lossy().to_string();
+        let (triggers, jobs) = workflow_jobs(&read_to_string(&wf));
+        assert!(!jobs.is_empty(), "{file}: no jobs parsed");
+        let triggers = triggers.join(", ");
+        for (id, name, runs_on) in jobs {
+            assert!(!runs_on.is_empty(), "{file}: job `{id}` has no runs-on");
+            body.push_str(&format!(
+                "| `{file}` | {triggers} | `{id}` | {} | `{}` |\n",
+                name.replace('|', "\\|"),
+                runs_on.replace('|', "\\|")
+            ));
+        }
+    }
+    check_generated_block(
+        &root.join("docs").join("DEVELOPMENT.md"),
+        "ci-matrix",
+        &body,
+    );
+}
+
+/// (13) Living documentation must not carry obsolete applicability markers.
+///
+/// The crate version and MSRV live in `Cargo.toml`; documents that restate
+/// them drift (a page that says "current as of v0.7" while describing 0.9
+/// behaviour cannot be trusted line by line). Historical documents —
+/// the changelog, migration guide, roadmap, release process, the path-to-1.0
+/// plan, and benchmark history (which must cite the build it measured) — are
+/// exempt.
+#[test]
+fn living_docs_have_no_version_applicability_markers() {
+    let root = repo_root();
+    let manifest = read_to_string(&root.join("Cargo.toml"));
+    let version = cargo_package_version(&manifest);
+    let exempt = [
+        "CHANGELOG.md",
+        "ROADMAP.md",
+        "RELEASING.md",
+        "docs/MIGRATION_GUIDE.md",
+        "docs/PATH_TO_1.0.md",
+        "docs/BENCHMARKS.md",
+        "docs/GROUPBY_PERF.md",
+    ];
+    let mut docs: Vec<PathBuf> = vec![root.join("README.md"), root.join("CONTRIBUTING.md")];
+    for entry in fs::read_dir(root.join("docs")).expect("read docs") {
+        let p = entry.expect("entry").path();
+        if p.extension().and_then(|e| e.to_str()) == Some("md") {
+            docs.push(p);
+        }
+    }
+    let mut problems = Vec::new();
+    for doc in docs {
+        let rel = doc
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if exempt.contains(&rel.as_str()) {
+            continue;
+        }
+        for (n, line) in read_to_string(&doc).lines().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            let mut flag =
+                |why: &str| problems.push(format!("{rel}:{}: {why}: {}", n + 1, line.trim()));
+            if lower.contains("rust 1.74") || lower.contains("msrv 1.74") {
+                flag("retired MSRV");
+            }
+            if lower.contains("as of v0.") || lower.contains("as of 0.") {
+                flag("version applicability marker");
+            }
+            if lower.contains("current as of") {
+                flag("version applicability marker");
+            }
+            if lower.contains(" wave") && lower.contains("0.") {
+                flag("milestone-wave marker");
+            }
+            // `craton-bolt = "x.y"` dependency snippets must name the current
+            // major.minor.
+            if let Some(rest) = line.trim_start().strip_prefix("craton-bolt = ") {
+                let mm: String = version.split('.').take(2).collect::<Vec<_>>().join(".");
+                if !rest.contains(&format!("\"{mm}")) {
+                    flag("stale dependency snippet");
+                }
+            }
+            // A `v`-prefixed crate version (`v0.6`, `v0.9.0`) restates the
+            // version a living doc should not pin.
+            let bytes = line.as_bytes();
+            for i in 0..bytes.len().saturating_sub(3) {
+                let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                if boundary
+                    && bytes[i] == b'v'
+                    && bytes[i + 1] == b'0'
+                    && bytes[i + 2] == b'.'
+                    && bytes[i + 3].is_ascii_digit()
+                {
+                    flag("pinned crate version");
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "living docs restate versions/milestones (keep them in Cargo.toml / CHANGELOG.md):\n{}",
+        problems.join("\n")
+    );
 }

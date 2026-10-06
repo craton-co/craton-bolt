@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Execution: the [`Engine`](engine::Engine) query front door, the per-shape
+//! GPU / host executors, and the device-table, dictionary and streaming
+//! machinery they share.
+
 pub mod engine;
 #[doc(hidden)]
 pub mod launch;
