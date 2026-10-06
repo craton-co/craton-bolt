@@ -148,7 +148,7 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         // (it copies two halves rather than one typed value), even though
         // the 6-arg ABI is identical.
         DataType::Decimal128(_, _) => "bolt_gather_decimal128",
-        // v0.7: temporal gather reuses the matching integer kernel. The
+        // temporal gather reuses the matching integer kernel. The
         // gather kernel is type-agnostic apart from the load/store width,
         // so we route Date32 to the i32 kernel and Timestamp to the i64
         // kernel — they emit the same PTX shape and same SM occupancy.
@@ -1400,7 +1400,7 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
         // (`reg_class == "rd"` reuses the already-declared `b64` bank, so no
         // extra `.reg` decl is emitted). See the `is_128` branch below.
         DataType::Decimal128(_, _) => ("u64", "rd", "b64"),
-        // v0.7: temporal gather lowers to integer gather on the underlying
+        // temporal gather lowers to integer gather on the underlying
         // days / ticks. Same register classes as Int32 / Int64.
         DataType::Date32 => ("s32", "r", "b32"),
         DataType::Timestamp(_, _) => ("s64", "rl", "b64"),

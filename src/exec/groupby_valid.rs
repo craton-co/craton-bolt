@@ -907,7 +907,7 @@ enum AccDownload {
         sum_spill: Vec<(i64, f64)>,
         count_spill: Vec<(i64, i64)>,
     },
-    /// v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
+    /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP per-group
     /// Welford state. The full (count, mean, M2) update doesn't fit a
     /// single atomic, so per-group accumulation runs host-side. Two
     /// shapes:
@@ -1085,7 +1085,7 @@ fn run_one_aggregate(
         | AggregateExpr::VarSamp(expr)
         | AggregateExpr::StddevPop(expr)
         | AggregateExpr::StddevSamp(expr) => {
-            // v0.7: per-group Welford. Mirrors the matching arm in
+            // per-group Welford. Mirrors the matching arm in
             // `crate::exec::groupby::run_one_aggregate` — the GPU
             // hash-aggregate kernel can only update one scalar slot at a
             // time, but numerically-stable Welford needs the coupled
@@ -2129,7 +2129,7 @@ fn build_agg_array_from_per_group(
                 ))),
             }
         }
-        // v0.7: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP from the
+        // VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP from the
         // per-group Welford state. By this point fold_acc_with_spill has
         // re-indexed the accumulator from "by encoded i64 key" to "by
         // group position", so we can walk `states` directly. Empty /
@@ -2257,8 +2257,8 @@ fn aggregate_to_op(agg: &AggregateExpr) -> ReduceOp {
         AggregateExpr::Max(_) => ReduceOp::Max,
         AggregateExpr::Count(_) => ReduceOp::Sum, // count = sum of ones
         AggregateExpr::Avg(_) => ReduceOp::Sum,   // AVG sum-side; count uses Sum too
-        // v0.5: GROUP BY VAR_POP/VAR_SAMP is rejected at engine dispatch
-        // and the run-time arms above also short-circuit; if a future
+        // GROUP BY VAR_POP/VAR_SAMP is finalised by the per-group Welford
+        // arms above and never reaches this helper; if a future
         // refactor reaches this helper, fall back to Sum so the spill
         // accounting stays defined while still surfacing the issue
         // upstream (the run match returns an error).
@@ -2696,7 +2696,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // checks that a NULL row in the same batch as a `-0.0` row produces the
 // correct (post-mask) key vector with the `-0.0` row preserved.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]
@@ -2914,7 +2914,7 @@ mod tests {
         );
     }
 
-    // ---- v0.7 async-memcpy migration smoke -------------------------------
+    // ---- async-memcpy migration smoke -------------------------------
     //
     // Exercise the migrated `alloc_agg_spill` + `prepare_filtered_keys`
     // entry points so the async H2D / pinned D2H wiring is reachable from
@@ -2935,7 +2935,7 @@ mod tests {
     }
 
     /// Engine-level GROUP BY through the valid-flag executor: confirms
-    /// the v0.7 async memcpy plumbing produces the same per-group sums
+    /// the async memcpy plumbing produces the same per-group sums
     /// as a host-side oracle. Routes through `execute_groupby_valid`
     /// because the key column has NULLs.
     #[test]

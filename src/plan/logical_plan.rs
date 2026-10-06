@@ -45,7 +45,7 @@ pub fn intern_timezone(name: &str) -> &'static str {
 
 /// Minimal set of column data types the GPU engine handles.
 ///
-/// **v0.6 / M4**: `Date32` and `Timestamp` were added. The variant signature
+/// **M4**: `Date32` and `Timestamp` were added. The variant signature
 /// for `Timestamp` is documented in the project spec as
 /// `Timestamp(TimeUnit, Option<String>)`. To keep `DataType: Copy` (a deep
 /// invariant the executor depends on across hundreds of by-value call sites)
@@ -68,7 +68,7 @@ pub enum DataType {
     /// UTF-8 string; variable width, only legal in filter/group-by columns.
     Utf8,
     /// Fixed-point decimal with `precision` total digits and `scale` digits
-    /// after the decimal point (v0.6 / M4 plan-level only — GPU codegen
+    /// after the decimal point (plan-level only — GPU codegen
     /// rejects this with "Decimal128 not yet lowered to GPU" until the
     /// follow-up lands). Round-trips losslessly to/from Arrow's
     /// `Decimal128(precision, scale)` array type.
@@ -122,7 +122,7 @@ impl DataType {
     /// helper used by callers that want to special-case decimal handling
     /// before GPU codegen rejects the type. Not part of `is_numeric()` yet:
     /// arithmetic / comparison between decimals and the existing primitive
-    /// numerics is intentionally NOT defined in v0.6, so leaving
+    /// numerics is intentionally NOT defined, so leaving
     /// `is_numeric()` unchanged means a decimal column will surface a clear
     /// type error if anyone tries to add it to (e.g.) an Int64.
     pub fn is_decimal(self) -> bool {
@@ -225,7 +225,7 @@ pub enum Literal {
     /// UTF-8 string constant.
     Utf8(String),
     /// Fixed-point decimal constant: raw i128 value scaled by `10^scale`,
-    /// with `precision` total digits. v0.6 / M4 plan-level only; the GPU
+    /// with `precision` total digits. Plan-level only; the GPU
     /// codegen rejects this with "Decimal128 not yet lowered to GPU" until
     /// the follow-up lands.
     Decimal128(i128, u8, i8),
@@ -460,7 +460,7 @@ pub enum UnaryOp {
 
 /// Scalar string functions surfaced through the SQL frontend.
 ///
-/// v0.5 MVP scope: parser + type-check only. The physical-plan boundary
+/// MVP scope: parser + type-check only. The physical-plan boundary
 /// rejects every variant cleanly with a `BoltError::Plan` so the planner
 /// can accept the syntax without misleading the user about kernel support.
 /// Execution wiring (host-side fallback or GPU codegen) is a follow-up.
@@ -553,7 +553,7 @@ impl ScalarFnKind {
 
 /// Calendar field selectable by SQL `EXTRACT(field FROM ts)`.
 ///
-/// **v0.7 / date-scalar-fns**: a focused subset that lowers to pure integer
+/// **date-scalar-fns**: a focused subset that lowers to pure integer
 /// arithmetic on the underlying fixed-width storage (`Date32` = days since the
 /// Unix epoch as `i32`; `Timestamp` = `i64` ticks since the epoch). The fields
 /// that need a full proleptic-Gregorian civil-date decomposition (`YEAR`,
@@ -605,7 +605,7 @@ impl DateField {
 
 /// Granularity selectable by SQL `DATE_TRUNC(unit, ts)`.
 ///
-/// **v0.7 / date-scalar-fns**: `DATE_TRUNC` rounds a temporal value *down* to
+/// **date-scalar-fns**: `DATE_TRUNC` rounds a temporal value *down* to
 /// the start of the given unit, preserving the input dtype (`Date32` →
 /// `Date32`, `Timestamp` → `Timestamp` at the same `TimeUnit`/timezone). The
 /// sub-day units (`Hour`, `Minute`, `Second`) are only defined on `Timestamp`.
@@ -765,7 +765,7 @@ pub enum Expr {
     /// plane — anything else surfaces a `BoltError::Type` from
     /// [`Expr::dtype`]. The physical planner currently rejects every `Cast`
     /// at the lowering boundary (see [`crate::plan::physical_plan::lower`]);
-    /// GPU codegen for the runtime conversion is a v0.6 follow-up.
+    /// GPU codegen for the runtime conversion is a follow-up.
     Cast {
         /// Inner expression whose value is converted.
         expr: Box<Expr>,
@@ -814,7 +814,7 @@ pub enum Expr {
         to_text: bool,
     },
     /// Scalar string function call (UPPER / LOWER / LENGTH / SUBSTRING /
-    /// CONCAT). v0.5 MVP scope: parser + type-check only — the physical
+    /// CONCAT). MVP scope: parser + type-check only — the physical
     /// planner rejects every variant at `lower()` with a clear "string
     /// scalar functions are not yet lowered to GPU" error. See
     /// [`ScalarFnKind`] for the per-kind type-check contract.
@@ -827,7 +827,7 @@ pub enum Expr {
     /// SQL `EXTRACT(field FROM ts)` — pull a calendar/clock field out of a
     /// `Date32` or `Timestamp` value as an `Int64`.
     ///
-    /// **v0.7 / date-scalar-fns**: lowered to integer arithmetic on the
+    /// **date-scalar-fns**: lowered to integer arithmetic on the
     /// underlying fixed-width storage. See [`DateField`] for the per-field
     /// dtype rules (intra-day fields require a `Timestamp` operand). The GPU
     /// codegen lives in [`crate::jit::date_scalar`].
@@ -840,7 +840,7 @@ pub enum Expr {
     /// SQL `DATE_TRUNC(unit, ts)` — round a temporal value down to the start
     /// of `unit`, preserving the operand's dtype.
     ///
-    /// **v0.7 / date-scalar-fns**: lowered to integer arithmetic on the
+    /// **date-scalar-fns**: lowered to integer arithmetic on the
     /// underlying fixed-width storage. See [`DateTruncUnit`] for the per-unit
     /// dtype rules (sub-day units require a `Timestamp` operand). The GPU
     /// codegen lives in [`crate::jit::date_scalar`].
@@ -1089,7 +1089,7 @@ impl Expr {
                 let r = peer_typed_dtype(right, left, schema, *op)?;
                 let _ = depth; // depth threading enforced at function entry
                 if op.is_arithmetic() {
-                    // v0.7: Date32/Timestamp subtraction lowers to integer sub
+                    // Date32/Timestamp subtraction lowers to integer sub
                     // on the underlying days/ticks. Only Sub is wired (Date - Date
                     // yields a day count; Timestamp - Timestamp yields a tick
                     // count in the source unit). Mixing two Timestamps with
@@ -1099,13 +1099,13 @@ impl Expr {
                     if let Some(dt) = date_or_timestamp_arith_result(*op, l, r) {
                         return dt;
                     }
-                    // v0.7 sub-task B: Decimal128 arithmetic at the logical
+                    // sub-task B: Decimal128 arithmetic at the logical
                     // plane returns the SQL-convention result dtype directly;
                     // the physical-plan codegen mirrors the rule via
                     // `decimal128_arith_result_dtype`. Mixed Decimal / non-
                     // Decimal arithmetic isn't wired yet (it would require an
                     // implicit promotion path); reject with a tight message
-                    // so the user sees the v0.7 envelope.
+                    // so the user sees the envelope.
                     if let Some(dt) = decimal128_arith_result(*op, l, r) {
                         return dt;
                     }
@@ -1763,8 +1763,8 @@ fn peer_typed_dtype(e: &Expr, peer: &Expr, schema: &Schema, _op: BinaryOp) -> Bo
 
 /// True if the engine's logical plane accepts `CAST(<src> AS <target>)`.
 ///
-/// The v0.5 surface is intentionally small — only the primitive conversions
-/// the GPU executor will plausibly lower in v0.6 are admitted. Anything
+/// The surface is intentionally small — only the primitive conversions
+/// the GPU executor will plausibly lower are admitted. Anything
 /// involving `Utf8` is rejected at this layer (string -> numeric parsing
 /// would need a runtime fallible path we don't have yet).
 ///
@@ -1852,7 +1852,7 @@ pub(crate) fn safe_cast_is_supported(src: DataType, target: DataType) -> bool {
     )
 }
 
-/// v0.7: result dtype for an arithmetic op on Date32 / Timestamp operands.
+/// Result dtype for an arithmetic op on Date32 / Timestamp operands.
 ///
 /// Returns `Some(Ok(dtype))` if the op is in scope:
 ///   * `Date32 - Date32`              → `Int32` (number of days)
@@ -1913,7 +1913,7 @@ pub(crate) fn date_or_timestamp_arith_result(
     }
 }
 
-/// v0.7 sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
+/// sub-task B: result dtype for `Decimal128(p1, s1) op Decimal128(p2, s2)`
 /// arithmetic at the logical plane. Mirrors the physical-plane helper
 /// `physical_plan::decimal128_arith_result_dtype` so a SELECT that
 /// references a Decimal arithmetic expression resolves to the same dtype
@@ -2066,15 +2066,15 @@ pub enum AggregateExpr {
     ///
     /// Computed via Welford's online algorithm at scalar-aggregate level
     /// (M2 / count, returning NULL for empty input). The scalar path lives
-    /// in `crate::exec::aggregate`; the GROUP BY path is intentionally
-    /// rejected with a clear error in v0.5.
+    /// in `crate::exec::aggregate`; GROUP BY uses a per-group Welford fold in
+    /// the GROUP BY executors.
     VarPop(Box<Expr>),
     /// `VAR_SAMP(expr)` — sample variance (`VARIANCE` / `VAR_SAMP` per SQL
     /// standard), output `Float64`. Returns NULL when count <= 1.
     VarSamp(Box<Expr>),
     /// `STDDEV_POP(expr)` — population standard deviation; output `Float64`.
     /// Computed via Welford's one-pass algorithm on the host (see
-    /// [`crate::exec::welford`]); GPU offload is a v0.6 stretch goal.
+    /// [`crate::exec::welford`]); GPU offload is a stretch goal.
     /// Returns `0.0` (not NULL) when no rows are aggregated, mirroring the
     /// existing AVG convention for an empty/all-NULL input.
     StddevPop(Box<Expr>),
@@ -2121,7 +2121,7 @@ impl AggregateExpr {
     /// This widening contract is mirrored by the GPU-side accumulator in
     /// `crate::jit::agg_kernels` and the host-side scalar-aggregate path in
     /// `crate::exec::aggregate`; keep all three in sync.
-    fn output_dtype(&self, input: &Schema) -> BoltResult<DataType> {
+    pub(crate) fn output_dtype(&self, input: &Schema) -> BoltResult<DataType> {
         match self {
             AggregateExpr::Count(_) => Ok(DataType::Int64),
             AggregateExpr::Sum(e) => {
@@ -2144,7 +2144,7 @@ impl AggregateExpr {
             }
             AggregateExpr::Min(e) | AggregateExpr::Max(e) => e.dtype(input),
             AggregateExpr::Avg(e) => {
-                // v0.7: AVG over Date / Timestamp is non-standard SQL — the
+                // AVG over Date / Timestamp is non-standard SQL — the
                 // "mean of two dates" is not well-defined in the SQL spec
                 // (you can't average two calendar instants). Reject at the
                 // logical layer with a clear message rather than silently
@@ -2194,7 +2194,7 @@ pub fn sum_output_dtype(input: DataType) -> DataType {
         // engine's `DataType`). Overflow risk on Int64 is acknowledged at the
         // API boundary.
         DataType::Int64 | DataType::Float32 | DataType::Float64 => input,
-        // v0.7: `SUM(Decimal128(p, s))` widens precision to the Arrow
+        // `SUM(Decimal128(p, s))` widens precision to the Arrow
         // Decimal128 maximum (38 digits) and keeps the same scale. The
         // host-side accumulator in `crate::exec::aggregate` (see
         // `sum_decimal128_from_batch`) folds rows into an `i128` with a
@@ -2535,7 +2535,7 @@ pub enum LogicalPlan {
     /// equi-join predicate (`on` non-empty) OR a non-equi `filter`;
     /// CROSS requires both `on` and `filter` to be empty (no ON clause).
     ///
-    /// # Non-equi join contract (v0.6)
+    /// # Non-equi join contract
     ///
     /// `on` carries pure equi pairs (`left.col = right.col`) for the
     /// hash-join fast path. `filter` carries the residual non-equi predicate

@@ -415,7 +415,7 @@ fn execute_inner(plan: &PhysicalPlan, k1: &Int32Array, k2: &Int32Array) -> BoltR
 // machinery comes into play. End-to-end GPU coverage lives in the dedicated
 // e2e suite.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

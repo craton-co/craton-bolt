@@ -1,4 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--
+applies-to: main
+owner: jit
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
 
 # Kernel Contributor Guide
 

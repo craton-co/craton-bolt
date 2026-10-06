@@ -581,9 +581,10 @@ pub fn classify_operator(kind: OperatorKind) -> StreamCapability {
 ///
 /// This mirrors the scalar combiner ([`crate::exec::engine`]'s
 /// `combine_scalar_aggregate_partials`), lifted to a keyed fold. Only the
-/// distributive set is representable here — `AVG`/variance/stddev are not
-/// (folding finalised per-morsel averages is wrong), so the engine's streaming
-/// gate must reject them and drain instead.
+/// distributive set is representable as a single-column fold — folding
+/// finalised per-morsel averages is wrong. `AVG` / variance / stddev stream
+/// through [`merge_algebraic_partials`] instead, which recombines decomposed
+/// distributive partials (see [`AlgebraicMerge`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupedFold {
     /// Sum the per-morsel partials (COUNT, SUM).
@@ -821,6 +822,57 @@ pub fn merge_grouped_partials(
     n_group_cols: usize,
     agg_folds: &[GroupedFold],
 ) -> BoltResult<RecordBatch> {
+    let index = group_partial_rows(partials, n_group_cols)?;
+    let schema = partials[0].schema();
+    let n_aggs = schema.fields().len() - n_group_cols;
+    if agg_folds.len() != n_aggs {
+        return Err(BoltError::Plan(format!(
+            "merge_grouped_partials: {} fold ops for {n_aggs} aggregate columns",
+            agg_folds.len()
+        )));
+    }
+    // Per-group running accumulator per aggregate column.
+    let mut accums: Vec<Vec<Option<MergeNum>>> = vec![vec![None; n_aggs]; index.n_groups];
+    for (p, batch) in partials.iter().enumerate() {
+        for (row, &g) in index.row_group[p].iter().enumerate() {
+            for (a, &fold) in agg_folds.iter().enumerate() {
+                let col = batch.column(n_group_cols + a);
+                if let Some(v) = merge_num_at(col.as_ref(), row)? {
+                    accums[g][a] = Some(MergeNum::fold(accums[g][a], v, fold));
+                }
+            }
+        }
+    }
+    let mut out_cols = index.key_columns;
+    for a in 0..n_aggs {
+        let target = schema.field(n_group_cols + a).data_type();
+        let vals: Vec<Option<MergeNum>> = accums.iter().map(|g| g[a]).collect();
+        out_cols.push(build_agg_column(&vals, target)?);
+    }
+    RecordBatch::try_new(schema, out_cols)
+        .map_err(|e| BoltError::Other(format!("merge_grouped_partials: result build failed: {e}")))
+}
+
+/// Group-key bookkeeping shared by the partial merges: every partial row's
+/// group index, and the reconstructed group-key output columns.
+pub(crate) struct PartialGroupIndex {
+    /// Number of distinct groups (first-seen order).
+    pub(crate) n_groups: usize,
+    /// `row_group[p][row]` = group index of `partials[p]` row `row`.
+    pub(crate) row_group: Vec<Vec<usize>>,
+    /// The group-key output columns, one row per group in first-seen order,
+    /// gathered from each group's first occurrence (full Arrow fidelity for
+    /// any key dtype).
+    pub(crate) key_columns: Vec<arrow_array::ArrayRef>,
+}
+
+/// Hash the first `n_group_cols` columns of every partial into groups via the
+/// canonical [`crate::exec::distinct`] row-key relation (NULL keys group
+/// together). With `n_group_cols == 0` every row joins one group.
+pub(crate) fn group_partial_rows(
+    partials: &[RecordBatch],
+    n_group_cols: usize,
+) -> BoltResult<PartialGroupIndex> {
     use crate::exec::distinct::{ColumnReader, RowKeyValue};
     use std::collections::HashMap;
 
@@ -831,34 +883,17 @@ pub fn merge_grouped_partials(
                 .into(),
         ));
     }
-
-    let schema = partials[0].schema();
-    let n_cols = schema.fields().len();
+    let n_cols = partials[0].num_columns();
     if n_cols < n_group_cols {
         return Err(BoltError::Plan(format!(
             "merge_grouped_partials: partial has {n_cols} columns but {n_group_cols} \
              group columns were declared"
         )));
     }
-    let n_aggs = n_cols - n_group_cols;
-    if agg_folds.len() != n_aggs {
-        return Err(BoltError::Plan(format!(
-            "merge_grouped_partials: {} fold ops for {n_aggs} aggregate columns",
-            agg_folds.len()
-        )));
-    }
-
-    // Per-group state: a running accumulator per aggregate column. The output
-    // group-key columns are reconstructed from the partials directly (via
-    // `interleave` below), so we do not store key cells here.
-    struct GroupState {
-        accums: Vec<Option<MergeNum>>,
-    }
-
-    let mut groups: HashMap<Vec<RowKeyValue>, GroupState> = HashMap::new();
-    // First-seen key order so the output is deterministic.
-    let mut order: Vec<Vec<RowKeyValue>> = Vec::new();
-
+    let mut groups: HashMap<Vec<RowKeyValue>, usize> = HashMap::new();
+    // (partial, row) of each group's first occurrence, in first-seen order.
+    let mut first: Vec<(usize, usize)> = Vec::new();
+    let mut row_group: Vec<Vec<usize>> = Vec::with_capacity(partials.len());
     for (p, batch) in partials.iter().enumerate() {
         if batch.num_columns() != n_cols {
             return Err(BoltError::Plan(format!(
@@ -866,74 +901,188 @@ pub fn merge_grouped_partials(
                 batch.num_columns()
             )));
         }
-        // Typed readers for the group-key columns (canonical row-key relation).
         let key_readers: Vec<ColumnReader<'_>> = (0..n_group_cols)
             .map(|c| ColumnReader::new(batch.column(c).as_ref()))
             .collect::<BoltResult<_>>()?;
-
+        let mut rows = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let key: Vec<RowKeyValue> = key_readers.iter().map(|r| r.value_at(row)).collect();
-            // Track first-seen order before the (borrowing) entry lookup.
-            if !groups.contains_key(&key) {
-                order.push(key.clone());
-            }
-            let state = groups.entry(key).or_insert_with(|| GroupState {
-                accums: vec![None; n_aggs],
+            let next = first.len();
+            let g = *groups.entry(key).or_insert_with(|| {
+                first.push((p, row));
+                next
             });
-            for (a, &fold) in agg_folds.iter().enumerate() {
-                let col = batch.column(n_group_cols + a);
-                if let Some(v) = merge_num_at(col.as_ref(), row)? {
-                    state.accums[a] = Some(MergeNum::fold(state.accums[a], v, fold));
+            rows.push(g);
+        }
+        row_group.push(rows);
+    }
+    let mut key_columns = Vec::with_capacity(n_group_cols);
+    for c in 0..n_group_cols {
+        let arrays: Vec<&dyn Array> = partials.iter().map(|b| b.column(c).as_ref()).collect();
+        let col = arrow::compute::interleave(&arrays, &first).map_err(|e| {
+            BoltError::Other(format!(
+                "merge_grouped_partials: interleave of group-key column {c} failed: {e}"
+            ))
+        })?;
+        key_columns.push(col);
+    }
+    Ok(PartialGroupIndex {
+        n_groups: first.len(),
+        row_group,
+        key_columns,
+    })
+}
+
+/// How one finalised aggregate is rebuilt from its per-morsel partial
+/// columns in [`merge_algebraic_partials`]. Column indices are into the
+/// partial batches' *aggregate* columns (after the group keys).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlgebraicMerge {
+    /// A distributive aggregate kept as-is (COUNT / SUM / MIN / MAX).
+    Distributive {
+        /// Partial column.
+        col: usize,
+        /// Fold across morsels.
+        fold: GroupedFold,
+    },
+    /// `AVG(e)` from per-morsel `SUM(e)` and `COUNT(e)`: `Σsum / Σcount`,
+    /// NULL for an empty group.
+    Avg {
+        /// Partial `SUM(e)` column.
+        sum: usize,
+        /// Partial `COUNT(e)` column.
+        count: usize,
+    },
+    /// `VAR_*` / `STDDEV_*` from per-morsel `COUNT(e)`, `SUM(e)` and
+    /// `VAR_POP(e)`, combined with the parallel (Chan et al.) update in two
+    /// exact passes: the group mean `μ = Σsum / Σn`, then
+    /// `M2 = Σ [M2_i + n_i (mean_i - μ)^2]` with `M2_i = var_pop_i * n_i` —
+    /// deviations are taken from the true group mean, so no catastrophic
+    /// cancellation.
+    Variance {
+        /// Partial `COUNT(e)` column.
+        count: usize,
+        /// Partial `SUM(e)` column.
+        sum: usize,
+        /// Partial `VAR_POP(e)` column.
+        var_pop: usize,
+        /// Sample (`n - 1`) rather than population (`n`) denominator.
+        sample: bool,
+        /// Return the square root (STDDEV) rather than the variance.
+        sqrt: bool,
+    },
+}
+
+/// Merge per-morsel partials of a decomposed aggregate (see
+/// [`AlgebraicMerge`]) into the finalised result with `output_schema`
+/// (group keys followed by one column per `merges` entry).
+pub fn merge_algebraic_partials(
+    partials: &[RecordBatch],
+    n_group_cols: usize,
+    merges: &[AlgebraicMerge],
+    output_schema: arrow_schema::SchemaRef,
+) -> BoltResult<RecordBatch> {
+    let index = group_partial_rows(partials, n_group_cols)?;
+    let n = index.n_groups;
+    let num = |p: usize, col: usize, row: usize| -> BoltResult<Option<MergeNum>> {
+        merge_num_at(partials[p].column(n_group_cols + col).as_ref(), row)
+    };
+    let as_f64 = |v: MergeNum| match v {
+        MergeNum::Int(i) => i as f64,
+        MergeNum::Float(f) => f,
+    };
+    let mut out_cols = index.key_columns.clone();
+    for (m, merge) in merges.iter().enumerate() {
+        let target = output_schema.field(n_group_cols + m).data_type();
+        let col = match merge {
+            AlgebraicMerge::Distributive { col, fold } => {
+                let mut acc: Vec<Option<MergeNum>> = vec![None; n];
+                for (p, groups) in index.row_group.iter().enumerate() {
+                    for (row, &g) in groups.iter().enumerate() {
+                        if let Some(v) = num(p, *col, row)? {
+                            acc[g] = Some(MergeNum::fold(acc[g], v, *fold));
+                        }
+                    }
                 }
+                build_agg_column(&acc, target)?
             }
-        }
-    }
-
-    // Reconstruct group-key output columns from the partials' key columns via a
-    // first-occurrence index, preserving full Arrow fidelity for any key dtype.
-    // For each distinct key, find one (partial, row) that produced it.
-    let mut key_source: HashMap<&[RowKeyValue], (usize, usize)> = HashMap::new();
-    for (p, batch) in partials.iter().enumerate() {
-        let key_readers: Vec<ColumnReader<'_>> = (0..n_group_cols)
-            .map(|c| ColumnReader::new(batch.column(c).as_ref()))
-            .collect::<BoltResult<_>>()?;
-        for row in 0..batch.num_rows() {
-            let key: Vec<RowKeyValue> = key_readers.iter().map(|r| r.value_at(row)).collect();
-            // Borrow the stored key slice (stable in `groups`) as the map key so
-            // we don't re-allocate; first occurrence wins.
-            if let Some((stored_key, _)) = groups.get_key_value(&key) {
-                key_source.entry(stored_key.as_slice()).or_insert((p, row));
+            AlgebraicMerge::Avg { sum, count } => {
+                let mut s = vec![0.0f64; n];
+                let mut k = vec![0.0f64; n];
+                for (p, groups) in index.row_group.iter().enumerate() {
+                    for (row, &g) in groups.iter().enumerate() {
+                        if let Some(c) = num(p, *count, row)? {
+                            k[g] += as_f64(c);
+                        }
+                        if let Some(v) = num(p, *sum, row)? {
+                            s[g] += as_f64(v);
+                        }
+                    }
+                }
+                let vals: Vec<Option<MergeNum>> = (0..n)
+                    .map(|g| (k[g] > 0.0).then(|| MergeNum::Float(s[g] / k[g])))
+                    .collect();
+                build_agg_column(&vals, target)?
             }
-        }
+            AlgebraicMerge::Variance {
+                count,
+                sum,
+                var_pop,
+                sample,
+                sqrt,
+            } => {
+                // Pass 1: Σn and Σsum per group → the group mean.
+                let mut k = vec![0.0f64; n];
+                let mut s = vec![0.0f64; n];
+                for (p, groups) in index.row_group.iter().enumerate() {
+                    for (row, &g) in groups.iter().enumerate() {
+                        if let Some(c) = num(p, *count, row)? {
+                            k[g] += as_f64(c);
+                        }
+                        if let Some(v) = num(p, *sum, row)? {
+                            s[g] += as_f64(v);
+                        }
+                    }
+                }
+                let mean: Vec<f64> = (0..n)
+                    .map(|g| if k[g] > 0.0 { s[g] / k[g] } else { 0.0 })
+                    .collect();
+                // Pass 2: M2 = Σ [M2_i + n_i (mean_i - μ)^2].
+                let mut m2 = vec![0.0f64; n];
+                for (p, groups) in index.row_group.iter().enumerate() {
+                    for (row, &g) in groups.iter().enumerate() {
+                        let n_i = match num(p, *count, row)? {
+                            Some(c) => as_f64(c),
+                            None => 0.0,
+                        };
+                        if n_i == 0.0 {
+                            continue;
+                        }
+                        let sum_i = num(p, *sum, row)?.map(as_f64).unwrap_or(0.0);
+                        let var_i = num(p, *var_pop, row)?.map(as_f64).unwrap_or(0.0);
+                        let d = sum_i / n_i - mean[g];
+                        m2[g] += var_i * n_i + n_i * d * d;
+                    }
+                }
+                let vals: Vec<Option<MergeNum>> = (0..n)
+                    .map(|g| {
+                        let denom = if *sample { k[g] - 1.0 } else { k[g] };
+                        (denom > 0.0).then(|| {
+                            let var = (m2[g] / denom).max(0.0);
+                            MergeNum::Float(if *sqrt { var.sqrt() } else { var })
+                        })
+                    })
+                    .collect();
+                build_agg_column(&vals, target)?
+            }
+        };
+        out_cols.push(col);
     }
-
-    let mut out_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(n_cols);
-
-    // Group-key columns via `arrow::compute::interleave`: gather the
-    // first-occurrence (partial, row) of each ordered key.
-    if n_group_cols > 0 {
-        for c in 0..n_group_cols {
-            let arrays: Vec<&dyn Array> = partials.iter().map(|b| b.column(c).as_ref()).collect();
-            let indices: Vec<(usize, usize)> =
-                order.iter().map(|k| key_source[k.as_slice()]).collect();
-            let col = arrow::compute::interleave(&arrays, &indices).map_err(|e| {
-                BoltError::Other(format!(
-                    "merge_grouped_partials: interleave of group-key column {c} failed: {e}"
-                ))
-            })?;
-            out_cols.push(col);
-        }
-    }
-
-    // Aggregate columns: finalise the folded accumulators in key order.
-    for a in 0..n_aggs {
-        let target = schema.field(n_group_cols + a).data_type();
-        let vals: Vec<Option<MergeNum>> = order.iter().map(|k| groups[k].accums[a]).collect();
-        out_cols.push(build_agg_column(&vals, target)?);
-    }
-
-    RecordBatch::try_new(schema, out_cols)
-        .map_err(|e| BoltError::Other(format!("merge_grouped_partials: result build failed: {e}")))
+    RecordBatch::try_new(output_schema, out_cols).map_err(|e| {
+        BoltError::Other(format!(
+            "merge_algebraic_partials: result build failed: {e}"
+        ))
+    })
 }
 
 // ===========================================================================
@@ -1287,6 +1436,106 @@ impl MorselDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two-pass parallel combine reproduces the direct whole-population
+    /// AVG / variance / stddev from per-chunk (COUNT, SUM, VAR_POP) partials,
+    /// including a chunk with no rows for a group and a large common offset
+    /// (where a naive Σx² − (Σx)²/n would lose precision).
+    #[test]
+    fn merge_algebraic_partials_matches_direct_computation() {
+        use arrow_array::{Float64Array, Int64Array};
+        use arrow_schema::{DataType as D, Field as F, Schema as S};
+        let offset = 1.0e9;
+        let data: Vec<(i64, f64)> = (0..97)
+            .map(|i| (i % 3, offset + ((i * 37) % 11) as f64 * 0.25))
+            .collect();
+        // Split into uneven chunks; build per-chunk grouped partials.
+        let chunks = [&data[..10], &data[10..11], &data[11..60], &data[60..]];
+        let partial_schema = Arc::new(S::new(vec![
+            F::new("g", D::Int64, false),
+            F::new("count", D::Int64, true),
+            F::new("sum", D::Float64, true),
+            F::new("var_pop", D::Float64, true),
+        ]));
+        let partials: Vec<RecordBatch> = chunks
+            .iter()
+            .map(|chunk| {
+                let mut keys = Vec::new();
+                let mut counts = Vec::new();
+                let mut sums = Vec::new();
+                let mut vars = Vec::new();
+                for g in 0..3 {
+                    let xs: Vec<f64> = chunk.iter().filter(|r| r.0 == g).map(|r| r.1).collect();
+                    if xs.is_empty() {
+                        continue;
+                    }
+                    let n = xs.len() as f64;
+                    let mean = xs.iter().sum::<f64>() / n;
+                    keys.push(g);
+                    counts.push(xs.len() as i64);
+                    sums.push(xs.iter().sum::<f64>());
+                    vars.push(xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n);
+                }
+                RecordBatch::try_new(
+                    partial_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(Int64Array::from(counts)),
+                        Arc::new(Float64Array::from(sums)),
+                        Arc::new(Float64Array::from(vars)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let out_schema = Arc::new(S::new(vec![
+            F::new("g", D::Int64, false),
+            F::new("avg", D::Float64, true),
+            F::new("var_samp", D::Float64, true),
+            F::new("stddev_pop", D::Float64, true),
+        ]));
+        let merges = [
+            AlgebraicMerge::Avg { sum: 1, count: 0 },
+            AlgebraicMerge::Variance {
+                count: 0,
+                sum: 1,
+                var_pop: 2,
+                sample: true,
+                sqrt: false,
+            },
+            AlgebraicMerge::Variance {
+                count: 0,
+                sum: 1,
+                var_pop: 2,
+                sample: false,
+                sqrt: true,
+            },
+        ];
+        let out = merge_algebraic_partials(&partials, 1, &merges, out_schema).unwrap();
+        let g = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col = |c: usize| {
+            out.column(c)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+        };
+        for r in 0..out.num_rows() {
+            let xs: Vec<f64> = data
+                .iter()
+                .filter(|d| d.0 == g.value(r))
+                .map(|d| d.1)
+                .collect();
+            let n = xs.len() as f64;
+            let mean = xs.iter().sum::<f64>() / n;
+            let m2: f64 = xs.iter().map(|x| (x - mean).powi(2)).sum();
+            assert!((col(1).value(r) - mean).abs() < 1e-6, "avg");
+            assert!((col(2).value(r) - m2 / (n - 1.0)).abs() < 1e-6, "var_samp");
+            assert!(
+                (col(3).value(r) - (m2 / n).sqrt()).abs() < 1e-6,
+                "stddev_pop"
+            );
+        }
+    }
     use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;

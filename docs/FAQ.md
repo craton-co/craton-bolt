@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: maintainers
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # FAQ
 
 Frequently asked questions about Craton Bolt. For the supported SQL surface

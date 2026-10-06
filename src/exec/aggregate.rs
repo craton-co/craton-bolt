@@ -12,15 +12,15 @@
 //!   5. Pack the scalar results into a single-row Arrow `RecordBatch` whose
 //!      schema matches `AggregateSpec::output_schema`.
 //!
-//! # v0.6 async-memcpy pilot (promoted in v0.7)
+//! # async-memcpy pilot (promoted)
 //!
-//! This executor is the **pilot** for the v0.6 async memcpy + pinned host
+//! This executor was the **pilot** for the async memcpy + pinned host
 //! buffer rollout. The whole H2D → kernel → D2H chain is issued on a single
 //! per-call [`CudaStream`] (`CudaStream::null_or_default`) with the
 //! [`GpuVec::from_slice_async`] / [`GpuVec::to_pinned_async`] wrappers, and
 //! the executor synchronizes exactly once at the very end.
 //!
-//! As of v0.7 the local `upload_primitive_values_async` helper that
+//! The local `upload_primitive_values_async` helper that
 //! encapsulated the cuda-stub fallback was promoted to
 //! [`crate::exec::gpu_upload`] so the filter / GROUP BY / join executors
 //! can share the same shape. The aggregate path now imports it from
@@ -59,7 +59,7 @@
 //!
 //! # Validity (NULL) propagation
 //!
-//! v0.5/M1: primitive scalar aggregates now honour the Arrow validity bitmap.
+//! primitive scalar aggregates now honour the Arrow validity bitmap.
 //! The strategy is intentionally simple:
 //!
 //!   - **Fast path** (`null_count == 0`): zero-copy upload of the raw values
@@ -123,14 +123,14 @@ use crate::jit::agg_kernels::{
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema, TimeUnit};
 
 // `CudaModule` import dropped: every load site now routes through
-// `exec::module_cache::get_or_build_module_for_scalar_agg` (v0.7 — keys on
+// `exec::module_cache::get_or_build_module_for_scalar_agg` (keys on
 // the `ScalarAggSpec` planner IR), which returns the cached module directly.
 use crate::plan::physical_plan::{
     AggregateSpec, ColumnIO, PhysicalPlan, ScalarAggOp, ScalarAggSpec,
 };
 
-// v0.6 pilot helper `upload_primitive_values_async` was promoted to
-// `crate::exec::gpu_upload` in v0.7 so the filter / GROUP BY / join
+// pilot helper `upload_primitive_values_async` was promoted to
+// `crate::exec::gpu_upload` so the filter / GROUP BY / join
 // executors can share the same `(slice, &stream) -> GpuVec<T>` shape with
 // the identical `--features cuda-stub` graceful fallback. The aggregate
 // path uses it through the canonical name so the migration is a
@@ -283,7 +283,7 @@ fn build_one_aggregate(
         }
         AggregateExpr::StddevPop(expr) | AggregateExpr::StddevSamp(expr) => {
             // Welford one-pass reduction on the host. The scalar-aggregate
-            // path's GPU offload is a v0.6 stretch goal — for v0.5 we
+            // path's GPU offload is a stretch goal — for now we
             // download (or already have) the values as a host slice and
             // fold them via `WelfordState::push`. The output dtype is
             // always Float64; STDDEV_SAMP packs SQL NULL when count <= 1
@@ -343,7 +343,7 @@ fn build_one_aggregate(
             Ok(avg_result_array(sum_f64, count_u64, out_field.nullable))
         }
         AggregateExpr::VarPop(expr) | AggregateExpr::VarSamp(expr) => {
-            // v0.5 scalar-aggregate path: download the column to the host
+            // scalar-aggregate path: download the column to the host
             // and run Welford's online algorithm in f64. The output is
             // nullable Float64 — SQL says VAR_POP/VAR_SAMP over an empty
             // (or all-NULL) input is NULL, and VAR_SAMP additionally
@@ -670,7 +670,7 @@ fn reduce_column_from_batch(
     // are no nulls.
     let has_nulls = arr.null_count() > 0;
 
-    // v0.6 async-memcpy pilot: build a per-call stream and chain H2D-upload →
+    // async-memcpy pilot: build a per-call stream and chain H2D-upload →
     // kernel-launch → D2H-partials on it, syncing exactly once at the end.
     // `null_or_default` falls back to the NULL stream under `cuda-stub` (and
     // any other host without a working `cuStreamCreate`).
@@ -714,7 +714,7 @@ fn reduce_column_from_batch(
             } else {
                 // No-null fast path: async H2D of Arrow's value buffer on
                 // `stream`, then the kernel + partials D2H ride the same
-                // stream. v0.6 pilot replaced the synchronous
+                // stream. The pilot replaced the synchronous
                 // `primitive_to_gpu`+`from_buffer` pair here.
                 let dev = upload_primitive_values_async::<i32>(pa.values(), &stream)?;
                 if matches!(op, ReduceOp::Sum) {
@@ -961,7 +961,7 @@ fn fused_avg_from_batch(
     // Per-dtype: build a `GpuVec` (async H2D of Arrow's value buffer when
     // NULL-free, host-filtered upload otherwise) and dispatch to the fused
     // launcher. The launcher is monomorphic on the input dtype because
-    // `compile_avg_reduction_kernel` emits dtype-specific PTX. v0.6 pilot:
+    // `compile_avg_reduction_kernel` emits dtype-specific PTX. Pilot:
     // every upload site routes through `upload_primitive_values_async` so
     // the `cuda-stub` graceful fallback lives in one place.
     match col_io.dtype {
@@ -1063,7 +1063,7 @@ where
     let block_sums = GpuVec::<f64>::zeros_async(grid_x as usize, stream.raw())?;
     let block_counts = GpuVec::<u32>::zeros_async(grid_x as usize, stream.raw())?;
 
-    // v0.7 `ScalarAggSpec` cache layer: the fused AVG kernel is keyed by
+    // `ScalarAggSpec` cache layer: the fused AVG kernel is keyed by
     // `(Avg, input_dtype)` and uses the `bolt_avg_reduce` entry point. Same
     // layering as the non-fused reduction path (in-memory → disk → PTX-text
     // hash inside `CudaModule::from_ptx`); separate cache slot from `Sum`
@@ -1426,7 +1426,7 @@ fn decimal_minmax_gpu(op: ReduceOp, host: &[i128]) -> BoltResult<Option<i128>> {
 /// Build a Welford `(count, mean, M2)` state by folding the non-NULL values
 /// of `col_io` from `batch` in source order. Used by the scalar
 /// `STDDEV_POP` / `STDDEV_SAMP` aggregates; the host-side fold is
-/// acceptable for v0.5 (see `crate::exec::welford` module docs on host vs
+/// acceptable (see `crate::exec::welford` module docs on host vs
 /// device). All numeric input dtypes promote to `f64` at the push site so
 /// the accumulator stays in double precision regardless of input width.
 fn welford_state_from_batch(
@@ -1582,7 +1582,7 @@ where
 /// COUNT (which synthesizes an all-ones column on the host) and by the
 /// has-nulls path which filters Arrow's value buffer into a fresh `Vec` first.
 ///
-/// v0.6 async-memcpy pilot: drives the upload + reduction on a per-call
+/// async-memcpy pilot: drives the upload + reduction on a per-call
 /// stream so the H2D and the partials D2H overlap with the kernel where
 /// the driver allows it. Routes through [`upload_primitive_values_async`]
 /// so the `cuda-stub` graceful fallback lives in one place.
@@ -1633,7 +1633,7 @@ where
     // barrier.
     let partials = GpuVec::<T>::zeros_async(grid_x as usize, stream.raw())?;
 
-    // Compile + load the kernel via the **v0.7 `ScalarAggSpec` cache layer**
+    // Compile + load the kernel via the **`ScalarAggSpec` cache layer**
     // in `exec::module_cache`. Cache layering, outer-to-inner:
     //
     //   1. Process-wide `ScalarAggSpec`-keyed cache (this call): on a hit
@@ -1761,7 +1761,7 @@ where
 
     // Compile + load the kernel. The kernel takes the *input* dtype; it
     // internally widens to the accumulator dtype. Routed through the
-    // v0.7 `ScalarAggSpec` cache layer; the cache key is identical to the
+    // `ScalarAggSpec` cache layer; the cache key is identical to the
     // one `reduce_gpu_vec` uses for the same `(op, input dtype)` pair
     // (the accumulator dtype is derived inside the JIT layer and is not
     // part of the cache key), so a SUM(Int32) widened call hits the same
@@ -2500,7 +2500,7 @@ fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
 // count, and the pre-GPU filter keeps the raw values buffer's garbage bytes
 // out of the reduction.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

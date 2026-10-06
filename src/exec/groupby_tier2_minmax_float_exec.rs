@@ -371,7 +371,7 @@ fn execute_inner(
 // ---------------------------------------------------------------------------
 // Module-cache mechanics tests. Skip on CPU-only hosts.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

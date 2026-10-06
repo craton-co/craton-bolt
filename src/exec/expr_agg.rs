@@ -436,7 +436,7 @@ fn eval_inner(expr: &Expr, env: &ColumnEnv<'_>, n_rows: usize) -> BoltResult<Hos
         // as `BinaryOp::Concat`; if one of those reaches here it means a caller
         // bypassed lowering, so we surface a clear `Plan` error.
         Expr::ScalarFn { kind, args } => eval_scalar_fn(*kind, args, env, n_rows),
-        // v0.7 date-scalar-fns: EXTRACT / DATE_TRUNC have a standalone GPU
+        // date-scalar-fns: EXTRACT / DATE_TRUNC have a standalone GPU
         // codegen module but no host evaluator yet. The physical-plan boundary
         // rejects them before execution; reaching here means a future caller
         // built a Filter / Project around one without going through `lower()`.
@@ -1263,7 +1263,7 @@ fn eval_literal(lit: &Literal, n_rows: usize) -> BoltResult<HostColumn> {
                     .into(),
             ))
         }
-        // v0.6 / M4: Date32 stores as i32 days; Timestamp stores as i64
+        // Date32 stores as i32 days; Timestamp stores as i64
         // ticks. Broadcast as the underlying integer; the expression
         // evaluator does not yet apply temporal semantics.
         Literal::Date32(v) => HostColumn::I32(vec![Some(*v); n_rows]),

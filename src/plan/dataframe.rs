@@ -409,8 +409,7 @@ pub fn avg(e: Expr) -> AggregateExpr {
 }
 
 /// `VAR_POP(expr)` — population variance. Output dtype `Float64`. The
-/// GROUP BY path is rejected with a clear error in v0.5; the scalar
-/// (no GROUP BY) path is host-side Welford in `f64`.
+/// scalar and GROUP BY paths are host-side Welford in `f64`.
 pub fn var_pop(e: Expr) -> AggregateExpr {
     AggregateExpr::VarPop(Box::new(e))
 }

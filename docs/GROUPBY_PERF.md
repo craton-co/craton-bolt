@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: performance
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
 # GROUP BY performance
 
 Current results, methodology, hardware, and reproducible commands live in

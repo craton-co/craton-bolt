@@ -500,7 +500,7 @@ fn execute_inner(
 // We only exercise `try_execute`'s shape-gate logic; the kernel launch path
 // is GPU-bound and covered by the dedicated e2e suite.
 // ---------------------------------------------------------------------------
-// v0.7: these arrow/plan aliases are used only by the #[cfg(test)] modules
+// these arrow/plan aliases are used only by the #[cfg(test)] modules
 // below; the non-test schema conversion now lives in exec::schema_convert.
 // cfg(test)-gated so normal builds don't see an unused import.
 #[cfg(test)]

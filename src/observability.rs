@@ -2,7 +2,7 @@
 
 //! Observability surface — pool-stats observer + tracing span catalogue.
 //!
-//! # Tracing spans (v0.6 / M5)
+//! # Tracing spans
 //!
 //! Each query phase is wrapped in a `tracing` span at `info` level so a
 //! downstream subscriber can attribute latency to the correct slice of the

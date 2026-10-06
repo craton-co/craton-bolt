@@ -69,9 +69,9 @@ Every query — `Engine::sql`, `Engine::run_logical_plan` / `DataFrame::collect`
 ### Tables, streaming and residency
 
 - **Eager tables** (`register_table`, `register_batch`, `register_table_stream`) are stored coalesced as **one** host `RecordBatch` per table — multi-batch ingestion concatenates once at ingest, so no query pays a per-query concat. String columns get a dictionary (`dict_registry.rs`) built from the full data.
-- **Lazy tables** (`register_table_stream_lazy`) live in a `TableSource::Streaming` overlay. The compile pipeline drains exactly the tables a plan scans, validates every batch against the declared schema, and coalesces them.
+- **Lazy tables** (`register_table_stream_lazy`) live in a `TableSource::Streaming` overlay. The pipeline drains exactly the tables a statement scans (including inside its subqueries) before compiling it, validates every batch against the declared schema, coalesces them, and — without a memory budget — builds their string dictionaries.
 - **Device residency.** `ensure_gpu_table` keeps a `GpuTable` per table, versioned by per-column host revisions: unchanged columns are reused in place, appends upload only the new tail (DtoD-preserving the prefix).
-- **Morsels.** Under `EngineBuilder::memory_budget`, row-wise leaf scans and distributive aggregates over overlay tables are processed in bounded morsels (`engine_streaming_impl.rs`); everything else materialises its input.
+- **Morsels.** Under `EngineBuilder::memory_budget`, row-wise leaf scans and aggregates over overlay tables are processed in bounded morsels (`engine_streaming_impl.rs`) — distributive aggregates fold their partials directly, and `AVG` / `VAR_*` / `STDDEV_*` are decomposed into `SUM` / `COUNT` / `VAR_POP` partials and recombined exactly (`merge_algebraic_partials`); everything else materialises its input.
 
 ## Memory safety: CUDA-Oxide
 
@@ -107,7 +107,7 @@ The engine doesn't have a one-size-fits-all executor. The `Engine::execute` matc
 |----------------------|-----------------|-----------------------------------|------------------------------------------|
 | no                   | no              | `aggregate.rs`                    | Trivial scalar reductions.               |
 | no                   | yes             | `agg_with_pre.rs`                 | Resident on-device path first (pre kernel reads the `GpuTable` + dictionary index columns, reduces in place); host pre-stage fallback. |
-| yes                  | no              | `groupby.rs`                      | Resident Tier-1 shared-memory / Tier-2 partitioned paths; packed-i64-key hash table. |
+| yes                  | no              | `groupby.rs`                      | Resident Tier-1 shared-memory SUM (Int32/Int64 keys × Float64/Int64/Int32 values, ≤ 1024 groups, per-thread run-length + warp pre-aggregation) / Tier-2 partitioned paths; packed-i64-key hash table. |
 | yes                  | no, key collides w/ sentinel | `groupby_valid.rs` (fallback in `groupby.rs`) | Sentinel-free; bounded probe + spill. |
 | yes                  | no, > 64-bit composite key   | `groupby_wide.rs` (fallback in `groupby.rs`) | Host-side reduction.            |
 | yes                  | yes             | `groupby_with_pre.rs`             | Combines pre + GROUP BY pipelines.       |
@@ -136,7 +136,7 @@ StringArray ──► DictionaryColumn { dictionary: Vec<String>, indices: GpuVe
    └──────────────────┴──────────────────────────────────────┘
 ```
 
-The registry (`dict_registry.rs`) builds a dictionary for every Utf8 column at registration (from the table's full, coalesced data — so each dictionary is known-complete and an absent literal folds to a constant), picks i32 or i64 indices based on a distinct-string estimate, and exposes the `rewrite_plan` step of the compile pipeline. The rewriter folds `WHERE region = 'US'` into `WHERE __idx_region = <i32 or i64>(idx)` — pure integer equality, which the standard codegen already handles. Every distinct string owns exactly one index (duplicate Arrow dictionary values are merged on ingest). Lazily-registered tables have no dictionaries; their string predicates are evaluated on the host.
+The registry (`dict_registry.rs`) builds a dictionary for every Utf8 column at registration (from the table's full, coalesced data — so each dictionary is known-complete and an absent literal folds to a constant), picks i32 or i64 indices based on a distinct-string estimate, and exposes the `rewrite_plan` step of the compile pipeline. The rewriter folds `WHERE region = 'US'` into `WHERE __idx_region = <i32 or i64>(idx)` — pure integer equality, which the standard codegen already handles. Every distinct string owns exactly one index (duplicate Arrow dictionary values are merged on ingest). Lazily-registered tables get the same dictionaries when their producer is drained (before the rewrite runs) — except under a memory budget, where morsel execution would not match whole-table index columns and their string predicates are evaluated on the host.
 
 `UPPER` / `LOWER` / `LENGTH` lower to the GPU: `UPPER` / `LOWER` use the two-pass variable-width `PhysicalPlan::StringProject` executor (`string_project.rs`), and `LENGTH` uses the dictionary-gather `PhysicalPlan::StringLength` executor (`string_length.rs`). The GPU case-fold path is ASCII-only (byte-wise) and falls back to the full-Unicode host transform in `string_ops.rs` for any column whose dictionary contains non-ASCII bytes; both paths produce identical results for ASCII data. `LENGTH` counts characters (Unicode codepoints), not bytes (`OCTET_LENGTH` covers byte length). `SUBSTRING` / `TRIM` / `CONCAT` still run as pure-host dictionary transformations (`string_ops.rs`, `string_ops_extended.rs`) — CONCAT builds a new dictionary via cross-product on the host — because their variable-width device-write paths are not yet wired through the codegen path.
 
@@ -164,11 +164,11 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 - **No process model.** Everything runs in a single Rust process.
 - **One active `Engine` per process.** The memory pool, stream pool and module caches are process-global and bound to the CUDA context; `EngineBuilder::build` rejects a second live engine. Sequential engines are supported (and stress-tested). A shared-runtime / many-session model is post-1.0 work.
 - **No multi-GPU per engine.** One context, one device per `Engine`; `Engine::new_with_device(idx)` picks the device.
-- **Host memory bounds the data set.** Tables are host-resident Arrow batches; the morsel path bounds *device* working sets for row-wise scans and distributive aggregates, but sorts, joins, windows, distinct and set operations materialise their inputs. Spill-capable operators are open work.
+- **Host memory bounds the data set.** Tables are host-resident Arrow batches; the morsel path bounds *device* working sets for row-wise scans and aggregates (scalar and grouped, including `AVG` / variance), but sorts, joins, windows, distinct and set operations materialise their inputs. Spill-capable operators are open work.
 - **Non-equi joins are limited.** Non-equi predicates run through the host nested-loop fallback (`execute_nested_loop_join`), INNER-only and capped (`MAX_NESTED_LOOP_INNER_ROWS`).
 - **Host-orchestrated SQL shapes are host loops.** Recursive CTEs and correlated applies share the compile pipeline but are not physical operators; their cost is bounded by `CRATON_MAX_RECURSIVE_ITERATIONS` / `CRATON_MAX_APPLY_ROWS` (see [`ENV_VARS.md`](ENV_VARS.md)).
 - **Async memcpy coverage is partial.** Projection, scalar aggregates, the GROUP BY family and filter D2H use pinned async transfers; the join executor still issues most H2D uploads synchronously.
-- **Caches.** The PTX cache keys on the emitted PTX hash (skips PTXAS); the `KernelSpec`-keyed module cache skips codegen and PTXAS; the SQL plan cache memoises `LogicalPlan`s per schema version, and the shape classifier memoises "ordinary query" verdicts so repeats skip shape detection.
+- **Caches.** The PTX cache keys on the emitted PTX hash (skips PTXAS); the `KernelSpec`-keyed module cache skips codegen and PTXAS; the SQL plan cache memoises `LogicalPlan`s per schema version; the shape classifier memoises "ordinary query" verdicts; and each engine keeps a compiled-plan cache of fully prepared physical plans for repeated top-level SQL, keyed by `(SQL, schema version, data epoch)` — every registration, append, replace and lazy drain bumps the epoch, and the cache is bypassed while user `PlanRewrite` hooks are registered.
 
 See [`LIMITATIONS.md`](LIMITATIONS.md) for the user-facing consequences and [`ROADMAP.md`](../ROADMAP.md) for the plan.
 

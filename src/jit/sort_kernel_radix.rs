@@ -6,7 +6,7 @@
 //!
 //! The existing bitonic kernel ([`crate::jit::sort_kernel`]) is excellent for
 //! small, multi-key, NULL-aware ORDER BY — but its work complexity is
-//! `O(n log²n)`. For the v0.6 / M3 stretch goal of replacing the host
+//! `O(n log²n)`. For the stretch goal of replacing the host
 //! round-trip ORDER BY on very large single-key sorts, an `O(n · k/r)` radix
 //! sort (where `k` is the key bit-width and `r` the radix bit-width) wins.
 //!
@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     /// **The env-var off path still works.** This is the key contract from
-    /// the v0.6 scaffold task: when the radix-sort dispatch gate is off,
+    /// the scaffold task: when the radix-sort dispatch gate is off,
     /// `try_gpu_radix_sort` returns `Ok(false)` regardless of dtype, so the
     /// executor falls back to its existing host path.
     ///

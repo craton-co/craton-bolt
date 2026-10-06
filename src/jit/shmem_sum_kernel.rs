@@ -46,18 +46,28 @@
 //! }
 //! __syncthreads();
 //!
-//! // 2. Grid-stride accumulate.
+//! // 2. Grid-stride accumulate, with a per-thread run-length pre-aggregate:
+//! //    consecutive rows (in this thread's stride) with the same key are
+//! //    summed in registers and flushed to shared memory only when the key
+//! //    changes. Low-cardinality / clustered keys — the worst case for a
+//! //    shared atomic, where every thread of the block hits the same slot —
+//! //    collapse to one shared atomic per run instead of one per row; random
+//! //    keys degrade to one (lagged) atomic per row, as before.
+//! int cur = -1; double run = 0.0;
 //! for (i = blockIdx.x*blockDim.x + tid; i < n_rows; i += gridDim.x*blockDim.x) {
 //!     int32_t key = keys[i];
 //!     double  val = vals[i];
 //!     if (key >= BLOCK_GROUPS) {
 //!         // Overflow path: skip the shared table for this row.
 //!         atomicAdd(&out[key], val);
+//!     } else if (key == cur) {
+//!         run += val;
 //!     } else {
-//!         atomicAdd_shared(&block_acc[key], val);
-//!         block_set[key] = 1;   // unsynchronised single-byte store; harmless race
+//!         if (cur >= 0) { atomicAdd_shared(&block_acc[cur], run); block_set[cur] = 1; }
+//!         cur = key; run = val;
 //!     }
 //! }
+//! if (cur >= 0) { atomicAdd_shared(&block_acc[cur], run); block_set[cur] = 1; }
 //! __syncthreads();
 //!
 //! // 3. Merge block-local table into global output. One global atomic per
@@ -108,6 +118,44 @@ pub const BLOCK_THREADS: u32 = 256;
 /// Entry-point name embedded in the emitted PTX.
 pub const KERNEL_ENTRY: &str = "bolt_groupby_shmem_sum_f64";
 
+/// Key column dtype of a [`compile_shmem_sum_kernel_typed`] instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShmemKey {
+    /// `Int32` keys.
+    I32,
+    /// `Int64` keys (pre-validated to `[0, BLOCK_GROUPS)`).
+    I64,
+}
+
+/// Value column dtype (and accumulator) of a
+/// [`compile_shmem_sum_kernel_typed`] instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShmemValue {
+    /// `Float64` values, `f64` accumulator.
+    F64,
+    /// `Int64` values, `i64` accumulator.
+    I64,
+    /// `Int32` values widened to an `i64` accumulator (`SUM(Int32) -> Int64`).
+    I32Widened,
+}
+
+/// PTX entry name of a typed instance; `(I32, F64)` is [`KERNEL_ENTRY`].
+pub fn kernel_entry(key: ShmemKey, value: ShmemValue) -> String {
+    if (key, value) == (ShmemKey::I32, ShmemValue::F64) {
+        return KERNEL_ENTRY.to_string();
+    }
+    let k = match key {
+        ShmemKey::I32 => "i32",
+        ShmemKey::I64 => "i64",
+    };
+    let v = match value {
+        ShmemValue::F64 => "f64",
+        ShmemValue::I64 => "i64",
+        ShmemValue::I32Widened => "i32w",
+    };
+    format!("bolt_groupby_shmem_sum_k{k}_v{v}")
+}
+
 /// Generate PTX for the shared-memory per-block SUM kernel.
 ///
 /// Kernel signature (PTX-level):
@@ -124,9 +172,33 @@ pub const KERNEL_ENTRY: &str = "bolt_groupby_shmem_sum_f64";
 ///
 /// See module-level docs for the algorithm. `compile_shmem_sum_kernel()` is
 /// deterministic and pure: it returns a fixed PTX string and has no I/O.
+/// It is the `(Int32 key, Float64 value)` instance of
+/// [`compile_shmem_sum_kernel_typed`].
 pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
+    compile_shmem_sum_kernel_typed(ShmemKey::I32, ShmemValue::F64)
+}
+
+/// Generate the shared-memory SUM kernel for a key / value dtype pair.
+///
+/// The `(I32, F64)` instance is byte-identical to the original kernel
+/// (entry [`KERNEL_ENTRY`]); other instances use [`kernel_entry`]. Integer
+/// values accumulate in 64-bit two's complement (`atom.*.add.u64`), which
+/// WRAPS on overflow: callers must only launch an integer instance when the
+/// sum provably cannot leave `i64` range (see `groupby_shmem_exec`). `I64`
+/// keys must already be validated to lie in `[0, BLOCK_GROUPS)`.
+pub fn compile_shmem_sum_kernel_typed(key: ShmemKey, value: ShmemValue) -> BoltResult<String> {
     let mut ptx = String::new();
-    let entry = KERNEL_ENTRY;
+    let entry = kernel_entry(key, value);
+    let entry = entry.as_str();
+    let int = value != ShmemValue::F64;
+    // Run accumulator / loaded value / scratch registers and opcodes.
+    let (run, val, tmp) = if int {
+        ("%rd8", "%rd7", "%rd9")
+    } else {
+        ("%fd5", "%fd0", "%fd6")
+    };
+    let add = if int { "add.s64" } else { "add.f64" };
+    let aty = if int { "u64" } else { "f64" };
     let block_groups = BLOCK_GROUPS;
     let acc_bytes = BLOCK_GROUPS * 8;
     let set_bytes = BLOCK_GROUPS;
@@ -168,7 +240,7 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
 
     // Register decls. Generous counts mirror the conventions of
     // `valid_flag_kernels::compile_keys_valid_kernel`.
-    writeln!(ptx, "\t.reg .pred  %p<8>;").map_err(write_err)?;
+    writeln!(ptx, "\t.reg .pred  %p<16>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b32   %r<32>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .b64   %rd<32>;").map_err(write_err)?;
     writeln!(ptx, "\t.reg .f64   %fd<8>;").map_err(write_err)?;
@@ -241,19 +313,56 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     //       atom.shared.add.f64 [block_acc + key*8], val
     //       st.shared.u8        [block_set + key],   1
     // ----------------------------------------------------------------------
+    // Run-length pre-aggregate state: %r14 = current run key (-1 = none),
+    // %fd5 = the run's partial sum.
+    writeln!(ptx, "\tmov.u32 %r14, -1;").map_err(write_err)?;
+    if int {
+        writeln!(ptx, "\tmov.u64 {run}, 0;").map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\tmov.f64 {run}, 0d0000000000000000;").map_err(write_err)?;
+    }
     writeln!(ptx, "LOOP_TOP:").map_err(write_err)?;
     writeln!(ptx, "\tsetp.ge.u32 %p1, %r3, %r6;").map_err(write_err)?;
     writeln!(ptx, "\t@%p1 bra LOOP_DONE;").map_err(write_err)?;
 
-    // key = keys[i] (i32 -> s32 register %r12)
-    writeln!(ptx, "\tmul.wide.u32 %rd14, %r3, 4;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.s32 %r12, [%rd15];").map_err(write_err)?;
+    // key = keys[i] (-> s32 register %r12)
+    match key {
+        ShmemKey::I32 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd14, %r3, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.s32 %r12, [%rd15];").map_err(write_err)?;
+        }
+        ShmemKey::I64 => {
+            // Pre-validated to [0, BLOCK_GROUPS); the unsigned clamp maps
+            // anything else (negative / huge) to -1, which the overflow
+            // path below drops instead of indexing with it.
+            writeln!(ptx, "\tmul.wide.u32 %rd14, %r3, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd15, %rd2, %rd14;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.u64 %rd6, [%rd15];").map_err(write_err)?;
+            writeln!(ptx, "\tmin.u64 %rd6, %rd6, 4294967295;").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.u32.u64 %r12, %rd6;").map_err(write_err)?;
+        }
+    }
 
-    // val = vals[i] (f64 -> %fd0)
-    writeln!(ptx, "\tmul.wide.u32 %rd16, %r3, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd17, %rd3, %rd16;").map_err(write_err)?;
-    writeln!(ptx, "\tld.global.f64 %fd0, [%rd17];").map_err(write_err)?;
+    // val = vals[i]
+    match value {
+        ShmemValue::F64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd16, %r3, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd17, %rd3, %rd16;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.f64 %fd0, [%rd17];").map_err(write_err)?;
+        }
+        ShmemValue::I64 => {
+            writeln!(ptx, "\tmul.wide.u32 %rd16, %r3, 8;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd17, %rd3, %rd16;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.s64 %rd7, [%rd17];").map_err(write_err)?;
+        }
+        ShmemValue::I32Widened => {
+            writeln!(ptx, "\tmul.wide.u32 %rd16, %r3, 4;").map_err(write_err)?;
+            writeln!(ptx, "\tadd.s64 %rd17, %rd3, %rd16;").map_err(write_err)?;
+            writeln!(ptx, "\tld.global.s32 %r9, [%rd17];").map_err(write_err)?;
+            writeln!(ptx, "\tcvt.s64.s32 %rd7, %r9;").map_err(write_err)?;
+        }
+    }
 
     // Overflow check: if (unsigned)key >= BLOCK_GROUPS, take the global path.
     // We compare unsigned: a negative key (which shouldn't happen because the
@@ -265,16 +374,24 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     writeln!(ptx, "\tsetp.ge.u32 %p2, %r12, {bg};", bg = block_groups).map_err(write_err)?;
     writeln!(ptx, "\t@%p2 bra OVERFLOW;").map_err(write_err)?;
 
-    // Shared accumulate.
-    //   addr_acc = block_acc + key * 8
-    writeln!(ptx, "\tmul.wide.s32 %rd18, %r12, 8;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd19, %rd0, %rd18;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd19], %fd0;").map_err(write_err)?;
-    //   block_set[key] = 1  (unsynchronised; all stores have the same value)
-    writeln!(ptx, "\tcvt.s64.s32 %rd20, %r12;").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd21, %rd1, %rd20;").map_err(write_err)?;
-    writeln!(ptx, "\tmov.u32 %r13, 1;").map_err(write_err)?;
-    writeln!(ptx, "\tst.shared.u8 [%rd21], %r13;").map_err(write_err)?;
+    // Same key as the current run: accumulate in registers.
+    writeln!(ptx, "\tsetp.eq.s32 %p6, %r12, %r14;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p6 bra RUN_ADD;").map_err(write_err)?;
+    // Key changed: flush the previous run (if any), then start a new one.
+    writeln!(ptx, "\tsetp.lt.s32 %p7, %r14, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra RUN_START;").map_err(write_err)?;
+    emit_run_flush(&mut ptx, int)?;
+    writeln!(ptx, "RUN_START:").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r14, %r12;").map_err(write_err)?;
+    writeln!(
+        ptx,
+        "\tmov.{} {run}, {val};",
+        if int { "u64" } else { "f64" }
+    )
+    .map_err(write_err)?;
+    writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
+    writeln!(ptx, "RUN_ADD:").map_err(write_err)?;
+    writeln!(ptx, "\t{add} {run}, {run}, {val};").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_NEXT;").map_err(write_err)?;
 
     // Overflow path: skip the shared table, hit `out` directly. This is the
@@ -295,13 +412,48 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     writeln!(ptx, "\t@%p5 bra OVERFLOW_SKIP;").map_err(write_err)?;
     writeln!(ptx, "\tmul.wide.u32 %rd22, %r12, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd23, %rd4, %rd22;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.global.add.f64 %fd2, [%rd23], %fd0;").map_err(write_err)?;
+    if int {
+        writeln!(ptx, "\tatom.global.add.u64 %rd9, [%rd23], {val};").map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\tatom.global.add.f64 %fd2, [%rd23], {val};").map_err(write_err)?;
+    }
     writeln!(ptx, "OVERFLOW_SKIP:").map_err(write_err)?;
 
     writeln!(ptx, "LOOP_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r3, %r3, %r5;").map_err(write_err)?;
     writeln!(ptx, "\tbra LOOP_TOP;").map_err(write_err)?;
     writeln!(ptx, "LOOP_DONE:").map_err(write_err)?;
+    // Flush the thread's last run before the block-wide merge. Every lane
+    // of every warp reaches this point (no early exit above), so the
+    // full-mask warp intrinsics below are well-defined. When all 32 lanes of
+    // a warp end on the same (valid) run key — the low-cardinality case —
+    // the runs are shuffle-reduced and lane 0 issues ONE shared atomic for
+    // the warp instead of 32 contending ones.
+    writeln!(ptx, "\tshfl.sync.idx.b32 %r15, %r14, 0, 31, -1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.eq.s32 %p8, %r14, %r15;").map_err(write_err)?;
+    writeln!(ptx, "\tvote.sync.all.pred %p9, %p8, -1;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ge.s32 %p10, %r15, 0;").map_err(write_err)?;
+    writeln!(ptx, "\tand.pred %p9, %p9, %p10;").map_err(write_err)?;
+    writeln!(ptx, "\t@!%p9 bra FINAL_PER_LANE;").map_err(write_err)?;
+    // Tree-reduce the f64 run sums across the warp (split into b32 halves
+    // for shfl). Only lane 0's result is used.
+    for off in [16u32, 8, 4, 2, 1] {
+        writeln!(ptx, "\tmov.b64 {{%r16, %r17}}, {run};").map_err(write_err)?;
+        writeln!(ptx, "\tshfl.sync.down.b32 %r18, %r16, {off}, 31, -1;").map_err(write_err)?;
+        writeln!(ptx, "\tshfl.sync.down.b32 %r19, %r17, {off}, 31, -1;").map_err(write_err)?;
+        writeln!(ptx, "\tmov.b64 {tmp}, {{%r18, %r19}};").map_err(write_err)?;
+        writeln!(ptx, "\t{add} {run}, {run}, {tmp};").map_err(write_err)?;
+    }
+    writeln!(ptx, "\tmov.u32 %r16, %laneid;").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.ne.u32 %p11, %r16, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p11 bra FINAL_FLUSH_DONE;").map_err(write_err)?;
+    emit_run_flush(&mut ptx, int)?;
+    writeln!(ptx, "\tbra FINAL_FLUSH_DONE;").map_err(write_err)?;
+    writeln!(ptx, "FINAL_PER_LANE:").map_err(write_err)?;
+    writeln!(ptx, "\tsetp.lt.s32 %p7, %r14, 0;").map_err(write_err)?;
+    writeln!(ptx, "\t@%p7 bra FINAL_FLUSH_DONE;").map_err(write_err)?;
+    emit_run_flush(&mut ptx, int)?;
+    writeln!(ptx, "FINAL_FLUSH_DONE:").map_err(write_err)?;
     writeln!(ptx, "\tbar.sync 0;").map_err(write_err)?;
     writeln!(ptx).map_err(write_err)?;
 
@@ -332,9 +484,15 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     // Load shared accumulator, atomic-add into the global output.
     writeln!(ptx, "\tmul.wide.u32 %rd26, %r20, 8;").map_err(write_err)?;
     writeln!(ptx, "\tadd.s64 %rd27, %rd0, %rd26;").map_err(write_err)?;
-    writeln!(ptx, "\tld.shared.f64 %fd3, [%rd27];").map_err(write_err)?;
-    writeln!(ptx, "\tadd.s64 %rd28, %rd4, %rd26;").map_err(write_err)?;
-    writeln!(ptx, "\tatom.global.add.f64 %fd4, [%rd28], %fd3;").map_err(write_err)?;
+    if int {
+        writeln!(ptx, "\tld.shared.u64 %rd9, [%rd27];").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd28, %rd4, %rd26;").map_err(write_err)?;
+        writeln!(ptx, "\tatom.global.add.u64 %rd5, [%rd28], %rd9;").map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\tld.shared.f64 %fd3, [%rd27];").map_err(write_err)?;
+        writeln!(ptx, "\tadd.s64 %rd28, %rd4, %rd26;").map_err(write_err)?;
+        writeln!(ptx, "\tatom.global.add.{aty} %fd4, [%rd28], %fd3;").map_err(write_err)?;
+    }
 
     writeln!(ptx, "MERGE_NEXT:").map_err(write_err)?;
     writeln!(ptx, "\tadd.u32 %r20, %r20, {bt};", bt = block_threads).map_err(write_err)?;
@@ -345,6 +503,25 @@ pub fn compile_shmem_sum_kernel() -> BoltResult<String> {
     writeln!(ptx, "}}").map_err(write_err)?;
 
     Ok(ptx)
+}
+
+/// Emit the run flush: `block_acc[%r14] += run; block_set[%r14] = 1`, where
+/// `run` is `%fd5` (float instance) or `%rd8` (integer instance). `%r14` is a
+/// valid in-range slot whenever this is reached.
+fn emit_run_flush(ptx: &mut String, int: bool) -> BoltResult<()> {
+    writeln!(ptx, "\tmul.wide.s32 %rd18, %r14, 8;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd19, %rd0, %rd18;").map_err(write_err)?;
+    if int {
+        writeln!(ptx, "\tatom.shared.add.u64 %rd9, [%rd19], %rd8;").map_err(write_err)?;
+    } else {
+        writeln!(ptx, "\tatom.shared.add.f64 %fd1, [%rd19], %fd5;").map_err(write_err)?;
+    }
+    // block_set[slot] = 1 (unsynchronised; all stores have the same value).
+    writeln!(ptx, "\tcvt.s64.s32 %rd20, %r14;").map_err(write_err)?;
+    writeln!(ptx, "\tadd.s64 %rd21, %rd1, %rd20;").map_err(write_err)?;
+    writeln!(ptx, "\tmov.u32 %r13, 1;").map_err(write_err)?;
+    writeln!(ptx, "\tst.shared.u8 [%rd21], %r13;").map_err(write_err)?;
+    Ok(())
 }
 
 /// Adapt a `std::fmt::Error` into a `BoltError`. Same shape as the helper

@@ -267,3 +267,46 @@ fn utf8_projection_with_non_string_predicate() {
         vec!["c"]
     );
 }
+
+/// A lazily-registered table gets string dictionaries when it is drained, so
+/// its string predicates fold to the dictionary index exactly like an eager
+/// table's (visible in EXPLAIN as `__idx_s`) — and results match.
+#[test]
+#[ignore = "gpu:e2e — lazy tables get dictionaries"]
+fn lazy_table_string_predicates_use_dictionaries() {
+    let decl = Schema::new(vec![
+        Field::new("s", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]);
+    let mut engine = Engine::new().expect("ctx");
+    engine
+        .register_table_stream_lazy(
+            "lz",
+            decl,
+            Box::new(|| Box::new(std::iter::once(Ok(utf8_table(&["a", "b", "a", "c"]))))),
+        )
+        .unwrap();
+    // First query drains the table (and builds its dictionaries) before the
+    // dictionary rewrite runs.
+    assert_eq!(
+        scalar_i64(&engine, "SELECT COUNT(*) FROM lz WHERE s = 'a'"),
+        Some(2)
+    );
+    let explain = engine
+        .explain_sql("SELECT COUNT(*) FROM lz WHERE s = 'a'")
+        .unwrap();
+    assert!(explain.contains("__idx_s"), "{explain}");
+    assert_eq!(
+        scalar_i64(&engine, "SELECT SUM(v) FROM lz WHERE s <> 'a'"),
+        Some(1 + 3)
+    );
+    assert_eq!(
+        scalar_i64(&engine, "SELECT COUNT(*) FROM lz WHERE s = 'zz'"),
+        Some(0)
+    );
+    let out = engine
+        .sql("SELECT s FROM lz WHERE s = 'c'")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(out.num_rows(), 1);
+}

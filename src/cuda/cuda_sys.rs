@@ -1457,7 +1457,7 @@ pub(crate) unsafe fn memcpy_h2d_async<T: Pod>(
     {
         // Stage 2 (review C3): real async via cudarc's driver::sys raw
         // bindings. The cudarc backend retains stream-ordered semantics.
-        return crate::cuda::cudarc_backend::memcpy_h2d_async::<T>(dst, src, n, stream);
+        crate::cuda::cudarc_backend::memcpy_h2d_async::<T>(dst, src, n, stream)
     }
 
     #[cfg(not(feature = "cudarc"))]
@@ -1507,7 +1507,7 @@ pub(crate) unsafe fn memcpy_d2h_async<T: Pod>(
     {
         // Stage 2 (review C3): real async via cudarc's driver::sys raw
         // bindings. See `cudarc_backend::memcpy_d2h_async`.
-        return crate::cuda::cudarc_backend::memcpy_d2h_async::<T>(dst, src, n, stream);
+        crate::cuda::cudarc_backend::memcpy_d2h_async::<T>(dst, src, n, stream)
     }
 
     #[cfg(not(feature = "cudarc"))]
@@ -1547,9 +1547,7 @@ pub(crate) fn memset_d8_async(
         // bindings. See `cudarc_backend::memset_d8_async`.
         // SAFETY: precondition documented on the function — caller
         // guarantees the device range is live and not in use.
-        return unsafe {
-            crate::cuda::cudarc_backend::memset_d8_async(ptr, value, n_bytes, stream)
-        };
+        unsafe { crate::cuda::cudarc_backend::memset_d8_async(ptr, value, n_bytes, stream) }
     }
 
     #[cfg(not(feature = "cudarc"))]

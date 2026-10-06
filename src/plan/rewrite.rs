@@ -36,6 +36,10 @@
 //! | Host-orchestrated SQL shapes (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`, `DISTINCT ON`, `COUNT(DISTINCT)` + `GROUP BY`) | each component subplan, every time it is compiled — e.g. a recursive term once per iteration, a LATERAL subquery once per left row |
 //! | An uncorrelated scalar / `IN` subquery | only as part of its enclosing plan — the extracted subplan is NOT re-submitted, so no hook is applied to it twice |
 //!
+//! The engine's compiled-plan cache (which reuses prepared physical plans for
+//! repeated SQL) is bypassed whenever hooks are registered, so hooks see every
+//! compilation exactly as described above.
+//!
 //! ## Contract
 //!
 //! Implementations MUST preserve the plan's external semantics — the engine

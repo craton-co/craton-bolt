@@ -366,7 +366,7 @@ impl Default for LoadCounter {
 }
 
 // ---------------------------------------------------------------------------
-// v0.6 / M1+M6: KernelSpec-keyed cache layer.
+// KernelSpec-keyed cache layer.
 //
 // The PTX-text-hash cache in `jit::jit_compiler` (and the string-keyed
 // `GLOBAL_MODULE_CACHE` above) only short-circuits AFTER codegen has run —
@@ -857,7 +857,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// v0.7: ScalarAggSpec-keyed cache layer.
+// ScalarAggSpec-keyed cache layer.
 //
 // Mirrors the `KernelSpec` layer above but keyed on the scalar-aggregate
 // planner IR (see [`crate::plan::physical_plan::ScalarAggSpec`]). The
@@ -873,7 +873,7 @@ where
 //      that moved the reduction call out of `exec::aggregate` would silently
 //      change the key.
 //   3. The disk-cache key (when wired) needs an explicit, visible domain
-//      prefix per the v0.7 task brief.
+//      prefix per the task brief.
 //
 // This layer keys on the `ScalarAggSpec` IR itself (a `(op, dtype)` pair),
 // uses the same 128-bit content-hash shape as `KernelSpecKey`, and stamps
@@ -973,7 +973,7 @@ pub fn scalar_agg_cache_stats() -> (usize, usize) {
 /// under the ScalarAggSpec key so subsequent calls with the same spec
 /// hit the fast path.
 ///
-/// # Disk-cache integration (v0.6 / M6)
+/// # Disk-cache integration
 ///
 /// When the disk-backed PTX cache is enabled (env var `BOLT_PTX_CACHE_DIR`
 /// or builder override), a miss in the in-memory cache consults the disk
@@ -1014,7 +1014,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// v0.7: HashJoinKernelSpec-keyed cache layer.
+// HashJoinKernelSpec-keyed cache layer.
 //
 // Mirrors the `ScalarAggSpec` layer above but keyed on the hash-join planner
 // IR (see [`crate::plan::physical_plan::HashJoinKernelSpec`]). Every
@@ -1155,7 +1155,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// v0.7: RadixSortKernelSpec-keyed cache layer.
+// RadixSortKernelSpec-keyed cache layer.
 //
 // Mirrors the `ScalarAggSpec` / `HashJoinKernelSpec` layers above but keyed
 // on the radix-sort planner IR (see
@@ -1350,7 +1350,7 @@ where
     Ok(module)
 }
 // ---------------------------------------------------------------------------
-// CompactionKernelSpec-keyed cache (v0.7). Mirror of the other spec-keyed
+// CompactionKernelSpec-keyed cache. Mirror of the other spec-keyed
 // caches above.
 // ---------------------------------------------------------------------------
 
@@ -1930,7 +1930,7 @@ mod kernelspec_cache_tests {
         );
     }
 
-    /// v0.7 integration test: call the **real** `get_or_build_module_for_spec_with`
+    /// integration test: call the **real** `get_or_build_module_for_spec_with`
     /// twice with the same spec and confirm the second call hits the cache
     /// (compile closure runs exactly once across both calls). This is the
     /// production code path — only the module loader is stubbed out, since
@@ -2841,7 +2841,7 @@ mod radix_sort_cache_tests {
         );
     }
 
-    /// v0.7 integration test: call the real `get_or_build_module_for_radix_sort_with`
+    /// integration test: call the real `get_or_build_module_for_radix_sort_with`
     /// twice with the same `(spec, entry)` pair and confirm the second call
     /// hits the cache. The compile closure runs exactly once across both
     /// calls; the stub loader likewise runs exactly once. This is the

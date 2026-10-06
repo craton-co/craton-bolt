@@ -8,7 +8,7 @@ use thiserror::Error;
 
 /// Engine-wide error enum.
 ///
-/// # v0.6 / M5: `#[non_exhaustive]`
+/// # `#[non_exhaustive]`
 ///
 /// Marked `#[non_exhaustive]` so future minor releases can add new variants
 /// (e.g. a richer `Plan` shape carrying its own span) without forcing every
@@ -16,7 +16,7 @@ use thiserror::Error;
 /// match on `BoltError` *outside* this crate now requires a wildcard arm; we
 /// already use `other => …` / `_ => …` everywhere inside the crate, so the
 /// addition was a no-op for existing code at the time `#[non_exhaustive]`
-/// was introduced (see the v0.6 commit "v0.6: structured errors with optional
+/// was introduced (see the commit "structured errors with optional
 /// source spans" for the audit).
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -67,7 +67,7 @@ pub enum BoltError {
     /// SQL parse / planning error carrying an optional source span
     /// (byte offsets into the original SQL string).
     ///
-    /// Introduced in v0.6 (M5) so editor / IDE consumers can underline the
+    /// Introduced (M5) so editor / IDE consumers can underline the
     /// offending token. The legacy [`BoltError::Sql`] variant is preserved
     /// because most internal call sites have only a human-readable string
     /// and no positional information to attach. Prefer this variant whenever
@@ -212,7 +212,7 @@ mod tests {
         assert!(matches!(e, BoltError::Cuda(_)));
     }
 
-    // ----- v0.6 / M5: SqlWithSpan variant + span() accessor ---------------
+    // ----- SqlWithSpan variant + span accessor ---------------
 
     /// The new span-bearing variant pattern-matches on `{ msg, span }` and
     /// renders both the message and a bracketed `[start..end]` location in

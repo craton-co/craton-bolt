@@ -184,7 +184,7 @@ impl RegAlloc {
             DataType::Int64 => "rl",
             DataType::Float32 => "f",
             DataType::Float64 => "fd",
-            // v0.7: Date32 / Timestamp lower to their underlying integer
+            // Date32 / Timestamp lower to their underlying integer
             // register classes (Date32 = i32, Timestamp = i64). Matches
             // `ptx_gen::RegAlloc::class_for`.
             DataType::Date32 => "r",
@@ -497,7 +497,7 @@ fn emit_op(
         // A `WHERE NOT (a > b)` predicate lowers to one `Op::Not` over the
         // comparison's Bool result. Mirrors `ptx_gen::emit_not`.
         Op::Not { dst, src } => emit_not(b, *dst, *src),
-        // Decimal128 / i128 dual-register ops (v0.7 Sub-task A). A WHERE
+        // Decimal128 / i128 dual-register ops. A WHERE
         // predicate over Decimal128 columns (e.g. `WHERE d1 = d2`,
         // `WHERE d1 + d2 > d3`) flows through this kernel via:
         //
@@ -755,7 +755,7 @@ fn emit_const(b: &mut PtxBuilder, dst: Reg, lit: &Literal) -> BoltResult<()> {
         Literal::Decimal128(..) => Err(BoltError::Plan(
             "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
         )),
-        // v0.7: Date32 / Timestamp literals lower to integer movs on the
+        // Date32 / Timestamp literals lower to integer movs on the
         // underlying days / ticks. Matches `ptx_gen::emit_const`.
         //
         // HARDENING (codegen-injection, mirror ptx_gen): emit the integer /
@@ -834,7 +834,7 @@ fn emit_cast(
                         "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
                     ))
                 }
-                // v0.7: identity-cast on Date32 / Timestamp = typed mov on
+                // identity-cast on Date32 / Timestamp = typed mov on
                 // the underlying integer width.
                 Date32 => "s32",
                 Timestamp(_, _) => "s64",
@@ -923,7 +923,7 @@ fn emit_binary(
     use BinaryOp::*;
     match op {
         Add | Sub | Mul | Div => {
-            // v0.7: same temporal-Sub shape as `ptx_gen::emit_binary`.
+            // same temporal-Sub shape as `ptx_gen::emit_binary`.
             //   * Date32 - Date32 → Int32 (day count)
             //   * Timestamp - Timestamp → Int64 (tick count in source unit)
             // Other arithmetic on temporal operands surfaces as the
@@ -1271,7 +1271,7 @@ fn arith_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         (Div, Int64) => "div.s64",
         (Div, Float32) => "div.rn.f32",
         (Div, Float64) => "div.rn.f64",
-        // v0.7: Date32 / Timestamp Sub lowers to the underlying integer
+        // Date32 / Timestamp Sub lowers to the underlying integer
         // sub. Add/Mul/Div on temporal operands has no meaningful PTX
         // form here — the catch-all below produces "unsupported".
         (Sub, Date32) => "sub.s32",
@@ -1316,7 +1316,7 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
-        // v0.7: temporal compare lowers to integer setp on the underlying
+        // temporal compare lowers to integer setp on the underlying
         // days / ticks. Matching unit + tz is enforced upstream.
         Date32 => "s32",
         Timestamp(_, _) => "s64",
@@ -1350,7 +1350,7 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
-        // v0.7: Date32 / Timestamp ld/st widths follow the underlying
+        // Date32 / Timestamp ld/st widths follow the underlying
         // integer type. Matches `ptx_gen::ld_st_suffix`.
         DataType::Date32 => "s32",
         DataType::Timestamp(_, _) => "s64",
