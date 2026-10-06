@@ -89,6 +89,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
         run: cargo test --doc --features cuda-stub --no-default-features
 
+      # Examples are user-facing documentation: they must compile, and the
+      # quickstart must run (on a CUDA-less host it reports the missing GPU
+      # and exits cleanly; the GPU lane runs it against real hardware).
+      - name: examples (compile + host run)
+        run: |
+          cargo build --examples --features cuda-stub --no-default-features
+          cargo run --example quickstart --features cuda-stub --no-default-features
+
   # Build and run the optional subsystem tests rather than merely type-checking
   # them, so decode/encode and plan-conversion behavior cannot silently rot.
   #
@@ -448,6 +456,15 @@ jobs:
       # `substrait`. Run their #[ignore]-gated tier here.
       - name: Install protoc (substrait codegen)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The published examples must execute against real hardware, not just
+      # compile — the quickstart query is exactly what a new user runs first.
+      - name: examples (GPU run)
+        run: |
+          cargo run --example quickstart --no-default-features --features cudarc
+          cargo run --example groupby --no-default-features --features cudarc
+        env:
+          RUSTFLAGS: ""
 
       - name: cargo test (GPU, optional subsystems)
         run: |

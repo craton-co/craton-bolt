@@ -7,10 +7,15 @@ SQL today, see `docs/SQL_REFERENCE.md`. For the full 1.0 plan, see
 
 ## 0.9.0 (current — pre-production, API stabilising)
 
-v0.7 turns the v0.6 carry-overs into live code paths: it lights up the
-`Decimal128` / `Date` / `Timestamp` GPU lowering boundaries, wires the
-`KernelSpec` module cache into real call sites, and lands the GPU radix-sort
-dispatch in the executor. Highlights (see `CHANGELOG.md` for the full list):
+0.9 makes SQL semantics the default and hardens the runtime contract (see
+`CHANGELOG.md` for the full list): SQL NULL semantics for integer / decimal
+division, NULL grouped `AVG` over empty groups, three-valued literal `IN`; a
+process-wide permit rejecting a second live `Engine`; MSRV 1.85; `cudarc` as
+the supported CUDA adapter; planner-selected (not env-gated) GPU paths; the
+public `ExecutionTier` contract; and a committed public-API snapshot.
+
+The capability summary below was assembled across the 0.6 – 0.7 milestones
+and is kept for reference:
 
 - **`Decimal128` GPU arithmetic** (`+`, `-`, `*`) and comparisons (`=`, `!=`,
   `<`, `>`, `<=`, `>=`, reachable from `WHERE`); `SUM(Decimal128)` via
@@ -159,9 +164,21 @@ v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What
   `BOLT_GPU_SORT` is a tri-state diagnostic override.
 - The disk PTX cache honors both `BOLT_PTX_CACHE_DIR` and
   `EngineBuilder::persistent_cache`, with the builder taking precedence.
-- The lazy streaming executor behind `Engine::register_table_stream` is
-  still the eager drain implementation (the signature is
-  future-compatible).
+- `Engine::register_table_stream` drains eagerly (one validated, coalesced
+  install); `register_table_stream_lazy` defers the producer to the first
+  query that references the table. Both end host-resident: there is no
+  spill-capable operator yet (see `docs/LIMITATIONS.md`).
+
+### On `main` since 0.9.0 (see CHANGELOG `[Unreleased]`)
+
+- One compile pipeline (`QueryCompiler`) for `sql`, `explain_sql`,
+  `run_logical_plan` and host-orchestrated subplans; SQL classified once.
+- Lazy streams drain only referenced tables and enforce the declared schema.
+- Multi-batch tables coalesced at ingest (no per-query concatenation).
+- Aggregates over joins / unions / host-only filters (`AggregateOverInput`);
+  string-literal aggregates and `Utf8` projections under a predicate fixed.
+- Cost-model benchmark suite, reproducibility manifests, scheduled GPU
+  benchmark history; generated module inventory and CI matrix docs.
 
 ## Beyond 0.9 — toward 1.0 (next)
 

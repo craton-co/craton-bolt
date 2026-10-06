@@ -1,3 +1,9 @@
+<!--
+applies-to: main
+owner: performance
+generated-fields: none (numbers are measured; every published table names its provenance)
+-->
+
 # Craton Bolt Benchmarks
 
 This document captures the current measured performance of the Craton Bolt
@@ -8,6 +14,13 @@ preserves the wave-by-wave progression for context.
 ---
 
 ## Section 1 — Current benchmark results (0.9.0, RTX 2060)
+
+> **Provenance.** The h2o.ai table was refreshed at commit `059b454`
+> (2026-10-13, crate 0.9.0); the heavy-arithmetic and CPU-overhead tables are
+> carried forward from earlier 0.9-line runs on the same machine and predate
+> the reproducibility manifest. Treat them as measurements of the build that
+> produced them, not as guarantees about `main` — re-run with the manifest
+> (below) before quoting a number against a newer commit.
 
 All GPU numbers were captured on **NVIDIA GeForce RTX 2060**, driver
 610.88 (WDDM), CUDA 13.3 toolkit, with the `BOLT_BENCH_GPU=1` environment
@@ -225,6 +238,101 @@ The pressure point must either complete or return a bounded
 failure. Cross-GPU comparisons belong in separate rows with exact model,
 driver, toolkit, power mode, and row sweep. The current canonical numbers are
 RTX 2060-only and must not be generalized to another GPU class.
+
+### Reproducibility manifest
+
+Every bench binary writes a JSON manifest at start-up to
+`target/bench-manifests/<bench>-<unix-seconds>.json` (helper:
+[`benches/support/manifest.rs`](../benches/support/manifest.rs)) and prints
+its path. A published number must cite one. Fields:
+
+| Field | Source |
+|---|---|
+| `commit`, `worktree_dirty` | `GITHUB_SHA` or `git rev-parse HEAD`; `git status --porcelain` |
+| `crate_version` | `CARGO_PKG_VERSION` |
+| `rustc`, `profile`, `features` | `rustc --version`; `debug_assertions`; compiled-in Cargo features |
+| `gpu.model`, `gpu.compute_capability`, `gpu.vram`, `driver`, `power_limit` | `nvidia-smi --query-gpu=...` |
+| `cuda_toolkit` | `nvcc --version` |
+| `os` | target OS |
+| `axes` | the bench's experimental axes: rows, sweep, cold/warm, transfer-included, correctness oracle |
+
+Fields whose source is unavailable are `null`, never guessed. Criterion's
+median / CI live in `target/criterion/**/estimates.json`; archive them with
+the manifest.
+
+### Cost-model matrix
+
+[`benches/cost_model.rs`](../benches/cost_model.rs) turns runtime decisions
+into response surfaces: each group sweeps one independent variable with
+everything else fixed.
+
+| Group | Independent variable | Records | Needs GPU |
+|---|---|---|---|
+| `plan_pipeline` | query shape (filter, 64-term expression, 3-way join, subqueries, GROUP BY+HAVING) × stage; optimizer on/off | parse / optimize / lower µs | no |
+| `dict_rewrite` | predicate count × dictionary cardinality | rewrite µs | CUDA build |
+| `fragmentation` | 1, 2, 8, 64, 1024 batches at constant rows | per-query concat (pre-coalescing behaviour) vs coalesced read, bytes copied | no |
+| `batch_ingest` | 1 → 512 appended batches | ingest + first query | yes |
+| `filter_selectivity` | 0 / 1 / 10 / 50 / 90 / 100 % | end-to-end (kernel + compaction + D2H) | yes |
+| `groupby_cardinality` | 1 → 1 M keys | throughput | yes |
+| `groupby_skew` | uniform vs Zipf-like hot keys | throughput / atomic serialisation | yes |
+| `null_density` | 0 / 10 / 50 / 90 % NULL | validity overhead | yes |
+| `jit_cache` | cold codegen + module load vs warm module | latency | yes |
+| `residency` | resident `GpuTable` vs re-uploaded table | H2D cost | yes |
+| `join_shape` | build:probe ratio 1:1, 1:10, 1:100 | latency | yes |
+| `string_width` | 4 B / 64 B / 1 KiB values | dictionary filter latency | yes |
+| `morsel_size` | memory budget = table … table/64 (lazy stream) | morsel overhead | yes |
+| `recursive_cte` | depth 10 / 100 / 500 | cumulative materialisation | yes |
+
+```bash
+cargo bench --bench cost_model --no-default-features --features cuda-stub   # host groups
+BOLT_BENCH_GPU=1 BOLT_COST_ROWS=4000000 cargo bench --bench cost_model      # all groups
+```
+
+**What it already decided.** The `fragmentation` group measured the cost
+the multi-batch representation used to impose on *every* query: concatenating
+a 2 M-row (16 MB) table held in 2–1024 batches took **7–10 ms per query**,
+versus **~0.1 µs** for reading a coalesced batch (RTX 2060 host, Criterion
+`--quick`, manifest commit `9041595`+local changes). That is why tables are
+now coalesced once at ingest (`register_batch`, `register_table_stream`, lazy
+drain) instead of concatenated per query. The `batch_ingest` group keeps the
+remaining ingest-side cost visible: N appends still rebuild the dictionary
+union over the whole table, so N tiny appends cost O(N × table) — prefer one
+`register_table_stream` call (a single coalesce) for bulk loads.
+
+### Publishing a result
+
+Use this template for any number that leaves the repository (README, release
+notes, talks):
+
+```markdown
+### <Benchmark name>
+
+Commit: `<sha>` (manifest: `target/bench-manifests/<file>.json`)
+Craton Bolt: <crate version>        Date: YYYY-MM-DD
+
+Hardware: GPU <model, CC, VRAM> · CPU <model> · RAM <GB> · PCIe <gen×lanes>
+Driver <version> · CUDA <toolkit> · power limit <W>
+
+Configuration: features <...> · memory budget <...> · PTX cache cold/warm ·
+input residency host/GPU · transfers included yes/no
+
+Dataset: rows <n> · columns <...> · key cardinality <...> · skew <...> ·
+null fraction <...>
+
+Correctness oracle: DuckDB <version> / Polars <version>, tolerance <...>
+
+| Query | median | p95 | CI | rows/s |
+|---|---|---|---|---|
+```
+
+### Scheduled benchmark history
+
+Hosted CI runs `cuda-stub`, so it cannot observe GPU performance. The
+[`bench-history`](../.github/workflows/bench-history.yml) workflow runs the
+cost-model and h2o suites weekly (and on demand) on the self-hosted GPU
+runner and uploads `target/criterion` plus `target/bench-manifests` as a
+dated artifact, building the per-commit history regressions are judged
+against.
 
 ### Remaining measurement detail
 

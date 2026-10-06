@@ -24,6 +24,9 @@
 //! (cross-engine disagreement panics), then timed at h2o's "small" scale.
 //! Gated on `BOLT_BENCH_GPU=1` for the device path.
 
+#[path = "support/manifest.rs"]
+mod manifest;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -316,5 +319,23 @@ fn bench_entry(c: &mut Criterion) {
     bench_bolt_group(c);
 }
 
-criterion_group!(benches, bench_entry);
+/// Record the build / hardware context of this run (see
+/// `benches/support/manifest.rs` and `docs/BENCHMARKS.md`).
+fn write_manifest(_: &mut Criterion) {
+    manifest::write(
+        "compute_benchmarks",
+        &[
+            manifest::Axis {
+                name: "workload",
+                value: "compute-bound fused expressions".into(),
+            },
+            manifest::Axis {
+                name: "transfer_included",
+                value: "true".into(),
+            },
+        ],
+    );
+}
+
+criterion_group!(benches, write_manifest, bench_entry);
 criterion_main!(benches);

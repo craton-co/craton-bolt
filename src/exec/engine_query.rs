@@ -273,8 +273,7 @@ impl Engine {
 
     /// Compile and execute a SQL query string.
     ///
-    /// The statement is classified once
-    /// ([`classify_query`](crate::plan::sql_frontend::classify_query)); an
+    /// The statement is classified once (`sql_frontend::classify_query`); an
     /// ordinary query runs through the shared compiler pipeline (see the
     /// module docs), and a host-orchestrated shape (recursive CTE, LATERAL,
     /// correlated WHERE, VALUES, generate_series, DISTINCT ON, COUNT(DISTINCT)

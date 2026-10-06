@@ -1,7 +1,12 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--
+applies-to: main
+owner: execution
+version-neutral: the crate version and MSRV live in Cargo.toml; do not pin them here
+-->
 # Craton Bolt — Limitations
 
-**Crate:** `craton-bolt` v0.9.0 · **License:** Apache-2.0
+**Crate:** `craton-bolt` (version: see `Cargo.toml` / [`CHANGELOG.md`](../CHANGELOG.md)) · **License:** Apache-2.0
 
 This is the 30-second, honest read on what Craton Bolt **cannot** do yet, what
 it **requires**, and why it is **not production-ready**. It consolidates caveats
@@ -75,7 +80,7 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 ## Pre-1.0 API instability
 
-- The crate is `0.9.0`. Per [SemVer](https://semver.org/), pre-1.0 the public
+- The crate is pre-1.0. Per [SemVer](https://semver.org/), pre-1.0 the public
   API may break on any minor (`0.x`) bump. The IR, `KernelSpec`, executor
   surface, and several `Engine` methods are still moving.
 - See [`docs/API_SURFACE.md`](API_SURFACE.md) for the per-item stability tiers
@@ -94,6 +99,57 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   green workflow; host-only evidence is never presented as device evidence.
 
 ---
+
+## Query pipeline and extension hooks
+
+- **One compile pipeline.** `Engine::sql`, `Engine::explain_sql`,
+  `Engine::run_logical_plan` / `DataFrame::collect`, and every component
+  subplan of a host-orchestrated SQL shape run the same sequence: dictionary
+  rewrite → built-in optimizer → `PlanRewrite` hooks → subquery resolution →
+  lowering. The exact plans a hook receives on each path are documented on
+  `PlanRewrite`; the notable consequence is that host-orchestrated shapes
+  (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`,
+  `DISTINCT ON`, `COUNT(DISTINCT)` + `GROUP BY`) hand hooks their component
+  subplans — once per compilation, e.g. once per recursive iteration —
+  rather than one whole-statement plan.
+- **`EXPLAIN` does not execute subqueries.** When a plan carries uncorrelated
+  scalar / `IN` subqueries, `explain_sql` labels its physical section
+  `Physical plan (pre-subquery-resolution ...)`: at run time each subquery is
+  executed and folded to a constant first, so the executed physical plan can
+  differ from the rendered one in exactly that respect. Host-orchestrated
+  shapes render their descriptor (component subplans as planned).
+- **Host-orchestrated shapes still exist.** They are classified once by the
+  frontend and share the compile pipeline, but they are host loops over
+  subplans, not physical operators (a LATERAL / correlated apply is a capped
+  O(left × subquery) nested loop).
+
+## Streaming and data size
+
+- **Lazy streams materialise on first reference.**
+  `register_table_stream_lazy` registers in O(1) and invokes the producer only
+  when a query (or one of its subqueries / component subplans) scans the
+  table; unrelated lazy tables are never drained, and `explain_sql` never
+  drains. The drained batches are validated against the declared schema
+  (column count, names, plan dtypes) — a mismatch fails every query that
+  references the table — and coalesced into one host batch.
+- **Host memory bounds the data set.** Every registered table — eager or
+  drained lazy — lives in host memory as one coalesced Arrow batch. The
+  morsel path bounds *device* working sets for projection / filter / scalar
+  and distributive grouped aggregates under a memory budget; sorts, joins,
+  windows, distinct, set operations and non-distributive aggregates
+  materialise their whole input.
+- **Appends rebuild the dictionary union.** Each `register_batch` append
+  coalesces the table and rebuilds string dictionaries over all rows, so N
+  appends cost O(N × table). Bulk-load with one `register_table_stream` call
+  (a single coalesce) instead.
+- **Lazy tables have no string dictionaries.** String predicates over a lazy
+  table are evaluated host-side (correct, but without the dictionary-index
+  GPU fold an eager table gets).
+- **Aggregates over a non-fusable input are materialised.** `GROUP BY` /
+  aggregates over a join, union, distinct, or a filter the fused GPU kernel
+  cannot evaluate (e.g. a raw `Utf8` comparison) run the input first, bind
+  its rows as an ephemeral table, and aggregate that (GPU where the
+  aggregate shape allows). Correct, at the cost of materialising the input.
 
 ## Known semantic gaps
 
@@ -144,7 +200,7 @@ These are real, code-level behaviors to be aware of:
   non-dict or protected column) still fall back to a host string comparison.
 - **Temporal / decimal types: lowered, with residual gaps.** `Decimal128`,
   `Date32`, and `Timestamp` parse and lower to the GPU. GPU gather (filter /
-  compaction) and column upload are wired for all three. As of the 0.7 wave:
+  compaction) and column upload are wired for all three.
   `COUNT`, **`MIN`, and `MAX`** over a `Date32` / `Timestamp` column work
   end-to-end (GPU reduction on the i32 / i64 storage; the result is rebuilt
   preserving the date type, or the timestamp **unit + timezone** — scalar and

@@ -397,7 +397,7 @@ pub type craton_bolt::cuda::CUstream = *mut core::ffi::c_void
 pub mod craton_bolt::exec
 pub mod craton_bolt::exec::agg_with_pre
 pub fn craton_bolt::exec::agg_with_pre::execute_aggregate_with_pre(&crate::plan::physical_plan::PhysicalPlan, &arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
-pub fn craton_bolt::exec::agg_with_pre::try_execute_resident(&crate::plan::physical_plan::PhysicalPlan, &craton_bolt::exec::gpu_table::GpuTable) -> craton_bolt::BoltResult<core::option::Option<arrow_array::record_batch::RecordBatch>>
+pub fn craton_bolt::exec::agg_with_pre::try_execute_resident(&crate::plan::physical_plan::PhysicalPlan, &craton_bolt::exec::gpu_table::GpuTable, &dyn core::ops::function::Fn(&str) -> core::option::Option<(craton_bolt::plan::logical_plan::DataType, craton_bolt::cuda::cuda_sys::CUdeviceptr)>) -> craton_bolt::BoltResult<core::option::Option<arrow_array::record_batch::RecordBatch>>
 pub mod craton_bolt::exec::aggregate
 pub fn craton_bolt::exec::aggregate::execute_aggregate(&crate::plan::physical_plan::PhysicalPlan, &arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub mod craton_bolt::exec::compact
@@ -427,7 +427,6 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
 pub fn craton_bolt::exec::engine::Engine::execute(&self, &PhysicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::memory_budget_bytes(&self) -> core::option::Option<usize>
 pub fn craton_bolt::exec::engine::Engine::morsel_plan_for_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::streaming::MorselPlan>
 pub fn craton_bolt::exec::engine::Engine::new() -> craton_bolt::BoltResult<Self>
@@ -439,10 +438,12 @@ pub fn craton_bolt::exec::engine::Engine::register_table_stream<I>(&mut self, im
 pub fn craton_bolt::exec::engine::Engine::register_table_stream_lazy(&mut self, impl core::convert::Into<alloc::string::String>, craton_bolt::plan::logical_plan::Schema, craton_bolt::exec::streaming::BatchProducer) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::replace_table(&mut self, impl core::convert::Into<alloc::string::String>, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::rewrite_count(&self) -> usize
-pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::tracing_enabled(&self) -> bool
 pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<dyn craton_bolt::plan::rewrite::PlanRewrite>) -> Self
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::exec::engine::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
@@ -966,7 +967,6 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
 pub fn craton_bolt::exec::engine::Engine::execute(&self, &PhysicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::memory_budget_bytes(&self) -> core::option::Option<usize>
 pub fn craton_bolt::exec::engine::Engine::morsel_plan_for_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::streaming::MorselPlan>
 pub fn craton_bolt::exec::engine::Engine::new() -> craton_bolt::BoltResult<Self>
@@ -978,10 +978,12 @@ pub fn craton_bolt::exec::engine::Engine::register_table_stream<I>(&mut self, im
 pub fn craton_bolt::exec::engine::Engine::register_table_stream_lazy(&mut self, impl core::convert::Into<alloc::string::String>, craton_bolt::plan::logical_plan::Schema, craton_bolt::exec::streaming::BatchProducer) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::replace_table(&mut self, impl core::convert::Into<alloc::string::String>, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::rewrite_count(&self) -> usize
-pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::tracing_enabled(&self) -> bool
 pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<dyn craton_bolt::plan::rewrite::PlanRewrite>) -> Self
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::exec::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
@@ -2810,7 +2812,6 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
 pub fn craton_bolt::exec::engine::Engine::execute(&self, &PhysicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::memory_budget_bytes(&self) -> core::option::Option<usize>
 pub fn craton_bolt::exec::engine::Engine::morsel_plan_for_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::streaming::MorselPlan>
 pub fn craton_bolt::exec::engine::Engine::new() -> craton_bolt::BoltResult<Self>
@@ -2822,10 +2823,12 @@ pub fn craton_bolt::exec::engine::Engine::register_table_stream<I>(&mut self, im
 pub fn craton_bolt::exec::engine::Engine::register_table_stream_lazy(&mut self, impl core::convert::Into<alloc::string::String>, craton_bolt::plan::logical_plan::Schema, craton_bolt::exec::streaming::BatchProducer) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::replace_table(&mut self, impl core::convert::Into<alloc::string::String>, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::rewrite_count(&self) -> usize
-pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::tracing_enabled(&self) -> bool
 pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<dyn craton_bolt::plan::rewrite::PlanRewrite>) -> Self
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>

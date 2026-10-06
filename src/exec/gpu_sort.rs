@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU-side ORDER BY: upload a key column, bitonic-sort on the device, gather
-//! every other column on the host.
+//! GPU-side ORDER BY: sort key columns on the device (stable LSD radix for
+//! supported Int32/Int64 keys, bitonic otherwise), gather every other column
+//! on the host. The flow below is the bitonic path.
 //!
 //! Pairs with [`crate::jit::sort_kernel`], which emits the PTX. The flow:
 //!

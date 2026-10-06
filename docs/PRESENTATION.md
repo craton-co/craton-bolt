@@ -7,9 +7,9 @@
 > A JIT-compiled GPU SQL engine in Rust. SQL strings go in, NVIDIA PTX comes out at runtime, the GPU does the rest.
 
 - **What**: A SQL execution engine that compiles *each* query into a fresh NVIDIA PTX kernel at runtime, loads it via the CUDA driver, and runs it on the GPU.
-- **Language**: Rust (2021 edition, MSRV 1.74) on top of the raw CUDA driver API — no C++ shim, no precompiled kernel library, no third-party query-engine FFI.
+- **Language**: Rust (2021 edition; MSRV per `rust-version` in `Cargo.toml`) on top of the raw CUDA driver API — no C++ shim, no precompiled kernel library, no third-party query-engine FFI.
 - **Pipeline**: parse → plan → codegen → launch, end to end in pure Rust.
-- **Status**: `0.9.0`, active development, pre-1.0 (public API unstable). Compiles clean on Windows MSVC and Linux against CUDA Toolkit ≥ 12; targets `sm_70` (Volta) and newer.
+- **Status**: active development, pre-1.0 (public API unstable; version per `Cargo.toml` / `CHANGELOG.md`). Compiles clean on Windows MSVC and Linux against CUDA Toolkit ≥ 12; targets `sm_70` (Volta) and newer.
 
 ---
 
@@ -102,17 +102,18 @@ on the GPU. (`docs/SQL_REFERENCE.md` is authoritative.)
 
 ## Slide 6 · Performance — Heavy-Arithmetic OLAP
 
-Measured on an **NVIDIA GeForce RTX 2060**, CUDA 12.6, verified bit-equivalent against
-Polars 0.42 and DuckDB 1.2 before timing. 50 M rows, fused multi-operator arithmetic —
-the regime where GPU compute density pays off.
+Measured on an **NVIDIA GeForce RTX 2060** (driver 610.88, CUDA 13.3 toolkit) on the
+0.9 release line, verified bit-equivalent against Polars 0.42 and DuckDB 1.2 before
+timing; provenance per table in [`BENCHMARKS.md`](BENCHMARKS.md). 50 M rows, fused
+multi-operator arithmetic — the regime where GPU compute density pays off.
 
 | Query                                | Polars (CPU MT) | Craton Bolt (GPU) | Speedup |
 |--------------------------------------|-----------------|-------------------|---------|
-| 11-op arithmetic chain (50 M rows)   | 4.05 s          | **124.8 ms**      | **32.4×** |
-| Filter + 4-op arithmetic (50 M rows) | 369 ms          | **41.8 ms**       | **8.8×**  |
+| 11-op arithmetic chain (50 M rows)   | 3.39 s          | **185.7 ms**      | **18.3×** |
+| Filter + 4-op arithmetic (50 M rows) | 358.2 ms        | **110.0 ms**      | **3.3×**  |
 
-Against an honest single-thread CPU reference loop (1.06 s) the arithmetic chain is still
-**8.5× faster** — the 32.4× figure is partly amplified by Polars' eager-binary
+Against an honest single-thread CPU reference loop (231.8 ms) the arithmetic chain is
+still **1.25× faster** — the 18.3× figure is partly amplified by Polars' eager-binary
 materialisation under chained `lit() * col()` expressions.
 
 **CPU-side overhead** — plan + lower + codegen, no GPU needed — is **under 25 µs per
@@ -229,12 +230,12 @@ strokes before a stable 1.0:
 | **How** | SQL → logical plan → SSA IR → fresh PTX kernel per query → CUDA driver → Arrow |
 | **Distinguishing idea 1** | Kernel fusion: one PTX kernel per query, fused tree in registers |
 | **Distinguishing idea 2** | Borrow-checked GPU memory — UAF / double-free / aliasing are compile errors |
-| **Arithmetic win** | 32.4× vs Polars on a 50 M-row 11-op chain (8.5× vs honest CPU ref) |
-| **GROUP BY win** | Beats DuckDB & Polars on the two highest-cardinality h2o.ai queries |
+| **Arithmetic win** | 18.3× vs Polars on a 50 M-row 11-op chain (1.25× vs honest CPU ref) |
+| **GROUP BY win** | Beats DuckDB & Polars on three of five h2o.ai queries (q1, q3, q5) |
 | **Codegen cost** | < 25 µs plan + lower + codegen per query, any dataset size |
 | **Stack** | Pure Rust on the raw CUDA driver API — no C++ shim, no FFI to a 3rd-party engine |
 | **Targets** | CUDA 12+, NVIDIA `sm_70`+ (Volta); Linux & Windows MSVC; `cuda-stub` type-checks anywhere |
-| **Status** | v0.9.0, active development, pre-1.0 — API unstable, not production-ready |
+| **Status** | active development, pre-1.0 — API unstable, not production-ready |
 | **License** | Apache-2.0 |
 
 ---

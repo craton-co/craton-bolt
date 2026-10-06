@@ -98,6 +98,32 @@ use crate::error::{BoltError, BoltResult};
 /// The factory returns a fresh boxed iterator each time it is called. Producer
 /// errors surface as `Err` items from that iterator, exactly like the eager
 /// `register_table_stream` contract.
+///
+/// # Stability
+///
+/// Experimental until 1.0 (the streaming surface is still evolving).
+///
+/// # Execution semantics
+///
+/// Invoked by [`Engine::register_table_stream_lazy`](crate::Engine::register_table_stream_lazy)
+/// tables on the first query that scans the table (never for `explain_sql`,
+/// never for unrelated queries). Every yielded batch is validated against the
+/// declared schema and the batches are coalesced into one host batch.
+///
+/// # Threading
+///
+/// Called synchronously on the querying thread; `Send + Sync` so the engine
+/// may hold it.
+///
+/// # Errors
+///
+/// The first `Err` item aborts the drain and fails the query; a schema
+/// mismatch fails it too. The table stays un-drained, so the next query
+/// re-invokes the factory.
+///
+/// # Compatibility
+///
+/// Each call must return the same logical batch sequence.
 pub type BatchProducer =
     Box<dyn Fn() -> Box<dyn Iterator<Item = BoltResult<RecordBatch>>> + Send + Sync>;
 

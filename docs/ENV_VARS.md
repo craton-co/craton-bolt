@@ -40,7 +40,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_POOL_WATCH_LOW_WATER_FRAC` | 0.10                 | `(0, 1)`    | Watcher proactive-evict threshold (free/total)  |
 | `BOLT_GPU_JOIN_TABLE_CAP_MB`     | driver-detected      | `64..=4096` | Override hash-table byte cap (MiB)              |
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
-| `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root (v0.6 / M6)   |
+| `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root               |
 | `BOLT_GPU_SORT`                  | planner heuristic    | `1` / `0`   | Force a GPU attempt / force host for `ORDER BY` |
 | `BOLT_GPU_DISTINCT`              | on                   | `0`/`false`/`no` | Force the single-primitive-key `DISTINCT` dedup to its host mirror |
 | `BOLT_GPU_STRING`                | on                   | `0`/`false`/`no` | Force validated GPU string shapes to their host mirrors |
@@ -53,6 +53,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_BENCH_GPU`                 | off                  | `1`         | Enable GPU paths in `cargo bench`               |
 | `BOLT_BENCH_THRESHOLD`           | off                  | `1`         | Enable the Utf8-sort threshold bench            |
 | `BOLT_SCALING_ROWS`              | bounded sweep        | CSV rows    | Override real-GPU scaling row counts            |
+| `BOLT_COST_ROWS`                 | 4_000_000            | integer > 0 | Row count for the cost-model bench GPU groups   |
 | `BOLT_VRAM_PRESSURE_ROWS`        | unset                | rows        | Add one near-capacity GPU benchmark point       |
 | `BOLT_REGRESSION_WRITE_BASELINE` | unset                | path        | Write host benchmark medians as JSON            |
 | `BOLT_REGRESSION_BASELINE`       | unset                | path        | Compare host benchmark medians with JSON        |
@@ -199,7 +200,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 ### `BOLT_PTX_CACHE_DIR`
 - **Default**: unset (disk-backed cache disabled — in-process cache only)
 - **Type**: path to a writable directory
-- **What**: Enables the optional disk-backed PTX cache (v0.6 / M6). On a
+- **What**: Enables the optional disk-backed PTX cache. On a
   miss in the in-process module cache the engine reads
   `<dir>/<entry>-<hash>.ptx` from disk before re-running codegen; on a
   disk miss it writes the freshly-generated PTX back to disk for the
@@ -337,6 +338,14 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 - **What**: Replaces the default row sweep in the real-device scaling
   benchmark.
 - **Source**: `benches/scaling_benchmarks.rs::configured_rows`.
+
+### `BOLT_COST_ROWS`
+- **Default**: `4000000`
+- **Type**: positive integer
+- **What**: Row count for the GPU groups of the cost-model benchmark
+  (filter selectivity, GROUP BY cardinality / skew, NULL density, residency,
+  join shape, ...). Host groups use fixed sizes.
+- **Source**: `benches/cost_model.rs::gpu_rows`.
 
 ### `BOLT_VRAM_PRESSURE_ROWS`
 - **Default**: unset

@@ -45,7 +45,6 @@ use crate::exec::engine_cache_key::{
     ClonedHostRevision, HostRevisionSnapshot, HostTableRevision, ModuleCacheKey,
 };
 use crate::exec::engine_device_col::DeviceCol;
-#[cfg(test)]
 use crate::exec::engine_provider::EngineProvider;
 use crate::exec::engine_support::{
     arrow_schema_to_plan_schema, build_count_rows_batch, column_storage_rows, concat_table_batches,
@@ -121,6 +120,55 @@ fn max_recursive_rows() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(MAX_RECURSIVE_ROWS)
+}
+
+/// Download a registered dictionary's per-row index column (`0` = NULL,
+/// real strings from `1`) — the exact values the GPU kernels read for a
+/// rewriter-emitted `__idx_<col>` input.
+fn host_dict_indices(
+    dict: &crate::cuda::dictionary_any::DictionaryColumnAny,
+) -> BoltResult<ArrayRef> {
+    Ok(match dict {
+        crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
+            Arc::new(arrow_array::Int32Array::from(d.indices.to_vec()?))
+        }
+        crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
+            Arc::new(Int64Array::from(d.indices.to_vec()?))
+        }
+    })
+}
+
+/// Map a dictionary's per-row indices through a rewriter rank table — the
+/// per-row values of a `__rank_<col>` column (NULL rows carry index 0, which
+/// the rank table maps to the `-1` sentinel). Bounds-checked so a malformed
+/// index is a structured error, not a panic.
+fn host_rank_values(
+    dict: &crate::cuda::dictionary_any::DictionaryColumnAny,
+    rank_table: &[i64],
+    original: &str,
+) -> BoltResult<Vec<i64>> {
+    let idxs: Vec<i64> = match dict {
+        crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
+            d.indices.to_vec()?.into_iter().map(i64::from).collect()
+        }
+        crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => d.indices.to_vec()?,
+    };
+    idxs.into_iter()
+        .map(|ix| {
+            if ix < 0 {
+                return Err(BoltError::Other(format!(
+                    "rank materialise: negative index {ix} for column '{original}'"
+                )));
+            }
+            rank_table.get(ix as usize).copied().ok_or_else(|| {
+                BoltError::Other(format!(
+                    "rank materialise: index {ix} for column '{original}' out of rank-table \
+                     range {}",
+                    rank_table.len()
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Validate one streamed batch against a table's declared plan schema
@@ -1026,12 +1074,14 @@ impl Drop for ActiveEnginePermit {
 /// other access is via inherent methods.
 #[non_exhaustive]
 pub struct Engine {
-    /// Registered tables, keyed by name. A single table may comprise multiple
-    /// batches (wave-7 multi-batch support): the engine concatenates them via
-    /// `arrow::compute::concat_batches` at query time. This is a 0.2-era
-    /// simplification — a streaming, per-batch query plan is a 0.3 goal — so
-    /// large multi-batch tables pay a full materialisation cost on every
-    /// `sql()` call. Keep the per-table batch count modest until then.
+    /// Registered tables, keyed by name.
+    ///
+    /// **Invariant: every entry holds exactly one batch.** Multi-batch
+    /// ingestion (`register_batch` appends, `register_table_stream`) is
+    /// coalesced at ingest time, so query-time reads are Arc clones and no
+    /// query pays an O(table-bytes) host concatenation. The `Vec` shape is
+    /// kept so the validity probes and morsel planner can take a batch slice
+    /// uniformly with the streaming overlay.
     ///
     /// `pub(crate)` (was module-private): read by the engine-method clusters
     /// that were split out of this file into sibling modules
@@ -1783,46 +1833,32 @@ impl Engine {
         Ok(())
     }
 
-    /// Register a table from a producer that yields batches lazily.
+    /// Register a table from an iterator of batches, consuming it eagerly.
     ///
     /// `schema` declares the expected per-batch schema up front (column
     /// names + dtypes); every batch yielded by `batches` is validated
-    /// against it before being installed. Producer-side errors propagate
-    /// out of the iterator as `BoltResult::Err(_)` — yielding an `Err`
-    /// aborts registration with that error, leaving the engine in the
-    /// state it had before this call (modulo any batches already
-    /// installed for *this* table, which are rolled back via
-    /// `tables.remove`).
+    /// against it. Producer-side errors propagate out of the iterator as
+    /// `BoltResult::Err(_)` — yielding an `Err` aborts registration with that
+    /// error.
     ///
-    /// # v0.6 semantics: eager consumption
-    ///
-    /// The v0.6 cut consumes `batches` EAGERLY: every batch is pulled
-    /// from the iterator and pushed into the engine's existing
-    /// multi-batch in-memory table representation (the same `Vec<RecordBatch>`
-    /// that backs `register_table` + repeated `register_batch`). This is
-    /// deliberate — the goal here is to land a stable API *shape* so
-    /// callers can write streaming-style code today and have it keep
-    /// compiling when v0.7+ replaces the body with a truly lazy
-    /// per-batch query plan. Until then, large streams still pay the
-    /// full host-side materialisation cost on every `sql()` call (see
-    /// the field doc on `tables` for the perf caveat).
-    ///
-    /// Roadmap: v0.7 is expected to land lazy streaming where each
-    /// yielded batch is processed and discarded without materialising
-    /// the full table in host memory. The signature here is
-    /// future-compatible with that change.
+    /// The iterator is drained, validated, and coalesced into ONE batch which
+    /// is then installed exactly as [`Engine::register_table`] would install
+    /// it — so the call is atomic (nothing is installed unless every batch
+    /// arrived and validated) and costs a single O(total bytes) copy, rather
+    /// than one dictionary rebuild per batch.
     ///
     /// For a registration path that does NOT drain the producer up front,
     /// see [`Engine::register_table_stream_lazy`], which stores a replayable
-    /// producer and only materialises it on first query — the lazy seam that
-    /// backs morsel/larger-than-VRAM execution.
+    /// producer and only materialises it on the first query that references
+    /// the table.
     ///
     /// # Errors
-    /// - The iterator is empty (a table must contain at least one batch
-    ///   for `materialize_table` to succeed).
+    /// - The iterator is empty (a registered table must contain at least
+    ///   one batch).
     /// - Any yielded `Err` propagates out unchanged.
     /// - Any batch's schema (column names + plan-level dtypes) does not
-    ///   match the declared `schema`.
+    ///   match the declared `schema`, or its Arrow schema differs from the
+    ///   first batch's (the same rule [`Engine::register_batch`] applies).
     /// - A table named `name` is already registered.
     pub fn register_table_stream<I>(
         &mut self,
@@ -1840,98 +1876,76 @@ impl Engine {
                  cannot append to an existing table; use register_batch instead"
             )));
         }
-        // Eagerly drain the iterator, threading errors out and rolling
-        // back the (just-installed) table on any failure so the engine
-        // never observes a partially-installed table from this call.
-        let mut iter = batches.into_iter();
-        let first = match iter.next() {
-            Some(Ok(b)) => b,
-            Some(Err(e)) => return Err(e),
-            None => {
-                return Err(BoltError::Plan(format!(
-                    "register_table_stream: iterator for table '{name}' yielded \
-                     zero batches — a registered table must contain at least one batch"
-                )));
-            }
-        };
-        validate_stream_batch_schema("register_table_stream", &schema, &first, &name, 0)?;
-        // Install the first batch through the same path
-        // `register_table` uses — dictionaries, provider, GpuTable,
-        // host-revisions all set up in one place.
-        self.register_table(name.clone(), first)?;
-        // Stream subsequent batches in. On any error, roll back the
-        // entire table install so this call is atomic from the caller's
-        // perspective.
-        let mut batch_idx: usize = 1;
-        loop {
-            let next = match iter.next() {
-                Some(Ok(b)) => b,
-                Some(Err(e)) => {
-                    self.unregister_table_best_effort(&name);
-                    return Err(e);
-                }
-                None => break,
-            };
-            if let Err(e) = validate_stream_batch_schema(
+        let mut collected: Vec<RecordBatch> = Vec::new();
+        for (batch_idx, item) in batches.into_iter().enumerate() {
+            let batch = item?;
+            validate_stream_batch_schema(
                 "register_table_stream",
                 &schema,
-                &next,
+                &batch,
                 &name,
                 batch_idx,
-            ) {
-                self.unregister_table_best_effort(&name);
-                return Err(e);
+            )?;
+            if let Some(first) = collected.first() {
+                if first.schema() != batch.schema() {
+                    return Err(BoltError::Plan(format!(
+                        "register_table_stream: batch {batch_idx} for table '{name}' has \
+                         Arrow schema {:?}, which differs from batch 0's {:?}",
+                        batch.schema(),
+                        first.schema()
+                    )));
+                }
             }
-            if let Err(e) = self.register_batch(&name, next) {
-                self.unregister_table_best_effort(&name);
-                return Err(e);
-            }
-            batch_idx += 1;
+            collected.push(batch);
         }
-        Ok(())
-    }
-
-    /// Best-effort rollback helper used by `register_table_stream` when a
-    /// mid-stream error needs to undo the partial install. Mirrors the
-    /// state touched by `register_table` / `register_batch`.
-    fn unregister_table_best_effort(&mut self, name: &str) {
-        self.tables.remove(name);
-        self.streaming_sources.borrow_mut().remove(name);
-        self.dict_registry.unregister_table(name);
-        self.provider.unregister_table(name);
-        self.host_revisions.remove(name);
-        self.gpu_tables.borrow_mut().remove(name);
+        if collected.is_empty() {
+            return Err(BoltError::Plan(format!(
+                "register_table_stream: iterator for table '{name}' yielded \
+                 zero batches — a registered table must contain at least one batch"
+            )));
+        }
+        let coalesced = concat_table_batches(&name, &collected)?;
+        drop(collected);
+        // Install through the same path `register_table` uses — dictionaries,
+        // provider, GpuTable, host-revisions all set up in one place.
+        self.register_table(name, coalesced)
     }
 
     /// Register a table from a producer that yields batches lazily, WITHOUT
     /// draining the producer at registration time (truly lazy path).
     ///
     /// Unlike [`Engine::register_table_stream`] — which drains the iterator
-    /// eagerly into the engine's in-memory `Vec<RecordBatch>` representation
-    /// the moment it is called — this method stores a *replayable producer*
-    /// ([`crate::exec::streaming::TableSource::Streaming`]) and only registers
-    /// the table's schema with the SQL frontend. The producer is not invoked
-    /// until the first query that references the table, at which point the
-    /// source is collapsed into the canonical materialised representation (see
-    /// [`Engine::ensure_streaming_materialized`]).
+    /// eagerly the moment it is called — this method stores a *replayable
+    /// producer* ([`crate::exec::streaming::TableSource::Streaming`]) and only
+    /// registers the table's declared schema with the SQL frontend, so
+    /// registration is O(1).
     ///
-    /// This keeps registration O(1) for large streams and is the seam through
-    /// which larger-than-VRAM, morsel-at-a-time execution will be threaded:
-    /// the budget hook ([`Engine::morsel_plan_for_table`]) inspects the
-    /// materialised batches against [`Engine::memory_budget_bytes`] and decides
-    /// whether to upload the table whole or process it in bounded morsels.
+    /// **When the producer runs.** On the first query whose compiled plan
+    /// scans this table (including a subquery or a component subplan of a
+    /// host-orchestrated shape that scans it); never for queries that do not
+    /// reference it, and never for [`Engine::explain_sql`]. The drain
+    /// (`Engine::materialize_streaming_source`) validates every batch
+    /// against `schema` with the same rule the eager path uses, coalesces the
+    /// batches into one, and stages it in the overlay; later queries reuse it.
+    ///
+    /// **What the table gets.** The overlay table is queryable by every
+    /// executor. Under [`Engine::memory_budget_bytes`], row-wise scans and
+    /// distributive aggregates over it run in bounded morsels (the budget
+    /// hook is [`Engine::morsel_plan_for_table`]). It is *not* promoted into
+    /// the eager store, so it gets no string dictionaries: string predicates
+    /// over it stay real string comparisons, evaluated on the host.
     ///
     /// `producer` is a factory: each call must return a fresh iterator over
-    /// the same logical batch sequence (so the source can be re-drained if the
-    /// engine ever re-derives the table). Producer-side errors surface as
-    /// `Err` items and abort the first materialisation.
+    /// the same logical batch sequence. Producer-side errors surface as `Err`
+    /// items and fail the query; the table stays un-drained, so the next
+    /// referencing query invokes the factory again.
     ///
     /// # Errors
     /// - A table named `name` is already registered (eager or lazy).
-    /// - Note: schema/content validation and the empty-stream check are
-    ///   deferred to first query (when the producer is actually drained),
-    ///   matching the lazy contract. The eager
-    ///   [`Engine::register_table_stream`] validates up front instead.
+    /// - Schema validation and the empty-stream check happen at the first
+    ///   referencing query (when the producer is actually drained) and fail
+    ///   that query — and every later one, deterministically, until the
+    ///   producer yields conforming batches.
     pub fn register_table_stream_lazy(
         &mut self,
         name: impl Into<String>,
@@ -1946,10 +1960,10 @@ impl Engine {
             )));
         }
         // Register the declared schema with the SQL frontend so planning can
-        // resolve column references before the producer is ever drained. We do
-        // NOT extend it with dictionary `__idx_<col>` columns here — string
-        // dictionaries are built when the source is materialised on first
-        // query (see `ensure_streaming_materialized`).
+        // resolve column references before the producer is ever drained. It
+        // is NOT extended with dictionary `__idx_<col>` columns: overlay tables
+        // never get dictionaries (see the method docs), so the dictionary
+        // rewrite leaves their string predicates as string comparisons.
         self.provider.register(name.clone(), schema);
         self.streaming_sources.borrow_mut().insert(
             name,
@@ -1991,8 +2005,9 @@ impl Engine {
     /// failure the entry stays `Streaming`, so every later query referencing
     /// the table reports the same error.
     ///
-    /// The drained batches are staged in the overlay (not moved into
-    /// `tables`) because query paths hold only `&self`. The read paths
+    /// The drained batches are coalesced into one batch and staged in the
+    /// overlay (not moved into `tables`) because query paths hold only
+    /// `&self`. The read paths
     /// ([`Engine::materialize_table`], the validity-probe provider, `ensure_gpu_table`)
     /// consult the overlay as a fall-back, so the table is fully queryable;
     /// see [`Engine::register_table_stream_lazy`] for the dictionary caveat.
@@ -2008,9 +2023,14 @@ impl Engine {
         for (i, batch) in drained.iter().enumerate() {
             validate_stream_batch_schema("register_table_stream_lazy", &declared, batch, name, i)?;
         }
+        // Coalesce once at drain time (the drained batches are dropped right
+        // after), so every later query reads the table with an Arc clone
+        // instead of re-concatenating the producer's batches per query.
+        let coalesced = concat_table_batches(name, &drained)?;
+        drop(drained);
         self.streaming_sources.borrow_mut().insert(
             name.to_string(),
-            crate::exec::streaming::TableSource::Materialized(drained),
+            crate::exec::streaming::TableSource::Materialized(vec![coalesced]),
         );
         Ok(())
     }
@@ -2153,9 +2173,12 @@ impl Engine {
     }
 
     /// Append `batch` to the table named `name`, creating it if absent.
-    /// Multi-batch tables are concatenated into a single `RecordBatch` at
-    /// query time via `arrow::compute::concat_batches` — see the field doc on
-    /// `tables` for the perf caveat.
+    ///
+    /// The append is coalesced into the table's single stored batch here, at
+    /// ingest (see the field doc on `tables`), so no query ever pays a
+    /// full-table host concatenation. The coalesced batch is the one the
+    /// dictionary union below needs anyway, so storing it costs nothing
+    /// extra.
     ///
     /// Subsequent batches MUST share the schema of the first batch; mismatched
     /// schemas surface a `Plan` error here rather than at query time.
@@ -2213,6 +2236,11 @@ impl Engine {
                 }
             }
             existing.push(batch);
+            // Coalesce: the table becomes ONE batch again. Every later read
+            // (`materialize_table`, GPU upload, validity probes) is then an
+            // Arc clone instead of an O(table-bytes) concat per query.
+            let coalesced = concat_table_batches(name, existing)?;
+            *existing = vec![coalesced];
             // Review C10: rebuild the dict registry against the *concatenated*
             // batches so the string-literal rewriter sees every dict value
             // from every batch — not just batch 0. Without this, a literal
@@ -2499,12 +2527,13 @@ impl Engine {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Materialise the concatenated `RecordBatch` for a registered table.
+    /// The single `RecordBatch` holding a registered table's rows.
     ///
-    /// Fast-path: zero batches errors, one batch is cloned cheaply (Arrow
-    /// arrays are Arc-backed). Two or more batches go through
-    /// `arrow::compute::concat_batches`, which copies every column — the
-    /// 0.2 perf cost the field doc on `tables` warns about.
+    /// Both the eager store and the materialised lazy overlay keep each
+    /// table coalesced into exactly one batch (see the field docs on
+    /// `tables` / `streaming_sources`), so this is an Arc clone — no column
+    /// is copied. `concat_table_batches` is retained only as a defensive
+    /// fallback for an out-of-band multi-batch entry.
     // `pub(crate)` (was module-private): called from the string method
     // cluster split out into `engine_string_impl`. Pure visibility widening.
     pub(crate) fn materialize_table(&self, name: &str) -> BoltResult<RecordBatch> {
@@ -2515,6 +2544,150 @@ impl Engine {
         // Streaming overlay: collapse the source to materialised on first
         // read, then concat its batches.
         self.streaming_batches(name, |batches| concat_table_batches(name, batches))
+    }
+
+    /// Execute a [`PhysicalPlan::AggregateOverInput`]: run `input`, bind its
+    /// rows as the ephemeral overlay table `table` (columns conformed to
+    /// `input_schema`'s names), populate the inner aggregate's validity flags
+    /// from the bound rows, and run `aggregate` through the ordinary
+    /// aggregate dispatch. The binding is removed on every exit path.
+    fn execute_aggregate_over_input(
+        &self,
+        input: &PhysicalPlan,
+        table: &str,
+        input_schema: &Schema,
+        aggregate: &PhysicalPlan,
+    ) -> BoltResult<QueryHandle> {
+        use crate::exec::streaming::TableSource;
+        let rows = self.execute(input)?.into_record_batch();
+        if rows.num_columns() != input_schema.fields.len() {
+            return Err(BoltError::Other(format!(
+                "aggregate input produced {} columns, expected {}",
+                rows.num_columns(),
+                input_schema.fields.len()
+            )));
+        }
+        // Conform column names to the logical input schema the aggregate was
+        // lowered against (a physical join may disambiguate differently).
+        let fields: Vec<arrow_schema::FieldRef> = rows
+            .schema()
+            .fields()
+            .iter()
+            .zip(&input_schema.fields)
+            .map(|(f, want)| Arc::new(f.as_ref().clone().with_name(want.name.clone())))
+            .collect();
+        let rows = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(fields)),
+            rows.columns().to_vec(),
+        )
+        .map_err(|e| BoltError::Other(format!("failed to bind aggregate input: {e}")))?;
+        if self.tables.contains_key(table) || self.streaming_sources.borrow().contains_key(table) {
+            return Err(BoltError::Plan(format!(
+                "reserved aggregate-input table name '{table}' collides with a registered table"
+            )));
+        }
+        self.gpu_tables.borrow_mut().remove(table);
+        self.streaming_sources
+            .borrow_mut()
+            .insert(table.to_string(), TableSource::Materialized(vec![rows]));
+        // Nothing below can fail before `execute`, so no early return can skip
+        // the cleanup that follows.
+        let mut aggregate = aggregate.clone();
+        let nb = EngineProvider {
+            base: &self.provider,
+            tables: &self.tables,
+            streaming: self.streaming_sources.borrow(),
+        };
+        crate::plan::physical_plan::populate_input_validity(&mut aggregate, &nb);
+        drop(nb);
+        let result = self.execute(&aggregate);
+        self.streaming_sources.borrow_mut().remove(table);
+        self.gpu_tables.borrow_mut().remove(table);
+        result
+    }
+
+    /// [`Engine::materialize_table`] extended with every rewriter-synthesised
+    /// column (`__idx_<col>` dictionary indices, `__rank_<col>` Utf8 ordering
+    /// ranks) that a kernel reading `inputs` needs.
+    ///
+    /// Those columns never exist in the registered batch — the GPU projection
+    /// path resolves them straight from the dictionary registry's device
+    /// buffers. Host-batch executors (the aggregate / GROUP BY pre-stage
+    /// fallbacks) need them materialised as ordinary columns, with exactly the
+    /// values the device path reads, or a string-equality predicate folded by
+    /// the dictionary rewrite fails with "column not present".
+    pub(crate) fn materialize_table_for_inputs<'n>(
+        &self,
+        table: &str,
+        inputs: impl IntoIterator<Item = &'n str>,
+    ) -> BoltResult<RecordBatch> {
+        let batch = self.materialize_table(table)?;
+        let schema = batch.schema();
+        let missing: Vec<&str> = inputs
+            .into_iter()
+            .filter(|name| {
+                (name.starts_with("__idx_") || name.starts_with("__rank_"))
+                    && schema.index_of(name).is_err()
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(batch);
+        }
+        let mut fields: Vec<arrow_schema::FieldRef> = schema.fields().iter().cloned().collect();
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        let mut added = std::collections::HashSet::new();
+        for name in missing {
+            if !added.insert(name) {
+                continue;
+            }
+            let no_dict = |original: &str| {
+                BoltError::Plan(format!(
+                    "rewriter-emitted column '{name}' references column '{original}' with no \
+                     dictionary in registry"
+                ))
+            };
+            let array: ArrayRef = if let Some(original) = name.strip_prefix("__idx_") {
+                let dict = self
+                    .dict_registry
+                    .dictionary(table, original)
+                    .ok_or_else(|| no_dict(original))?;
+                host_dict_indices(dict)?
+            } else {
+                let original = name.strip_prefix("__rank_").unwrap_or(name);
+                let rank_table = self.dict_registry.rank_table(name).ok_or_else(|| {
+                    BoltError::Plan(format!(
+                        "rewriter-emitted rank column '{name}' has no rank table in registry"
+                    ))
+                })?;
+                let dict = self
+                    .dict_registry
+                    .dictionary(table, original)
+                    .ok_or_else(|| no_dict(original))?;
+                Arc::new(Int64Array::from(host_rank_values(
+                    dict,
+                    &rank_table,
+                    original,
+                )?))
+            };
+            if array.len() != batch.num_rows() {
+                return Err(BoltError::Other(format!(
+                    "synthesised column '{name}' has {} rows, table '{table}' has {}",
+                    array.len(),
+                    batch.num_rows()
+                )));
+            }
+            fields.push(Arc::new(arrow_schema::Field::new(
+                name,
+                array.data_type().clone(),
+                false,
+            )));
+            columns.push(array);
+        }
+        RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).map_err(|e| {
+            BoltError::Other(format!(
+                "failed to extend table '{table}' with synthesised columns: {e}"
+            ))
+        })
     }
 
     /// Ensure the streaming source for `name` is drained, then run `f` over its
@@ -3608,7 +3781,11 @@ impl Engine {
                 // populates the slot table.
                 let out = match (!aggregate.group_by.is_empty(), pre.is_some()) {
                     (true, true) => {
-                        let batch = self.materialize_table(table)?;
+                        let inputs = pre.as_ref().map_or(&[][..], |p| p.inputs.as_slice());
+                        let batch = self.materialize_table_for_inputs(
+                            table,
+                            inputs.iter().map(|io| io.name.as_str()),
+                        )?;
                         crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, &batch)?
                     }
                     (true, false) => {
@@ -3645,16 +3822,33 @@ impl Engine {
                         // an unaccelerated aggregate. The resident-table borrow
                         // is scoped to this match so the fallback can
                         // re-borrow `gpu_tables` via `materialize_table`.
+                        let synthetic = |name: &str| {
+                            let original = name.strip_prefix("__idx_")?;
+                            let dict = self.dict_registry.dictionary(table, original)?;
+                            let ptr = match dict {
+                                crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
+                                    d.indices.device_ptr()
+                                }
+                                crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
+                                    d.indices.device_ptr()
+                                }
+                            };
+                            Some((dict.index_dtype(), ptr))
+                        };
                         let fast = match self.ensure_gpu_table(table) {
-                            Ok(resident) => {
-                                crate::exec::agg_with_pre::try_execute_resident(phys, &resident)?
-                            }
+                            Ok(resident) => crate::exec::agg_with_pre::try_execute_resident(
+                                phys, &resident, &synthetic,
+                            )?,
                             Err(_) => None,
                         };
                         match fast {
                             Some(b) => b,
                             None => {
-                                let batch = self.materialize_table(table)?;
+                                let inputs = pre.as_ref().map_or(&[][..], |p| p.inputs.as_slice());
+                                let batch = self.materialize_table_for_inputs(
+                                    table,
+                                    inputs.iter().map(|io| io.name.as_str()),
+                                )?;
                                 crate::exec::agg_with_pre::execute_aggregate_with_pre(phys, &batch)?
                             }
                         }
@@ -3683,6 +3877,12 @@ impl Engine {
                 let h = self.execute(input)?;
                 crate::exec::distinct::execute_distinct(h)
             }
+            PhysicalPlan::AggregateOverInput {
+                input,
+                table,
+                input_schema,
+                aggregate,
+            } => self.execute_aggregate_over_input(input, table, input_schema, aggregate),
             PhysicalPlan::CountRows {
                 input,
                 output_schema,
@@ -3993,54 +4193,8 @@ impl Engine {
                 // Gather host-side: download the index column once, map each
                 // index through the rank table, upload the i64 rank column. This
                 // is per-query setup cost (one D2H + one H2D of the index/rank
-                // column), not a per-row hot path; it reuses the existing index
-                // buffer rather than re-deriving indices. A bounds-checked map
-                // turns a malformed index into a structured error rather than an
-                // out-of-range panic.
-                let host_ranks: Vec<i64> = match dict {
-                    crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
-                        let idxs = d.indices.to_vec()?;
-                        let mut out = Vec::with_capacity(idxs.len());
-                        for &ix in &idxs {
-                            if ix < 0 {
-                                return Err(BoltError::Other(format!(
-                                    "rank materialise: negative index {} for column '{}'",
-                                    ix, original
-                                )));
-                            }
-                            let slot = ix as usize;
-                            let rank = rank_table.get(slot).copied().ok_or_else(|| {
-                                BoltError::Other(format!(
-                                    "rank materialise: index {} for column '{}' out of rank-table range {}",
-                                    ix, original, rank_table.len()
-                                ))
-                            })?;
-                            out.push(rank);
-                        }
-                        out
-                    }
-                    crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
-                        let idxs = d.indices.to_vec()?;
-                        let mut out = Vec::with_capacity(idxs.len());
-                        for &ix in &idxs {
-                            if ix < 0 {
-                                return Err(BoltError::Other(format!(
-                                    "rank materialise: negative index {} for column '{}'",
-                                    ix, original
-                                )));
-                            }
-                            let slot = ix as usize;
-                            let rank = rank_table.get(slot).copied().ok_or_else(|| {
-                                BoltError::Other(format!(
-                                    "rank materialise: index {} for column '{}' out of rank-table range {}",
-                                    ix, original, rank_table.len()
-                                ))
-                            })?;
-                            out.push(rank);
-                        }
-                        out
-                    }
-                };
+                // column), not a per-row hot path.
+                let host_ranks = host_rank_values(dict, &rank_table, original)?;
                 if host_ranks.len() != n_rows {
                     return Err(BoltError::Other(format!(
                         "rank materialise: column '{}' produced {} rows, table has {}",
@@ -5285,6 +5439,76 @@ mod tests {
         let sum: i64 = (0..actual.len()).map(|i| actual.value(i)).sum();
         let expected_sum: i64 = (0..total_rows as i64).sum();
         assert_eq!(sum, expected_sum, "sum of x column across all 10 batches");
+    }
+
+    /// Multi-batch ingestion is coalesced at ingest: after any number of
+    /// appends (or an eager multi-batch stream, or a lazy drain) the table
+    /// holds exactly one batch, so no query concatenates. Values and order
+    /// are preserved.
+    #[test]
+    #[ignore = "gpu:projection"]
+    fn multi_batch_ingest_is_coalesced_to_one_batch() {
+        let mut engine = Engine::new().expect("ctx");
+        for i in 0..5i64 {
+            engine
+                .register_batch("appended", int64_batch(i * 10, 10))
+                .unwrap();
+            assert_eq!(engine.tables["appended"].len(), 1, "after append {i}");
+        }
+        engine
+            .register_table_stream(
+                "streamed",
+                x_schema(),
+                (0..4i64).map(|i| Ok(int64_batch(i * 10, 10))),
+            )
+            .unwrap();
+        assert_eq!(engine.tables["streamed"].len(), 1);
+        engine
+            .register_table_stream_lazy(
+                "lazy",
+                x_schema(),
+                Box::new(|| Box::new((0..3i64).map(|i| Ok(int64_batch(i * 10, 10))))),
+            )
+            .unwrap();
+        for (table, rows) in [("appended", 50usize), ("streamed", 40), ("lazy", 30)] {
+            let out = engine
+                .sql(&format!("SELECT x FROM {table}"))
+                .unwrap()
+                .into_record_batch();
+            let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let got: Vec<i64> = (0..col.len()).map(|i| col.value(i)).collect();
+            assert_eq!(got, (0..rows as i64).collect::<Vec<_>>(), "{table}");
+        }
+        let overlay = engine.streaming_sources.borrow();
+        match overlay.get("lazy") {
+            Some(crate::exec::streaming::TableSource::Materialized(b)) => assert_eq!(b.len(), 1),
+            other => panic!("lazy table not materialised: {other:?}"),
+        };
+    }
+
+    /// An eager stream is atomic: a producer error or schema drift in a later
+    /// batch installs nothing.
+    #[test]
+    #[ignore = "gpu:projection"]
+    fn register_table_stream_is_atomic_on_late_failure() {
+        let mut engine = Engine::new().expect("ctx");
+        let err = engine
+            .register_table_stream(
+                "t",
+                x_schema(),
+                vec![
+                    Ok(int64_batch(0, 4)),
+                    Err(BoltError::Plan("producer failed".into())),
+                ],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("producer failed"));
+        assert!(!engine.tables.contains_key("t"));
+        assert!(engine.sql("SELECT x FROM t").is_err());
+        // The name is free again.
+        engine
+            .register_table_stream("t", x_schema(), vec![Ok(int64_batch(0, 4))])
+            .unwrap();
     }
 
     /// Build a three-column `RecordBatch` (`a` Int32, `b` Int64, `c` Float64)

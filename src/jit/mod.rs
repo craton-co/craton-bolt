@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! PTX code generation and module loading: one emitter per kernel family,
+//! plus the in-process and disk PTX caches.
+
 pub mod agg_kernels;
 /// PTX codegen + host reference math for the date/time scalar functions
 /// `EXTRACT(field FROM ts)` and `DATE_TRUNC(unit, ts)`, lowered to integer

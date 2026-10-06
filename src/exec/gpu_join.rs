@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU-side INNER JOIN: build a hash table on the GPU from the smaller
-//! (build) side, probe it with the larger (probe) side, materialise the
-//! result host-side via `arrow::compute::take`.
+//! GPU hash join (INNER, LEFT / RIGHT / FULL OUTER, CROSS): build a hash
+//! table on the GPU from the smaller (build) side, probe it with the larger
+//! (probe) side, materialise the result host-side via `arrow::compute::take`.
+//! The flow below is the INNER core; the outer variants add matched-row
+//! bitmaps and the CROSS variant a cartesian index kernel.
 //!
 //! Pairs with [`crate::jit::hash_join_kernel`], which emits the PTX. Flow:
 //!

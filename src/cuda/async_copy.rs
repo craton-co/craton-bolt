@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pinned-host-buffer + async H2D/D2H copy helpers (M1 perf foundation).
+//! Pinned-host-buffer + async H2D/D2H copy helpers used by the executors to overlap transfers with compute.
 //!
 //! This module is the on-ramp for overlapping PCIe transfers with kernel
 //! execution. It provides:

@@ -13,8 +13,23 @@ The project's two distinguishing ideas:
 
 ## Status
 
-**Active development — v0.9.0.** The crate targets CUDA ≥ 12 and `sm_70`
-(Volta) or newer. Projection, filtering, scalar and grouped aggregates, joins,
+Craton Bolt is pre-1.0 research/engineering software and is not yet
+recommended for production workloads.
+
+### Compatibility
+
+- Rust MSRV: see `rust-version` in [`Cargo.toml`](Cargo.toml) (currently Rust 1.85)
+- GPU: NVIDIA compute capability ≥ 7.0 (`sm_70`, Volta or newer)
+- CUDA: 12.x-compatible toolkit/driver
+- Host-only development: `--no-default-features --features cuda-stub`
+
+For exact support and current limitations, see
+[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), [`docs/INSTALL.md`](docs/INSTALL.md)
+and [`CHANGELOG.md`](CHANGELOG.md) (the source of release truth).
+
+### Surface
+
+Projection, filtering, scalar and grouped aggregates, joins,
 sorts, set operations, windows, CTEs, subqueries, and the documented scalar
 surface are implemented, but support is not synonymous with device-only
 execution. Every physical plan and result reports a deterministic planned
@@ -177,9 +192,13 @@ For the long form, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs
 
 ## Performance
 
-All GPU numbers below were measured on an **NVIDIA GeForce RTX 2060**,
-CUDA 12.6, verified end-to-end equivalent against Polars 0.42 and DuckDB 1.2
-before timing. Full methodology and per-bench breakdown: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+All GPU numbers below were measured on an **NVIDIA GeForce RTX 2060**
+(driver 610.88, CUDA 13.3 toolkit) on the 0.9 release line — the h2o.ai table
+at commit `059b454` — and verified end-to-end equivalent against Polars 0.42
+and DuckDB 1.2 before timing. They describe the build that produced them, not
+every later commit: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) carries the
+per-table provenance, the methodology, and the reproducibility manifest every
+bench run now writes.
 
 **CPU-side overhead** (plan + lower + codegen, no GPU needed) is **sub-25 µs** per
 query regardless of dataset size — JIT-compiling every query has negligible cost.

@@ -22,15 +22,13 @@ cannot run a kernel.
 
 ## Q3. What's the status of async memcpy?
 
-It's shipped. The FFI bindings for `cuMemcpyAsync` and pinned host
-allocation landed in 0.3.0, and the safe wrappers (`memcpy_h2d_async`,
-`memcpy_d2h_async`, `memset_d8_async`, `PinnedHostBuffer<T>`,
-`GpuBuffer::copy_{from,to}_async`) followed. The scalar-aggregate
-executor was the 0.6 pilot
-(`upload_primitive_values_async`); 0.7 rolled async memcpy out to the
-remaining `GROUP BY` variants (tier2 / shmem / wide / valid) and added
-async D2H for `compact::download_mask` (the `WHERE` filter path). See
-`docs/JIT_PIPELINE.md` for the staging history.
+It's shipped. The safe wrappers (`memcpy_h2d_async`, `memcpy_d2h_async`,
+`memset_d8_async`, `PinnedHostBuffer<T>`, `GpuBuffer::copy_{from,to}_async`)
+are used by the projection executor, the scalar-aggregate executor
+(`upload_primitive_values_async`), every `GROUP BY` variant (tier2 / shmem /
+wide / valid) and the `WHERE`-filter mask download
+(`compact::download_mask`). The join executor still issues most of its H2D
+uploads synchronously. See `docs/JIT_PIPELINE.md` for details.
 
 ## Q4. Can I share a `GpuVec` between threads?
 
@@ -67,10 +65,11 @@ for the full overflow semantics, including the grouped-`SUM` streaming caveat.
 
 ## Q8. Are `SELECT t.col FROM t` and `SELECT COL FROM t` (uppercase) accepted?
 
-Yes — both work as of 0.5. Single-level qualified column references
+Yes — both work. Single-level qualified column references
 (`t.col`, `alias.col`) resolve against the FROM-tree, including JOIN
-aliases, in SELECT / WHERE / GROUP BY / HAVING / `JOIN ... ON`; only the
-resolved column name survives lowering. Deeper qualifications
+aliases, in SELECT / WHERE / GROUP BY / HAVING / `JOIN ... ON` (not in
+`ORDER BY`, which runs after projection — use the output name or alias);
+only the resolved column name survives lowering. Deeper qualifications
 (`db.t.col`, struct-field access) are still rejected.
 
 Identifiers are also case-insensitive: an unquoted SQL ident folds to

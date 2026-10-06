@@ -61,6 +61,29 @@ use super::expr_util::collect_columns;
 /// when unknown. The optimizer only reorders a chain when *every* leaf has an
 /// estimate, so a partial estimator is safe (it simply disables reordering for
 /// chains it can't fully cost).
+///
+/// # Stability
+///
+/// Experimental until 1.0; expected to grow into a richer statistics/cost
+/// interface.
+///
+/// # Execution semantics
+///
+/// Consulted by the join-reorder pass of the built-in optimizer, inside the
+/// shared compile pipeline (before `PlanRewrite` hooks). Estimates only steer
+/// join order; they never change results.
+///
+/// # Threading
+///
+/// `Send + Sync`; called synchronously on the planning thread.
+///
+/// # Errors
+///
+/// Infallible by design — return `None` when unsure.
+///
+/// # Compatibility
+///
+/// Must tolerate leaf shapes it does not recognise (return `None`).
 pub trait RowEstimator: Send + Sync {
     /// Estimated row count of `plan`, or `None` if unknown.
     fn estimate(&self, plan: &LogicalPlan) -> Option<u64>;

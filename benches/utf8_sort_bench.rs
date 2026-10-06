@@ -32,6 +32,9 @@
 //! single zero-work `b.iter(|| ())` so criterion's HTML report still
 //! renders without GPU work.
 
+#[path = "support/manifest.rs"]
+mod manifest;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,5 +135,23 @@ fn bench_utf8_threshold(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_utf8_threshold);
+/// Record the build / hardware context of this run (see
+/// `benches/support/manifest.rs` and `docs/BENCHMARKS.md`).
+fn write_manifest(_: &mut Criterion) {
+    manifest::write(
+        "utf8_sort_bench",
+        &[
+            manifest::Axis {
+                name: "workload",
+                value: "ORDER BY utf8 cardinality sweep".into(),
+            },
+            manifest::Axis {
+                name: "transfer_included",
+                value: "true".into(),
+            },
+        ],
+    );
+}
+
+criterion_group!(benches, write_manifest, bench_utf8_threshold);
 criterion_main!(benches);
