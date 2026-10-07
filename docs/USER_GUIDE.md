@@ -376,6 +376,11 @@ the spans appear automatically (span names are catalogued in
 `src/observability.rs`). The `log`-level diagnostics and the pool-stats
 observer remain available alongside the spans.
 
+Pre-aggregated latency histograms (`craton_bolt::metrics_snapshot()` /
+`render_prometheus`) cover the `parse`, `plan`, `lower`, `codegen`,
+`ptx_load`, `execute` and `materialize` phases, so cold-JIT cost (`codegen` +
+`ptx_load`) is separable from steady-state execution without a subscriber.
+
 ---
 
 ## Performance tuning

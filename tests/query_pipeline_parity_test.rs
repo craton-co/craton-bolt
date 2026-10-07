@@ -29,7 +29,7 @@ use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{col, lit, DataFrame, DataType, Field, LogicalPlan, PlanRewrite, Schema};
-use craton_bolt::{metrics, BatchProducer, BoltResult, Counter, Engine};
+use craton_bolt::{metrics, BatchProducer, BoltResult, Counter, Engine, Phase};
 
 fn x_schema() -> Schema {
     Schema::new(vec![Field::new("x", DataType::Int64, false)])
@@ -380,6 +380,32 @@ fn run_logical_plan_planning_failure_bumps_queries_failed() {
     assert!(engine.run_logical_plan(&plan).is_err());
     let (t1, f1) = counters();
     assert_eq!((t1, f1), (t0 + 1, f0 + 1));
+}
+
+#[test]
+#[ignore = "gpu:e2e — phase histograms observe JIT and execution"]
+fn phase_histograms_observe_codegen_load_and_execute() {
+    let count = |p: Phase| metrics().histogram(p).count();
+    let mut engine = Engine::new().expect("ctx");
+    engine.register_table("t", int64_batch(0, 64)).unwrap();
+    let before = [Phase::Codegen, Phase::PtxLoad, Phase::Execute].map(count);
+    // A constant no other test uses, so the projection kernel is a cold miss.
+    engine
+        .sql("SELECT x * 7919 + 104729 AS y FROM t")
+        .unwrap()
+        .into_record_batch();
+    let after = [Phase::Codegen, Phase::PtxLoad, Phase::Execute].map(count);
+    for (i, name) in ["codegen", "ptx_load", "execute"].iter().enumerate() {
+        assert!(after[i] > before[i], "{name} histogram not observed");
+    }
+    // A warm repeat executes again but generates no code.
+    let codegen = count(Phase::Codegen);
+    engine
+        .sql("SELECT x * 7919 + 104729 AS y FROM t")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(count(Phase::Codegen), codegen, "warm repeat re-ran codegen");
+    assert!(count(Phase::Execute) > after[2]);
 }
 
 // ---- process-global resources -------------------------------------------------

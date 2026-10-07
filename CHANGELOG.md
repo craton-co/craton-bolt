@@ -103,6 +103,12 @@ All notable changes to this project will be documented here. The format follows 
   and `tests/string_eq_aggregate_test.rs`.
 
 ### Changed
+- **Per-phase latency histograms for JIT and execution.** `metrics::Phase`
+  gains `Codegen` (PTX generation on a module-cache miss), `PtxLoad` (driver
+  module load on a PTX-cache miss) and `Execute` (post-planning execution of a
+  top-level statement), so cold-JIT cost is separable from steady-state
+  execution in `metrics_snapshot()` / `render_prometheus`. `Phase` is now
+  `#[non_exhaustive]`; an exhaustive `match` on it needs a wildcard arm.
 - **Low-cardinality GROUP BY no longer serialises on one shared atomic.** The
   Tier-1 SUM and COUNT kernels pre-aggregate per-thread runs of equal keys in
   registers (and warp-reduce the final runs) before touching shared memory:

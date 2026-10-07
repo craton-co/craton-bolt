@@ -574,7 +574,15 @@ impl CudaModule {
     /// numbers for malformed instructions) is appended to the returned error.
     #[tracing::instrument(name = "ptx_load", level = "info", skip_all, fields(ptx_len = ptx.len()))]
     pub fn from_ptx(ptx: &str) -> BoltResult<Self> {
-        Self::from_ptx_with(ptx, Self::load_uncached)
+        Self::from_ptx_with(ptx, |ptx| {
+            // Timed inside the loader so only real loads (PTX-cache misses)
+            // feed the `PtxLoad` histogram.
+            let start = std::time::Instant::now();
+            let module = Self::load_uncached(ptx);
+            crate::metrics::metrics()
+                .observe_duration(crate::metrics::Phase::PtxLoad, start.elapsed());
+            module
+        })
     }
 
     /// Shared cache logic, parameterised over the loader. Production code
