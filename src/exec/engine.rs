@@ -183,7 +183,7 @@ fn host_rank_values(
 /// same column non-nullable — the engine treats per-row null counts as the
 /// truth and the declared `nullable` is informational only. `api` names the
 /// registering entry point in the error message.
-fn validate_stream_batch_schema(
+pub(crate) fn validate_stream_batch_schema(
     api: &str,
     declared: &Schema,
     batch: &RecordBatch,
@@ -1242,6 +1242,19 @@ pub struct Engine {
     /// Compiled physical plans for repeated top-level SQL (see
     /// `engine_query::CompiledPlanCache`). Host-only data; no device handles.
     pub(crate) compiled_plans: RefCell<crate::exec::engine_query::CompiledPlanCache>,
+    /// Registered [`StorageTable`](crate::storage::StorageTable)s and the scan
+    /// installed for each (see `engine_storage`). Their scanned data lives in
+    /// `streaming_sources` as a materialized overlay entry.
+    pub(crate) storage_tables: RefCell<HashMap<String, crate::exec::engine_storage::StorageEntry>>,
+    /// Per-table data versions (the `data_epoch` value at the table's last
+    /// change), for materialized-view staleness. Catalog tables use the
+    /// catalog's persisted versions instead.
+    pub(crate) table_versions: RefCell<HashMap<String, u64>>,
+    /// Materialized-view definitions (see `engine_views`).
+    pub(crate) views: RefCell<HashMap<String, crate::exec::engine_views::ViewDef>>,
+    /// Persistent catalog attached with [`EngineBuilder::database`].
+    #[cfg(feature = "storage")]
+    pub(crate) catalog: Option<crate::storage::Catalog>,
     /// Owned CUDA context — declared after every context-bound resource so it
     /// drops after dictionaries, tables, and module handles.
     _ctx: CudaContext,
@@ -1285,6 +1298,12 @@ pub struct EngineBuilder {
     persistent_cache_path: Option<std::path::PathBuf>,
     /// Install a default tracing subscriber from [`build`](Self::build).
     enable_tracing: bool,
+    /// Persistent catalog directory to open (see [`EngineBuilder::database`]).
+    #[cfg(feature = "storage")]
+    database: Option<std::path::PathBuf>,
+    /// Open that catalog read-only at this snapshot.
+    #[cfg(feature = "storage")]
+    database_snapshot: Option<u64>,
     /// Test-only: when `true`, [`build`](Self::build) constructs an engine
     /// that SKIPS the built-in logical optimizer. Defaults to `false`
     /// (optimizer ON — the production behaviour), so the derived
@@ -1305,6 +1324,10 @@ impl EngineBuilder {
             persistent_cache_path: None,
             enable_tracing: false,
             disable_optimizer: false,
+            #[cfg(feature = "storage")]
+            database: None,
+            #[cfg(feature = "storage")]
+            database_snapshot: None,
         }
     }
 
@@ -1361,6 +1384,26 @@ impl EngineBuilder {
     /// `set_logger` is idempotent under contention).
     pub fn enable_tracing(mut self) -> Self {
         self.enable_tracing = true;
+        self
+    }
+
+    /// Open (creating if needed) the persistent catalog at `path`: its
+    /// tables are registered (and scanned with pruning per query), and
+    /// `CREATE TABLE` / `INSERT` / `COPY ... FROM` / materialized views
+    /// through [`Engine::execute_sql`] become durable. One engine writes a
+    /// catalog at a time. See [`crate::storage::catalog`].
+    #[cfg(feature = "storage")]
+    pub fn database(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.database = Some(path.into());
+        self
+    }
+
+    /// Open the catalog at `path` read-only, as of snapshot `version` (time
+    /// travel). Writes to catalog tables fail; temporary tables still work.
+    #[cfg(feature = "storage")]
+    pub fn database_snapshot(mut self, path: impl Into<std::path::PathBuf>, version: u64) -> Self {
+        self.database = Some(path.into());
+        self.database_snapshot = Some(version);
         self
     }
 
@@ -1504,10 +1547,27 @@ impl EngineBuilder {
             optimize: !self.disable_optimizer,
             data_epoch: std::cell::Cell::new(0),
             compiled_plans: RefCell::new(crate::exec::engine_query::CompiledPlanCache::default()),
+            storage_tables: RefCell::new(HashMap::new()),
+            table_versions: RefCell::new(HashMap::new()),
+            views: RefCell::new(HashMap::new()),
+            #[cfg(feature = "storage")]
+            catalog: None,
             _ctx: ctx,
             _active_engine_permit: active_engine_permit,
         };
         drop(build_guard);
+        #[cfg(feature = "storage")]
+        let engine = {
+            let mut engine = engine;
+            if let Some(path) = self.database {
+                let catalog = match self.database_snapshot {
+                    Some(v) => crate::storage::Catalog::open_snapshot(&path, v)?,
+                    None => crate::storage::Catalog::open(&path)?,
+                };
+                engine.attach_catalog(catalog)?;
+            }
+            engine
+        };
         Ok(engine)
     }
 }
@@ -1764,6 +1824,11 @@ impl Engine {
     /// preserve the prior `column_revisions` HashMap allocation and to
     /// update `column_n_rows` per the append semantics. See its inline
     /// code.
+    /// Drop table `name`'s host revisions (it was deregistered).
+    pub(crate) fn forget_host_revisions(&mut self, name: &str) {
+        self.host_revisions.remove(name);
+    }
+
     fn bump_table_full_replace(&mut self, name: &str, batch: &RecordBatch) {
         let prev = self.host_revisions.remove(name);
         let next_table_rev = prev.as_ref().map(|p| p.table_revision).unwrap_or(0) + 1;
@@ -1801,12 +1866,13 @@ impl Engine {
     ) -> BoltResult<()> {
         self.bump_data_epoch();
         let name = name.into();
-        if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
+        if self.has_table(&name) {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — use register_batch to append \
                  additional batches to an existing table"
             )));
         }
+        self.touch_table(&name);
         // Stage 6: the historical flatten step (`flatten_dictionary_utf8_columns`)
         // is gone from the hot path. `DictRegistry::register_table` matches
         // `DictionaryArray<Int32, Utf8>` directly and re-uses the input
@@ -1892,7 +1958,7 @@ impl Engine {
         I: IntoIterator<Item = BoltResult<RecordBatch>>,
     {
         let name = name.into();
-        if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
+        if self.has_table(&name) {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — register_table_stream \
                  cannot append to an existing table; use register_batch instead"
@@ -1979,7 +2045,7 @@ impl Engine {
     ) -> BoltResult<()> {
         self.bump_data_epoch();
         let name = name.into();
-        if self.tables.contains_key(&name) || self.streaming_sources.borrow().contains_key(&name) {
+        if self.has_table(&name) {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — register_table_stream_lazy \
                  cannot append to an existing table"
@@ -2141,6 +2207,7 @@ impl Engine {
     pub fn replace_table(&mut self, name: impl Into<String>, batch: RecordBatch) -> BoltResult<()> {
         self.bump_data_epoch();
         let name = name.into();
+        self.touch_table(&name);
 
         // ---- STAGE (fallible): compute the entire replacement into locals.
         //
@@ -2276,6 +2343,7 @@ impl Engine {
     /// worth — one HtoD copy of the new tail per append.
     pub fn register_batch(&mut self, name: &str, batch: RecordBatch) -> BoltResult<()> {
         self.bump_data_epoch();
+        self.touch_table(name);
         // Stage 6: dict-encoded columns are ingested natively now, so no
         // flatten-to-StringArray is needed for the schema check below to
         // line up — batch 0 and any appended batch both carry the Arrow
@@ -2639,7 +2707,7 @@ impl Engine {
             rows.columns().to_vec(),
         )
         .map_err(|e| BoltError::Other(format!("failed to bind aggregate input: {e}")))?;
-        if self.tables.contains_key(table) || self.streaming_sources.borrow().contains_key(table) {
+        if self.has_table(table) {
             return Err(BoltError::Plan(format!(
                 "reserved aggregate-input table name '{table}' collides with a registered table"
             )));
@@ -2822,9 +2890,7 @@ impl Engine {
         // would otherwise clobber the user's data for the duration of the
         // query (and the cleanup below would wrongly delete a real table's
         // overlay entry).
-        if self.tables.contains_key(&rec.name)
-            || self.streaming_sources.borrow().contains_key(&rec.name)
-        {
+        if self.has_table(&rec.name) {
             return Err(BoltError::Plan(format!(
                 "WITH RECURSIVE: CTE name '{}' collides with a registered \
                  table — rename the CTE",
@@ -3064,8 +3130,7 @@ impl Engine {
 
         // Refuse to shadow real tables under either reserved ephemeral name.
         for name in [LATERAL_OUTER_TABLE, LATERAL_APPLY_RESULT_TABLE] {
-            if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name)
-            {
+            if self.has_table(name) {
                 return Err(BoltError::Plan(format!(
                     "LATERAL apply: reserved ephemeral table name '{name}' collides \
                      with a registered table"
@@ -3313,8 +3378,7 @@ impl Engine {
 
         // Refuse to shadow real tables under either reserved ephemeral name.
         for name in [LATERAL_OUTER_TABLE, CORR_WHERE_RESULT_TABLE] {
-            if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name)
-            {
+            if self.has_table(name) {
                 return Err(BoltError::Plan(format!(
                     "correlated WHERE: reserved ephemeral table name '{name}' \
                      collides with a registered table"
@@ -3515,9 +3579,7 @@ impl Engine {
         // Reject collisions with real tables (and detect any duplicate name the
         // frontend already guards, defensively).
         for term in &rec.ctes {
-            if self.tables.contains_key(&term.name)
-                || self.streaming_sources.borrow().contains_key(&term.name)
-            {
+            if self.has_table(&term.name) {
                 return Err(BoltError::Plan(format!(
                     "WITH RECURSIVE: CTE name '{}' collides with a registered \
                      table — rename the CTE",

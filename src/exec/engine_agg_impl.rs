@@ -71,7 +71,7 @@ impl Engine {
         };
         use crate::exec::streaming::TableSource;
         let name = crate::plan::sql_frontend::COUNT_DISTINCT_GROUPBY_RESULT_TABLE;
-        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+        if self.has_table(name) {
             return Err(BoltError::Plan(format!(
                 "COUNT(DISTINCT) GROUP BY: reserved result table name '{name}' collides \
                  with a registered table"
@@ -110,7 +110,7 @@ impl Engine {
 
         // Refuse to shadow a real table under the bind name.
         let name = &vp.bind_name;
-        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+        if self.has_table(name) {
             return Err(BoltError::Plan(format!(
                 "VALUES: relation name '{name}' collides with a registered table — \
                  rename the VALUES alias"
@@ -175,7 +175,7 @@ impl Engine {
 
         // Refuse to shadow a real table under the bind name.
         let name = &gp.bind_name;
-        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+        if self.has_table(name) {
             return Err(BoltError::Plan(format!(
                 "generate_series: relation name '{name}' collides with a registered table — \
                  add an alias (e.g. `AS gs`)"
@@ -230,7 +230,7 @@ impl Engine {
             Some(lo) => lo,
         };
         let name = crate::plan::sql_frontend::DISTINCT_ON_RESULT_TABLE;
-        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+        if self.has_table(name) {
             return Err(BoltError::Plan(format!(
                 "DISTINCT ON: reserved result table name '{name}' collides with a \
                  registered table"
@@ -285,7 +285,7 @@ impl Engine {
         };
         use crate::exec::streaming::TableSource;
         let name = crate::plan::sql_frontend::MULTI_AGG_GROUPBY_RESULT_TABLE;
-        if self.tables.contains_key(name) || self.streaming_sources.borrow().contains_key(name) {
+        if self.has_table(name) {
             return Err(BoltError::Plan(format!(
                 "multi-agg GROUP BY: reserved result table name '{name}' collides \
                  with a registered table"

@@ -117,7 +117,7 @@ fn max_sql_tokens() -> usize {
 /// process during recursive `Drop`, long before the [`MAX_RECURSION_DEPTH`]
 /// lowering guard could fire. Returns a descriptive [`BoltError::Sql`] so
 /// the failure is a clean, recoverable error rather than a process abort.
-fn guard_sql_size(sql: &str) -> BoltResult<()> {
+pub(crate) fn guard_sql_size(sql: &str) -> BoltResult<()> {
     let max_bytes = max_sql_bytes();
     if sql.len() > max_bytes {
         return Err(BoltError::Sql(format!(

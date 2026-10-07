@@ -51,6 +51,7 @@ pub mod jit;
 pub mod metrics;
 pub mod observability;
 pub mod plan;
+pub mod storage;
 
 mod error;
 pub use error::{BoltError, BoltResult};
@@ -65,6 +66,7 @@ pub use error::{BoltError, BoltResult};
 pub use ::tracing;
 
 pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
+pub use exec::engine_views::{RefreshMode, ViewStatus};
 pub use exec::streaming::{BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource};
 pub use exec::{Engine, EngineBuilder, QueryHandle};
 pub use plan::{DataFrame, ExecutionTier, Expr, LogicalPlan, PhysicalPlan};
