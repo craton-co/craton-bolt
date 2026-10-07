@@ -88,6 +88,12 @@ substrait = { version = "0.55", optional = true }
 # the normal library and integration-test lanes do not compile DuckDB/Polars.
 duckdb = { version = "1.2", optional = true, features = ["bundled"] }
 polars = { version = "0.42", optional = true, default-features = false, features = ["lazy"] }
+# Storage layer (feature `storage`, src/storage/): Parquet-backed tables,
+# zone-map pruning, and the persistent `Database` catalog whose manifests are
+# JSON. `parquet` is pinned to the Arrow major version above.
+parquet = { version = "53", optional = true, default-features = false, features = ["arrow", "snap", "lz4", "flate2", "zstd"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -108,7 +114,7 @@ insta = "1"
 tracing-subscriber = "0.3"
 
 [features]
-default = ["cudarc"]
+default = ["cudarc", "storage"]
 # Stub-mode lets non-CUDA hosts at least compile; real builds use the linked CUDA path.
 cuda-stub = []
 # Arrow Flight SQL server frontend (src/flight/). EXPERIMENTAL but compiles +
@@ -123,6 +129,10 @@ flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:futures", "dep:byte
 # Off by default. NOTE: the `substrait` crate's build script needs `protoc`
 # (set the PROTOC env var or put protoc on PATH). Build: `--features substrait`.
 substrait = ["dep:substrait"]
+# Storage layer: Parquet tables, statistics/pruning, the persistent `Database`
+# catalog (manifests + snapshots), spill files, materialized views. On by
+# default; turn off with `--no-default-features` for a pure in-memory engine.
+storage = ["dep:parquet", "dep:serde", "dep:serde_json"]
 reference-tests = ["dep:duckdb"]
 reference-benches = ["dep:duckdb", "dep:polars"]
 # Supported CUDA context/driver backend. Enabled by default; remaining raw

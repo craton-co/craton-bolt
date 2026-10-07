@@ -12,7 +12,7 @@ pub mod launch;
 mod engine_cache_key;
 mod engine_device_col;
 mod engine_provider;
-mod engine_support;
+pub(crate) mod engine_support;
 // Pure-reorg split (engine-split): coherent `impl Engine` method clusters
 // lifted out of `engine.rs` into sibling modules. These define additional
 // `impl Engine { .. }` blocks (no new types); `engine.rs` keeps the struct,
@@ -21,10 +21,13 @@ mod engine_support;
 pub mod aggregate;
 pub mod compact;
 mod engine_agg_impl;
+pub(crate) mod engine_ddl;
 mod engine_join_impl;
 mod engine_query;
+pub(crate) mod engine_storage;
 mod engine_streaming_impl;
 mod engine_string_impl;
+pub(crate) mod engine_views;
 /// Shared async-memcpy / pinned-host-buffer helpers for executors.
 /// Lifted out of `exec::aggregate` so filter, GROUP BY, joins
 /// and friends can adopt the same `(slice, &stream) -> GpuVec<T>` shape

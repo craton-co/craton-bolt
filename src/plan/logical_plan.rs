@@ -2907,6 +2907,27 @@ pub(crate) fn join_rename(name: &str, taken: &mut std::collections::HashSet<Stri
     out_name
 }
 
+impl LogicalPlan {
+    /// Direct relational inputs of this node (expression-nested subquery
+    /// plans are not included).
+    pub(crate) fn children(&self) -> Vec<&LogicalPlan> {
+        match self {
+            LogicalPlan::Scan { .. } => Vec::new(),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Sort { input, .. } => vec![input],
+            LogicalPlan::Union { inputs } => inputs.iter().collect(),
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+                vec![left, right]
+            }
+        }
+    }
+}
+
 /// Names of every base table scanned by `plan`'s relational tree, in
 /// depth-first order (duplicates preserved — a self-join lists its table
 /// twice).

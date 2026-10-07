@@ -95,6 +95,7 @@ pub const HISTOGRAM_BUCKETS: usize = 24;
 /// guaranteed-zero series; add them back only together with the call-site bumps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Counter {
     /// Total queries accepted for execution (success or failure).
     QueriesTotal = 0,
@@ -108,17 +109,23 @@ pub enum Counter {
     GpuLaunchesTotal = 4,
     /// Queries (or sub-plans) that fell back to the host execution path.
     HostFallbacksTotal = 5,
+    /// Storage-table chunks (row groups / batches) read by scans.
+    StorageChunksRead = 6,
+    /// Storage-table chunks skipped by zone-map pruning.
+    StorageChunksPruned = 7,
 }
 
 impl Counter {
     /// All counters in declaration / snapshot order.
-    pub const ALL: [Counter; 6] = [
+    pub const ALL: [Counter; 8] = [
         Counter::QueriesTotal,
         Counter::QueriesFailed,
         Counter::PtxCacheHits,
         Counter::PtxCacheMisses,
         Counter::GpuLaunchesTotal,
         Counter::HostFallbacksTotal,
+        Counter::StorageChunksRead,
+        Counter::StorageChunksPruned,
     ];
 
     /// Stable snake_case name, suitable as a metric key (no `craton_` prefix —
@@ -131,6 +138,8 @@ impl Counter {
             Counter::PtxCacheMisses => "ptx_cache_misses",
             Counter::GpuLaunchesTotal => "gpu_launches_total",
             Counter::HostFallbacksTotal => "host_fallbacks_total",
+            Counter::StorageChunksRead => "storage_chunks_read",
+            Counter::StorageChunksPruned => "storage_chunks_pruned",
         }
     }
 
@@ -148,6 +157,8 @@ impl Counter {
             Counter::HostFallbacksTotal => {
                 "Queries or sub-plans that fell back to the host execution path."
             }
+            Counter::StorageChunksRead => "Storage-table chunks read by scans.",
+            Counter::StorageChunksPruned => "Storage-table chunks skipped by zone-map pruning.",
         }
     }
 }

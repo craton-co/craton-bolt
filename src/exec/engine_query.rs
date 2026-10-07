@@ -139,7 +139,15 @@ impl QueryCompiler<'_> {
 /// executor (returning an empty one-column batch), so what counts as a
 /// subquery cannot drift from what the execution path resolves; the folded
 /// plan is discarded.
-fn deep_scan_tables(plan: &LogicalPlan) -> Vec<String> {
+pub(crate) fn deep_scan_tables(plan: &LogicalPlan) -> Vec<String> {
+    let (mut tree, nested) = split_scan_tables(plan);
+    tree.extend(nested);
+    tree
+}
+
+/// [`deep_scan_tables`] split into the tables of `plan`'s relational tree
+/// and those scanned (only or also) inside its subqueries.
+fn split_scan_tables(plan: &LogicalPlan) -> (Vec<String>, Vec<String>) {
     let mut nested: Vec<String> = Vec::new();
     let mut record = |subplan: LogicalPlan| -> BoltResult<RecordBatch> {
         nested.extend(deep_scan_tables(&subplan));
@@ -151,9 +159,28 @@ fn deep_scan_tables(plan: &LogicalPlan) -> Vec<String> {
         Ok(RecordBatch::new_empty(schema))
     };
     let _ = crate::exec::subquery_resolve::resolve_plan(plan.clone(), &mut record);
-    let mut out = crate::plan::logical_plan::collect_scan_tables(plan);
-    out.extend(nested);
-    out
+    (crate::plan::logical_plan::collect_scan_tables(plan), nested)
+}
+
+/// `Plan` error for a statement [`Engine::sql`] does not run (DDL / DML /
+/// catalog maintenance), pointing at [`Engine::execute_sql`].
+fn reject_table_statement(query: &str) -> BoltResult<()> {
+    let first = query
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    const STATEMENTS: [&str; 13] = [
+        "CREATE", "INSERT", "DROP", "TRUNCATE", "COPY", "ANALYZE", "SHOW", "DESCRIBE", "DESC",
+        "COMPACT", "VACUUM", "REFRESH", "DELETE",
+    ];
+    if STATEMENTS.contains(&first.as_str()) {
+        return Err(BoltError::Plan(format!(
+            "{first} statements are run with Engine::execute_sql (Engine::sql runs queries)"
+        )));
+    }
+    Ok(())
 }
 
 /// `true` if `plan` still carries a scalar / IN subquery anywhere.
@@ -193,7 +220,7 @@ impl Engine {
     /// drained yet are intentionally omitted — costing them would force
     /// materialisation at plan time. Their absence simply leaves any join chain
     /// touching them un-reordered (the conservative default).
-    fn row_estimator(&self) -> Arc<dyn RowEstimator> {
+    pub(crate) fn row_estimator(&self) -> Arc<dyn RowEstimator> {
         let mut row_counts = std::collections::HashMap::new();
         for (name, batches) in &self.tables {
             let rows = batches
@@ -210,6 +237,9 @@ impl Engine {
                     .fold(0usize, |a, n| a.saturating_add(n));
                 row_counts.entry(name.clone()).or_insert(rows);
             }
+        }
+        for (name, rows) in self.storage_row_counts() {
+            row_counts.entry(name).or_insert(rows);
         }
         Arc::new(crate::plan::StatsEstimator::new(EngineTableStats {
             row_counts,
@@ -293,8 +323,12 @@ impl Engine {
         // reads — including inside its subqueries — BEFORE compiling, so the
         // dictionary rewrite already sees their dictionaries and no drain has
         // to mutate the registry while a compile holds it.
-        for table in deep_scan_tables(plan) {
-            self.materialize_streaming_source(&table)?;
+        let (tree_tables, nested_tables) = split_scan_tables(plan);
+        // Storage tables: load this statement's pruned scan (or reuse one that
+        // covers it) — also before compiling, for the same reason.
+        self.scan_storage_tables(plan, &tree_tables, &nested_tables, top_level)?;
+        for table in tree_tables.iter().chain(&nested_tables) {
+            self.materialize_streaming_source(table)?;
         }
         let registry = self.dict_registry.borrow();
         let compiled = self.compiler(&registry).compile(
@@ -359,6 +393,7 @@ impl Engine {
     }
 
     fn sql_inner(&self, query: &str) -> BoltResult<QueryHandle> {
+        reject_table_statement(query)?;
         // User hooks may be stateful or nondeterministic, so their presence
         // disables plan reuse (the contract runs them on every compile).
         let cacheable = self.rewrites.is_empty();
