@@ -45,13 +45,12 @@
 //!
 //! Note that the span catalogue and the pre-aggregated latency histograms in
 //! [`metrics`](crate::metrics) are *independent* surfaces and do **not** line up
-//! one-to-one. Only the phases the engine explicitly times feed a
-//! [`Phase`](crate::metrics::Phase) histogram (`parse`, `plan`, `lower`,
-//! `materialize`); the device-side spans (`codegen`, `ptx_load`, `launch`,
-//! `transfer`) are emitted here for tracing but have no histogram counterpart in
-//! the registry, so they are absent from [`Phase`](crate::metrics::Phase). Use
-//! a tracing subscriber to time those phases until a histogram observation is
-//! wired at their source sites.
+//! one-to-one. The [`Phase`](crate::metrics::Phase) histograms cover `parse`,
+//! `plan`, `lower`, `codegen`, `ptx_load`, `materialize` and an `execute`
+//! phase (the whole post-planning execution, which has no single span). The
+//! per-kernel `launch` and per-copy `transfer` spans have no histogram:
+//! copies are stream-ordered and asynchronous, so use a tracing subscriber or
+//! a GPU timeline profiler to attribute time between H2D, kernels and D2H.
 //!
 //! # Pool-stats observer
 //!

@@ -160,17 +160,18 @@ impl Counter {
 /// device-side phases), whereas this enum lists only the phases that feed a
 /// histogram. [`Phase::ALL`] iterates in declaration order.
 ///
-/// Only phases whose latency is *actually observed* on the hot path live here
-/// (`exec::engine` times `Parse` / `Plan` / `Lower` / `Materialize`). The
-/// device-side phases — `codegen`, `ptx_load`, `launch`, `transfer` — still
-/// appear as tracing spans (see the catalogue in
-/// [`observability`](crate::observability)) but never had a histogram
-/// observation wired at their kernel call sites, so they are intentionally
-/// absent from this enum rather than exposing a permanently empty histogram via
-/// [`snapshot()`]. Re-add a variant only together with the
-/// `observe_duration(Phase::_, …)` call at its source site.
+/// Only phases whose latency is *actually observed* on the hot path live here:
+/// `exec::engine` times `Parse` / `Plan` / `Lower` / `Execute` /
+/// `Materialize`, the module caches time `Codegen` on a miss, and
+/// `jit::CudaModule::from_ptx` times `PtxLoad` when it really loads a module.
+/// The per-kernel `launch` and per-copy `transfer` phases appear only as
+/// tracing spans (see the catalogue in [`observability`](crate::observability)):
+/// copies are stream-ordered and asynchronous, so a host-side timer around
+/// them would measure issue time, not transfer time. Add a variant only
+/// together with the `observe_duration(Phase::_, …)` call at its source site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Phase {
     /// SQL text → `LogicalPlan`.
     Parse = 0,
@@ -180,11 +181,27 @@ pub enum Phase {
     Lower = 2,
     /// Arrow array packing of results.
     Materialize = 3,
+    /// PTX generation for a kernel that missed every module cache.
+    Codegen = 4,
+    /// PTX → loaded driver module (`cuModuleLoadDataEx`), on a PTX-cache miss.
+    PtxLoad = 5,
+    /// Execution of a top-level statement once it is planned: H2D, kernels,
+    /// D2H and host tiers together. For a host-orchestrated shape (recursive
+    /// CTE, LATERAL, …) this also covers compiling its component subplans.
+    Execute = 6,
 }
 
 impl Phase {
     /// All phases in declaration / snapshot order.
-    pub const ALL: [Phase; 4] = [Phase::Parse, Phase::Plan, Phase::Lower, Phase::Materialize];
+    pub const ALL: [Phase; 7] = [
+        Phase::Parse,
+        Phase::Plan,
+        Phase::Lower,
+        Phase::Materialize,
+        Phase::Codegen,
+        Phase::PtxLoad,
+        Phase::Execute,
+    ];
 
     /// Stable snake_case name, matching the corresponding tracing span.
     pub const fn as_str(self) -> &'static str {
@@ -193,6 +210,9 @@ impl Phase {
             Phase::Plan => "plan",
             Phase::Lower => "lower",
             Phase::Materialize => "materialize",
+            Phase::Codegen => "codegen",
+            Phase::PtxLoad => "ptx_load",
+            Phase::Execute => "execute",
         }
     }
 
@@ -203,6 +223,9 @@ impl Phase {
             Phase::Plan => "Logical-plan rewrite pipeline latency.",
             Phase::Lower => "LogicalPlan to PhysicalPlan lowering latency.",
             Phase::Materialize => "Arrow array packing (result materialization) latency.",
+            Phase::Codegen => "PTX generation latency on a module-cache miss.",
+            Phase::PtxLoad => "PTX to loaded driver module latency on a PTX-cache miss.",
+            Phase::Execute => "Top-level statement execution latency (after planning).",
         }
     }
 }
@@ -658,9 +681,11 @@ mod tests {
 
     #[test]
     fn phase_names_match_variants() {
-        assert_eq!(Phase::ALL.len(), 4);
+        assert_eq!(Phase::ALL.len(), 7);
         assert_eq!(Phase::Parse.as_str(), "parse");
         assert_eq!(Phase::Materialize.as_str(), "materialize");
+        assert_eq!(Phase::PtxLoad.as_str(), "ptx_load");
+        assert_eq!(Phase::Execute.as_str(), "execute");
         for (i, p) in Phase::ALL.iter().enumerate() {
             assert_eq!(*p as usize, i);
         }

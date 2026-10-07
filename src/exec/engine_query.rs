@@ -246,8 +246,8 @@ impl Engine {
     /// Compile one logical plan through the shared pipeline and execute it.
     ///
     /// `user_rewrites` — see [`QueryCompiler::compile`]. `top_level` controls
-    /// whether the `Plan` / `Lower` phase histograms are observed (nested
-    /// subplans are folded into their enclosing query's `Plan` phase).
+    /// whether the `Plan` / `Lower` / `Execute` phase histograms are observed
+    /// (nested subplans are folded into their enclosing query's phases).
     pub(crate) fn execute_logical(
         &self,
         plan: &LogicalPlan,
@@ -255,7 +255,23 @@ impl Engine {
         top_level: bool,
     ) -> BoltResult<QueryHandle> {
         let phys = self.prepare_physical(plan, user_rewrites, top_level)?;
-        self.execute(&phys)
+        if top_level {
+            self.timed_execute(|| self.execute(&phys))
+        } else {
+            self.execute(&phys)
+        }
+    }
+
+    /// Run a top-level statement's execution step, feeding the `Execute`
+    /// phase histogram (observed on failure too).
+    fn timed_execute(
+        &self,
+        f: impl FnOnce() -> BoltResult<QueryHandle>,
+    ) -> BoltResult<QueryHandle> {
+        let start = Instant::now();
+        let result = f();
+        crate::metrics::metrics().observe_duration(crate::metrics::Phase::Execute, start.elapsed());
+        result
     }
 
     /// Everything [`Engine::execute_logical`] does before execution: drain the
@@ -350,7 +366,7 @@ impl Engine {
             let key = self.compiled_plan_key(query);
             let cached = self.compiled_plans.borrow_mut().get(&key);
             if let Some(phys) = cached {
-                return self.execute(&phys);
+                return self.timed_execute(|| self.execute(&phys));
             }
         }
         let parse_start = Instant::now();
@@ -366,8 +382,18 @@ impl Engine {
                     let key = self.compiled_plan_key(query);
                     self.compiled_plans.borrow_mut().insert(key, phys.clone());
                 }
-                self.execute(&phys)
+                self.timed_execute(|| self.execute(&phys))
             }
+            // Host-orchestrated shapes: their component subplans compile and
+            // run inside the descriptor, so `Execute` covers both.
+            shape => self.timed_execute(|| self.execute_shape(shape)),
+        }
+    }
+
+    /// Run a host-orchestrated [`QueryShape`] descriptor.
+    fn execute_shape(&self, shape: QueryShape) -> BoltResult<QueryHandle> {
+        match shape {
+            QueryShape::Generic(plan) => self.execute_logical(&plan, true, false),
             QueryShape::Recursive(RecursiveQueryPlan::Single(rec)) => {
                 self.execute_recursive_cte(&rec)
             }

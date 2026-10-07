@@ -319,7 +319,7 @@ where
     // `cuModuleLoadDataEx` can be slow; we don't want unrelated cache
     // misses serialising behind one ongoing compile. The jit PTX-text-hash
     // cache deduplicates the cubin load on its own.
-    let ptx = compile()?;
+    let ptx = timed_codegen(compile)?;
     let module = CudaModule::from_ptx(&ptx)?;
     GLOBAL_LOAD_COUNT.fetch_add(1, Ordering::SeqCst);
     if let Some(c) = local_counter {
@@ -333,6 +333,17 @@ where
     // the previously-unbounded cache (F1).
     let mut cache = GLOBAL_MODULE_CACHE.lock();
     Ok(cache.insert((namespace, spec_id), module))
+}
+
+/// Run a cache-miss codegen closure, feeding the `Codegen` phase histogram.
+fn timed_codegen<F>(compile: F) -> BoltResult<String>
+where
+    F: FnOnce() -> BoltResult<String>,
+{
+    let start = std::time::Instant::now();
+    let ptx = compile();
+    crate::metrics::metrics().observe_duration(crate::metrics::Phase::Codegen, start.elapsed());
+    ptx
 }
 
 /// Per-executor test helper: a thin newtype around `AtomicUsize` that
@@ -708,7 +719,7 @@ where
         (Some(dcache), Some(k)) => match dcache.lookup(k) {
             Some(text) => text,
             None => {
-                let text = compile()?;
+                let text = timed_codegen(compile)?;
                 // Write-through to disk. Errors here are non-fatal: a failed
                 // write just means future processes won't benefit, the
                 // current process still loads the module successfully.
@@ -716,7 +727,7 @@ where
                 text
             }
         },
-        _ => compile()?,
+        _ => timed_codegen(compile)?,
     };
     let module = CudaModule::from_ptx(&ptx)?;
     // Insert and hand back a clone. Concurrent winners are tolerated by
@@ -842,7 +853,7 @@ where
     }
     // Miss: run codegen + module load WITHOUT the cache lock held. Both
     // steps can be slow and we don't want to serialise unrelated misses.
-    let ptx = compile(spec)?;
+    let ptx = timed_codegen(|| compile(spec))?;
     let module = loader(&ptx)?;
     // Store under the KernelSpec key so the next call skips codegen.
     KERNELSPEC_CACHE.lock().insert(
@@ -1337,7 +1348,7 @@ where
     if let Some(cached) = RADIXSORT_CACHE.lock().get(&key, Some(material.as_str())) {
         return Ok(cached.module);
     }
-    let ptx = compile(spec)?;
+    let ptx = timed_codegen(|| compile(spec))?;
     let module = loader(&ptx)?;
     RADIXSORT_CACHE.lock().insert(
         key,
