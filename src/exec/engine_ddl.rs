@@ -675,6 +675,8 @@ impl Engine {
         self.streaming_sources.borrow_mut().remove(name);
         self.storage_tables.borrow_mut().remove(name);
         self.gpu_tables.borrow_mut().remove(name);
+        self.overlay_uploads.borrow_mut().remove(name);
+        self.gpu_residency.borrow_mut().remove(name);
         self.dict_registry.get_mut().unregister_table(name);
         self.provider.unregister_table(name);
         self.forget_host_revisions(name);
