@@ -5,6 +5,10 @@ All notable changes to this project will be documented here. The format follows 
 ## [Unreleased]
 
 ### Fixed
+- **Lazy and storage tables re-uploaded to the GPU on every query.** Overlay
+  tables carry no host revisions, so `ensure_gpu_table` never took its cache
+  hit for them; the cached copy is now reused while the overlay holds the
+  very batch that was uploaded.
 - **Lazy streams drain only the tables a query references.**
   `register_table_stream_lazy` promised that a producer runs on the first query
   that *references* its table, but every generic query drained every pending
@@ -51,6 +55,39 @@ All notable changes to this project will be documented here. The format follows 
   `GROUP BY <utf8 key>` under a predicate, execute (see `AggregateOverInput`).
 
 ### Added
+- **Storage layer (`storage` feature, on by default).** `storage::StorageTable`
+  — chunked data with per-chunk `TableStatistics` — is scanned per
+  statement: a `ScanRequest` derived from the optimized plan (read columns +
+  prunable filter conjuncts) lets the table skip chunks by zone map, and a
+  covering installed scan is reused. `ParquetTable` (row groups as chunks,
+  footer statistics, projection, type normalisation) and `MemoryTable`
+  implement it; `write_parquet` writes atomically. `Engine::register_parquet`,
+  `register_storage_table`, `last_scan`, `table_statistics`, `table_names`,
+  `deregister_table`.
+- **SQL statements.** `Engine::execute_sql(&mut self)` runs `CREATE [TEMP |
+  EXTERNAL] TABLE [AS]`, `INSERT`, `DROP`, `TRUNCATE`, `COPY` to / from
+  Parquet and CSV, `ANALYZE`, `SHOW TABLES`, `DESCRIBE`, `COMPACT TABLE`,
+  `VACUUM`, and multi-statement scripts.
+- **Persistent catalog.** `EngineBuilder::database(dir)`: immutable Parquet
+  data files plus atomically committed JSON manifests; every manifest is a
+  snapshot (`database_snapshot(dir, version)`, read-only time travel);
+  writer lock; compaction; vacuum.
+- **Materialized views.** `CREATE / REFRESH / DROP MATERIALIZED VIEW`,
+  dependency and per-table data-version tracking, `Engine::view_status`,
+  manual or `on_commit` refresh; durable in a catalog.
+- **Memory governor.** `MemoryGovernor` with host / device budgets,
+  `MemoryReservation`, `MemoryConsumer`, `MemoryStats`;
+  `EngineBuilder::host_memory_budget` / `spill_dir`; `Engine::memory_stats`.
+  Loaded storage scans and idle GPU table copies are evicted LRU to fit.
+- **Out-of-core execution.** Over-budget `GROUP BY` / `DISTINCT` (any
+  aggregate), equi-joins of every type (grace hash join) and `ORDER BY
+  [LIMIT]` run on spilled hash partitions / sorted runs with the ordinary GPU
+  operators. `Counter::SpillFilesWritten` / `SpillBytesWritten` /
+  `StorageChunksRead` / `StorageChunksPruned`.
+- **Sessions.** `Database` owns the engine on a runtime thread; cloneable
+  `Session`s submit from any thread (`sql`, `submit` → `PendingResult` with
+  `wait` / `Future` / cancel-on-drop, `try_submit`), read-only sessions,
+  `with_engine`, `DatabaseStats`.
 - **Typed Tier-1 shared-memory GROUP BY SUM.** The resident on-device path
   now covers `Int64` keys and `SUM(Int64)` / `SUM(Int32)` values (≤ 1024
   groups), not only `Int32` keys × `SUM(Float64)`. Integer sums stay exact:
@@ -103,6 +140,13 @@ All notable changes to this project will be documented here. The format follows 
   and `tests/string_eq_aggregate_test.rs`.
 
 ### Changed
+- **`Counter` is `#[non_exhaustive]`** (it gained storage and spill
+  counters); match it with a wildcard arm.
+- **Hosted CI covers the storage layer** (`--features cuda-stub,storage`,
+  GPU lane `cudarc,storage`), with a separate storage-less clippy gate; the
+  public-API snapshot is generated with `storage` on.
+- **`Engine::sql` names `execute_sql`** when given a statement (`CREATE`,
+  `INSERT`, …) instead of failing in the parser.
 - **Per-phase latency histograms for JIT and execution.** `metrics::Phase`
   gains `Codegen` (PTX generation on a module-cache miss), `PtxLoad` (driver
   module load on a PTX-cache miss) and `Execute` (post-planning execution of a

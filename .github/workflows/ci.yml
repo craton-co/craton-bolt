@@ -66,7 +66,11 @@ jobs:
 
       - name: clippy (blocking)
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
-        run: cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings
+        run: cargo clippy --lib --tests --features cuda-stub,storage --no-default-features -- -D warnings
+
+      - name: clippy (lib without the storage feature)
+        if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
+        run: cargo clippy --lib --features cuda-stub --no-default-features -- -D warnings
 
       # Production-library compile gate: rustc warnings are errors here so the
       # shipped crate stays warning-clean. (Test code is compiled without
@@ -83,11 +87,11 @@ jobs:
           RUSTFLAGS: ""
 
       - name: cargo test (lib + integration)
-        run: cargo test --lib --tests --features cuda-stub --no-default-features
+        run: cargo test --lib --tests --features cuda-stub,storage --no-default-features
 
       - name: cargo test (doctests)
         if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
-        run: cargo test --doc --features cuda-stub --no-default-features
+        run: cargo test --doc --features cuda-stub,storage --no-default-features
 
       # Examples are user-facing documentation: they must compile, and the
       # quickstart must run (on a CUDA-less host it reports the missing GPU
@@ -200,7 +204,7 @@ jobs:
             ${{ runner.os }}-cargo-doc-
 
       - name: cargo doc (no-deps, cuda-stub)
-        run: cargo doc --no-default-features --features cuda-stub --no-deps
+        run: cargo doc --no-default-features --features cuda-stub,storage --no-deps
 
   # Packaging / crates.io dry-run. `cargo publish --dry-run` packages the
   # crate exactly as `cargo publish` would (honouring `include`/`exclude`,
@@ -289,8 +293,8 @@ jobs:
           # from the report: that code is dark on github-hosted runners (no
           # CUDA device, cuda-stub stubs the FFI), so including it would tank
           # the host coverage number for paths that physically cannot run here.
-          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
-          cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
+          cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
+          cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
 
       - name: Upload coverage report (lcov)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -444,7 +448,7 @@ jobs:
           # are not meant to compile. That phase can never pass, so it would
           # keep this lane permanently red. Doctests are covered by the
           # `cargo test (doctests)` step in the build job.
-          BOLT_BENCH_GPU=1 cargo test --lib --tests --no-default-features --features cudarc -- --ignored --test-threads=1
+          BOLT_BENCH_GPU=1 cargo test --lib --tests --no-default-features --features cudarc,storage -- --ignored --test-threads=1
           BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest -- --ignored --test-threads=1
         env:
           RUSTFLAGS: ""

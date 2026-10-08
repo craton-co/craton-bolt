@@ -424,7 +424,9 @@ fn local_and_hosted_ci_commands_stay_in_sync() {
     let workflow = read_to_string(&root.join(".github").join("workflows").join("ci.yml"));
     let local = read_to_string(&root.join("ci_local.sh"));
     for command in [
-        "cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings",
+        "cargo clippy --lib --tests --features cuda-stub,storage --no-default-features -- -D warnings",
+        "cargo clippy --lib --features cuda-stub --no-default-features -- -D warnings",
+        "cargo test --lib --tests --features cuda-stub,storage --no-default-features",
         "cargo test --lib --tests --no-default-features --features cuda-stub,flight",
         "cargo build --examples --features cuda-stub --no-default-features",
         "cargo run --example quickstart --features cuda-stub --no-default-features",
@@ -433,7 +435,7 @@ fn local_and_hosted_ci_commands_stay_in_sync() {
         "--fail-under-lines 50",
         "cargo deny --all-features check advisories licenses bans",
         "bash scripts/check_public_api.sh",
-        "--features cudarc -- --ignored --test-threads=1",
+        "--features cudarc,storage -- --ignored --test-threads=1",
     ] {
         assert!(
             workflow.contains(command),

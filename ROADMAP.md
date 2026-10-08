@@ -166,8 +166,8 @@ v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What
   `EngineBuilder::persistent_cache`, with the builder taking precedence.
 - `Engine::register_table_stream` drains eagerly (one validated, coalesced
   install); `register_table_stream_lazy` defers the producer to the first
-  query that references the table. Both end host-resident: there is no
-  spill-capable operator yet (see `docs/LIMITATIONS.md`).
+  query that references the table. Both end host-resident (see
+  `docs/LIMITATIONS.md`).
 
 ### On `main` since 0.9.0 (see CHANGELOG `[Unreleased]`)
 
@@ -179,6 +179,12 @@ v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What
   string-literal aggregates and `Utf8` projections under a predicate fixed.
 - Cost-model benchmark suite, reproducibility manifests, scheduled GPU
   benchmark history; generated module inventory and CI matrix docs.
+- Storage layer: Parquet tables and a `StorageTable` contract with zone-map
+  pruning and statistics; SQL DDL / DML / `COPY` / `ANALYZE`; a persistent,
+  snapshot-versioned catalog; materialized views.
+- Memory governor (host / device budgets, eviction) and out-of-core
+  `GROUP BY` / `DISTINCT` / grace hash join / external sort through spill
+  files; a shared runtime (`Database`) serving concurrent `Session`s.
 
 ## Beyond 0.9 — toward 1.0 (next)
 

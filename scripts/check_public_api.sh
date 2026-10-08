@@ -13,7 +13,7 @@ sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' \
   docs/PUBLIC_API_SNAPSHOT.txt > "$expected"
 
 cargo +nightly-2026-04-03 public-api -sss --color never \
-  --no-default-features --features cuda-stub > "$actual"
+  --no-default-features --features cuda-stub,storage > "$actual"
 
 if ! diff -u "$expected" "$actual"; then
   echo >&2

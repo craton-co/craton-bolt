@@ -94,10 +94,10 @@ echo "========================================"
   _step() { echo \"\$1\" > /ci_tmp/tests_failed_step; echo \">>> Running \$1\"; }
 
   _step 'cargo test (lib + integration)'
-  cargo test --lib --tests --features cuda-stub --no-default-features
+  cargo test --lib --tests --features cuda-stub,storage --no-default-features
 
   _step 'cargo test (doctests)'
-  cargo test --doc --features cuda-stub --no-default-features
+  cargo test --doc --features cuda-stub,storage --no-default-features
 
   _step 'examples (compile + host run)'
   cargo build --examples --features cuda-stub --no-default-features
@@ -125,7 +125,9 @@ TESTS_PID=$!
   cargo fmt --all -- --check
 
   _step 'clippy (blocking)'
-  cargo clippy --lib --tests --features cuda-stub --no-default-features -- -D warnings
+  cargo clippy --lib --tests --features cuda-stub,storage --no-default-features -- -D warnings
+  _step 'clippy (lib without the storage feature)'
+  cargo clippy --lib --features cuda-stub --no-default-features -- -D warnings
 
   _step 'cargo check (lib, strict)'
   RUSTFLAGS='-D warnings' cargo check --lib --features cuda-stub --no-default-features
@@ -135,7 +137,7 @@ TESTS_PID=$!
 
   _step 'MSRV gate (1.85, mirrors the hosted matrix leg)'
   cargo +1.85.0 check --lib --features cuda-stub --no-default-features
-  cargo +1.85.0 test --lib --tests --features cuda-stub --no-default-features
+  cargo +1.85.0 test --lib --tests --features cuda-stub,storage --no-default-features
 
   _step 'feature tests (flight + substrait)'
   cargo test --lib --tests --no-default-features --features cuda-stub,flight
@@ -145,14 +147,14 @@ TESTS_PID=$!
   bash scripts/check_public_api.sh
 
   _step 'cargo doc'
-  cargo doc --no-default-features --features cuda-stub --no-deps
+  cargo doc --no-default-features --features cuda-stub,storage --no-deps
 
   _step 'package (cargo publish --dry-run)'
   cargo publish --dry-run --allow-dirty --no-default-features --features cuda-stub
 
   _step 'coverage (host, >=50% lines)'
-  cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
-  cargo llvm-cov --no-default-features --features cuda-stub --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
+  cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
+  cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
 
   _step 'cargo deny (licenses + bans)'
   cargo deny check licenses bans
@@ -208,7 +210,7 @@ if [[ "${BOLT_LOCAL_GPU:-0}" == "1" ]]; then
     # ```ignore``` examples that are illustrative by construction and cannot
     # compile — that phase would keep the lane permanently red. Doctests run in
     # the tests container above.
-    BOLT_BENCH_GPU=1 cargo test --lib --tests --no-default-features --features cudarc -- --ignored --test-threads=1
+    BOLT_BENCH_GPU=1 cargo test --lib --tests --no-default-features --features cudarc,storage -- --ignored --test-threads=1
     BOLT_BENCH_GPU=1 cargo test --no-default-features --features cudarc,reference-tests \
         --test diff_duckdb --test diff_duckdb_semantics --test sql_proptest \
         -- --ignored --test-threads=1

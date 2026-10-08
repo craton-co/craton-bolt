@@ -272,5 +272,5 @@ debug = "line-tables-only"
 
 [package.metadata.docs.rs]
 default-features = false
-features = ["cuda-stub"]
+features = ["cuda-stub", "storage"]
 rustdoc-args = ["--cfg", "docsrs"]

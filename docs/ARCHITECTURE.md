@@ -13,7 +13,9 @@ This document maps Craton Bolt's source tree to the runtime pipeline, and explai
 
 | Layer | Directory | Role |
 |---|---|---|
-| Query front door | `src/exec/engine.rs`, `src/exec/engine_query.rs` | `Engine` / `EngineBuilder`, table registration, the one compile pipeline (`QueryCompiler`), `sql` / `explain_sql` / `run_logical_plan` |
+| Query front door | `src/exec/engine.rs`, `src/exec/engine_query.rs`, `src/exec/engine_ddl.rs` | `Engine` / `EngineBuilder`, table registration, the one compile pipeline (`QueryCompiler`), `sql` / `explain_sql` / `run_logical_plan`, and `execute_sql` for DDL / DML / `COPY` / `ANALYZE` / maintenance statements |
+| Storage | `src/storage/`, `src/exec/engine_storage.rs`, `src/exec/engine_views.rs` | the `StorageTable` scan contract with per-chunk statistics and zone-map pruning, Parquet tables and writer, the persistent snapshot-versioned `Catalog`, materialized views |
+| Resources | `src/exec/memory.rs`, `src/exec/engine_ooc.rs`, `src/exec/spill.rs`, `src/exec/session.rs` | the memory governor (host / device budgets, evictions), out-of-core execution through spill files, and the shared runtime (`Database`) serving `Session`s |
 | Planning | `src/plan/` | SQL frontend (sqlparser → `LogicalPlan`, shape classification), `DataFrame` builder, logical optimizer, physical lowering to the SSA-shaped IR |
 | Execution | `src/exec/` | per-shape GPU / host executors (projection, aggregates, GROUP BY tiers, joins, sort, distinct, windows, set ops, strings), dictionary registry, device tables, streaming / morsel machinery |
 | Code generation | `src/jit/` | one PTX emitter per kernel family, in-process + disk PTX caches, module loading |
@@ -32,12 +34,19 @@ Every query — `Engine::sql`, `Engine::run_logical_plan` / `DataFrame::collect`
        │   (parse once; recognise host-orchestrated shapes)│
        ▼                                                  │
    QueryShape ── Generic(LogicalPlan) ────────────────────┤
+       │      (over budget? engine_ooc runs it in spilled  │
+       │       hash partitions — see below)               │
        │                                                  │
        └─ Recursive / Lateral / CorrelatedWhere /         │
           Values / GenerateSeries / DistinctOn /          │
           CountDistinctGroupBy / MultiAggGroupBy          │
             (host loop over component subplans — each     │
              subplan re-enters the compiler below) ───────┤
+                                                          ▼
+                 before compiling: evict idle device tables over the
+                 device budget; load each storage table's pruned scan
+                 (engine_storage); drain the lazy streams it reads
+                                                          │
                                                           ▼
                  QueryCompiler::compile  (exec/engine_query.rs)
                    1. dict_registry.rewrite_plan   (col = 'x' → __idx_col = k)
@@ -71,6 +80,7 @@ Every query — `Engine::sql`, `Engine::run_logical_plan` / `DataFrame::collect`
 - **Eager tables** (`register_table`, `register_batch`, `register_table_stream`) are stored coalesced as **one** host `RecordBatch` per table — multi-batch ingestion concatenates once at ingest, so no query pays a per-query concat. String columns get a dictionary (`dict_registry.rs`) built from the full data.
 - **Lazy tables** (`register_table_stream_lazy`) live in a `TableSource::Streaming` overlay. The pipeline drains exactly the tables a statement scans (including inside its subqueries) before compiling it, validates every batch against the declared schema, coalesces them, and — without a memory budget — builds their string dictionaries.
 - **Device residency.** `ensure_gpu_table` keeps a `GpuTable` per table, versioned by per-column host revisions: unchanged columns are reused in place, appends upload only the new tail (DtoD-preserving the prefix).
+- **Storage tables** (`register_storage_table`, `register_parquet`, catalog tables) implement `storage::StorageTable`: data in chunks (Parquet row groups, batches) each carrying `TableStatistics` (row count, size, per-column min / max / null count, distinct estimate). Before a statement compiles, `engine_storage` derives a `ScanRequest` per storage table from the statement's optimized plan — the columns it reads and the prunable conjuncts of the filter on its scan, in disjunctive form across repeated scans — lets the table prune chunks with their zone maps, and installs the selected rows in the overlay (unread columns as zero placeholders). Filters stay in the plan, so a later statement whose request the installed scan covers reuses it, GPU copy included. Overlay entries keep their device copy across statements while the overlay still holds the very batch that was uploaded (`Arc` identity of its first column).
 - **Morsels.** Under `EngineBuilder::memory_budget`, row-wise leaf scans and aggregates over overlay tables are processed in bounded morsels (`engine_streaming_impl.rs`) — distributive aggregates fold their partials directly, and `AVG` / `VAR_*` / `STDDEV_*` are decomposed into `SUM` / `COUNT` / `VAR_POP` partials and recombined exactly (`merge_algebraic_partials`); everything else materialises its input.
 
 ## Memory safety: CUDA-Oxide
@@ -157,14 +167,28 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 
 ## Multi-pass prefix scan
 
+### Statements, catalog and materialized views
+
+`Engine::execute_sql(&mut self)` runs one or more `;`-separated statements: queries go through `sql`; `CREATE TABLE [AS]`, `CREATE EXTERNAL TABLE`, `INSERT`, `DROP`, `TRUNCATE`, `COPY` (Parquet / CSV), `ANALYZE`, `SHOW TABLES`, `DESCRIBE`, `COMPACT TABLE`, `VACUUM` and the materialized-view statements are handled in `engine_ddl` / `engine_views`. Without a catalog, tables are in-memory. With `EngineBuilder::database(dir)` a `storage::Catalog` is attached: every change writes immutable Parquet files and then commits a new JSON manifest (the full table list with per-file statistics) by atomic rename of `_bolt/CURRENT`; each manifest is a snapshot (`database_snapshot(dir, v)` opens one read-only), a writer lock admits one writer, `COMPACT` rewrites a table's files, and `VACUUM` drops old snapshots and unreferenced files. Catalog tables are registered as storage tables, so they are scanned with pruning. A materialized view is a table plus its defining query, its base tables and their data versions at the last refresh (`view_status` reports staleness; `on_commit` views refresh after statements that change a base table); in a catalog its definition is part of the snapshot.
+
+### Memory governance and out-of-core execution
+
+`exec::memory::MemoryGovernor` holds the host budget (`host_memory_budget`) and device budget (`memory_budget`). Installed storage scans hold host reservations and are evicted least-recently-used to fit the host budget; resident GPU tables are evicted least-recently-used *between statements* (never while an executor may hold device pointers) to fit the device budget; registered `MemoryConsumer`s are asked to spill last.
+
+A statement whose input table exceeds the budget, in a shape the morsel path does not bound, runs out of core (`engine_ooc`): the large table is streamed (never installed whole), hash-partitioned on the relevant columns into Arrow IPC spill files (`spill.rs`, type-normalised hashing so independently partitioned join sides align; NULL keys in partition 0), and the ordinary compiled operators run on one partition at a time under an ephemeral overlay name. `GROUP BY` / `DISTINCT` partition on the grouping columns (through joins on which the large table is preserved) — groups never span partitions, so any aggregate is exact; equi-joins run as a grace hash join; `ORDER BY [LIMIT]` over a row-wise scan sorts bounded runs (top-k under a LIMIT) and merges them with the Arrow row format. The executed node is replaced by a scan of its result and the rest of the plan continues, possibly going out of core again.
+
+### Sessions
+
+`exec::session::Database` builds an `Engine` on a dedicated runtime thread and owns it there; `Session`s (cloneable, any thread) submit statements to a bounded FIFO queue and get `PendingResult`s (blocking `wait`, `Future`, cancel-on-drop before start). Statements run one at a time — one GPU runtime, fairly shared — with panics caught per statement.
+
 `prefix_scan.rs` tops out at `n_rows ≤ u32::MAX / BLOCK_SIZE ≈ 16.8M` (the host-side scan over block_sums assumes the array fits comfortably). For larger inputs `prefix_scan_multipass.rs` recursively scans the block_sums via the same kernel, building a depth-3-or-4 ladder of prefix-summed arrays. The dispatch lives at the top of `gpu_compact.rs::prefix_scan_mask` — if `n_rows > limit`, delegate.
 
 ## What's deliberately *not* in this architecture
 
 - **No process model.** Everything runs in a single Rust process.
-- **One active `Engine` per process.** The memory pool, stream pool and module caches are process-global and bound to the CUDA context; `EngineBuilder::build` rejects a second live engine. Sequential engines are supported (and stress-tested). A shared-runtime / many-session model is post-1.0 work.
+- **One active `Engine` per process.** The memory pool, stream pool and module caches are process-global and bound to the CUDA context; `EngineBuilder::build` rejects a second live engine. Sequential engines are supported (and stress-tested). Many clients share the one engine through `Database` / `Session` (statements serialised FIFO on the runtime thread); concurrent kernel execution across queries is not attempted.
 - **No multi-GPU per engine.** One context, one device per `Engine`; `Engine::new_with_device(idx)` picks the device.
-- **Host memory bounds the data set.** Tables are host-resident Arrow batches; the morsel path bounds *device* working sets for row-wise scans and aggregates (scalar and grouped, including `AVG` / variance), but sorts, joins, windows, distinct and set operations materialise their inputs. Spill-capable operators are open work.
+- **Results are host-resident.** Storage tables are read per statement (pruned) and over-budget `GROUP BY` / `DISTINCT` / equi-joins / `ORDER BY` run out of core, but every statement's result — and every out-of-core node's intermediate result — is one host Arrow batch, and windows, set operations and non-equi joins still materialise their inputs.
 - **Non-equi joins are limited.** Non-equi predicates run through the host nested-loop fallback (`execute_nested_loop_join`), INNER-only and capped (`MAX_NESTED_LOOP_INNER_ROWS`).
 - **Host-orchestrated SQL shapes are host loops.** Recursive CTEs and correlated applies share the compile pipeline but are not physical operators; their cost is bounded by `CRATON_MAX_RECURSIVE_ITERATIONS` / `CRATON_MAX_APPLY_ROWS` (see [`ENV_VARS.md`](ENV_VARS.md)).
 - **Async memcpy coverage is partial.** Projection, scalar aggregates, the GROUP BY family and filter D2H use pinned async transfers; the join executor still issues most H2D uploads synchronously.
@@ -205,13 +229,17 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/engine.rs` | Top-level engine: dispatches per-shape executors (scalar agg, GROUP BY, etc.); performs GPU prefix-scan + gather compaction for filter outputs, or a host-side `arrow::compute::filter` fallback when any output column is Utf8. |
 | `src/exec/engine_agg_impl.rs` | Host-side aggregate / row-source query executors for [`Engine`]. |
 | `src/exec/engine_cache_key.rs` | Module-cache key + host-revision snapshot types lifted out of `exec::engine` (pure reorganization; no behavior change). |
+| `src/exec/engine_ddl.rs` | SQL statements that change tables: `CREATE TABLE [AS]`, `CREATE EXTERNAL TABLE`, `INSERT`, `DROP TABLE`, `TRUNCATE`, `COPY`, `ANALYZE`, plus the read-only `SHOW TABLES` / `DESCRIBE` and the catalog-maintenance statements `COMPACT TABLE` and `VACUUM`. |
 | `src/exec/engine_device_col.rs` | Heterogenous owned device output column ([`DeviceCol`]) and its download / staging helpers, lifted out of `exec::engine` (pure reorganization; no behavior change). |
 | `src/exec/engine_join_impl.rs` | Reserved sibling module for the join execution / dispatch methods of [`crate::exec::engine::Engine`]. |
+| `src/exec/engine_ooc.rs` | Out-of-core statement execution. |
 | `src/exec/engine_provider.rs` | Planner-facing adapters over the engine's registered tables, lifted out of `exec::engine` (pure reorganization; no behavior change). |
 | `src/exec/engine_query.rs` | The SQL / DataFrame query front door of [`Engine`]: `sql`, `explain_sql`, `run_logical_plan` and the internal `run_subplan`, plus the single [`QueryCompiler`] pipeline every one of them shares. |
+| `src/exec/engine_storage.rs` | Engine glue for [`StorageTable`]s: registration, per-query pruned scans, and table statistics. |
 | `src/exec/engine_streaming_impl.rs` | Streaming / morsel-driven execution methods for [`Engine`]. |
 | `src/exec/engine_string_impl.rs` | String-projection execution methods for [`Engine`]. |
 | `src/exec/engine_support.rs` | Standalone free helper functions lifted out of `exec::engine` (pure reorganization; no behavior change). |
+| `src/exec/engine_views.rs` | Materialized views. |
 | `src/exec/expr_agg.rs` | Host-side expression evaluator for aggregate inputs. |
 | `src/exec/extended_agg.rs` | Host-side aggregate execution for the dtypes the GPU reduction kernels don't cover: `Bool` (any aggregate) and `Utf8` (COUNT/MIN/MAX only). |
 | `src/exec/filter.rs` | Host-side post-aggregate filter executor. |
@@ -257,12 +285,15 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/launch.rs` | Kernel launch glue: turns `CudaFunction` + `GpuView`s into a 1D grid launch. |
 | `src/exec/like.rs` | Host-side SQL `LIKE` evaluator. |
 | `src/exec/limit.rs` | LIMIT / OFFSET executor — slice the input RecordBatch. |
+| `src/exec/memory.rs` | Query-level memory governance. |
 | `src/exec/mod.rs` | Execution: the [`Engine`](engine::Engine) query front door, the per-shape GPU / host executors, and the device-table, dictionary and streaming machinery they share. |
 | `src/exec/module_cache.rs` | Process-wide JIT module cache shared across executors. |
 | `src/exec/partition_offsets.rs` | Exclusive prefix-sum offsets for Tier-2 hash-partitioned GROUP BY. |
 | `src/exec/schema_convert.rs` | Single-source-of-truth conversions between the plan-layer `DataType` / `Schema` and Arrow's `DataType` / `Schema`. |
+| `src/exec/session.rs` | Shared runtime and sessions. |
 | `src/exec/setops.rs` | `EXCEPT` / `INTERSECT` executor — host-side multiset set operations. |
 | `src/exec/sort.rs` | ORDER BY executor — host-side sort of a RecordBatch. |
+| `src/exec/spill.rs` | Spill files and hash partitioning for out-of-core execution. |
 | `src/exec/streaming.rs` | Morsel / chunk streaming abstractions for bounded, larger-than-VRAM execution. |
 | `src/exec/string_col.rs` | Device columns for non-primitive dtypes: `Bool` and `Utf8`. |
 | `src/exec/string_length.rs` | Executor for the fully-GPU `SELECT LENGTH(<utf8_col>)` projection ([`crate::plan::physical_plan::PhysicalPlan::StringLength`]). |
@@ -345,4 +376,10 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/plan/substrait/mod.rs` | Substrait plan ingestion (feature `substrait`). |
 | `src/plan/substrait/rel.rs` | Substrait `Rel` → engine [`LogicalPlan`] conversion (feature `substrait`). |
 | `src/plan/suggest.rs` | "Did you mean...?" suggestion helpers for unknown SQL identifiers. |
+| `src/storage/catalog.rs` | Persistent, snapshot-versioned table catalog. |
+| `src/storage/mod.rs` | Storage layer: tables whose data lives outside the engine's in-memory store, their statistics, and scan pruning. |
+| `src/storage/parquet.rs` | Parquet-backed tables and the Parquet writer. |
+| `src/storage/scan.rs` | Scan requests and zone-map pruning. |
+| `src/storage/stats.rs` | Table and column statistics. |
+| `src/storage/table.rs` | The storage-table contract and the in-memory implementation. |
 <!-- module-inventory:end -->

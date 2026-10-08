@@ -692,6 +692,31 @@ SELECT ... FROM <table>
 - SQL NULL semantics on keys: `NULL = NULL` is `UNKNOWN`, so NULL-keyed rows never match. For OUTER joins they still emit on the preserved side with the opposite side NULL-padded.
 - Every shape has a GPU fast path with a host fallback (`src/exec/join.rs` dispatches to `src/exec/gpu_join.rs`): `INNER` (`try_gpu_inner_join`), `LEFT`/`RIGHT`/`FULL` (`try_gpu_outer_join`), and `CROSS` (`execute_cross_join_on_gpu`). The GPU paths are gated (dtype, NULL-freedom, cardinality / cell-count windows); a gate miss or kernel decline transparently falls back to the host hash-join (or host cartesian product for CROSS).
 
+## Statements
+
+`Engine::execute_sql` (and `Session::sql`) run these in addition to queries;
+`Engine::sql` runs queries only and points at `execute_sql` for the rest.
+Each statement commits on its own; a statement that changes tables returns
+one row, `rows_affected`.
+
+| Statement | Notes |
+|---|---|
+| `CREATE [TEMP] TABLE [IF NOT EXISTS] t (col type [NOT NULL], ...)` | Empty table. Types: `INT` / `INTEGER` / `SMALLINT` → Int32, `BIGINT` → Int64, `REAL` → Float32, `DOUBLE` / `FLOAT` → Float64, `BOOLEAN`, `VARCHAR` / `TEXT` / `CHAR` → Utf8, `DATE`, `TIMESTAMP[(p)] [WITH TIME ZONE]`, `DECIMAL(p, s)` |
+| `CREATE [OR REPLACE] [TEMP] TABLE t [(col type, ...)] AS SELECT ...` | A column list casts the result |
+| `CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 'path'` | File or directory; read-only; pruned per query |
+| `INSERT INTO t [(cols)] SELECT ... \| VALUES (...), ...` | Values are cast to the column types (an impossible cast fails the statement); unnamed columns get NULL; `NOT NULL` is enforced |
+| `DROP TABLE [IF EXISTS] t, ...`, `TRUNCATE [TABLE] t` | |
+| `COPY t [(cols)] \| (SELECT ...) TO 'file' [(FORMAT parquet \| csv, HEADER b, DELIMITER 'c')]` | Format from the extension when omitted (`.csv` → CSV) |
+| `COPY t [(cols)] FROM 'file' [(FORMAT ...)]` | Appends; Parquet columns matched by name |
+| `ANALYZE [TABLE] t` | One row per column: row count, null count, min, max, distinct estimate (recorded in the catalog) |
+| `SHOW TABLES`, `DESCRIBE t` | |
+| `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'manual' \| 'on_commit')] AS SELECT ...` | Read like a table; staleness via `Engine::view_status` |
+| `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` | Full refresh |
+| `COMPACT TABLE t`, `VACUUM [KEEP n]` | Catalog tables only (`EngineBuilder::database`) |
+
+With a catalog attached, tables (other than `TEMP`) and materialized views
+are durable and every change is a new catalog snapshot.
+
 ## What's NOT supported
 
 These produce explicit errors at parse / plan time:
@@ -745,8 +770,8 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - `INTO`, table-valued functions **other than `generate_series`** (`unnest`, etc.), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `SETTINGS`, and the trailing `FORMAT` output clause (distinct from the supported `CAST(... FORMAT '<pattern>')` expression — see the CASE / CAST section). (`FETCH` and T-SQL `TOP` now fold into `LIMIT`, `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, `PREWHERE` is folded into `WHERE`, and `generate_series(...)` and `VALUES` are supported row sources — see the [generate_series](#generate_series) and [VALUES](#values-as-a-row-source) sections. Residuals: `FETCH` / `TOP` with `PERCENT` or `WITH TIES`, and a `TOP` combined with `LIMIT` / `FETCH`.)
 - (`GROUP BY ALL` / `ROLLUP` / `CUBE` / `GROUPING SETS` / `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` and the `GROUPING()` / `GROUPING_ID()` indicators are now **supported** — see [GROUP BY](#group-by). Residuals: more than 12 grouping columns, and `GROUPING()` without a grouping construct.)
 - `SELECT AS STRUCT/VALUE`.
-- DDL of any kind — no `CREATE TABLE`. Tables are registered via the Rust API (`Engine::register_table`).
-- DML (`INSERT`, `UPDATE`, `DELETE`).
+- `UPDATE`, `DELETE`, `MERGE`, `ALTER TABLE` (tables are append-only), plain (non-materialized) `CREATE VIEW`, and multi-statement transactions (`BEGIN` / `COMMIT`). The supported statements are listed under [Statements](#statements).
+- `SELECT` without a `FROM` clause (`SELECT 1`); select from `(VALUES (1)) AS v(x)` instead.
 
 ### Validity propagation
 - Scalar primitive aggregates honor validity: `COUNT(col)` excludes NULLs,

@@ -162,6 +162,124 @@ index comparisons as for an eager table; under a budget they are evaluated
 on the host. See
 [`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
 
+### Parquet and other storage tables
+
+`Engine::register_parquet(name, path)` registers a Parquet file, or every
+`*.parquet` file of a directory, without reading data. Each statement then
+reads only the row groups whose footer statistics (min / max / null count)
+may match its filters, and only the columns it uses:
+
+```rust
+engine.register_parquet("events", "/data/events/")?;
+let n = engine.sql("SELECT COUNT(*) FROM events WHERE day >= DATE '2026-01-01'")?;
+let r = engine.last_scan("events").unwrap();   // chunks_total / chunks_read / rows_read
+```
+
+A later statement whose needs are covered by what is already loaded reuses
+it (GPU copy included). Any type implementing `storage::StorageTable` —
+chunks plus per-chunk `TableStatistics` — registers the same way via
+`register_storage_table`; `storage::MemoryTable` is an in-memory example.
+`Engine::table_statistics(name)` returns row count, size and per-column
+bounds / null counts / distinct estimates for any table.
+
+---
+
+## SQL statements and the persistent catalog
+
+`Engine::sql` runs queries. `Engine::execute_sql(&mut self, sql)` runs one or
+more `;`-separated statements of any kind and returns the last result
+(statements return a one-row `rows_affected` batch):
+
+```rust
+engine.execute_sql("CREATE TABLE sales (id BIGINT NOT NULL, region VARCHAR, amount DOUBLE)")?;
+engine.execute_sql("INSERT INTO sales VALUES (1, 'eu', 9.5), (2, 'us', 3.0)")?;
+engine.execute_sql("CREATE TABLE eu AS SELECT * FROM sales WHERE region = 'eu'")?;
+engine.execute_sql("COPY sales TO '/tmp/sales.parquet'")?;
+engine.execute_sql("CREATE EXTERNAL TABLE raw STORED AS PARQUET LOCATION '/data/raw/'")?;
+engine.execute_sql("ANALYZE sales")?;   // per-column statistics, one row per column
+```
+
+The full statement list is in [`SQL_REFERENCE.md`](SQL_REFERENCE.md#statements).
+
+Without a catalog, tables created this way are in-memory. Attach a catalog
+directory to make them durable:
+
+```rust
+let mut engine = Engine::builder().database("/var/lib/bolt/warehouse").build()?;
+engine.execute_sql("CREATE TABLE IF NOT EXISTS t (k BIGINT, v DOUBLE)")?;
+engine.execute_sql("INSERT INTO t SELECT k, v FROM staging")?;   // a new immutable file + snapshot
+// ... restart: the tables (and materialized views) are still there.
+let v = engine.catalog().unwrap().version();
+let old = Engine::builder().database_snapshot("/var/lib/bolt/warehouse", v - 1).build()?; // read-only
+```
+
+Each statement commits on its own (append-only; no `UPDATE` / `DELETE`).
+`COMPACT TABLE t` merges a table's files; `VACUUM [KEEP n]` deletes old
+snapshots and unreferenced files. `CREATE TEMP TABLE` stays in memory even
+with a catalog attached. One engine writes a catalog at a time.
+
+**Materialized views.**
+
+```rust
+engine.execute_sql("CREATE MATERIALIZED VIEW by_region AS SELECT region, SUM(amount) AS total FROM sales GROUP BY region")?;
+engine.execute_sql("CREATE MATERIALIZED VIEW live WITH (refresh = 'on_commit') AS SELECT COUNT(*) AS n FROM sales")?;
+assert!(!engine.view_status("by_region")?.fresh);   // after a change to `sales`
+engine.execute_sql("REFRESH MATERIALIZED VIEW by_region")?;
+```
+
+Views are read like tables (no automatic query rewrite) and refresh in
+full. `on_commit` views refresh after any statement that changes a base
+table (and before the next `execute_sql` statement if a base table changed
+through the Rust API). In a catalog, view definitions and freshness persist.
+
+---
+
+## Memory budgets and out-of-core execution
+
+```rust
+let engine = Engine::builder()
+    .memory_budget(4 << 30)          // device bytes
+    .host_memory_budget(16 << 30)    // host bytes the engine holds for itself
+    .spill_dir("/fast/scratch")
+    .build()?;
+println!("{:?}", engine.memory_stats());   // reserved / peak, spills, evictions
+```
+
+Under a budget, idle GPU table copies and loaded storage scans are evicted
+(least recently used) to make room, and a statement whose input table is
+larger than the budget runs **out of core**: the table is hash-partitioned
+into spill files and the normal GPU operators run on one partition at a
+time — `GROUP BY` / `DISTINCT` (exact for every aggregate), equi-joins
+(grace hash join, all join types), and `ORDER BY [LIMIT]` (sorted runs,
+k-way merge). Simple aggregates over lazily-held tables keep using the
+single-pass morsel path. Results are always one host batch. See
+[`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
+
+---
+
+## Sharing an engine: `Database` and sessions
+
+One process has one active `Engine`. To serve many clients, wrap it in a
+`Database`, which owns the engine on a runtime thread; `Session`s are cheap
+handles usable from any thread:
+
+```rust
+use craton_bolt::{Database, Engine};
+
+let db = Database::open(Engine::builder().database("/var/lib/bolt/warehouse"))?;
+let s = db.session();
+s.sql("INSERT INTO t VALUES (1, 2.0)")?;
+let pending = db.session().submit("SELECT COUNT(*) FROM t");  // returns at once
+let batch = pending.wait()?;                                   // or `.await` it
+let ro = db.session();
+ro.set_read_only(true);                                        // queries only
+db.with_engine(|e| e.table_names())?;                          // non-SQL engine access
+```
+
+Statements run one at a time in arrival order on the shared GPU runtime;
+dropping a `PendingResult` before its statement starts cancels it, and a
+panic fails only its own statement. `Database::stats()` reports queue waits.
+
 ---
 
 ## Supported SQL
@@ -428,6 +546,7 @@ craton-bolt = { version = "0.9", features = ["pool-sharded"] }
 | `cudarc`       | on      | Supported default primary-context and CUDA driver adapter; see `docs/CUDARC_ADOPTION.md`. |
 | `pool-sharded` | off     | Swap the memory-pool bucket map from a `DashMap` to a fixed 32-way mutex-array shard. Turn on only if profiling shows DashMap contention. |
 | `pool-watcher` | off     | Spawn a background thread that polls device memory and proactively evicts when free / total drops below `BOLT_POOL_WATCH_LOW_WATER_FRAC` (default 10%). Off by default — adds a permanently-resident thread. |
+| `storage`      | on      | Parquet tables (`register_parquet`, `CREATE EXTERNAL TABLE`, `COPY` to / from Parquet), the persistent catalog (`EngineBuilder::database`) and durable materialized views. Pulls in `parquet` / `serde_json`. Without it, `execute_sql` still runs in-memory DDL / DML and CSV `COPY`. |
 
 ### The PTX module cache
 
