@@ -424,10 +424,21 @@ pub fn craton_bolt::exec::dict_registry::DictRegistry::default() -> Self
 pub mod craton_bolt::exec::engine
 #[non_exhaustive] pub struct craton_bolt::exec::engine::Engine
 impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::analyze_table(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str) -> craton_bolt::BoltResult<usize>
+pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::vacuum(&mut self, usize) -> craton_bolt::BoltResult<usize>
+impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
 pub fn craton_bolt::exec::engine::Engine::execute(&self, &PhysicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::host_memory_budget_bytes(&self) -> core::option::Option<usize>
 pub fn craton_bolt::exec::engine::Engine::memory_budget_bytes(&self) -> core::option::Option<usize>
+pub fn craton_bolt::exec::engine::Engine::memory_governor(&self) -> &alloc::sync::Arc<craton_bolt::exec::memory::MemoryGovernor>
+pub fn craton_bolt::exec::engine::Engine::memory_stats(&self) -> craton_bolt::exec::memory::MemoryStats
 pub fn craton_bolt::exec::engine::Engine::morsel_plan_for_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::streaming::MorselPlan>
 pub fn craton_bolt::exec::engine::Engine::new() -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::exec::engine::Engine::new_with_device(i32) -> craton_bolt::BoltResult<Self>
@@ -441,17 +452,36 @@ pub fn craton_bolt::exec::engine::Engine::rewrite_count(&self) -> usize
 pub fn craton_bolt::exec::engine::Engine::tracing_enabled(&self) -> bool
 pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<dyn craton_bolt::plan::rewrite::PlanRewrite>) -> Self
 impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::catalog(&self) -> core::option::Option<&craton_bolt::storage::catalog::Catalog>
+pub fn craton_bolt::exec::engine::Engine::last_scan(&self, &str) -> core::option::Option<craton_bolt::storage::ScanReport>
+pub fn craton_bolt::exec::engine::Engine::register_parquet(&mut self, impl core::convert::Into<alloc::string::String>, impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::register_storage_table(&mut self, impl core::convert::Into<alloc::string::String>, alloc::sync::Arc<dyn craton_bolt::storage::table::StorageTable>) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::storage_table(&self, &str) -> core::option::Option<alloc::sync::Arc<dyn craton_bolt::storage::table::StorageTable>>
+pub fn craton_bolt::exec::engine::Engine::table_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::table_statistics(&self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::stats::TableStatistics>
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::create_view(&mut self, &str, &str, craton_bolt::RefreshMode, bool) -> craton_bolt::BoltResult<u64>
+pub fn craton_bolt::exec::engine::Engine::drop_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::refresh_view(&mut self, &str) -> craton_bolt::BoltResult<u64>
+pub fn craton_bolt::exec::engine::Engine::view_exists(&self, &str) -> bool
+pub fn craton_bolt::exec::engine::Engine::view_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::view_status(&self, &str) -> craton_bolt::BoltResult<craton_bolt::ViewStatus>
+impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::exec::engine::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
+pub fn craton_bolt::exec::engine::EngineBuilder::database(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::database_snapshot(self, impl core::convert::Into<std::path::PathBuf>, u64) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::device(self, i32) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::enable_tracing(self) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::host_memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub struct craton_bolt::exec::engine::QueryHandle
 impl craton_bolt::exec::engine::QueryHandle
 pub fn craton_bolt::exec::engine::QueryHandle::into_record_batch(self) -> arrow_array::record_batch::RecordBatch
@@ -720,12 +750,87 @@ pub fn craton_bolt::exec::like::PatternMatcher::compile(&str, core::option::Opti
 pub fn craton_bolt::exec::like::PatternMatcher::compile_ci(&str, core::option::Option<char>, bool) -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::exec::like::PatternMatcher::matches(&self, &str) -> bool
 pub fn craton_bolt::exec::like::host_like(&arrow_array::array::string_array::StringArray, &str, core::option::Option<char>, bool) -> craton_bolt::BoltResult<arrow_array::array::boolean_array::BooleanArray>
+pub mod craton_bolt::exec::memory
+pub enum craton_bolt::exec::memory::MemoryKind
+pub craton_bolt::exec::memory::MemoryKind::Device
+pub craton_bolt::exec::memory::MemoryKind::Host
+pub struct craton_bolt::exec::memory::MemoryGovernor
+impl craton_bolt::exec::memory::MemoryGovernor
+pub fn craton_bolt::exec::memory::MemoryGovernor::available(&self, craton_bolt::exec::memory::MemoryKind) -> usize
+pub fn craton_bolt::exec::memory::MemoryGovernor::budget(&self, craton_bolt::exec::memory::MemoryKind) -> core::option::Option<usize>
+pub fn craton_bolt::exec::memory::MemoryGovernor::new(core::option::Option<usize>, core::option::Option<usize>) -> alloc::sync::Arc<Self>
+pub fn craton_bolt::exec::memory::MemoryGovernor::register_consumer(&self, &alloc::sync::Arc<dyn craton_bolt::exec::memory::MemoryConsumer>)
+pub fn craton_bolt::exec::memory::MemoryGovernor::reserve_unchecked(&alloc::sync::Arc<Self>, craton_bolt::exec::memory::MemoryKind, usize) -> craton_bolt::exec::memory::MemoryReservation
+pub fn craton_bolt::exec::memory::MemoryGovernor::reserved(&self, craton_bolt::exec::memory::MemoryKind) -> usize
+pub fn craton_bolt::exec::memory::MemoryGovernor::stats(&self) -> craton_bolt::exec::memory::MemoryStats
+pub fn craton_bolt::exec::memory::MemoryGovernor::try_reserve(&alloc::sync::Arc<Self>, craton_bolt::exec::memory::MemoryKind, usize) -> craton_bolt::BoltResult<craton_bolt::exec::memory::MemoryReservation>
+impl core::fmt::Debug for craton_bolt::exec::memory::MemoryGovernor
+pub fn craton_bolt::exec::memory::MemoryGovernor::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craton_bolt::exec::memory::MemoryReservation
+impl craton_bolt::exec::memory::MemoryReservation
+pub fn craton_bolt::exec::memory::MemoryReservation::bytes(&self) -> usize
+impl core::ops::drop::Drop for craton_bolt::exec::memory::MemoryReservation
+pub fn craton_bolt::exec::memory::MemoryReservation::drop(&mut self)
+#[non_exhaustive] pub struct craton_bolt::exec::memory::MemoryStats
+pub craton_bolt::exec::memory::MemoryStats::device_budget: core::option::Option<usize>
+pub craton_bolt::exec::memory::MemoryStats::evictions: u64
+pub craton_bolt::exec::memory::MemoryStats::host_budget: core::option::Option<usize>
+pub craton_bolt::exec::memory::MemoryStats::host_peak: usize
+pub craton_bolt::exec::memory::MemoryStats::host_reserved: usize
+pub craton_bolt::exec::memory::MemoryStats::out_of_core_statements: u64
+pub craton_bolt::exec::memory::MemoryStats::spill_files: u64
+pub craton_bolt::exec::memory::MemoryStats::spilled_bytes: u64
+pub trait craton_bolt::exec::memory::MemoryConsumer: core::marker::Send + core::marker::Sync
+pub fn craton_bolt::exec::memory::MemoryConsumer::bytes_reserved(&self) -> usize
+pub fn craton_bolt::exec::memory::MemoryConsumer::name(&self) -> &str
+pub fn craton_bolt::exec::memory::MemoryConsumer::spill(&self, usize) -> craton_bolt::BoltResult<usize>
 pub mod craton_bolt::exec::partition_offsets
 pub const craton_bolt::exec::partition_offsets::NUM_PARTITIONS: u32
 pub fn craton_bolt::exec::partition_offsets::compute_and_upload_partition_offsets_async(&craton_bolt::cuda::smart_ptrs::GpuVec<u32>, craton_bolt::cuda::cuda_sys::CUstream) -> craton_bolt::BoltResult<(alloc::vec::Vec<u32>, craton_bolt::cuda::smart_ptrs::GpuVec<u32>)>
 pub fn craton_bolt::exec::partition_offsets::compute_partition_offsets(&craton_bolt::cuda::smart_ptrs::GpuVec<u32>) -> craton_bolt::BoltResult<alloc::vec::Vec<u32>>
 pub fn craton_bolt::exec::partition_offsets::invalidate_pinned_scratch_on_context_teardown()
 pub fn craton_bolt::exec::partition_offsets::upload_offsets(&[u32]) -> craton_bolt::BoltResult<craton_bolt::cuda::smart_ptrs::GpuVec<u32>>
+pub mod craton_bolt::exec::session
+pub struct craton_bolt::exec::session::Database
+impl craton_bolt::exec::session::Database
+pub fn craton_bolt::exec::session::Database::close(&self)
+pub fn craton_bolt::exec::session::Database::open(craton_bolt::exec::engine::EngineBuilder) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
+pub fn craton_bolt::exec::session::Database::open_with_capacity(craton_bolt::exec::engine::EngineBuilder, usize) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
+pub fn craton_bolt::exec::session::Database::session(&self) -> craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Database::stats(&self) -> craton_bolt::exec::session::DatabaseStats
+pub fn craton_bolt::exec::session::Database::with_engine<R, F>(&self, F) -> craton_bolt::BoltResult<R> where R: core::marker::Send + 'static, F: core::ops::function::FnOnce(&mut craton_bolt::exec::engine::Engine) -> R + core::marker::Send + 'static
+impl core::fmt::Debug for craton_bolt::exec::session::Database
+pub fn craton_bolt::exec::session::Database::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct craton_bolt::exec::session::DatabaseStats
+pub craton_bolt::exec::session::DatabaseStats::cancelled: u64
+pub craton_bolt::exec::session::DatabaseStats::failed: u64
+pub craton_bolt::exec::session::DatabaseStats::max_queue_wait: core::time::Duration
+pub craton_bolt::exec::session::DatabaseStats::sessions: u64
+pub craton_bolt::exec::session::DatabaseStats::statements: u64
+pub craton_bolt::exec::session::DatabaseStats::total_queue_wait: core::time::Duration
+pub struct craton_bolt::exec::session::PendingResult
+impl craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::PendingResult::try_take(&mut self) -> core::option::Option<craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
+pub fn craton_bolt::exec::session::PendingResult::wait(self) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+impl core::future::future::Future for craton_bolt::exec::session::PendingResult
+pub type craton_bolt::exec::session::PendingResult::Output = core::result::Result<arrow_array::record_batch::RecordBatch, craton_bolt::BoltError>
+pub fn craton_bolt::exec::session::PendingResult::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+impl core::ops::drop::Drop for craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::PendingResult::drop(&mut self)
+pub struct craton_bolt::exec::session::Session
+impl craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Session::id(&self) -> u64
+pub fn craton_bolt::exec::session::Session::set_read_only(&self, bool)
+pub fn craton_bolt::exec::session::Session::settings(&self) -> craton_bolt::exec::session::SessionSettings
+pub fn craton_bolt::exec::session::Session::sql(&self, &str) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::exec::session::Session::statement_count(&self) -> u64
+pub fn craton_bolt::exec::session::Session::submit(&self, &str) -> craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::Session::try_submit(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::session::PendingResult>
+impl core::fmt::Debug for craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Session::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct craton_bolt::exec::session::SessionSettings
+pub craton_bolt::exec::session::SessionSettings::read_only: bool
+pub const craton_bolt::exec::session::DEFAULT_QUEUE_CAPACITY: usize
 pub mod craton_bolt::exec::streaming
 pub enum craton_bolt::exec::streaming::AlgebraicMerge
 pub craton_bolt::exec::streaming::AlgebraicMerge::Avg
@@ -978,10 +1083,21 @@ pub fn craton_bolt::exec::streaming::BatchStream<'a>::num_morsels(&self) -> usiz
 pub fn craton_bolt::exec::streaming::BatchStream<'a>::total_rows(&self) -> usize
 #[non_exhaustive] pub struct craton_bolt::exec::Engine
 impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::analyze_table(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str) -> craton_bolt::BoltResult<usize>
+pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::vacuum(&mut self, usize) -> craton_bolt::BoltResult<usize>
+impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
 pub fn craton_bolt::exec::engine::Engine::execute(&self, &PhysicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::host_memory_budget_bytes(&self) -> core::option::Option<usize>
 pub fn craton_bolt::exec::engine::Engine::memory_budget_bytes(&self) -> core::option::Option<usize>
+pub fn craton_bolt::exec::engine::Engine::memory_governor(&self) -> &alloc::sync::Arc<craton_bolt::exec::memory::MemoryGovernor>
+pub fn craton_bolt::exec::engine::Engine::memory_stats(&self) -> craton_bolt::exec::memory::MemoryStats
 pub fn craton_bolt::exec::engine::Engine::morsel_plan_for_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::streaming::MorselPlan>
 pub fn craton_bolt::exec::engine::Engine::new() -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::exec::engine::Engine::new_with_device(i32) -> craton_bolt::BoltResult<Self>
@@ -995,17 +1111,36 @@ pub fn craton_bolt::exec::engine::Engine::rewrite_count(&self) -> usize
 pub fn craton_bolt::exec::engine::Engine::tracing_enabled(&self) -> bool
 pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<dyn craton_bolt::plan::rewrite::PlanRewrite>) -> Self
 impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::catalog(&self) -> core::option::Option<&craton_bolt::storage::catalog::Catalog>
+pub fn craton_bolt::exec::engine::Engine::last_scan(&self, &str) -> core::option::Option<craton_bolt::storage::ScanReport>
+pub fn craton_bolt::exec::engine::Engine::register_parquet(&mut self, impl core::convert::Into<alloc::string::String>, impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::register_storage_table(&mut self, impl core::convert::Into<alloc::string::String>, alloc::sync::Arc<dyn craton_bolt::storage::table::StorageTable>) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::storage_table(&self, &str) -> core::option::Option<alloc::sync::Arc<dyn craton_bolt::storage::table::StorageTable>>
+pub fn craton_bolt::exec::engine::Engine::table_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::table_statistics(&self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::stats::TableStatistics>
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::create_view(&mut self, &str, &str, craton_bolt::RefreshMode, bool) -> craton_bolt::BoltResult<u64>
+pub fn craton_bolt::exec::engine::Engine::drop_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::refresh_view(&mut self, &str) -> craton_bolt::BoltResult<u64>
+pub fn craton_bolt::exec::engine::Engine::view_exists(&self, &str) -> bool
+pub fn craton_bolt::exec::engine::Engine::view_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::view_status(&self, &str) -> craton_bolt::BoltResult<craton_bolt::ViewStatus>
+impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::exec::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
+pub fn craton_bolt::exec::engine::EngineBuilder::database(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::database_snapshot(self, impl core::convert::Into<std::path::PathBuf>, u64) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::device(self, i32) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::enable_tracing(self) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::host_memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub struct craton_bolt::exec::PinnedBudget
 impl craton_bolt::exec::streaming::PinnedBudget
 pub fn craton_bolt::exec::streaming::PinnedBudget::fits(&self, usize) -> bool
@@ -1464,15 +1599,19 @@ pub fn craton_bolt::jit::current_disk_ptx_cache_dir() -> core::option::Option<st
 pub fn craton_bolt::jit::ptx_cache_stats() -> (usize, usize, usize)
 pub fn craton_bolt::jit::set_disk_ptx_cache_dir(core::option::Option<std::path::PathBuf>)
 pub mod craton_bolt::metrics
-#[repr(usize)] pub enum craton_bolt::metrics::Counter
+#[non_exhaustive] #[repr(usize)] pub enum craton_bolt::metrics::Counter
 pub craton_bolt::metrics::Counter::GpuLaunchesTotal = 4
 pub craton_bolt::metrics::Counter::HostFallbacksTotal = 5
 pub craton_bolt::metrics::Counter::PtxCacheHits = 2
 pub craton_bolt::metrics::Counter::PtxCacheMisses = 3
 pub craton_bolt::metrics::Counter::QueriesFailed = 1
 pub craton_bolt::metrics::Counter::QueriesTotal = 0
+pub craton_bolt::metrics::Counter::SpillBytesWritten = 9
+pub craton_bolt::metrics::Counter::SpillFilesWritten = 8
+pub craton_bolt::metrics::Counter::StorageChunksPruned = 7
+pub craton_bolt::metrics::Counter::StorageChunksRead = 6
 impl craton_bolt::metrics::Counter
-pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 6]
+pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 10]
 pub const fn craton_bolt::metrics::Counter::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Counter::help(self) -> &'static str
 #[non_exhaustive] #[repr(usize)] pub enum craton_bolt::metrics::Phase
@@ -2644,6 +2783,336 @@ pub fn craton_bolt::plan::stddev_samp(craton_bolt::plan::logical_plan::Expr) -> 
 pub fn craton_bolt::plan::sum(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
 pub fn craton_bolt::plan::var_pop(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
 pub fn craton_bolt::plan::var_samp(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
+pub mod craton_bolt::storage
+pub mod craton_bolt::storage::catalog
+pub enum craton_bolt::storage::catalog::RefreshPolicy
+pub craton_bolt::storage::catalog::RefreshPolicy::Manual
+pub craton_bolt::storage::catalog::RefreshPolicy::OnCommit
+pub enum craton_bolt::storage::catalog::TableKind
+pub craton_bolt::storage::catalog::TableKind::External
+pub craton_bolt::storage::catalog::TableKind::External::location: alloc::string::String
+pub craton_bolt::storage::catalog::TableKind::Managed
+pub struct craton_bolt::storage::catalog::Catalog
+impl craton_bolt::storage::catalog::Catalog
+pub fn craton_bolt::storage::catalog::Catalog::append(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::compact(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::CompactReport>
+pub fn craton_bolt::storage::catalog::Catalog::create_external_table(&mut self, &str, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::create_table(&mut self, &str, &craton_bolt::plan::logical_plan::Schema, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::is_read_only(&self) -> bool
+pub fn craton_bolt::storage::catalog::Catalog::manifest(&self) -> &craton_bolt::storage::catalog::Manifest
+pub fn craton_bolt::storage::catalog::Catalog::open(impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::catalog::Catalog::open_snapshot(impl core::convert::AsRef<std::path::Path>, u64) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::catalog::Catalog::open_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::parquet::ParquetTable>
+pub fn craton_bolt::storage::catalog::Catalog::put_view(&mut self, &str, craton_bolt::storage::catalog::ViewMeta) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::remove_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::replace_contents(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::root(&self) -> &std::path::Path
+pub fn craton_bolt::storage::catalog::Catalog::set_statistics(&mut self, &str, craton_bolt::storage::stats::TableStatistics) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::set_write_options(&mut self, craton_bolt::storage::parquet::ParquetWriteOptions)
+pub fn craton_bolt::storage::catalog::Catalog::snapshots(&self) -> craton_bolt::BoltResult<alloc::vec::Vec<u64>>
+pub fn craton_bolt::storage::catalog::Catalog::table(&self, &str) -> core::option::Option<&craton_bolt::storage::catalog::TableMeta>
+pub fn craton_bolt::storage::catalog::Catalog::truncate(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::vacuum(&mut self, usize) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::VacuumReport>
+pub fn craton_bolt::storage::catalog::Catalog::version(&self) -> u64
+pub struct craton_bolt::storage::catalog::ColumnMeta
+pub craton_bolt::storage::catalog::ColumnMeta::dtype: alloc::string::String
+pub craton_bolt::storage::catalog::ColumnMeta::name: alloc::string::String
+pub craton_bolt::storage::catalog::ColumnMeta::nullable: bool
+#[non_exhaustive] pub struct craton_bolt::storage::catalog::CompactReport
+pub craton_bolt::storage::catalog::CompactReport::files_after: usize
+pub craton_bolt::storage::catalog::CompactReport::files_before: usize
+pub struct craton_bolt::storage::catalog::DataFile
+pub craton_bolt::storage::catalog::DataFile::bytes: u64
+pub craton_bolt::storage::catalog::DataFile::path: alloc::string::String
+pub craton_bolt::storage::catalog::DataFile::rows: u64
+pub craton_bolt::storage::catalog::DataFile::stats: craton_bolt::storage::stats::TableStatistics
+pub struct craton_bolt::storage::catalog::Manifest
+pub craton_bolt::storage::catalog::Manifest::format: u32
+pub craton_bolt::storage::catalog::Manifest::next_table_id: u64
+pub craton_bolt::storage::catalog::Manifest::tables: alloc::collections::btree::map::BTreeMap<alloc::string::String, craton_bolt::storage::catalog::TableMeta>
+pub craton_bolt::storage::catalog::Manifest::version: u64
+pub craton_bolt::storage::catalog::Manifest::views: alloc::collections::btree::map::BTreeMap<alloc::string::String, craton_bolt::storage::catalog::ViewMeta>
+pub struct craton_bolt::storage::catalog::TableMeta
+pub craton_bolt::storage::catalog::TableMeta::analyzed: core::option::Option<craton_bolt::storage::stats::TableStatistics>
+pub craton_bolt::storage::catalog::TableMeta::columns: alloc::vec::Vec<craton_bolt::storage::catalog::ColumnMeta>
+pub craton_bolt::storage::catalog::TableMeta::files: alloc::vec::Vec<craton_bolt::storage::catalog::DataFile>
+pub craton_bolt::storage::catalog::TableMeta::id: u64
+pub craton_bolt::storage::catalog::TableMeta::kind: craton_bolt::storage::catalog::TableKind
+pub craton_bolt::storage::catalog::TableMeta::table_version: u64
+impl craton_bolt::storage::catalog::TableMeta
+pub fn craton_bolt::storage::catalog::TableMeta::row_count(&self) -> u64
+pub fn craton_bolt::storage::catalog::TableMeta::schema(&self) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
+#[non_exhaustive] pub struct craton_bolt::storage::catalog::VacuumReport
+pub craton_bolt::storage::catalog::VacuumReport::files_removed: usize
+pub craton_bolt::storage::catalog::VacuumReport::manifests_removed: usize
+pub struct craton_bolt::storage::catalog::ViewMeta
+pub craton_bolt::storage::catalog::ViewMeta::backing_table: alloc::string::String
+pub craton_bolt::storage::catalog::ViewMeta::base_versions: alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>
+pub craton_bolt::storage::catalog::ViewMeta::dependencies: alloc::vec::Vec<alloc::string::String>
+pub craton_bolt::storage::catalog::ViewMeta::refresh: craton_bolt::storage::catalog::RefreshPolicy
+pub craton_bolt::storage::catalog::ViewMeta::sql: alloc::string::String
+pub fn craton_bolt::storage::catalog::dtype_from_text(&str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::DataType>
+pub fn craton_bolt::storage::catalog::dtype_to_text(craton_bolt::plan::logical_plan::DataType) -> craton_bolt::BoltResult<alloc::string::String>
+pub mod craton_bolt::storage::parquet
+pub struct craton_bolt::storage::parquet::ParquetTable
+impl craton_bolt::storage::parquet::ParquetTable
+pub fn craton_bolt::storage::parquet::ParquetTable::arrow_schema(&self) -> &arrow_schema::schema::SchemaRef
+pub fn craton_bolt::storage::parquet::ParquetTable::files(&self) -> alloc::vec::Vec<&std::path::Path>
+pub fn craton_bolt::storage::parquet::ParquetTable::from_files(&[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::parquet::ParquetTable::open(impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::parquet::ParquetTable::skipped_columns(&self) -> &[alloc::string::String]
+pub fn craton_bolt::storage::parquet::ParquetTable::with_schema(arrow_schema::schema::SchemaRef, &[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::parquet::ParquetTable
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::parquet::ParquetTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::parquet::ParquetTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::parquet::ParquetTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::parquet::ParquetTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+pub struct craton_bolt::storage::parquet::ParquetWriteOptions
+pub craton_bolt::storage::parquet::ParquetWriteOptions::row_group_rows: usize
+pub craton_bolt::storage::parquet::ParquetWriteOptions::zstd_level: i32
+impl core::default::Default for craton_bolt::storage::parquet::ParquetWriteOptions
+pub fn craton_bolt::storage::parquet::ParquetWriteOptions::default() -> Self
+pub fn craton_bolt::storage::parquet::write_parquet(&std::path::Path, &[arrow_array::record_batch::RecordBatch], &craton_bolt::storage::parquet::ParquetWriteOptions) -> craton_bolt::BoltResult<u64>
+pub mod craton_bolt::storage::scan
+pub enum craton_bolt::storage::scan::PruneOp
+pub craton_bolt::storage::scan::PruneOp::Eq
+pub craton_bolt::storage::scan::PruneOp::Gt
+pub craton_bolt::storage::scan::PruneOp::GtEq
+pub craton_bolt::storage::scan::PruneOp::Lt
+pub craton_bolt::storage::scan::PruneOp::LtEq
+pub craton_bolt::storage::scan::PruneOp::NotEq
+pub enum craton_bolt::storage::scan::PrunePredicate
+pub craton_bolt::storage::scan::PrunePredicate::Compare
+pub craton_bolt::storage::scan::PrunePredicate::Compare::column: usize
+pub craton_bolt::storage::scan::PrunePredicate::Compare::op: craton_bolt::storage::scan::PruneOp
+pub craton_bolt::storage::scan::PrunePredicate::Compare::value: craton_bolt::plan::logical_plan::Literal
+pub craton_bolt::storage::scan::PrunePredicate::InList
+pub craton_bolt::storage::scan::PrunePredicate::InList::column: usize
+pub craton_bolt::storage::scan::PrunePredicate::InList::values: alloc::vec::Vec<craton_bolt::plan::logical_plan::Literal>
+pub craton_bolt::storage::scan::PrunePredicate::IsNotNull
+pub craton_bolt::storage::scan::PrunePredicate::IsNotNull::column: usize
+pub craton_bolt::storage::scan::PrunePredicate::IsNull
+pub craton_bolt::storage::scan::PrunePredicate::IsNull::column: usize
+impl craton_bolt::storage::scan::PrunePredicate
+pub fn craton_bolt::storage::scan::PrunePredicate::may_match(&self, &[craton_bolt::storage::stats::ColumnStatistics], u64) -> bool
+pub struct craton_bolt::storage::scan::ScanRequest
+pub craton_bolt::storage::scan::ScanRequest::columns: core::option::Option<alloc::collections::btree::set::BTreeSet<usize>>
+pub craton_bolt::storage::scan::ScanRequest::filters: alloc::vec::Vec<alloc::vec::Vec<craton_bolt::storage::scan::PrunePredicate>>
+impl craton_bolt::storage::scan::ScanRequest
+pub fn craton_bolt::storage::scan::ScanRequest::chunk_may_match(&self, &[craton_bolt::storage::stats::ColumnStatistics], u64) -> bool
+pub fn craton_bolt::storage::scan::ScanRequest::full() -> Self
+pub fn craton_bolt::storage::scan::ScanRequest::union(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::scan::ScanRequest
+pub fn craton_bolt::storage::scan::scan_requests(&craton_bolt::plan::logical_plan::LogicalPlan, &[&str]) -> std::collections::hash::map::HashMap<alloc::string::String, craton_bolt::storage::scan::ScanRequest>
+pub mod craton_bolt::storage::stats
+pub struct craton_bolt::storage::stats::ColumnStatistics
+pub craton_bolt::storage::stats::ColumnStatistics::distinct_estimate: core::option::Option<u64>
+pub craton_bolt::storage::stats::ColumnStatistics::max: core::option::Option<craton_bolt::plan::logical_plan::Literal>
+pub craton_bolt::storage::stats::ColumnStatistics::min: core::option::Option<craton_bolt::plan::logical_plan::Literal>
+pub craton_bolt::storage::stats::ColumnStatistics::null_count: core::option::Option<u64>
+pub struct craton_bolt::storage::stats::Hll
+impl craton_bolt::storage::stats::Hll
+pub fn craton_bolt::storage::stats::Hll::estimate(&self) -> u64
+pub fn craton_bolt::storage::stats::Hll::insert(&mut self, &craton_bolt::plan::logical_plan::Literal)
+pub fn craton_bolt::storage::stats::Hll::merge(&mut self, &craton_bolt::storage::stats::Hll)
+pub fn craton_bolt::storage::stats::Hll::new() -> Self
+impl core::default::Default for craton_bolt::storage::stats::Hll
+pub fn craton_bolt::storage::stats::Hll::default() -> Self
+pub struct craton_bolt::storage::stats::TableStatistics
+pub craton_bolt::storage::stats::TableStatistics::byte_size: u64
+pub craton_bolt::storage::stats::TableStatistics::columns: alloc::vec::Vec<craton_bolt::storage::stats::ColumnStatistics>
+pub craton_bolt::storage::stats::TableStatistics::row_count: u64
+impl craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::stats::TableStatistics::from_batches(&[arrow_array::record_batch::RecordBatch]) -> Self
+pub fn craton_bolt::storage::stats::TableStatistics::merge(&mut self, &craton_bolt::storage::stats::TableStatistics)
+pub fn craton_bolt::storage::stats::array_value(&dyn arrow_array::array::Array, usize) -> core::option::Option<craton_bolt::plan::logical_plan::Literal>
+pub fn craton_bolt::storage::stats::compare_literals(&craton_bolt::plan::logical_plan::Literal, &craton_bolt::plan::logical_plan::Literal) -> core::option::Option<core::cmp::Ordering>
+pub mod craton_bolt::storage::table
+pub struct craton_bolt::storage::table::MemoryTable
+impl craton_bolt::storage::table::MemoryTable
+pub fn craton_bolt::storage::table::MemoryTable::try_new(alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, core::option::Option<usize>) -> craton_bolt::BoltResult<Self>
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::table::MemoryTable
+pub fn craton_bolt::storage::table::MemoryTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::table::MemoryTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::table::MemoryTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::MemoryTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::table::MemoryTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::table::MemoryTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+pub struct craton_bolt::storage::table::ScanSelection
+pub craton_bolt::storage::table::ScanSelection::bytes: u64
+pub craton_bolt::storage::table::ScanSelection::chunks: alloc::vec::Vec<usize>
+pub craton_bolt::storage::table::ScanSelection::chunks_total: usize
+pub craton_bolt::storage::table::ScanSelection::columns: core::option::Option<alloc::collections::btree::set::BTreeSet<usize>>
+pub craton_bolt::storage::table::ScanSelection::rows: u64
+impl craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::ScanSelection::covers(&self, &craton_bolt::storage::table::ScanSelection) -> bool
+pub fn craton_bolt::storage::table::ScanSelection::union(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::storage::table::ScanSelection
+pub trait craton_bolt::storage::table::StorageTable: core::marker::Send + core::marker::Sync + core::fmt::Debug
+pub fn craton_bolt::storage::table::StorageTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::table::StorageTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::table::StorageTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::StorageTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::table::StorageTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::table::StorageTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::parquet::ParquetTable
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::parquet::ParquetTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::parquet::ParquetTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::parquet::ParquetTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::parquet::ParquetTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::table::MemoryTable
+pub fn craton_bolt::storage::table::MemoryTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::table::MemoryTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::table::MemoryTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::MemoryTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::table::MemoryTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::table::MemoryTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::table::placeholder_array(&arrow_schema::datatype::DataType, usize) -> craton_bolt::BoltResult<arrow_array::array::ArrayRef>
+pub fn craton_bolt::storage::table::widen_to_schema(&arrow_array::record_batch::RecordBatch, &arrow_schema::schema::SchemaRef, &[usize]) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub type craton_bolt::storage::table::BatchIter = alloc::boxed::Box<(dyn core::iter::traits::iterator::Iterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>> + core::marker::Send)>
+pub enum craton_bolt::storage::PruneOp
+pub craton_bolt::storage::PruneOp::Eq
+pub craton_bolt::storage::PruneOp::Gt
+pub craton_bolt::storage::PruneOp::GtEq
+pub craton_bolt::storage::PruneOp::Lt
+pub craton_bolt::storage::PruneOp::LtEq
+pub craton_bolt::storage::PruneOp::NotEq
+pub enum craton_bolt::storage::PrunePredicate
+pub craton_bolt::storage::PrunePredicate::Compare
+pub craton_bolt::storage::PrunePredicate::Compare::column: usize
+pub craton_bolt::storage::PrunePredicate::Compare::op: craton_bolt::storage::scan::PruneOp
+pub craton_bolt::storage::PrunePredicate::Compare::value: craton_bolt::plan::logical_plan::Literal
+pub craton_bolt::storage::PrunePredicate::InList
+pub craton_bolt::storage::PrunePredicate::InList::column: usize
+pub craton_bolt::storage::PrunePredicate::InList::values: alloc::vec::Vec<craton_bolt::plan::logical_plan::Literal>
+pub craton_bolt::storage::PrunePredicate::IsNotNull
+pub craton_bolt::storage::PrunePredicate::IsNotNull::column: usize
+pub craton_bolt::storage::PrunePredicate::IsNull
+pub craton_bolt::storage::PrunePredicate::IsNull::column: usize
+impl craton_bolt::storage::scan::PrunePredicate
+pub fn craton_bolt::storage::scan::PrunePredicate::may_match(&self, &[craton_bolt::storage::stats::ColumnStatistics], u64) -> bool
+pub enum craton_bolt::storage::RefreshPolicy
+pub craton_bolt::storage::RefreshPolicy::Manual
+pub craton_bolt::storage::RefreshPolicy::OnCommit
+pub struct craton_bolt::storage::Catalog
+impl craton_bolt::storage::catalog::Catalog
+pub fn craton_bolt::storage::catalog::Catalog::append(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::compact(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::CompactReport>
+pub fn craton_bolt::storage::catalog::Catalog::create_external_table(&mut self, &str, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::create_table(&mut self, &str, &craton_bolt::plan::logical_plan::Schema, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::is_read_only(&self) -> bool
+pub fn craton_bolt::storage::catalog::Catalog::manifest(&self) -> &craton_bolt::storage::catalog::Manifest
+pub fn craton_bolt::storage::catalog::Catalog::open(impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::catalog::Catalog::open_snapshot(impl core::convert::AsRef<std::path::Path>, u64) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::catalog::Catalog::open_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::parquet::ParquetTable>
+pub fn craton_bolt::storage::catalog::Catalog::put_view(&mut self, &str, craton_bolt::storage::catalog::ViewMeta) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::remove_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::replace_contents(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::root(&self) -> &std::path::Path
+pub fn craton_bolt::storage::catalog::Catalog::set_statistics(&mut self, &str, craton_bolt::storage::stats::TableStatistics) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::set_write_options(&mut self, craton_bolt::storage::parquet::ParquetWriteOptions)
+pub fn craton_bolt::storage::catalog::Catalog::snapshots(&self) -> craton_bolt::BoltResult<alloc::vec::Vec<u64>>
+pub fn craton_bolt::storage::catalog::Catalog::table(&self, &str) -> core::option::Option<&craton_bolt::storage::catalog::TableMeta>
+pub fn craton_bolt::storage::catalog::Catalog::truncate(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::storage::catalog::Catalog::vacuum(&mut self, usize) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::VacuumReport>
+pub fn craton_bolt::storage::catalog::Catalog::version(&self) -> u64
+pub struct craton_bolt::storage::ColumnStatistics
+pub craton_bolt::storage::ColumnStatistics::distinct_estimate: core::option::Option<u64>
+pub craton_bolt::storage::ColumnStatistics::max: core::option::Option<craton_bolt::plan::logical_plan::Literal>
+pub craton_bolt::storage::ColumnStatistics::min: core::option::Option<craton_bolt::plan::logical_plan::Literal>
+pub craton_bolt::storage::ColumnStatistics::null_count: core::option::Option<u64>
+#[non_exhaustive] pub struct craton_bolt::storage::CompactReport
+pub craton_bolt::storage::CompactReport::files_after: usize
+pub craton_bolt::storage::CompactReport::files_before: usize
+pub struct craton_bolt::storage::MemoryTable
+impl craton_bolt::storage::table::MemoryTable
+pub fn craton_bolt::storage::table::MemoryTable::try_new(alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, core::option::Option<usize>) -> craton_bolt::BoltResult<Self>
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::table::MemoryTable
+pub fn craton_bolt::storage::table::MemoryTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::table::MemoryTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::table::MemoryTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::MemoryTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::table::MemoryTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::table::MemoryTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+pub struct craton_bolt::storage::ParquetTable
+impl craton_bolt::storage::parquet::ParquetTable
+pub fn craton_bolt::storage::parquet::ParquetTable::arrow_schema(&self) -> &arrow_schema::schema::SchemaRef
+pub fn craton_bolt::storage::parquet::ParquetTable::files(&self) -> alloc::vec::Vec<&std::path::Path>
+pub fn craton_bolt::storage::parquet::ParquetTable::from_files(&[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::parquet::ParquetTable::open(impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::parquet::ParquetTable::skipped_columns(&self) -> &[alloc::string::String]
+pub fn craton_bolt::storage::parquet::ParquetTable::with_schema(arrow_schema::schema::SchemaRef, &[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::parquet::ParquetTable
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::parquet::ParquetTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::parquet::ParquetTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::parquet::ParquetTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::parquet::ParquetTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+pub struct craton_bolt::storage::ParquetWriteOptions
+pub craton_bolt::storage::ParquetWriteOptions::row_group_rows: usize
+pub craton_bolt::storage::ParquetWriteOptions::zstd_level: i32
+impl core::default::Default for craton_bolt::storage::parquet::ParquetWriteOptions
+pub fn craton_bolt::storage::parquet::ParquetWriteOptions::default() -> Self
+#[non_exhaustive] pub struct craton_bolt::storage::ScanReport
+pub craton_bolt::storage::ScanReport::chunks_read: usize
+pub craton_bolt::storage::ScanReport::chunks_total: usize
+pub craton_bolt::storage::ScanReport::columns_read: core::option::Option<usize>
+pub craton_bolt::storage::ScanReport::reused: bool
+pub craton_bolt::storage::ScanReport::rows_read: u64
+pub struct craton_bolt::storage::ScanRequest
+pub craton_bolt::storage::ScanRequest::columns: core::option::Option<alloc::collections::btree::set::BTreeSet<usize>>
+pub craton_bolt::storage::ScanRequest::filters: alloc::vec::Vec<alloc::vec::Vec<craton_bolt::storage::scan::PrunePredicate>>
+impl craton_bolt::storage::scan::ScanRequest
+pub fn craton_bolt::storage::scan::ScanRequest::chunk_may_match(&self, &[craton_bolt::storage::stats::ColumnStatistics], u64) -> bool
+pub fn craton_bolt::storage::scan::ScanRequest::full() -> Self
+pub fn craton_bolt::storage::scan::ScanRequest::union(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::scan::ScanRequest
+pub struct craton_bolt::storage::ScanSelection
+pub craton_bolt::storage::ScanSelection::bytes: u64
+pub craton_bolt::storage::ScanSelection::chunks: alloc::vec::Vec<usize>
+pub craton_bolt::storage::ScanSelection::chunks_total: usize
+pub craton_bolt::storage::ScanSelection::columns: core::option::Option<alloc::collections::btree::set::BTreeSet<usize>>
+pub craton_bolt::storage::ScanSelection::rows: u64
+impl craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::ScanSelection::covers(&self, &craton_bolt::storage::table::ScanSelection) -> bool
+pub fn craton_bolt::storage::table::ScanSelection::union(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::storage::table::ScanSelection
+pub struct craton_bolt::storage::TableStatistics
+pub craton_bolt::storage::TableStatistics::byte_size: u64
+pub craton_bolt::storage::TableStatistics::columns: alloc::vec::Vec<craton_bolt::storage::stats::ColumnStatistics>
+pub craton_bolt::storage::TableStatistics::row_count: u64
+impl craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::stats::TableStatistics::from_batches(&[arrow_array::record_batch::RecordBatch]) -> Self
+pub fn craton_bolt::storage::stats::TableStatistics::merge(&mut self, &craton_bolt::storage::stats::TableStatistics)
+#[non_exhaustive] pub struct craton_bolt::storage::VacuumReport
+pub craton_bolt::storage::VacuumReport::files_removed: usize
+pub craton_bolt::storage::VacuumReport::manifests_removed: usize
+pub trait craton_bolt::storage::StorageTable: core::marker::Send + core::marker::Sync + core::fmt::Debug
+pub fn craton_bolt::storage::StorageTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::StorageTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::StorageTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::StorageTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::StorageTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::StorageTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::parquet::ParquetTable
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::parquet::ParquetTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::parquet::ParquetTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::parquet::ParquetTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::parquet::ParquetTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::parquet::ParquetTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::table::MemoryTable
+pub fn craton_bolt::storage::table::MemoryTable::chunk_count(&self) -> usize
+pub fn craton_bolt::storage::table::MemoryTable::chunk_statistics(&self, usize) -> &craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::table::MemoryTable::plan_scan(&self, &craton_bolt::storage::scan::ScanRequest) -> craton_bolt::storage::table::ScanSelection
+pub fn craton_bolt::storage::table::MemoryTable::read(&self, &craton_bolt::storage::table::ScanSelection) -> craton_bolt::BoltResult<craton_bolt::storage::table::BatchIter>
+pub fn craton_bolt::storage::table::MemoryTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
+pub fn craton_bolt::storage::table::MemoryTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
+pub fn craton_bolt::storage::write_parquet(&std::path::Path, &[arrow_array::record_batch::RecordBatch], &craton_bolt::storage::parquet::ParquetWriteOptions) -> craton_bolt::BoltResult<u64>
+pub type craton_bolt::storage::BatchIter = alloc::boxed::Box<(dyn core::iter::traits::iterator::Iterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>> + core::marker::Send)>
 #[non_exhaustive] pub enum craton_bolt::BoltError
 pub craton_bolt::BoltError::Cuda(alloc::string::String)
 pub craton_bolt::BoltError::CudaWithCode
@@ -2664,15 +3133,19 @@ impl craton_bolt::BoltError
 pub fn craton_bolt::BoltError::span(&self) -> core::option::Option<core::ops::range::Range<usize>>
 impl core::convert::From<sqlparser::parser::ParserError> for craton_bolt::BoltError
 pub fn craton_bolt::BoltError::from(sqlparser::parser::ParserError) -> Self
-#[repr(usize)] pub enum craton_bolt::Counter
+#[non_exhaustive] #[repr(usize)] pub enum craton_bolt::Counter
 pub craton_bolt::Counter::GpuLaunchesTotal = 4
 pub craton_bolt::Counter::HostFallbacksTotal = 5
 pub craton_bolt::Counter::PtxCacheHits = 2
 pub craton_bolt::Counter::PtxCacheMisses = 3
 pub craton_bolt::Counter::QueriesFailed = 1
 pub craton_bolt::Counter::QueriesTotal = 0
+pub craton_bolt::Counter::SpillBytesWritten = 9
+pub craton_bolt::Counter::SpillFilesWritten = 8
+pub craton_bolt::Counter::StorageChunksPruned = 7
+pub craton_bolt::Counter::StorageChunksRead = 6
 impl craton_bolt::metrics::Counter
-pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 6]
+pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 10]
 pub const fn craton_bolt::metrics::Counter::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Counter::help(self) -> &'static str
 pub enum craton_bolt::ExecutionTier
@@ -2793,6 +3266,9 @@ pub craton_bolt::LogicalPlan::Window::partition_by: alloc::vec::Vec<craton_bolt:
 pub craton_bolt::LogicalPlan::Window::window_exprs: alloc::vec::Vec<craton_bolt::plan::logical_plan::WindowExpr>
 impl craton_bolt::plan::logical_plan::LogicalPlan
 pub fn craton_bolt::plan::logical_plan::LogicalPlan::schema(&self) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
+pub enum craton_bolt::MemoryKind
+pub craton_bolt::MemoryKind::Device
+pub craton_bolt::MemoryKind::Host
 pub enum craton_bolt::MorselPlan
 pub craton_bolt::MorselPlan::Morsels
 pub craton_bolt::MorselPlan::Morsels::morsel_rows: usize
@@ -2811,6 +3287,9 @@ impl craton_bolt::metrics::Phase
 pub const craton_bolt::metrics::Phase::ALL: [craton_bolt::metrics::Phase; 7]
 pub const fn craton_bolt::metrics::Phase::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Phase::help(self) -> &'static str
+#[non_exhaustive] pub enum craton_bolt::RefreshMode
+pub craton_bolt::RefreshMode::Manual
+pub craton_bolt::RefreshMode::OnCommit
 pub enum craton_bolt::TableSource
 pub craton_bolt::TableSource::Materialized(alloc::vec::Vec<arrow_array::record_batch::RecordBatch>)
 pub craton_bolt::TableSource::Streaming(craton_bolt::exec::streaming::BatchProducer)
@@ -2838,12 +3317,40 @@ pub fn craton_bolt::plan::dataframe::DataFrame::scan(impl core::convert::Into<al
 pub fn craton_bolt::plan::dataframe::DataFrame::schema(&self) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::dataframe::DataFrame::select<I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::plan::logical_plan::Expr>>(self, I) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::validation_error(&self) -> core::option::Option<&str>
+pub struct craton_bolt::Database
+impl craton_bolt::exec::session::Database
+pub fn craton_bolt::exec::session::Database::close(&self)
+pub fn craton_bolt::exec::session::Database::open(craton_bolt::exec::engine::EngineBuilder) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
+pub fn craton_bolt::exec::session::Database::open_with_capacity(craton_bolt::exec::engine::EngineBuilder, usize) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
+pub fn craton_bolt::exec::session::Database::session(&self) -> craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Database::stats(&self) -> craton_bolt::exec::session::DatabaseStats
+pub fn craton_bolt::exec::session::Database::with_engine<R, F>(&self, F) -> craton_bolt::BoltResult<R> where R: core::marker::Send + 'static, F: core::ops::function::FnOnce(&mut craton_bolt::exec::engine::Engine) -> R + core::marker::Send + 'static
+impl core::fmt::Debug for craton_bolt::exec::session::Database
+pub fn craton_bolt::exec::session::Database::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct craton_bolt::DatabaseStats
+pub craton_bolt::DatabaseStats::cancelled: u64
+pub craton_bolt::DatabaseStats::failed: u64
+pub craton_bolt::DatabaseStats::max_queue_wait: core::time::Duration
+pub craton_bolt::DatabaseStats::sessions: u64
+pub craton_bolt::DatabaseStats::statements: u64
+pub craton_bolt::DatabaseStats::total_queue_wait: core::time::Duration
 #[non_exhaustive] pub struct craton_bolt::Engine
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::analyze_table(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str) -> craton_bolt::BoltResult<usize>
+pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::vacuum(&mut self, usize) -> craton_bolt::BoltResult<usize>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
 pub fn craton_bolt::exec::engine::Engine::execute(&self, &PhysicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::host_memory_budget_bytes(&self) -> core::option::Option<usize>
 pub fn craton_bolt::exec::engine::Engine::memory_budget_bytes(&self) -> core::option::Option<usize>
+pub fn craton_bolt::exec::engine::Engine::memory_governor(&self) -> &alloc::sync::Arc<craton_bolt::exec::memory::MemoryGovernor>
+pub fn craton_bolt::exec::engine::Engine::memory_stats(&self) -> craton_bolt::exec::memory::MemoryStats
 pub fn craton_bolt::exec::engine::Engine::morsel_plan_for_table(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::streaming::MorselPlan>
 pub fn craton_bolt::exec::engine::Engine::new() -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::exec::engine::Engine::new_with_device(i32) -> craton_bolt::BoltResult<Self>
@@ -2857,17 +3364,36 @@ pub fn craton_bolt::exec::engine::Engine::rewrite_count(&self) -> usize
 pub fn craton_bolt::exec::engine::Engine::tracing_enabled(&self) -> bool
 pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<dyn craton_bolt::plan::rewrite::PlanRewrite>) -> Self
 impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::catalog(&self) -> core::option::Option<&craton_bolt::storage::catalog::Catalog>
+pub fn craton_bolt::exec::engine::Engine::last_scan(&self, &str) -> core::option::Option<craton_bolt::storage::ScanReport>
+pub fn craton_bolt::exec::engine::Engine::register_parquet(&mut self, impl core::convert::Into<alloc::string::String>, impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::register_storage_table(&mut self, impl core::convert::Into<alloc::string::String>, alloc::sync::Arc<dyn craton_bolt::storage::table::StorageTable>) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::storage_table(&self, &str) -> core::option::Option<alloc::sync::Arc<dyn craton_bolt::storage::table::StorageTable>>
+pub fn craton_bolt::exec::engine::Engine::table_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::table_statistics(&self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::stats::TableStatistics>
+impl craton_bolt::exec::engine::Engine
+pub fn craton_bolt::exec::engine::Engine::create_view(&mut self, &str, &str, craton_bolt::RefreshMode, bool) -> craton_bolt::BoltResult<u64>
+pub fn craton_bolt::exec::engine::Engine::drop_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::refresh_view(&mut self, &str) -> craton_bolt::BoltResult<u64>
+pub fn craton_bolt::exec::engine::Engine::view_exists(&self, &str) -> bool
+pub fn craton_bolt::exec::engine::Engine::view_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn craton_bolt::exec::engine::Engine::view_status(&self, &str) -> craton_bolt::BoltResult<craton_bolt::ViewStatus>
+impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
+pub fn craton_bolt::exec::engine::EngineBuilder::database(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::database_snapshot(self, impl core::convert::Into<std::path::PathBuf>, u64) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::device(self, i32) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::enable_tracing(self) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::host_memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub struct craton_bolt::GpuBuffer<T: bytemuck::pod::Pod>
 impl craton_bolt::cuda::buffer::GpuBuffer<u8>
 pub fn craton_bolt::cuda::buffer::GpuBuffer<u8>::from_arrow_bytes(&arrow_buffer::buffer::immutable::Buffer) -> craton_bolt::BoltResult<craton_bolt::cuda::buffer::GpuBuffer<u8>>
@@ -2930,12 +3456,47 @@ pub fn craton_bolt::cuda::smart_ptrs::GpuViewMut<'a, T>::is_empty(&self) -> bool
 pub fn craton_bolt::cuda::smart_ptrs::GpuViewMut<'a, T>::len(&self) -> usize
 pub fn craton_bolt::cuda::smart_ptrs::GpuViewMut<'a, T>::mark_launch_use(&self, craton_bolt::cuda::cuda_sys::CUstream)
 impl<'a, T: bytemuck::pod::Pod> core::marker::Send for craton_bolt::cuda::smart_ptrs::GpuViewMut<'a, T>
+pub struct craton_bolt::MemoryGovernor
+impl craton_bolt::exec::memory::MemoryGovernor
+pub fn craton_bolt::exec::memory::MemoryGovernor::available(&self, craton_bolt::exec::memory::MemoryKind) -> usize
+pub fn craton_bolt::exec::memory::MemoryGovernor::budget(&self, craton_bolt::exec::memory::MemoryKind) -> core::option::Option<usize>
+pub fn craton_bolt::exec::memory::MemoryGovernor::new(core::option::Option<usize>, core::option::Option<usize>) -> alloc::sync::Arc<Self>
+pub fn craton_bolt::exec::memory::MemoryGovernor::register_consumer(&self, &alloc::sync::Arc<dyn craton_bolt::exec::memory::MemoryConsumer>)
+pub fn craton_bolt::exec::memory::MemoryGovernor::reserve_unchecked(&alloc::sync::Arc<Self>, craton_bolt::exec::memory::MemoryKind, usize) -> craton_bolt::exec::memory::MemoryReservation
+pub fn craton_bolt::exec::memory::MemoryGovernor::reserved(&self, craton_bolt::exec::memory::MemoryKind) -> usize
+pub fn craton_bolt::exec::memory::MemoryGovernor::stats(&self) -> craton_bolt::exec::memory::MemoryStats
+pub fn craton_bolt::exec::memory::MemoryGovernor::try_reserve(&alloc::sync::Arc<Self>, craton_bolt::exec::memory::MemoryKind, usize) -> craton_bolt::BoltResult<craton_bolt::exec::memory::MemoryReservation>
+impl core::fmt::Debug for craton_bolt::exec::memory::MemoryGovernor
+pub fn craton_bolt::exec::memory::MemoryGovernor::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craton_bolt::MemoryReservation
+impl craton_bolt::exec::memory::MemoryReservation
+pub fn craton_bolt::exec::memory::MemoryReservation::bytes(&self) -> usize
+impl core::ops::drop::Drop for craton_bolt::exec::memory::MemoryReservation
+pub fn craton_bolt::exec::memory::MemoryReservation::drop(&mut self)
+#[non_exhaustive] pub struct craton_bolt::MemoryStats
+pub craton_bolt::MemoryStats::device_budget: core::option::Option<usize>
+pub craton_bolt::MemoryStats::evictions: u64
+pub craton_bolt::MemoryStats::host_budget: core::option::Option<usize>
+pub craton_bolt::MemoryStats::host_peak: usize
+pub craton_bolt::MemoryStats::host_reserved: usize
+pub craton_bolt::MemoryStats::out_of_core_statements: u64
+pub craton_bolt::MemoryStats::spill_files: u64
+pub craton_bolt::MemoryStats::spilled_bytes: u64
 pub struct craton_bolt::MetricsSnapshot
 impl craton_bolt::metrics::MetricsSnapshot
 pub fn craton_bolt::metrics::MetricsSnapshot::counter(&self, craton_bolt::metrics::Counter) -> u64
 pub fn craton_bolt::metrics::MetricsSnapshot::counters(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&'static str, u64)> + '_
 pub fn craton_bolt::metrics::MetricsSnapshot::histogram(&self, craton_bolt::metrics::Phase) -> &craton_bolt::metrics::HistogramSnapshot
 pub fn craton_bolt::metrics::MetricsSnapshot::histograms(&self) -> impl core::iter::traits::iterator::Iterator<Item = &craton_bolt::metrics::HistogramSnapshot> + '_
+pub struct craton_bolt::PendingResult
+impl craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::PendingResult::try_take(&mut self) -> core::option::Option<craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
+pub fn craton_bolt::exec::session::PendingResult::wait(self) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+impl core::future::future::Future for craton_bolt::exec::session::PendingResult
+pub type craton_bolt::exec::session::PendingResult::Output = core::result::Result<arrow_array::record_batch::RecordBatch, craton_bolt::BoltError>
+pub fn craton_bolt::exec::session::PendingResult::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+impl core::ops::drop::Drop for craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::PendingResult::drop(&mut self)
 pub struct craton_bolt::PinnedBudget
 impl craton_bolt::exec::streaming::PinnedBudget
 pub fn craton_bolt::exec::streaming::PinnedBudget::fits(&self, usize) -> bool
@@ -2954,6 +3515,28 @@ pub fn craton_bolt::exec::engine::QueryHandle::into_record_batch(self) -> arrow_
 pub fn craton_bolt::exec::engine::QueryHandle::num_rows(&self) -> usize
 pub fn craton_bolt::exec::engine::QueryHandle::planned_execution_tier(&self) -> craton_bolt::plan::physical_plan::ExecutionTier
 pub fn craton_bolt::exec::engine::QueryHandle::record_batch(&self) -> &arrow_array::record_batch::RecordBatch
+pub struct craton_bolt::Session
+impl craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Session::id(&self) -> u64
+pub fn craton_bolt::exec::session::Session::set_read_only(&self, bool)
+pub fn craton_bolt::exec::session::Session::settings(&self) -> craton_bolt::exec::session::SessionSettings
+pub fn craton_bolt::exec::session::Session::sql(&self, &str) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::exec::session::Session::statement_count(&self) -> u64
+pub fn craton_bolt::exec::session::Session::submit(&self, &str) -> craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::Session::try_submit(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::session::PendingResult>
+impl core::fmt::Debug for craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Session::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct craton_bolt::SessionSettings
+pub craton_bolt::SessionSettings::read_only: bool
+#[non_exhaustive] pub struct craton_bolt::ViewStatus
+pub craton_bolt::ViewStatus::dependencies: alloc::vec::Vec<alloc::string::String>
+pub craton_bolt::ViewStatus::fresh: bool
+pub craton_bolt::ViewStatus::refresh: craton_bolt::RefreshMode
+pub craton_bolt::ViewStatus::stale_dependencies: alloc::vec::Vec<alloc::string::String>
+pub trait craton_bolt::MemoryConsumer: core::marker::Send + core::marker::Sync
+pub fn craton_bolt::MemoryConsumer::bytes_reserved(&self) -> usize
+pub fn craton_bolt::MemoryConsumer::name(&self) -> &str
+pub fn craton_bolt::MemoryConsumer::spill(&self, usize) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::install_pool_stats_observer(alloc::boxed::Box<(dyn core::ops::function::Fn(craton_bolt::cuda::mem_pool::PoolStats) + core::marker::Send + core::marker::Sync + 'static)>)
 pub fn craton_bolt::metrics() -> &'static craton_bolt::metrics::Metrics
 pub fn craton_bolt::metrics_snapshot() -> craton_bolt::metrics::MetricsSnapshot

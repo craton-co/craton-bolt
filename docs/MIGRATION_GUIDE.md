@@ -672,6 +672,10 @@ was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
 | Multi-batch tables are coalesced at ingest | Performance | No action; repeated queries no longer concatenate |
 | `GROUP BY` / aggregates over joins, unions, distinct, and host-only filters execute (previously rejected) | Additive | — |
 | `exec::agg_with_pre::try_execute_resident` takes a synthetic-column resolver | Breaking (expert API, outside the 1.0 freeze scope) | Pass `&|_| None` to keep the previous behaviour |
+| `metrics::Counter` and `metrics::Phase` are `#[non_exhaustive]` (new variants: storage / spill counters, `Codegen` / `PtxLoad` / `Execute` phases) | Breaking for exhaustive `match` | Add a `_` arm |
+| New default feature `storage` (Parquet, catalog) adds the `parquet` / `serde` / `serde_json` dependencies | Additive (build) | `default-features = false, features = ["cudarc"]` keeps the previous dependency set |
+| `Engine::sql` given a DDL / DML statement reports "run with `Engine::execute_sql`" | Behavioural (error text) | Run statements through `execute_sql` |
+| `Engine::execute_sql`, storage tables, catalog, materialized views, memory budgets / out-of-core execution, `Database` / `Session` | Additive | — |
 
 ## Quick upgrade checklist
 

@@ -691,8 +691,9 @@ mod tests {
     #[test]
     fn counter_names_match_variants() {
         // Spot-check a couple and the full count.
-        assert_eq!(Counter::ALL.len(), 6);
+        assert_eq!(Counter::ALL.len(), 10);
         assert_eq!(Counter::QueriesTotal.as_str(), "queries_total");
+        assert_eq!(Counter::SpillBytesWritten.as_str(), "spill_bytes_written");
         assert_eq!(Counter::HostFallbacksTotal.as_str(), "host_fallbacks_total");
         // `as usize` discriminants line up with `ALL` ordering.
         for (i, c) in Counter::ALL.iter().enumerate() {

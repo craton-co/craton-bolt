@@ -308,9 +308,9 @@ pub(crate) fn split_by_partition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use arrow_array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
 
     fn one(col: ArrayRef) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(

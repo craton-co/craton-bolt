@@ -72,9 +72,13 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 - **Sequential** multi-engine use **is** supported: build an `Engine`, use it,
   drop it (its context tears down and the module caches are cleared), then build
   another. This is the right pattern for "reset" or per-job isolation.
-- Practical guidance: use **one long-lived `Engine` per process**, and serialize
-  queries through it. Multi-GPU / multi-context concurrency (per-context pools,
-  streams, and caches) is post-1.0 work.
+- Practical guidance: use **one long-lived `Engine` per process**. To serve
+  many threads or clients, wrap it in a `Database` and hand out `Session`s:
+  statements are queued and executed **one at a time** in arrival order on
+  the shared runtime (no concurrent kernel execution across queries, no
+  per-session resource limits beyond the queue capacity). Multi-GPU /
+  multi-context concurrency (per-context pools, streams, and caches) is
+  post-1.0 work.
 
 ---
 
@@ -132,13 +136,27 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   drains. The drained batches are validated against the declared schema
   (column count, names, plan dtypes) — a mismatch fails every query that
   references the table — and coalesced into one host batch.
-- **Host memory bounds the data set.** Every registered table — eager or
-  drained lazy — lives in host memory as one coalesced Arrow batch. The
-  morsel path bounds *device* working sets for projection / filter and for
-  scalar and grouped aggregates — `COUNT` / `SUM` / `MIN` / `MAX` fold
-  directly, `AVG` / `VAR_*` / `STDDEV_*` recombine exact per-morsel partials —
-  under a memory budget; sorts, joins, windows, distinct and set operations
-  materialise their whole input.
+- **What bounds the data set.** Tables registered in memory (eager or
+  drained lazy) live in host memory as one coalesced Arrow batch. Storage
+  tables (Parquet, catalog) are read per statement — only the row groups
+  whose zone maps may match and only the referenced columns. Under a budget
+  (`memory_budget`, `host_memory_budget`) the morsel path bounds device
+  working sets for row-wise scans and distributive / algebraic aggregates
+  over lazily-held tables, and `GROUP BY` / `DISTINCT` / equi-joins /
+  `ORDER BY [LIMIT]` over a larger input run **out of core** through spill
+  files. Residual limits:
+  - every statement's **result** is one host batch (an `ORDER BY` without
+    `LIMIT` over a huge input returns all rows in host memory), and so is
+    each out-of-core node's intermediate result (e.g. a grace-join output);
+  - out-of-core partitioning needs the grouping / join keys to be plain
+    columns of one base table (through filters, pass-through projections
+    and — for `GROUP BY` — joins on which that table is preserved); other
+    shapes, windows, set operations, non-equi joins and scalar aggregates
+    without a streaming form materialise their input;
+  - a partition that is still over budget (heavy key skew) is executed
+    anyway — there is no recursive repartitioning;
+  - a plain row-wise scan (`SELECT ... WHERE ...`) of a storage table whose
+    pruned rows exceed the host budget fails with `BoltError::Memory`.
 - **Appends rebuild the dictionary union.** Each `register_batch` append
   coalesces the table and rebuilds string dictionaries over all rows, so N
   appends cost O(N × table). Bulk-load with one `register_table_stream` call
@@ -152,6 +170,31 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   cannot evaluate (e.g. a raw `Utf8` comparison) run the input first, bind
   its rows as an ephemeral table, and aggregate that (GPU where the
   aggregate shape allows). Correct, at the cost of materialising the input.
+
+## Storage, catalog and statements
+
+- **Append-only tables.** `INSERT`, `COPY ... FROM` and `CREATE TABLE AS`
+  add rows; there is no `UPDATE`, `DELETE`, `MERGE` or `ALTER TABLE` (no
+  schema evolution), and no multi-statement transactions — each statement
+  commits (and in a catalog, snapshots) on its own.
+- **One writer per catalog.** `_bolt/LOCK` admits a single writing engine;
+  a crashed writer leaves the lock file to remove by hand. Snapshots opened
+  with `database_snapshot` are read-only.
+- **Parquet types.** Columns of nested, binary, unsigned-64 or other
+  non-engine types are skipped (`ParquetTable::skipped_columns`); narrow
+  integers widen to `Int32` / `Int64`, large / view strings and string
+  dictionaries read as `Utf8`. External tables are read-only.
+- **Statistics.** Chunk statistics come from Parquet footers (or are
+  computed for in-memory chunks); table-level distinct estimates merged
+  from chunks are lower bounds until `ANALYZE` records exact HyperLogLog
+  estimates. Statistics feed pruning and join-order row counts; there is no
+  selectivity-based cost model yet.
+- **Materialized views** refresh in full (no incremental maintenance) and
+  are never substituted into queries automatically. A view in a catalog may
+  read only catalog tables. `on_commit` refresh happens on the
+  `execute_sql` path, not inside `Engine::sql`.
+- **Temporary tables are engine-wide**, including across the `Session`s of
+  one `Database`.
 
 ## Known performance gaps
 
