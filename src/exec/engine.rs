@@ -1252,6 +1252,21 @@ pub struct Engine {
     pub(crate) table_versions: RefCell<HashMap<String, u64>>,
     /// Materialized-view definitions (see `engine_views`).
     pub(crate) views: RefCell<HashMap<String, crate::exec::engine_views::ViewDef>>,
+    /// Query-level memory accounting (see `crate::exec::memory`).
+    pub(crate) memory: Arc<crate::exec::memory::MemoryGovernor>,
+    /// Builder knob: host memory budget.
+    host_memory_budget_bytes: Option<usize>,
+    /// Builder knob: spill directory (default: a per-process temp dir).
+    pub(crate) spill_dir: Option<std::path::PathBuf>,
+    /// For overlay tables (no host revisions): the first column of the batch
+    /// whose GPU copy is cached, so a cache hit can prove the overlay data is
+    /// unchanged (`Arc` identity; holding it also rules out address reuse).
+    pub(crate) overlay_uploads: RefCell<HashMap<String, arrow_array::ArrayRef>>,
+    /// Estimated device bytes and last-use tick of each resident GPU table,
+    /// for budget-driven eviction between statements.
+    pub(crate) gpu_residency: RefCell<HashMap<String, (usize, u64)>>,
+    /// Monotone tick for least-recently-used bookkeeping.
+    pub(crate) lru_tick: std::cell::Cell<u64>,
     /// Persistent catalog attached with [`EngineBuilder::database`].
     #[cfg(feature = "storage")]
     pub(crate) catalog: Option<crate::storage::Catalog>,
@@ -1298,6 +1313,10 @@ pub struct EngineBuilder {
     persistent_cache_path: Option<std::path::PathBuf>,
     /// Install a default tracing subscriber from [`build`](Self::build).
     enable_tracing: bool,
+    /// Host memory budget in bytes (see [`EngineBuilder::host_memory_budget`]).
+    host_memory_budget_bytes: Option<usize>,
+    /// Spill directory (see [`EngineBuilder::spill_dir`]).
+    spill_dir: Option<std::path::PathBuf>,
     /// Persistent catalog directory to open (see [`EngineBuilder::database`]).
     #[cfg(feature = "storage")]
     database: Option<std::path::PathBuf>,
@@ -1324,6 +1343,8 @@ impl EngineBuilder {
             persistent_cache_path: None,
             enable_tracing: false,
             disable_optimizer: false,
+            host_memory_budget_bytes: None,
+            spill_dir: None,
             #[cfg(feature = "storage")]
             database: None,
             #[cfg(feature = "storage")]
@@ -1349,6 +1370,27 @@ impl EngineBuilder {
     /// across v0.x — the getter contract is what's stable.
     pub fn memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Set a host-memory budget, in bytes. Defaults to unlimited.
+    ///
+    /// Bounds the host data the engine holds on its own behalf: installed
+    /// storage-table scans are evicted (least recently used first) to stay
+    /// under it, and a statement whose input table exceeds it runs out of
+    /// core — hash-partitioned through spill files — instead of being loaded
+    /// whole. Tables registered in memory are the caller's and are not
+    /// counted. See [`Engine::memory_stats`].
+    pub fn host_memory_budget(mut self, bytes: usize) -> Self {
+        self.host_memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Directory for out-of-core spill files. Defaults to a per-process
+    /// directory under the system temp dir. Files are deleted as soon as
+    /// their partition has been processed.
+    pub fn spill_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.spill_dir = Some(path.into());
         self
     }
 
@@ -1550,6 +1592,15 @@ impl EngineBuilder {
             storage_tables: RefCell::new(HashMap::new()),
             table_versions: RefCell::new(HashMap::new()),
             views: RefCell::new(HashMap::new()),
+            memory: crate::exec::memory::MemoryGovernor::new(
+                self.host_memory_budget_bytes,
+                self.memory_budget_bytes,
+            ),
+            host_memory_budget_bytes: self.host_memory_budget_bytes,
+            spill_dir: self.spill_dir.clone(),
+            overlay_uploads: RefCell::new(HashMap::new()),
+            gpu_residency: RefCell::new(HashMap::new()),
+            lru_tick: std::cell::Cell::new(0),
             #[cfg(feature = "storage")]
             catalog: None,
             _ctx: ctx,
@@ -1630,6 +1681,25 @@ impl Engine {
     /// across v0.x releases but the getter's contract is stable.
     pub fn memory_budget_bytes(&self) -> Option<usize> {
         self.memory_budget_bytes
+    }
+
+    /// Host memory budget configured via
+    /// [`EngineBuilder::host_memory_budget`]. `None` means unlimited.
+    pub fn host_memory_budget_bytes(&self) -> Option<usize> {
+        self.host_memory_budget_bytes
+    }
+
+    /// Memory accounting: budgets, reserved and peak host bytes, spill
+    /// volume, evictions, out-of-core statements.
+    pub fn memory_stats(&self) -> crate::exec::memory::MemoryStats {
+        self.memory.stats()
+    }
+
+    /// The engine's memory governor, e.g. to register a
+    /// [`MemoryConsumer`](crate::exec::memory::MemoryConsumer) that spills
+    /// under pressure.
+    pub fn memory_governor(&self) -> &Arc<crate::exec::memory::MemoryGovernor> {
+        &self.memory
     }
 
     /// Disk-backed PTX cache directory, as set via
@@ -2460,11 +2530,37 @@ impl Engine {
         // `incremental_rebuild`.
         let host: Option<ClonedHostRevision> =
             self.host_revisions.get(name).cloned_revision_owned();
+        self.touch_residency(name, None);
+        // Overlay tables (lazy drains, storage scans, morsels) carry no host
+        // revisions; their cached copy is valid while the overlay still holds
+        // the very batch that was uploaded.
+        let overlay_head: Option<arrow_array::ArrayRef> = if host.is_none() {
+            match self.streaming_sources.borrow().get(name) {
+                Some(crate::exec::streaming::TableSource::Materialized(b)) if b.len() == 1 => {
+                    b[0].columns().first().cloned()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         // Fast path: cache hit AND every column is at the current
         // revision. Inspect under the same borrow we'd return.
         {
             let g = self.gpu_tables.borrow();
             if let Some(Some(gt)) = g.get(name) {
+                let overlay_fresh = match (&overlay_head, self.overlay_uploads.borrow().get(name)) {
+                    (Some(now), Some(then)) => Arc::ptr_eq(now, then) && gt.n_rows == now.len(),
+                    _ => false,
+                };
+                if overlay_fresh {
+                    return Ok(Ref::map(g, |m| {
+                        m.get(name)
+                            .expect("hit above")
+                            .as_ref()
+                            .expect("Some hit above")
+                    }));
+                }
                 if let Some(h) = host.as_ref() {
                     if gt.last_uploaded_revision == h.table_revision {
                         return Ok(Ref::map(g, |m| {
@@ -2508,6 +2604,20 @@ impl Engine {
         };
         tables_mut.insert(name.to_string(), Some(new_gpu_table));
         drop(tables_mut);
+        match overlay_head {
+            Some(head) => {
+                self.overlay_uploads
+                    .borrow_mut()
+                    .insert(name.to_string(), head);
+            }
+            None => {
+                self.overlay_uploads.borrow_mut().remove(name);
+            }
+        }
+        self.touch_residency(
+            name,
+            Some(crate::exec::streaming::estimate_batch_bytes(&concatenated)),
+        );
         let g = self.gpu_tables.borrow();
         Ok(Ref::map(g, |m| {
             m.get(name)

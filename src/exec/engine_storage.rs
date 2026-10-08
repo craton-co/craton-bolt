@@ -27,6 +27,10 @@ pub(crate) struct StorageEntry {
     pub(crate) table: Arc<dyn StorageTable>,
     installed: Option<ScanSelection>,
     last_scan: Option<ScanReport>,
+    /// Host bytes of the installed scan, counted against the host budget.
+    reservation: Option<crate::exec::memory::MemoryReservation>,
+    /// Last-use tick (least-recently-used eviction).
+    last_used: u64,
 }
 
 /// What the most recent scan of a storage table read.
@@ -70,6 +74,8 @@ impl Engine {
                 table,
                 installed: None,
                 last_scan: None,
+                reservation: None,
+                last_used: 0,
             },
         );
         Ok(())
@@ -241,19 +247,19 @@ impl Engine {
             return Ok(());
         }
         let requests = self.storage_scan_requests(plan, &wanted, nested_tables);
-        for name in wanted {
+        for name in &wanted {
             let request = requests
-                .get(&name)
+                .get(name)
                 .cloned()
                 .unwrap_or_else(ScanRequest::full);
-            self.install_storage_scan(&name, &request, top_level)?;
+            self.install_storage_scan(name, &request, top_level, &wanted)?;
         }
         Ok(())
     }
 
     /// Per-table requests from the statement's optimized plan. An optimizer
     /// failure falls back to full scans (the real compile reports it).
-    fn storage_scan_requests(
+    pub(crate) fn storage_scan_requests(
         &self,
         plan: &LogicalPlan,
         tables: &[String],
@@ -281,6 +287,7 @@ impl Engine {
         name: &str,
         request: &ScanRequest,
         top_level: bool,
+        keep: &[String],
     ) -> BoltResult<()> {
         let (table, installed) = {
             let st = self.storage_tables.borrow();
@@ -297,6 +304,15 @@ impl Engine {
             _ => needed,
         };
         let declared = table.schema().clone();
+        if let Some(budget) = self.host_memory_budget_bytes() {
+            let width: usize = declared
+                .fields
+                .iter()
+                .map(|f| f.dtype.byte_width().unwrap_or(32) + 1)
+                .sum();
+            let need = (selection.rows as usize).saturating_mul(width);
+            self.make_host_room(name, need, budget, keep)?;
+        }
         let mut batches: Vec<RecordBatch> = Vec::new();
         for b in table.read(&selection)? {
             let b = b?;
@@ -352,16 +368,158 @@ impl Engine {
             (selection.chunks_total - selection.chunks.len()) as u64,
         );
         self.record_scan(name, &selection, false);
-        self.storage_tables
-            .borrow_mut()
-            .get_mut(name)
-            .expect("storage entry")
-            .installed = Some(selection);
+        let reservation = {
+            let st = self.streaming_sources.borrow();
+            let bytes = match st.get(name) {
+                Some(crate::exec::streaming::TableSource::Materialized(b)) => {
+                    crate::exec::streaming::estimate_batches_bytes(b)
+                }
+                _ => 0,
+            };
+            self.memory
+                .reserve_unchecked(crate::exec::memory::MemoryKind::Host, bytes)
+        };
+        let mut st = self.storage_tables.borrow_mut();
+        let e = st.get_mut(name).expect("storage entry");
+        e.installed = Some(selection);
+        e.reservation = Some(reservation);
         Ok(())
     }
 
+    /// Evict installed storage scans other than `keep` (least recently used
+    /// first) until `need` more host bytes fit under `budget`; then ask the
+    /// governor's registered consumers.
+    fn make_host_room(
+        &self,
+        name: &str,
+        need: usize,
+        budget: usize,
+        keep: &[String],
+    ) -> BoltResult<()> {
+        use crate::exec::memory::MemoryKind;
+        // The scan being replaced frees its own reservation.
+        let own = self
+            .storage_tables
+            .borrow()
+            .get(name)
+            .and_then(|e| e.reservation.as_ref().map(|r| r.bytes()))
+            .unwrap_or(0);
+        let fits = |eng: &Engine| {
+            eng.memory.reserved(MemoryKind::Host).saturating_sub(own) + need <= budget
+        };
+        if fits(self) {
+            return Ok(());
+        }
+        let mut victims: Vec<(u64, String)> = self
+            .storage_tables
+            .borrow()
+            .iter()
+            .filter(|(n, e)| e.installed.is_some() && !keep.contains(n) && n.as_str() != name)
+            .map(|(n, e)| (e.last_used, n.clone()))
+            .collect();
+        victims.sort();
+        for (_, v) in victims {
+            if fits(self) {
+                break;
+            }
+            self.evict_storage_scan(&v);
+        }
+        if !fits(self) {
+            // Registered consumers may still free memory.
+            let r = self
+                .memory
+                .try_reserve(MemoryKind::Host, need.saturating_sub(own));
+            if let Err(e) = r {
+                return Err(BoltError::Memory(format!(
+                    "scanning storage table '{name}' needs ~{need} bytes, over the host \
+                     memory budget ({e}); filter it further, or let an aggregate / join \
+                     over it run out of core"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the installed scan of storage table `name` (re-read on next use).
+    pub(crate) fn evict_storage_scan(&self, name: &str) {
+        let mut st = self.storage_tables.borrow_mut();
+        if let Some(e) = st.get_mut(name) {
+            if e.installed.take().is_some() {
+                e.reservation = None;
+                drop(st);
+                self.streaming_sources.borrow_mut().remove(name);
+                self.gpu_tables.borrow_mut().remove(name);
+                self.overlay_uploads.borrow_mut().remove(name);
+                self.bump_data_epoch();
+                self.memory.record_eviction();
+            }
+        }
+    }
+
+    /// Bump `name`'s last-use tick; with `bytes`, also record its resident
+    /// device size.
+    pub(crate) fn touch_residency(&self, name: &str, bytes: Option<usize>) {
+        let tick = self.lru_tick.get() + 1;
+        self.lru_tick.set(tick);
+        let mut r = self.gpu_residency.borrow_mut();
+        match bytes {
+            Some(b) => {
+                r.insert(name.to_string(), (b, tick));
+            }
+            None => r.entry(name.to_string()).or_insert((0, tick)).1 = tick,
+        }
+    }
+
+    /// Evict least-recently-used resident GPU tables not in `keep` until the
+    /// resident total fits the device budget. Only called between
+    /// statements, when no executor holds a device table.
+    pub(crate) fn make_device_room(&self, keep: &[String]) {
+        let Some(budget) = self.memory_budget_bytes() else {
+            return;
+        };
+        let resident: Vec<(u64, String, usize)> = {
+            let g = self.gpu_tables.borrow();
+            let r = self.gpu_residency.borrow();
+            g.iter()
+                .filter(|(_, t)| t.is_some())
+                .map(|(n, _)| {
+                    let (b, t) = r.get(n).copied().unwrap_or((0, 0));
+                    // Tables uploaded at registration have no recorded size.
+                    let b = if b > 0 {
+                        b
+                    } else {
+                        self.estimated_table_bytes(n).unwrap_or(0)
+                    };
+                    (t, n.clone(), b)
+                })
+                .collect()
+        };
+        let mut total: usize = resident.iter().map(|(_, _, b)| b).sum();
+        if total <= budget {
+            return;
+        }
+        let mut victims: Vec<(u64, String, usize)> = resident
+            .into_iter()
+            .filter(|(_, n, _)| !keep.contains(n))
+            .collect();
+        victims.sort();
+        for (_, n, b) in victims {
+            if total <= budget {
+                break;
+            }
+            self.gpu_tables.borrow_mut().remove(&n);
+            self.overlay_uploads.borrow_mut().remove(&n);
+            self.gpu_residency.borrow_mut().remove(&n);
+            total = total.saturating_sub(b);
+            self.memory.record_eviction();
+        }
+    }
+
     fn record_scan(&self, name: &str, s: &ScanSelection, reused: bool) {
+        let tick = self.lru_tick.get() + 1;
+        self.lru_tick.set(tick);
         if let Some(e) = self.storage_tables.borrow_mut().get_mut(name) {
+            e.last_used = tick;
             e.last_scan = Some(ScanReport {
                 chunks_total: s.chunks_total,
                 chunks_read: s.chunks.len(),

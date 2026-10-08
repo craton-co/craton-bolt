@@ -113,11 +113,15 @@ pub enum Counter {
     StorageChunksRead = 6,
     /// Storage-table chunks skipped by zone-map pruning.
     StorageChunksPruned = 7,
+    /// Spill files written by out-of-core execution.
+    SpillFilesWritten = 8,
+    /// Bytes written to spill files by out-of-core execution.
+    SpillBytesWritten = 9,
 }
 
 impl Counter {
     /// All counters in declaration / snapshot order.
-    pub const ALL: [Counter; 8] = [
+    pub const ALL: [Counter; 10] = [
         Counter::QueriesTotal,
         Counter::QueriesFailed,
         Counter::PtxCacheHits,
@@ -126,6 +130,8 @@ impl Counter {
         Counter::HostFallbacksTotal,
         Counter::StorageChunksRead,
         Counter::StorageChunksPruned,
+        Counter::SpillFilesWritten,
+        Counter::SpillBytesWritten,
     ];
 
     /// Stable snake_case name, suitable as a metric key (no `craton_` prefix —
@@ -140,6 +146,8 @@ impl Counter {
             Counter::HostFallbacksTotal => "host_fallbacks_total",
             Counter::StorageChunksRead => "storage_chunks_read",
             Counter::StorageChunksPruned => "storage_chunks_pruned",
+            Counter::SpillFilesWritten => "spill_files_written",
+            Counter::SpillBytesWritten => "spill_bytes_written",
         }
     }
 
@@ -159,6 +167,8 @@ impl Counter {
             }
             Counter::StorageChunksRead => "Storage-table chunks read by scans.",
             Counter::StorageChunksPruned => "Storage-table chunks skipped by zone-map pruning.",
+            Counter::SpillFilesWritten => "Spill files written by out-of-core execution.",
+            Counter::SpillBytesWritten => "Bytes written to spill files by out-of-core execution.",
         }
     }
 }

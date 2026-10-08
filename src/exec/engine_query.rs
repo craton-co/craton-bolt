@@ -284,12 +284,32 @@ impl Engine {
         user_rewrites: bool,
         top_level: bool,
     ) -> BoltResult<QueryHandle> {
+        if top_level {
+            if let Some(h) = self.timed_ooc(plan)? {
+                return Ok(h);
+            }
+        }
         let phys = self.prepare_physical(plan, user_rewrites, top_level)?;
         if top_level {
             self.timed_execute(|| self.execute(&phys))
         } else {
             self.execute(&phys)
         }
+    }
+
+    /// Out-of-core execution of a top-level plan, if it needs it (see
+    /// `engine_ooc`), timed as `Execute`.
+    fn timed_ooc(&self, plan: &LogicalPlan) -> BoltResult<Option<QueryHandle>> {
+        if self.memory_budget_bytes().is_none() && self.host_memory_budget_bytes().is_none() {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let result = self.try_out_of_core(plan);
+        if matches!(result, Ok(Some(_)) | Err(_)) {
+            crate::metrics::metrics()
+                .observe_duration(crate::metrics::Phase::Execute, start.elapsed());
+        }
+        result
     }
 
     /// Run a top-level statement's execution step, feeding the `Execute`
@@ -324,6 +344,13 @@ impl Engine {
         // dictionary rewrite already sees their dictionaries and no drain has
         // to mutate the registry while a compile holds it.
         let (tree_tables, nested_tables) = split_scan_tables(plan);
+        if top_level {
+            // Between statements, nothing holds a device table: evict the
+            // least recently used resident tables this one does not read
+            // until the device budget has room.
+            let keep: Vec<String> = tree_tables.iter().chain(&nested_tables).cloned().collect();
+            self.make_device_room(&keep);
+        }
         // Storage tables: load this statement's pruned scan (or reuse one that
         // covers it) — also before compiling, for the same reason.
         self.scan_storage_tables(plan, &tree_tables, &nested_tables, top_level)?;
@@ -410,6 +437,11 @@ impl Engine {
             .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
         match shape {
             QueryShape::Generic(plan) => {
+                // Out-of-core results depend on the budget path taken and
+                // are not cached.
+                if let Some(h) = self.timed_ooc(&plan)? {
+                    return Ok(h);
+                }
                 let phys = self.prepare_physical(&plan, true, true)?;
                 if cacheable {
                     // Keyed AFTER preparing: a first query may drain lazy

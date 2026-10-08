@@ -23,6 +23,7 @@ pub mod compact;
 mod engine_agg_impl;
 pub(crate) mod engine_ddl;
 mod engine_join_impl;
+pub(crate) mod engine_ooc;
 mod engine_query;
 pub(crate) mod engine_storage;
 mod engine_streaming_impl;
@@ -35,6 +36,7 @@ pub(crate) mod engine_views;
 #[doc(hidden)]
 pub(crate) mod gpu_upload;
 pub mod groupby;
+pub mod memory;
 /// Process-wide JIT-module cache shared across executors. Lifted out of
 /// per-file `static MODULE_CACHE` declarations to avoid the multi-GPU
 /// hazard described in the module docs.
@@ -44,6 +46,8 @@ pub mod module_cache;
 /// Replaces ~25 copy-pasted `plan_dtype_to_arrow` / `arrow_dtype_to_plan` /
 /// `plan_schema_to_arrow_schema` definitions across the executors.
 pub(crate) mod schema_convert;
+pub mod session;
+pub(crate) mod spill;
 pub mod string_col;
 /// NULL / validity propagation audit matrix + shared validity helpers
 /// (Arrow-LE packed-bit bitmap construction). See the module docs for the
