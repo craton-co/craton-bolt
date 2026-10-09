@@ -6211,10 +6211,7 @@ fn plan_query(
             },
         )?;
         if !sort_exprs.is_empty() {
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                sort_exprs,
-            };
+            plan = sort_with_hidden_columns(plan, sort_exprs)?;
         }
     }
 
@@ -6507,6 +6504,56 @@ fn collect_union_branches(
 /// Lower a list of `OrderByExpr` into our `SortExpr`s. The default sort
 /// direction is ASC; the default NULL placement follows SQL convention
 /// (NULLS FIRST for ASC, NULLS LAST for DESC) when the user omits it.
+/// Layer `ORDER BY` over `plan`. When a sort key reads a column the SELECT
+/// list does not output (`SELECT v FROM t ORDER BY k`) but the projection's
+/// input has, the projection carries that column as a hidden extra output,
+/// the sort runs over it, and a final projection restores the SELECT list.
+fn sort_with_hidden_columns(
+    plan: LogicalPlan,
+    sort_exprs: Vec<SortExpr>,
+) -> BoltResult<LogicalPlan> {
+    let sort = |input: LogicalPlan, sort_exprs| LogicalPlan::Sort {
+        input: Box::new(input),
+        sort_exprs,
+    };
+    let LogicalPlan::Project { input, exprs } = &plan else {
+        return Ok(sort(plan, sort_exprs));
+    };
+    let out_schema = plan.schema()?;
+    let in_schema = input.schema()?;
+    let mut referenced = Vec::new();
+    for s in &sort_exprs {
+        crate::plan::optimizer::expr_util::collect_columns(&s.expr, &mut referenced);
+    }
+    let mut hidden: Vec<String> = Vec::new();
+    for c in referenced {
+        if out_schema.index_of(&c).is_err()
+            && in_schema.index_of(&c).is_ok()
+            && !hidden.contains(&c)
+        {
+            hidden.push(c);
+        }
+    }
+    if hidden.is_empty() {
+        return Ok(sort(plan, sort_exprs));
+    }
+    let mut extended = exprs.clone();
+    extended.extend(hidden.iter().map(|c| Expr::Column(c.clone())));
+    let widened = LogicalPlan::Project {
+        input: input.clone(),
+        exprs: extended,
+    };
+    let restore = out_schema
+        .fields
+        .iter()
+        .map(|f| Expr::Column(f.name.clone()))
+        .collect();
+    Ok(LogicalPlan::Project {
+        input: Box::new(sort(widened, sort_exprs)),
+        exprs: restore,
+    })
+}
+
 fn lower_order_by(exprs: &[OrderByExpr], ctx: SubqueryCtx<'_>) -> BoltResult<Vec<SortExpr>> {
     // ORDER BY runs outside the FROM-tree (after projection), so no table
     // qualifiers are in scope. We pass a resolver with no table scopes; bare

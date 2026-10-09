@@ -3951,6 +3951,19 @@ fn lower_aggregate_over_input(
     depth: usize,
 ) -> BoltResult<PhysicalPlan> {
     let mut input_schema = input.schema()?;
+    // Rewriter-synthesised dictionary columns (`__idx_<col>`, `__rank_<col>`)
+    // a scan schema may list are not real columns of the join / union / filter
+    // output; bind them only when the aggregate itself reads one.
+    let mut used = Vec::new();
+    for e in group_by
+        .iter()
+        .chain(aggregates.iter().map(aggregate_input_expr))
+    {
+        crate::plan::optimizer::expr_util::collect_columns(e, &mut used);
+    }
+    input_schema.fields.retain(|f| {
+        !(f.name.starts_with("__idx_") || f.name.starts_with("__rank_")) || used.contains(&f.name)
+    });
     // The child is lowered as an explicit `SELECT <every input column>` over
     // `input`, so it yields exactly the aggregate's input columns, by name,
     // in order — the same projection path an ordinary SELECT takes. Lowering
@@ -4893,7 +4906,11 @@ fn all_scalar_fns_host_evaluable(exprs: &[Expr]) -> bool {
             Expr::ScalarFn { kind, args } => {
                 let ok = matches!(
                     kind,
-                    ScalarFnKind::Substring
+                    ScalarFnKind::Upper
+                        | ScalarFnKind::Lower
+                        | ScalarFnKind::Length
+                        | ScalarFnKind::Concat
+                        | ScalarFnKind::Substring
                         | ScalarFnKind::TrimBoth
                         | ScalarFnKind::TrimLeading
                         | ScalarFnKind::TrimTrailing

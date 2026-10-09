@@ -5,6 +5,22 @@ All notable changes to this project will be documented here. The format follows 
 ## [Unreleased]
 
 ### Fixed
+- **`ORDER BY` a column the SELECT list does not output failed** (`SELECT v
+  FROM t ORDER BY k` → "Unable to get field named k"): the projection now
+  carries the sort columns as hidden outputs and a final projection restores
+  the SELECT list.
+- **String functions outside their dedicated shapes failed** (`SELECT
+  UPPER(s), v * 2 FROM t`, `LENGTH(s)` under an `ORDER BY` on another column,
+  … → "not yet lowered to GPU"): `UPPER` / `LOWER` / `LENGTH` / `CONCAT` now
+  evaluate on the host there, with the GPU producers' semantics.
+- **`GROUP BY` over a join of a dictionary-encoded table, under an `ORDER
+  BY`, bound a non-existent `__idx_<col>` column**; synthetic dictionary
+  columns are now bound only when the aggregate reads them.
+- **DuckDB differential lane**: the `OCTET_LENGTH` oracle query uses DuckDB's
+  `strlen` (DuckDB 1.2 has no `OCTET_LENGTH(VARCHAR)`), DECIMAL results are
+  decoded, and the property test's floor is measured over the queries DuckDB
+  accepts (96 cases), so random seeds that draw mostly oracle-invalid SQL no
+  longer fail it.
 - **`COUNT(*)` grouped by a string (or temporal / decimal / boolean) key
   failed** with "Bool/Utf8 in pre outputs not yet supported": the literal
   feed forced the aggregate pre-kernel, which cannot carry such a key. It now

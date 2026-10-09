@@ -202,6 +202,8 @@ fn duckdb_value_to_cell(v: duckdb::types::ValueRef<'_>) -> Cell {
         V::Float(f) => Cell::Float(f as f64),
         V::Double(f) => Cell::Float(f),
         V::Text(bytes) => Cell::Str(String::from_utf8_lossy(bytes).into_owned()),
+        // DECIMAL (e.g. from a `0.0000` literal): compared numerically.
+        V::Decimal(d) => Cell::Float(d.to_string().parse().unwrap_or(f64::NAN)),
         // Anything else (decimal, timestamp, blob, list, struct, …) is not
         // exercised by the curated query set; surface unsupported types as
         // a panic so a future test author updates this decoder rather than

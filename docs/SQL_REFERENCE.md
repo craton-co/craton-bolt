@@ -339,7 +339,7 @@ Rejected residuals: a grouping construct with **more than 12 distinct grouping c
 
 ## ORDER BY
 
-`ORDER BY <expr> [ASC|DESC] [NULLS FIRST|NULLS LAST] [, ...]` is supported and sits *above* the projection / aggregate / HAVING in the plan tree, so it sees the final output schema. Defaults:
+`ORDER BY <expr> [ASC|DESC] [NULLS FIRST|NULLS LAST] [, ...]` is supported and sits *above* the projection / aggregate / HAVING in the plan tree, so it sees the final output schema. A sort key may also read a column of the `FROM` tables that the SELECT list does not output (`SELECT v FROM t ORDER BY k`); it is carried as a hidden column and dropped after sorting. Output aliases take precedence over same-named input columns. Defaults:
 
 - Direction defaults to `ASC`.
 - NULL placement defaults to `NULLS FIRST` for `ASC` and `NULLS LAST` for `DESC` (SQL convention).

@@ -158,6 +158,8 @@ mod semantic_diff {
             V::Float(f) => Cell::Float(f as f64),
             V::Double(f) => Cell::Float(f),
             V::Text(bytes) => Cell::Str(String::from_utf8_lossy(bytes).into_owned()),
+            // DECIMAL (e.g. from a `0.0000` literal): compared numerically.
+            V::Decimal(d) => Cell::Float(d.to_string().parse().unwrap_or(f64::NAN)),
             // Any unsupported type means a future grammar extension reached
             // this helper without updating the decoder; surface it loudly.
             other => panic!("semantic_diff: unsupported DuckDB value type {other:?}"),
@@ -185,6 +187,9 @@ mod semantic_diff {
         }
         if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
             return Cell::Str(a.value(idx).to_string());
+        }
+        if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>() {
+            return Cell::Float(a.value(idx) as f64 / 10f64.powi(a.scale() as i32));
         }
         panic!(
             "semantic_diff: unsupported Arrow dtype {:?}",
@@ -1033,18 +1038,27 @@ proptest! {
 /// Number of cases the semantic property runs (mirrors the
 /// `ProptestConfig::with_cases` below). Used to know when the *last* case has
 /// run so the executed-fraction floor can be enforced exactly once per run.
-const SEMANTIC_CASES: u64 = 32;
+const SEMANTIC_CASES: u64 = 96;
 
 /// Minimum fraction of generated queries that must reach a real DuckDB-vs-Bolt
 /// row comparison for the differential property to be considered meaningful.
 ///
 /// Without a floor, `semantic_diff_against_duckdb` silently no-ops: a
 /// regression that rejects 100% of generated queries on one engine still
-/// "passes" with zero comparisons. 25% is a deliberately loose bar — the
-/// grammar intentionally emits many type-invalid queries (e.g. `SUM(s)`,
-/// `WHERE k`) — but it is high enough that a wholesale rejection regression
-/// trips the assert instead of hiding.
-const MIN_EXECUTED_FRACTION: f64 = 0.25;
+/// "passes" with zero comparisons.
+///
+/// The floor is measured over the queries the **oracle accepts**: the grammar
+/// intentionally emits many type-invalid queries (`SUM(s)`, `WHERE k`,
+/// `s = 1`) that DuckDB refuses, and how many of those a random seed draws
+/// says nothing about Bolt. Of the queries DuckDB runs, Bolt must run at
+/// least this fraction — a wholesale Bolt rejection regression still trips
+/// it, but seed-to-seed variation in the oracle's rejections no longer can.
+/// (Bolt is deliberately stricter on some implicit casts — `b = 0` for a
+/// boolean `b` — so the bar is a third, not all.)
+const MIN_EXECUTED_FRACTION: f64 = 0.34;
+
+/// Below this many oracle-accepted cases the fraction is too noisy to judge.
+const MIN_ORACLE_ACCEPTED: u64 = 8;
 
 // Process-wide counters for the executed-fraction floor. The semantic
 // property runs its cases sequentially within one process, so plain atomics
@@ -1053,6 +1067,8 @@ const MIN_EXECUTED_FRACTION: f64 = 0.25;
 // `compared` counts those that produced a real two-engine row comparison.
 static SEMANTIC_GENERATED: AtomicU64 = AtomicU64::new(0);
 static SEMANTIC_COMPARED: AtomicU64 = AtomicU64::new(0);
+/// Cases DuckDB executed (whether or not Bolt then did).
+static SEMANTIC_ORACLE_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(SEMANTIC_CASES as u32))]
@@ -1081,6 +1097,7 @@ proptest! {
         let (conn, engine) = semantic_diff::setup_engines();
         match semantic_diff::run_both(&conn, &engine, &sql) {
             Ok((duck, bolt)) => {
+                SEMANTIC_ORACLE_ACCEPTED.fetch_add(1, Ordering::Relaxed);
                 SEMANTIC_COMPARED.fetch_add(1, Ordering::Relaxed);
                 let duck = duck.canonicalise();
                 let bolt = bolt.canonicalise();
@@ -1093,6 +1110,10 @@ proptest! {
             // One side rejected — fine. The grammar emits many queries that
             // either engine will refuse on type grounds (e.g. `SUM(s)`);
             // those don't tell us anything about semantic agreement.
+            // Only Bolt refused: counts against the floor below.
+            Err(e) if e.starts_with("bolt:") => {
+                SEMANTIC_ORACLE_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+            }
             Err(_) => {}
         }
 
@@ -1104,14 +1125,18 @@ proptest! {
         let generated = SEMANTIC_GENERATED.load(Ordering::Relaxed);
         if generated == SEMANTIC_CASES {
             let compared = SEMANTIC_COMPARED.load(Ordering::Relaxed);
-            let fraction = compared as f64 / generated as f64;
+            let accepted = SEMANTIC_ORACLE_ACCEPTED.load(Ordering::Relaxed);
             prop_assert!(
-                fraction >= MIN_EXECUTED_FRACTION,
-                "semantic_diff_against_duckdb executed too few cases: \
-                 {compared}/{generated} = {fraction:.3} compared, \
-                 floor is {MIN_EXECUTED_FRACTION:.3}. Either both engines are \
-                 rejecting nearly everything (a real regression) or the grammar \
-                 drifted to emit mostly-invalid SQL.",
+                accepted > 0,
+                "semantic_diff_against_duckdb: DuckDB rejected all {generated} \
+                 generated queries — the grammar drifted to emit invalid SQL.",
+            );
+            let fraction = compared as f64 / accepted as f64;
+            prop_assert!(
+                accepted < MIN_ORACLE_ACCEPTED || fraction >= MIN_EXECUTED_FRACTION,
+                "semantic_diff_against_duckdb: Bolt ran only {compared} of the \
+                 {accepted} queries DuckDB accepted ({fraction:.3}; floor \
+                 {MIN_EXECUTED_FRACTION:.3}) — a Bolt rejection regression.",
             );
         }
     }

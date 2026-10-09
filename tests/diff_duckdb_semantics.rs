@@ -160,6 +160,8 @@ fn duckdb_value_to_cell(v: duckdb::types::ValueRef<'_>) -> Cell {
         V::Float(f) => Cell::Float(f as f64),
         V::Double(f) => Cell::Float(f),
         V::Text(bytes) => Cell::Str(String::from_utf8_lossy(bytes).into_owned()),
+        // DECIMAL (e.g. from a `0.0000` literal): compared numerically.
+        V::Decimal(d) => Cell::Float(d.to_string().parse().unwrap_or(f64::NAN)),
         other => panic!("diff_duckdb_semantics: unsupported DuckDB value type {other:?}"),
     }
 }
@@ -303,6 +305,15 @@ fn diff_query(label: &str, sql: &str, tables: &[TableSpec<'_>]) {
     assert_results_equal(label, &duck, &bolt);
 }
 
+/// [`diff_query`] where the oracle needs its own spelling of the same query
+/// (a function DuckDB names differently).
+fn diff_query_with_oracle(label: &str, duck_sql: &str, bolt_sql: &str, tables: &[TableSpec<'_>]) {
+    let (conn, engine) = setup(label, tables);
+    let duck = duckdb_run(&conn, duck_sql).canonicalise();
+    let bolt = bolt_run(&engine, bolt_sql).canonicalise();
+    assert_results_equal(label, &duck, &bolt);
+}
+
 #[allow(dead_code)]
 fn diff_query_ordered(label: &str, sql: &str, tables: &[TableSpec<'_>]) {
     let (conn, engine) = setup(label, tables);
@@ -418,8 +429,11 @@ fn not_in_tables(probe: Vec<Option<i32>>, set: Vec<Option<i32>>) -> Vec<TableSpe
 #[test]
 #[ignore = "gpu:string"]
 fn diff_length_and_octet_length_unicode() {
-    diff_query(
+    // DuckDB's OCTET_LENGTH takes only BLOB / BIT; its byte length of a
+    // VARCHAR is `strlen`.
+    diff_query_with_oracle(
         "diff_length_and_octet_length_unicode",
+        "SELECT id, LENGTH(s), strlen(s) FROM t",
         "SELECT id, LENGTH(s), OCTET_LENGTH(s) FROM t",
         &[TableSpec {
             name: "t",
