@@ -311,3 +311,57 @@ async fn flight_bearer_token_gates_rpcs() {
     let _ = tx.send(());
     let _ = served.await;
 }
+
+/// A `Database`-backed server answers concurrent clients through the shared
+/// runtime (no client blocks a tonic worker), refuses statements on its
+/// read-only session, and coexists with other sessions of the same database.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "gpu:e2e"]
+async fn flight_sql_over_a_shared_database() {
+    use arrow_flight::flight_service_client::FlightServiceClient;
+
+    let (_, batch) = sample();
+    let db = craton_bolt::Database::open(craton_bolt::Engine::builder()).expect("CUDA ctx");
+    db.with_engine(move |e| e.register_table("t", batch))
+        .unwrap()
+        .unwrap();
+    let addr = free_loopback_addr();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let svc = craton_bolt::flight::FlightSqlServer::from_database(&db);
+    let served = spawn_server(svc, addr, rx).await;
+
+    let run = |sql: &'static str| async move {
+        let mut client = FlightServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client connects");
+        let ticket = arrow_flight::Ticket {
+            ticket: statement_cmd(sql),
+        };
+        let stream = client
+            .do_get(ticket)
+            .await?
+            .into_inner()
+            .map_err(FlightError::Tonic);
+        let batches = FlightRecordBatchStream::new_from_flight_data(stream)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        Ok::<_, tonic::Status>(batches.iter().map(|b| b.num_rows()).sum::<usize>())
+    };
+    let clients: Vec<_> = (0..6)
+        .map(|_| tokio::spawn(run("SELECT id FROM t WHERE id > 1")))
+        .collect();
+    for c in clients {
+        assert_eq!(c.await.unwrap().unwrap(), 2);
+    }
+    // The endpoint's session is read-only.
+    assert!(run("DROP TABLE t").await.is_err());
+    // Another session of the same database still writes.
+    db.session()
+        .sql("CREATE TABLE u AS SELECT id FROM t")
+        .expect("writer session");
+    assert_eq!(run("SELECT id FROM u").await.unwrap(), 3);
+
+    let _ = tx.send(());
+    let _ = served.await;
+}

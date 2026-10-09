@@ -95,6 +95,18 @@ fn parquet_filter_prunes_row_groups_and_columns() {
     let mut e = Engine::new().expect("ctx");
     e.register_parquet("t", &path).unwrap();
     let pruned0 = metrics().counter(Counter::StorageChunksPruned).get();
+    // EXPLAIN reports the pruned scan without reading data.
+    let plan = e
+        .explain_sql("SELECT COUNT(*) AS n, SUM(k) AS sk FROM t WHERE k >= 7500")
+        .unwrap();
+    assert!(
+        plan.contains(
+            "Storage scans:
+  t: 3 of 10 chunks (~3000 rows), 1 of 4 columns"
+        ),
+        "{plan}"
+    );
+    assert!(e.last_scan("t").is_none(), "explain must not scan");
 
     let out = e
         .sql("SELECT COUNT(*) AS n, SUM(k) AS sk FROM t WHERE k >= 7500")
@@ -213,6 +225,51 @@ fn parquet_scan_runs_in_morsels_under_a_budget() {
         let expect: i64 = (3000..10_000).filter(|k| k % 7 == g).sum();
         assert_eq!(i64_at(&out, 1, row), expect, "g={g}");
     }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+#[ignore = "gpu:e2e — Hive-partitioned directories prune whole partitions"]
+fn hive_partitioned_tables_prune_partitions() {
+    let dir = temp_dir("hive");
+    for region in ["eu", "us", "apac"] {
+        for day in 1..=3 {
+            let d = dir
+                .join(format!("region={region}"))
+                .join(format!("day={day}"));
+            std::fs::create_dir_all(&d).unwrap();
+            write_parquet(
+                &d.join("part-0.parquet"),
+                &[batch(day * 1000, 100)],
+                &Default::default(),
+            )
+            .unwrap();
+        }
+    }
+    let mut e = Engine::new().expect("ctx");
+    e.execute_sql(&format!(
+        "CREATE EXTERNAL TABLE ev STORED AS PARQUET LOCATION '{}'",
+        dir.display()
+    ))
+    .unwrap();
+    let out = e
+        .sql("SELECT COUNT(*) AS n, SUM(day) AS d FROM ev WHERE region = 'us' AND day >= 2")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(i64_at(&out, 0, 0), 200);
+    assert_eq!(i64_at(&out, 1, 0), 2 * 100 + 3 * 100);
+    let r = e.last_scan("ev").unwrap();
+    assert_eq!(
+        (r.chunks_total, r.chunks_read),
+        (9, 2),
+        "two of nine partitions read"
+    );
+    let g = e
+        .sql("SELECT region, COUNT(*) AS n FROM ev GROUP BY region ORDER BY region")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(g.num_rows(), 3);
+    assert_eq!(g.column(0).as_string::<i32>().value(0), "apac");
     std::fs::remove_dir_all(dir).ok();
 }
 

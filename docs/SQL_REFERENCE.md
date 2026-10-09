@@ -712,10 +712,16 @@ one row, `rows_affected`.
 | `SHOW TABLES`, `DESCRIBE t` | |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'manual' \| 'on_commit')] AS SELECT ...` | Read like a table; staleness via `Engine::view_status` |
 | `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` | Full refresh |
-| `COMPACT TABLE t`, `VACUUM [KEEP n]` | Catalog tables only (`EngineBuilder::database`) |
+| `COMPACT TABLE t [ORDER BY (col, ...)]`, `VACUUM [KEEP n]` | Catalog tables only (`EngineBuilder::database`). `ORDER BY` rewrites the table sorted on a clustering key (recorded for later compactions), tightening its zone maps |
 
 With a catalog attached, tables (other than `TEMP`) and materialized views
 are durable and every change is a new catalog snapshot.
+
+`EXPLAIN` output (`Engine::explain_sql`) ends with a `Storage scans:`
+section — per storage table, the chunks and columns the statement would read
+after pruning (decided from statistics, nothing is read) — and, under a
+memory budget, an `Execution: out of core — ...` line naming the
+partitioned / grace-join / external-sort strategy the statement would use.
 
 ## What's NOT supported
 

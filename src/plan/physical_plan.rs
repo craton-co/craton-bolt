@@ -3669,10 +3669,12 @@ fn build_projection_kernel(
     // `Project` producing the SELECT list. Rewriter-synthesised
     // `__idx_<col>` / `__rank_<col>` columns a dictionary-folded predicate
     // reads are materialised by the `StringProject` executor.
-    if let Some(pred) = predicate {
-        if projection_needs_host_columns(scan_schema, projected) {
-            return lower_host_filtered_projection(table, scan_schema, pred, projected);
-        }
+    // ... and WITHOUT one, when the SELECT list computes something next to a
+    // Utf8 column (`SELECT s, v * 2 FROM t`, `SELECT s, 1 AS one FROM t`): the
+    // bare-passthrough escape above does not apply, so evaluate the list on
+    // the host over a passthrough of the columns it reads.
+    if projection_needs_host_columns(scan_schema, projected) {
+        return lower_host_filtered_projection(table, scan_schema, predicate, projected);
     }
 
     let mut cg = Codegen::new(scan_schema);
@@ -3724,17 +3726,19 @@ fn projection_needs_host_columns(scan_schema: &Schema, projected: &[(String, Exp
     })
 }
 
-/// Host lowering of a predicated projection over a `Utf8` column:
-/// `Project(SELECT list) <- Filter(predicate) <- StringProject(passthrough of
-/// every referenced column)`.
+/// Host lowering of a projection over a `Utf8` column:
+/// `Project(SELECT list) <- [Filter(predicate) <-] StringProject(passthrough
+/// of every referenced column)`.
 fn lower_host_filtered_projection(
     table: &str,
     scan_schema: &Schema,
-    predicate: &Expr,
+    predicate: Option<&Expr>,
     projected: &[(String, Expr)],
 ) -> BoltResult<PhysicalPlan> {
     let mut referenced = Vec::new();
-    crate::plan::optimizer::expr_util::collect_columns(predicate, &mut referenced);
+    if let Some(p) = predicate {
+        crate::plan::optimizer::expr_util::collect_columns(p, &mut referenced);
+    }
     for (_, e) in projected {
         crate::plan::optimizer::expr_util::collect_columns(e, &mut referenced);
     }
@@ -3754,9 +3758,12 @@ fn lower_host_filtered_projection(
         outputs,
         output_schema: Schema::new(fields),
     };
-    let filtered = PhysicalPlan::Filter {
-        input: Box::new(base),
-        predicate: predicate.clone(),
+    let filtered = match predicate {
+        Some(p) => PhysicalPlan::Filter {
+            input: Box::new(base),
+            predicate: p.clone(),
+        },
+        None => base,
     };
     let mut exprs = Vec::with_capacity(projected.len());
     let mut out_fields = Vec::with_capacity(projected.len());
@@ -3899,6 +3906,26 @@ fn aggregate_needs_materialized_input(
     Ok(feeds_non_numeric && resolved.predicate.is_some())
 }
 
+/// `COUNT(*)`: the frontend's `COUNT(<non-NULL literal>)`.
+fn is_count_star(a: &AggregateExpr) -> bool {
+    matches!(a, AggregateExpr::Count(Expr::Literal(l)) if !matches!(l, Literal::Null))
+}
+
+/// A non-nullable column of `schema` to count rows through (a fixed-width
+/// one preferred), if any.
+fn non_nullable_count_column(schema: &Schema) -> Option<String> {
+    schema
+        .fields
+        .iter()
+        .find(|f| !f.nullable && f.dtype != DataType::Utf8)
+        .or_else(|| schema.fields.iter().find(|f| !f.nullable))
+        .map(|f| f.name.clone())
+}
+
+/// Name of the synthetic all-ones column [`lower_aggregate_over_input`] adds
+/// when `COUNT(*)` has no non-nullable column to count through.
+const ROW_COUNT_COLUMN: &str = "__bolt_row_count";
+
 /// The input expression an aggregate folds (`COUNT(*)` is `COUNT(1)`).
 fn aggregate_input_expr(agg: &AggregateExpr) -> &Expr {
     match agg {
@@ -3923,20 +3950,32 @@ fn lower_aggregate_over_input(
     aggregates: &[AggregateExpr],
     depth: usize,
 ) -> BoltResult<PhysicalPlan> {
-    let input_schema = input.schema()?;
+    let mut input_schema = input.schema()?;
     // The child is lowered as an explicit `SELECT <every input column>` over
     // `input`, so it yields exactly the aggregate's input columns, by name,
     // in order — the same projection path an ordinary SELECT takes. Lowering
     // `input` bare is not equivalent: a physical scan/join may carry columns
     // the (projection-pruned) logical schema does not, and a bare Filter/Scan
     // lowering rejects Utf8 outputs.
+    let mut exprs: Vec<Expr> = input_schema
+        .fields
+        .iter()
+        .map(|f| Expr::Column(f.name.clone()))
+        .collect();
+    // `COUNT(*)` with no non-nullable column to count through: project a
+    // constant non-NULL column to count instead.
+    if aggregates.iter().any(is_count_star) && non_nullable_count_column(&input_schema).is_none() {
+        exprs.push(Expr::Alias(
+            Box::new(Expr::Literal(Literal::Int64(1))),
+            ROW_COUNT_COLUMN.to_string(),
+        ));
+        input_schema
+            .fields
+            .push(Field::new(ROW_COUNT_COLUMN, DataType::Int64, false));
+    }
     let select_all = LogicalPlan::Project {
         input: Box::new(input.clone()),
-        exprs: input_schema
-            .fields
-            .iter()
-            .map(|f| Expr::Column(f.name.clone()))
-            .collect(),
+        exprs,
     };
     let child = lower_depth(&select_all, depth + 1)?;
     let table = format!("{AGGREGATE_INPUT_TABLE_PREFIX}{depth}");
@@ -4038,6 +4077,44 @@ fn lower_aggregate(
     }
     if aggregate_needs_materialized_input(input, group_by, aggregates)? {
         return lower_aggregate_over_input(input, group_by, aggregates, depth);
+    }
+    // `COUNT(*)` reaches the planner as `COUNT(<literal>)`, a computed feed
+    // that needs the aggregate pre-kernel — which cannot output a `Utf8` /
+    // `Bool` / temporal / decimal group key. Count through a non-nullable
+    // column instead (the same rows), which keeps the aggregate on the
+    // pre-kernel-free path; with no such column, bind the input with a
+    // synthetic row column (`lower_aggregate_over_input`).
+    if !group_by.is_empty() && aggregates.iter().any(is_count_star) {
+        let input_schema = input.schema()?;
+        let key_needs_passthrough = group_by.iter().any(|e| {
+            matches!(
+                e.dtype(&input_schema),
+                Ok(DataType::Utf8
+                    | DataType::Bool
+                    | DataType::Date32
+                    | DataType::Timestamp(_, _)
+                    | DataType::Decimal128(_, _))
+            )
+        });
+        if key_needs_passthrough {
+            return match non_nullable_count_column(&input_schema) {
+                Some(c) => {
+                    let counted: Vec<AggregateExpr> = aggregates
+                        .iter()
+                        .map(|a| {
+                            if is_count_star(a) {
+                                AggregateExpr::Count(Expr::Column(c.clone()))
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
+                    // `plan` keeps the original output names (`COUNT(*)`).
+                    lower_aggregate(plan, input, group_by, &counted, depth)
+                }
+                None => lower_aggregate_over_input(input, group_by, aggregates, depth),
+            };
+        }
     }
     let resolved = resolve_source(input)?;
     let table = resolved.table;

@@ -1250,6 +1250,8 @@ pub struct Engine {
     /// change), for materialized-view staleness. Catalog tables use the
     /// catalog's persisted versions instead.
     pub(crate) table_versions: RefCell<HashMap<String, u64>>,
+    /// `ANALYZE` results of tables, with the table version they describe.
+    pub(crate) analyzed: RefCell<HashMap<String, (u64, crate::storage::TableStatistics)>>,
     /// Materialized-view definitions (see `engine_views`).
     pub(crate) views: RefCell<HashMap<String, crate::exec::engine_views::ViewDef>>,
     /// Query-level memory accounting (see `crate::exec::memory`).
@@ -1258,6 +1260,10 @@ pub struct Engine {
     host_memory_budget_bytes: Option<usize>,
     /// Builder knob: spill directory (default: a per-process temp dir).
     pub(crate) spill_dir: Option<std::path::PathBuf>,
+    /// Builder knob: compact a catalog table once appends leave it with more
+    /// than this many data files (catalogs need the `storage` feature).
+    #[cfg_attr(not(feature = "storage"), allow(dead_code))]
+    pub(crate) auto_compact_files: Option<usize>,
     /// For overlay tables (no host revisions): the first column of the batch
     /// whose GPU copy is cached, so a cache hit can prove the overlay data is
     /// unchanged (`Arc` identity; holding it also rules out address reuse).
@@ -1317,6 +1323,8 @@ pub struct EngineBuilder {
     host_memory_budget_bytes: Option<usize>,
     /// Spill directory (see [`EngineBuilder::spill_dir`]).
     spill_dir: Option<std::path::PathBuf>,
+    /// Compaction policy (see [`EngineBuilder::auto_compact`]).
+    auto_compact_files: Option<usize>,
     /// Persistent catalog directory to open (see [`EngineBuilder::database`]).
     #[cfg(feature = "storage")]
     database: Option<std::path::PathBuf>,
@@ -1345,6 +1353,7 @@ impl EngineBuilder {
             disable_optimizer: false,
             host_memory_budget_bytes: None,
             spill_dir: None,
+            auto_compact_files: None,
             #[cfg(feature = "storage")]
             database: None,
             #[cfg(feature = "storage")]
@@ -1383,6 +1392,15 @@ impl EngineBuilder {
     /// counted. See [`Engine::memory_stats`].
     pub fn host_memory_budget(mut self, bytes: usize) -> Self {
         self.host_memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Compact a catalog table automatically once appends (`INSERT`, `COPY
+    /// ... FROM`, [`Engine::insert_batch`], [`Engine::ingest_stream`]) leave it
+    /// with more than `max_files` data files. Compaction keeps the table's
+    /// clustering key. Off by default (`COMPACT TABLE` runs it by hand).
+    pub fn auto_compact(mut self, max_files: usize) -> Self {
+        self.auto_compact_files = Some(max_files.max(1));
         self
     }
 
@@ -1592,12 +1610,14 @@ impl EngineBuilder {
             storage_tables: RefCell::new(HashMap::new()),
             table_versions: RefCell::new(HashMap::new()),
             views: RefCell::new(HashMap::new()),
+            analyzed: RefCell::new(HashMap::new()),
             memory: crate::exec::memory::MemoryGovernor::new(
                 self.host_memory_budget_bytes,
                 self.memory_budget_bytes,
             ),
             host_memory_budget_bytes: self.host_memory_budget_bytes,
             spill_dir: self.spill_dir.clone(),
+            auto_compact_files: self.auto_compact_files,
             overlay_uploads: RefCell::new(HashMap::new()),
             gpu_residency: RefCell::new(HashMap::new()),
             lru_tick: std::cell::Cell::new(0),

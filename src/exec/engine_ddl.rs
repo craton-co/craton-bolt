@@ -273,9 +273,26 @@ impl Engine {
             .as_slice()
         {
             ["COMPACT", "TABLE", _] => Some(
-                self.compact_table(&strip(words[2]))
+                self.compact_table(&strip(words[2]), None)
                     .map(|r| status(r as u64)),
             ),
+            ["COMPACT", "TABLE", _, "ORDER", "BY", ..] => {
+                let cols: Vec<String> = words[5..]
+                    .join(" ")
+                    .trim_matches(|c| c == '(' || c == ')')
+                    .split(',')
+                    .map(|c| c.trim().trim_matches('"').to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                Some(if cols.is_empty() {
+                    Err(BoltError::Sql(
+                        "COMPACT TABLE ... ORDER BY needs columns".into(),
+                    ))
+                } else {
+                    self.compact_table(&strip(words[2]), Some(&cols))
+                        .map(|r| status(r as u64))
+                })
+            }
             ["VACUUM"] => Some(self.vacuum(1).map(|r| status(r as u64))),
             ["VACUUM", "KEEP", n] => Some(match n.parse::<usize>() {
                 Ok(n) => self.vacuum(n).map(|r| status(r as u64)),
@@ -636,6 +653,13 @@ impl Engine {
         if let Some(cat) = self.catalog.as_mut() {
             if cat.table(name).is_some() {
                 cat.append(name, std::slice::from_ref(&aligned))?;
+                // Compaction policy: merge the table's files (keeping its
+                // clustering key) once appends have produced too many.
+                if let Some(max) = self.auto_compact_files {
+                    if cat.table(name).is_some_and(|t| t.files.len() > max) {
+                        cat.compact(name, None)?;
+                    }
+                }
                 self.register_catalog_table(name)?;
                 self.after_table_change(name)?;
                 return Ok(n);
@@ -650,6 +674,64 @@ impl Engine {
             "table '{name}' is read-only (lazy streams and registered storage tables \
              cannot be inserted into)"
         )))
+    }
+
+    /// Append `batch` to table `name`, matching columns by position and
+    /// casting to the column types. An in-memory table grows in place; a
+    /// catalog table gets one new immutable data file and a new snapshot.
+    /// Returns the number of rows stored.
+    ///
+    /// # Errors
+    /// The column count differs, a value cannot be cast, a `NOT NULL` column
+    /// would receive NULLs, or the table is read-only (lazy stream, external
+    /// or registered storage table, materialized view).
+    pub fn insert_batch(&mut self, name: &str, batch: RecordBatch) -> BoltResult<u64> {
+        self.insert_rows(name, &batch, &[])
+    }
+
+    /// Append a stream of batches to table `name`, buffering up to
+    /// `flush_rows` rows per commit: a catalog table gets one data file (and
+    /// one snapshot) per flush instead of one per batch. Returns the number
+    /// of rows stored.
+    ///
+    /// Each flush commits on its own: if the stream yields an error, the
+    /// rows already flushed stay in the table and the error is returned.
+    pub fn ingest_stream<I>(&mut self, name: &str, batches: I, flush_rows: usize) -> BoltResult<u64>
+    where
+        I: IntoIterator<Item = BoltResult<RecordBatch>>,
+    {
+        let flush_rows = flush_rows.max(1);
+        let mut pending: Vec<RecordBatch> = Vec::new();
+        let mut pending_rows = 0usize;
+        let mut stored = 0u64;
+        let flush = |engine: &mut Engine, pending: &mut Vec<RecordBatch>| -> BoltResult<u64> {
+            if pending.is_empty() {
+                return Ok(0);
+            }
+            let schema = pending[0].schema();
+            let rows = concat_or_empty(schema, pending)?;
+            pending.clear();
+            engine.insert_rows(name, &rows, &[])
+        };
+        for batch in batches {
+            let batch = batch?;
+            if let Some(first) = pending.first() {
+                if first.schema() != batch.schema() {
+                    // A schema change starts a new buffer (each is aligned
+                    // to the table on its own).
+                    stored += flush(self, &mut pending)?;
+                    pending_rows = 0;
+                }
+            }
+            pending_rows += batch.num_rows();
+            pending.push(batch);
+            if pending_rows >= flush_rows {
+                stored += flush(self, &mut pending)?;
+                pending_rows = 0;
+            }
+        }
+        stored += flush(self, &mut pending)?;
+        Ok(stored)
     }
 
     /// Remove table `name` from the engine, whatever kind it is. With a
@@ -677,6 +759,7 @@ impl Engine {
         self.gpu_tables.borrow_mut().remove(name);
         self.overlay_uploads.borrow_mut().remove(name);
         self.gpu_residency.borrow_mut().remove(name);
+        self.analyzed.borrow_mut().remove(name);
         self.dict_registry.get_mut().unregister_table(name);
         self.provider.unregister_table(name);
         self.forget_host_revisions(name);
@@ -716,6 +799,12 @@ impl Engine {
             if cat.table(name).is_some() && !cat.is_read_only() {
                 cat.set_statistics(name, stats.clone())?;
             }
+        }
+        // Valid until the table's data next changes; feeds the optimizer.
+        if let Some(v) = self.table_version(name) {
+            self.analyzed
+                .borrow_mut()
+                .insert(name.to_string(), (v, stats.clone()));
         }
         let schema = self.table_arrow_schema(name)?;
         let render =
@@ -822,17 +911,23 @@ impl Engine {
         Ok(QueryHandle::from_record_batch(batch))
     }
 
-    /// Rewrite a catalog table's data files into as few as possible.
-    /// Returns the file count afterwards.
-    pub fn compact_table(&mut self, name: &str) -> BoltResult<usize> {
+    /// Rewrite a catalog table's data files into as few as possible —
+    /// sorted on `cluster_by` (recorded as the table's clustering key), or on
+    /// its recorded key when `None`. Returns the file count afterwards.
+    pub fn compact_table(
+        &mut self,
+        name: &str,
+        cluster_by: Option<&[String]>,
+    ) -> BoltResult<usize> {
         #[cfg(feature = "storage")]
         if let Some(cat) = self.catalog.as_mut() {
             if cat.table(name).is_some() {
-                let r = cat.compact(name)?;
+                let r = cat.compact(name, cluster_by)?;
                 self.register_catalog_table(name)?;
                 return Ok(r.files_after);
             }
         }
+        let _ = cluster_by;
         Err(BoltError::Plan(format!(
             "COMPACT: '{name}' is not a catalog table"
         )))

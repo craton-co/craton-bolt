@@ -85,6 +85,17 @@ use crate::exec::Engine;
 /// stay poisoned for the life of the process.)
 pub(crate) type SharedEngine = Arc<Mutex<Engine>>;
 
+/// What a [`FlightSqlServer`] executes queries on.
+#[derive(Clone)]
+pub(crate) enum Backend {
+    /// One engine behind a mutex; each query blocks a tonic worker while it
+    /// holds the lock.
+    Engine(SharedEngine),
+    /// A shared runtime: queries are queued to its runtime thread through a
+    /// read-only session and awaited, so tonic workers are never blocked.
+    Database(crate::exec::session::Session),
+}
+
 pub mod server;
 
 // Sibling-agent-owned modules. Declared here so the server can route into
@@ -145,9 +156,8 @@ impl Default for FlightSqlConfig {
 /// TLS, no per-user identity, no execution timeout).
 #[derive(Clone)]
 pub struct FlightSqlServer {
-    /// Shared, mutex-guarded query engine. `Arc` so the handle is cheap to
-    /// clone into each tonic request task.
-    pub(crate) engine: SharedEngine,
+    /// Where queries execute. Cheap to clone into each tonic request task.
+    pub(crate) backend: Backend,
     /// Resource limits applied to every query result.
     pub(crate) config: FlightSqlConfig,
     /// Optional shared bearer token. When `Some`, every RPC must present a
@@ -167,7 +177,22 @@ impl FlightSqlServer {
     /// Wrap a pre-shared engine handle (e.g. one shared with other subsystems).
     pub fn from_shared(engine: SharedEngine) -> Self {
         Self {
-            engine,
+            backend: Backend::Engine(engine),
+            config: FlightSqlConfig::default(),
+            bearer_token: None,
+        }
+    }
+
+    /// Serve a [`Database`](crate::Database): queries are submitted to its
+    /// shared runtime through a read-only session and awaited, so concurrent
+    /// clients queue on the runtime instead of blocking tonic worker threads,
+    /// and other [`Session`](crate::Session)s of the same database keep
+    /// working alongside the Flight endpoint.
+    pub fn from_database(db: &crate::exec::session::Database) -> Self {
+        let session = db.session();
+        session.set_read_only(true);
+        Self {
+            backend: Backend::Database(session),
             config: FlightSqlConfig::default(),
             bearer_token: None,
         }
@@ -195,14 +220,32 @@ impl FlightSqlServer {
         self
     }
 
-    /// Borrow the shared engine handle.
-    pub(crate) fn engine(&self) -> &SharedEngine {
-        &self.engine
+    /// Execute a Flight SQL command on the backend.
+    pub(crate) async fn execute(&self, cmd: &[u8]) -> Result<SqlCommandResult, tonic::Status> {
+        match &self.backend {
+            Backend::Engine(e) => sql::execute_flight_command(e, cmd, &self.config),
+            Backend::Database(s) => sql::execute_flight_command_on(s, cmd, &self.config).await,
+        }
     }
 
-    /// Borrow the resource limits.
-    pub(crate) fn config(&self) -> &FlightSqlConfig {
-        &self.config
+    /// Result schema of a Flight SQL command.
+    pub(crate) async fn schema(
+        &self,
+        cmd: &[u8],
+    ) -> Result<arrow_schema::SchemaRef, tonic::Status> {
+        match &self.backend {
+            Backend::Engine(e) => sql::schema_for_command(e, cmd),
+            Backend::Database(s) => Ok(sql::execute_flight_command_on(
+                s,
+                cmd,
+                &FlightSqlConfig {
+                    max_result_rows: None,
+                    max_result_bytes: None,
+                },
+            )
+            .await?
+            .schema),
+        }
     }
 
     /// Validate the `authorization` metadata of an incoming request against the

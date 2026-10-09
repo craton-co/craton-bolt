@@ -425,10 +425,12 @@ pub mod craton_bolt::exec::engine
 #[non_exhaustive] pub struct craton_bolt::exec::engine::Engine
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::analyze_table(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str) -> craton_bolt::BoltResult<usize>
+pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str, core::option::Option<&[alloc::string::String]>) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::ingest_stream<I>(&mut self, &str, I, usize) -> craton_bolt::BoltResult<u64> where I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
+pub fn craton_bolt::exec::engine::Engine::insert_batch(&mut self, &str, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::vacuum(&mut self, usize) -> craton_bolt::BoltResult<usize>
 impl craton_bolt::exec::engine::Engine
@@ -472,6 +474,7 @@ pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bo
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::exec::engine::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
+pub fn craton_bolt::exec::engine::EngineBuilder::auto_compact(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
 pub fn craton_bolt::exec::engine::EngineBuilder::database(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::database_snapshot(self, impl core::convert::Into<std::path::PathBuf>, u64) -> Self
@@ -1084,10 +1087,12 @@ pub fn craton_bolt::exec::streaming::BatchStream<'a>::total_rows(&self) -> usize
 #[non_exhaustive] pub struct craton_bolt::exec::Engine
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::analyze_table(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str) -> craton_bolt::BoltResult<usize>
+pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str, core::option::Option<&[alloc::string::String]>) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::ingest_stream<I>(&mut self, &str, I, usize) -> craton_bolt::BoltResult<u64> where I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
+pub fn craton_bolt::exec::engine::Engine::insert_batch(&mut self, &str, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::vacuum(&mut self, usize) -> craton_bolt::BoltResult<usize>
 impl craton_bolt::exec::engine::Engine
@@ -1131,6 +1136,7 @@ pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bo
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::exec::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
+pub fn craton_bolt::exec::engine::EngineBuilder::auto_compact(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
 pub fn craton_bolt::exec::engine::EngineBuilder::database(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::database_snapshot(self, impl core::convert::Into<std::path::PathBuf>, u64) -> Self
@@ -2795,7 +2801,7 @@ pub craton_bolt::storage::catalog::TableKind::Managed
 pub struct craton_bolt::storage::catalog::Catalog
 impl craton_bolt::storage::catalog::Catalog
 pub fn craton_bolt::storage::catalog::Catalog::append(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
-pub fn craton_bolt::storage::catalog::Catalog::compact(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::CompactReport>
+pub fn craton_bolt::storage::catalog::Catalog::compact(&mut self, &str, core::option::Option<&[alloc::string::String]>) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::CompactReport>
 pub fn craton_bolt::storage::catalog::Catalog::create_external_table(&mut self, &str, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::storage::catalog::Catalog::create_table(&mut self, &str, &craton_bolt::plan::logical_plan::Schema, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::storage::catalog::Catalog::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
@@ -2835,6 +2841,7 @@ pub craton_bolt::storage::catalog::Manifest::version: u64
 pub craton_bolt::storage::catalog::Manifest::views: alloc::collections::btree::map::BTreeMap<alloc::string::String, craton_bolt::storage::catalog::ViewMeta>
 pub struct craton_bolt::storage::catalog::TableMeta
 pub craton_bolt::storage::catalog::TableMeta::analyzed: core::option::Option<craton_bolt::storage::stats::TableStatistics>
+pub craton_bolt::storage::catalog::TableMeta::cluster_by: alloc::vec::Vec<alloc::string::String>
 pub craton_bolt::storage::catalog::TableMeta::columns: alloc::vec::Vec<craton_bolt::storage::catalog::ColumnMeta>
 pub craton_bolt::storage::catalog::TableMeta::files: alloc::vec::Vec<craton_bolt::storage::catalog::DataFile>
 pub craton_bolt::storage::catalog::TableMeta::id: u64
@@ -2861,6 +2868,7 @@ pub fn craton_bolt::storage::parquet::ParquetTable::arrow_schema(&self) -> &arro
 pub fn craton_bolt::storage::parquet::ParquetTable::files(&self) -> alloc::vec::Vec<&std::path::Path>
 pub fn craton_bolt::storage::parquet::ParquetTable::from_files(&[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::storage::parquet::ParquetTable::open(impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::parquet::ParquetTable::partition_columns(&self) -> alloc::vec::Vec<&str>
 pub fn craton_bolt::storage::parquet::ParquetTable::skipped_columns(&self) -> &[alloc::string::String]
 pub fn craton_bolt::storage::parquet::ParquetTable::with_schema(arrow_schema::schema::SchemaRef, &[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
 impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::parquet::ParquetTable
@@ -3000,7 +3008,7 @@ pub craton_bolt::storage::RefreshPolicy::OnCommit
 pub struct craton_bolt::storage::Catalog
 impl craton_bolt::storage::catalog::Catalog
 pub fn craton_bolt::storage::catalog::Catalog::append(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
-pub fn craton_bolt::storage::catalog::Catalog::compact(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::CompactReport>
+pub fn craton_bolt::storage::catalog::Catalog::compact(&mut self, &str, core::option::Option<&[alloc::string::String]>) -> craton_bolt::BoltResult<craton_bolt::storage::catalog::CompactReport>
 pub fn craton_bolt::storage::catalog::Catalog::create_external_table(&mut self, &str, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::storage::catalog::Catalog::create_table(&mut self, &str, &craton_bolt::plan::logical_plan::Schema, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::storage::catalog::Catalog::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
@@ -3044,6 +3052,7 @@ pub fn craton_bolt::storage::parquet::ParquetTable::arrow_schema(&self) -> &arro
 pub fn craton_bolt::storage::parquet::ParquetTable::files(&self) -> alloc::vec::Vec<&std::path::Path>
 pub fn craton_bolt::storage::parquet::ParquetTable::from_files(&[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::storage::parquet::ParquetTable::open(impl core::convert::AsRef<std::path::Path>) -> craton_bolt::BoltResult<Self>
+pub fn craton_bolt::storage::parquet::ParquetTable::partition_columns(&self) -> alloc::vec::Vec<&str>
 pub fn craton_bolt::storage::parquet::ParquetTable::skipped_columns(&self) -> &[alloc::string::String]
 pub fn craton_bolt::storage::parquet::ParquetTable::with_schema(arrow_schema::schema::SchemaRef, &[std::path::PathBuf]) -> craton_bolt::BoltResult<Self>
 impl craton_bolt::storage::table::StorageTable for craton_bolt::storage::parquet::ParquetTable
@@ -3337,10 +3346,12 @@ pub craton_bolt::DatabaseStats::total_queue_wait: core::time::Duration
 #[non_exhaustive] pub struct craton_bolt::Engine
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::analyze_table(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
-pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str) -> craton_bolt::BoltResult<usize>
+pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str, core::option::Option<&[alloc::string::String]>) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::ingest_stream<I>(&mut self, &str, I, usize) -> craton_bolt::BoltResult<u64> where I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
+pub fn craton_bolt::exec::engine::Engine::insert_batch(&mut self, &str, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::vacuum(&mut self, usize) -> craton_bolt::BoltResult<usize>
 impl craton_bolt::exec::engine::Engine
@@ -3384,6 +3395,7 @@ pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bo
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 #[non_exhaustive] pub struct craton_bolt::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
+pub fn craton_bolt::exec::engine::EngineBuilder::auto_compact(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::build(self) -> craton_bolt::BoltResult<craton_bolt::exec::engine::Engine>
 pub fn craton_bolt::exec::engine::EngineBuilder::database(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::database_snapshot(self, impl core::convert::Into<std::path::PathBuf>, u64) -> Self

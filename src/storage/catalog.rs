@@ -98,6 +98,10 @@ pub struct TableMeta {
     /// Statistics recorded by `ANALYZE` (exact distinct estimates).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzed: Option<TableStatistics>,
+    /// Clustering key: [`Catalog::compact`] rewrites the table sorted on
+    /// these columns, which tightens every row group's zone map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_by: Vec<String>,
 }
 
 impl TableMeta {
@@ -401,6 +405,7 @@ impl Catalog {
                 files,
                 table_version: 1,
                 analyzed: None,
+                cluster_by: Vec::new(),
             },
         );
         self.commit(next)
@@ -441,6 +446,7 @@ impl Catalog {
                 files: Vec::new(),
                 table_version: 1,
                 analyzed: None,
+                cluster_by: Vec::new(),
             },
         );
         self.commit(next)
@@ -506,9 +512,15 @@ impl Catalog {
     }
 
     /// Rewrite managed table `name`'s data files into as few files as the
-    /// write options allow (sorted reading order preserved). The row data is
+    /// write options allow. With a clustering key (`cluster_by`, or the
+    /// table's recorded one when `None`), the rows are rewritten sorted on it
+    /// and the key is recorded for later compactions. The row data is
     /// unchanged, so `table_version` is not bumped.
-    pub fn compact(&mut self, name: &str) -> BoltResult<CompactReport> {
+    pub fn compact(
+        &mut self,
+        name: &str,
+        cluster_by: Option<&[String]>,
+    ) -> BoltResult<CompactReport> {
         self.writable()?;
         let meta = self.require(name)?.clone();
         if !matches!(meta.kind, TableKind::Managed) {
@@ -516,8 +528,12 @@ impl Catalog {
                 "table '{name}' is external and read-only"
             )));
         }
+        let key: Vec<String> = cluster_by
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(|| meta.cluster_by.clone());
         let before = meta.files.len();
-        if before <= 1 {
+        let resort = cluster_by.is_some() && !key.is_empty();
+        if before <= 1 && !resort {
             return Ok(CompactReport {
                 files_before: before,
                 files_after: before,
@@ -525,12 +541,17 @@ impl Catalog {
         }
         let table = self.open_table(name)?;
         let all = table.plan_scan(&crate::storage::ScanRequest::full());
-        let batches: Vec<RecordBatch> = table.read(&all)?.collect::<BoltResult<_>>()?;
+        let mut batches: Vec<RecordBatch> = table.read(&all)?.collect::<BoltResult<_>>()?;
+        if !key.is_empty() && !batches.is_empty() {
+            batches = vec![sort_batches(&batches, &key)?];
+        }
         let mut next = self.manifest.clone();
         let version = next.version + 1;
         let files = self.write_files(meta.id, version, &batches)?;
         let after = files.len();
-        next.tables.get_mut(name).expect("checked").files = files;
+        let t = next.tables.get_mut(name).expect("checked");
+        t.files = files;
+        t.cluster_by = key;
         self.commit(next)?;
         Ok(CompactReport {
             files_before: before,
@@ -674,6 +695,38 @@ impl Catalog {
         self.manifest = next;
         Ok(())
     }
+}
+
+/// Concatenate `batches` and sort the rows on the `key` columns (ascending,
+/// NULLs last).
+fn sort_batches(batches: &[RecordBatch], key: &[String]) -> BoltResult<RecordBatch> {
+    let schema = batches[0].schema();
+    let all = arrow::compute::concat_batches(&schema, batches)
+        .map_err(|e| io_err("clustering: concatenating", e))?;
+    let columns = key
+        .iter()
+        .map(|k| {
+            let i = schema.index_of(k).map_err(|_| {
+                BoltError::Plan(format!("clustering key column '{k}' does not exist"))
+            })?;
+            Ok(arrow::compute::SortColumn {
+                values: std::sync::Arc::clone(all.column(i)),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            })
+        })
+        .collect::<BoltResult<Vec<_>>>()?;
+    let idx = arrow::compute::lexsort_to_indices(&columns, None)
+        .map_err(|e| io_err("clustering: sorting", e))?;
+    let cols = all
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &idx, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io_err("clustering: reordering", e))?;
+    RecordBatch::try_new(schema, cols).map_err(|e| io_err("clustering", e))
 }
 
 fn manifest_path(root: &Path, version: u64) -> PathBuf {
@@ -869,7 +922,7 @@ mod tests {
         let old = Catalog::open_snapshot(&r, 1).unwrap();
         assert!(old.is_read_only());
         assert_eq!(rows(&old, "t"), 10);
-        let rep = c.compact("t").unwrap();
+        let rep = c.compact("t", None).unwrap();
         assert_eq!((rep.files_before, rep.files_after), (2, 1));
         assert_eq!(rows(&c, "t"), 15);
         c.drop_table("t").unwrap();
@@ -897,6 +950,56 @@ mod tests {
         c.set_statistics("e", TableStatistics::default()).unwrap();
         assert!(c.table("e").unwrap().analyzed.is_some());
         assert!(c.create_table("e", &schema(), &[]).is_err());
+        drop(c);
+        fs::remove_dir_all(&r).ok();
+    }
+
+    #[test]
+    fn clustered_compaction_tightens_zone_maps() {
+        let r = root("cluster");
+        let mut c = Catalog::open(&r).unwrap();
+        c.set_write_options(ParquetWriteOptions {
+            row_group_rows: 100,
+            ..Default::default()
+        });
+        // Two appends of interleaved keys: every row group spans everything.
+        let interleaved = |odd: bool| {
+            let k: Vec<i64> = (0..500).map(|i| i * 2 + odd as i64).collect();
+            let s: Vec<String> = k.iter().map(|v| format!("s{v}")).collect();
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("k", ArrowDataType::Int64, false),
+                    ArrowField::new("s", ArrowDataType::Utf8, true),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(k)),
+                    Arc::new(StringArray::from(s)),
+                ],
+            )
+            .unwrap()
+        };
+        c.create_table("t", &schema(), &[interleaved(false)])
+            .unwrap();
+        c.append("t", &[interleaved(true)]).unwrap();
+        c.compact("t", Some(&["k".to_string()])).unwrap();
+        assert_eq!(c.table("t").unwrap().cluster_by, vec!["k".to_string()]);
+        let t = c.open_table("t").unwrap();
+        assert_eq!(t.chunk_count(), 10);
+        let mut prev_max = -1i64;
+        for i in 0..t.chunk_count() {
+            let s = &t.chunk_statistics(i).columns[0];
+            let (
+                Some(crate::plan::logical_plan::Literal::Int64(lo)),
+                Some(crate::plan::logical_plan::Literal::Int64(hi)),
+            ) = (s.min.clone(), s.max.clone())
+            else {
+                panic!("bounds")
+            };
+            assert!(lo > prev_max, "row groups are disjoint after clustering");
+            assert_eq!(hi - lo, 99);
+            prev_max = hi;
+        }
+        assert_eq!(rows(&c, "t"), 1000);
         drop(c);
         fs::remove_dir_all(&r).ok();
     }

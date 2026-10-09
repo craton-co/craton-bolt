@@ -176,7 +176,10 @@ let r = engine.last_scan("events").unwrap();   // chunks_total / chunks_read / r
 ```
 
 A later statement whose needs are covered by what is already loaded reuses
-it (GPU copy included). Any type implementing `storage::StorageTable` —
+it (GPU copy included). A Hive-style directory (`region=eu/day=3/part.parquet`)
+adds `region` / `day` partition columns, and filters on them skip whole
+partitions without opening their files. `explain_sql` shows what a statement
+would read (`Storage scans:`). Any type implementing `storage::StorageTable` —
 chunks plus per-chunk `TableStatistics` — registers the same way via
 `register_storage_table`; `storage::MemoryTable` is an in-memory example.
 `Engine::table_statistics(name)` returns row count, size and per-column
@@ -214,8 +217,17 @@ let old = Engine::builder().database_snapshot("/var/lib/bolt/warehouse", v - 1).
 ```
 
 Each statement commits on its own (append-only; no `UPDATE` / `DELETE`).
-`COMPACT TABLE t` merges a table's files; `VACUUM [KEEP n]` deletes old
-snapshots and unreferenced files. `CREATE TEMP TABLE` stays in memory even
+`COMPACT TABLE t` merges a table's files — `COMPACT TABLE t ORDER BY (day,
+region)` also sorts it on a clustering key, so each row group covers a narrow
+key range and range filters prune most of it; `VACUUM [KEEP n]` deletes old
+snapshots and unreferenced files. `ANALYZE t` records exact column
+statistics that the optimizer uses for join ordering.
+
+From Rust, `engine.insert_batch("t", batch)` appends one batch (positional,
+cast to the column types), and `engine.ingest_stream("t", batches, 100_000)`
+buffers a batch stream into one data file per 100 000 rows — the
+streaming-ingest path. `Engine::builder().auto_compact(16)` compacts a table
+automatically once appends leave it with more than 16 files. `CREATE TEMP TABLE` stays in memory even
 with a catalog attached. One engine writes a catalog at a time.
 
 **Materialized views.**
@@ -279,6 +291,11 @@ db.with_engine(|e| e.table_names())?;                          // non-SQL engine
 Statements run one at a time in arrival order on the shared GPU runtime;
 dropping a `PendingResult` before its statement starts cancels it, and a
 panic fails only its own statement. `Database::stats()` reports queue waits.
+
+With the `flight` feature, `FlightSqlServer::from_database(&db)` serves the
+same database over Arrow Flight SQL: client queries go through a read-only
+session and are awaited, so concurrent clients queue on the runtime instead
+of blocking server threads, while other sessions keep writing.
 
 ---
 

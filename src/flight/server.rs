@@ -35,7 +35,7 @@ use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::flight::{encode, sql, FlightSqlServer};
+use crate::flight::{encode, FlightSqlServer};
 
 /// Boxed, `Send`-able server stream alias — every Flight RPC returns one of
 /// these (over a different item type).
@@ -129,7 +129,7 @@ impl FlightService for FlightSqlServer {
         // schema only and report the row/byte totals as "unknown" (-1), which
         // is valid Flight SQL. The single materialisation happens once, in
         // `do_get`.
-        let schema = sql::schema_for_command(self.engine(), &cmd)?;
+        let schema = self.schema(&cmd).await?;
 
         // The ticket carries the command bytes verbatim so `do_get` can map it
         // back to the same result set.
@@ -169,7 +169,7 @@ impl FlightService for FlightSqlServer {
         let descriptor = request.into_inner();
         let cmd = command_bytes(&descriptor)?;
 
-        let schema = sql::schema_for_command(self.engine(), &cmd)?;
+        let schema = self.schema(&cmd).await?;
         let ipc = encode::schema_to_ipc_bytes(schema.as_ref())?;
         Ok(Response::new(SchemaResult { schema: ipc }))
     }
@@ -186,7 +186,7 @@ impl FlightService for FlightSqlServer {
         let ticket = request.into_inner();
         let cmd = ticket.ticket;
 
-        let result = sql::execute_flight_command(self.engine(), &cmd, self.config())?;
+        let result = self.execute(&cmd).await?;
         let flight_stream: BoxStream<'static, Result<FlightData, Status>> =
             encode::batches_to_flight_stream(result);
 
