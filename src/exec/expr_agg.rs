@@ -996,10 +996,12 @@ fn civil_to_ticks(p: &CivilDateTime, unit: TimeUnit) -> Option<i64> {
 
 /// Evaluate a string scalar function host-side.
 ///
-/// Currently wired: `SUBSTRING` (`ScalarFnKind::Substring`) and `TRIM`
-/// (`ScalarFnKind::Trim{Both,Leading,Trailing}`). UPPER/LOWER/LENGTH have
-/// dedicated GPU producers and CONCAT is lowered to `BinaryOp::Concat`; if one
-/// of those reaches here, lowering was bypassed and we surface a `Plan` error.
+/// Every [`ScalarFnKind`] is evaluated here. UPPER / LOWER / LENGTH / CONCAT
+/// also have dedicated (GPU) producers for a bare-column `SELECT`; they reach
+/// this host evaluator when they sit in a shape those producers do not take
+/// (next to a computed column, over a computed argument, under a filter).
+/// Semantics match the producers: LENGTH counts characters, UPPER / LOWER
+/// fold Unicode case, CONCAT is NULL if any argument is NULL.
 ///
 /// All operands are evaluated to per-row columns so column-valued arguments
 /// (e.g. `SUBSTRING(s, start_col, len_col)`) work uniformly with the common
@@ -1163,13 +1165,46 @@ fn eval_scalar_fn(
             let out = s.iter().map(|c| c.as_deref().map(initcap_str)).collect();
             Ok(HostColumn::Utf8(out))
         }
-        // These never legitimately reach the host evaluator (see fn docs).
-        ScalarFnKind::Upper | ScalarFnKind::Lower | ScalarFnKind::Length | ScalarFnKind::Concat => {
-            Err(BoltError::Plan(format!(
-                "expr_agg: string scalar function {} is not evaluated host-side; \
-             it has a dedicated lowering path",
-                kind.sql_name()
-            )))
+        ScalarFnKind::Upper | ScalarFnKind::Lower => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, kind.sql_name())?;
+            let upper = matches!(kind, ScalarFnKind::Upper);
+            let out = s
+                .iter()
+                .map(|c| {
+                    c.as_deref().map(|v| {
+                        if upper {
+                            v.to_uppercase()
+                        } else {
+                            v.to_lowercase()
+                        }
+                    })
+                })
+                .collect();
+            Ok(HostColumn::Utf8(out))
+        }
+        ScalarFnKind::Length => {
+            let s = eval_utf8_arg(&args[0], env, n_rows, "LENGTH")?;
+            let out = s
+                .iter()
+                .map(|c| c.as_deref().map(|v| v.chars().count() as i64))
+                .collect();
+            Ok(HostColumn::I64(out))
+        }
+        ScalarFnKind::Concat => {
+            let cols = args
+                .iter()
+                .map(|a| eval_utf8_arg(a, env, n_rows, "CONCAT"))
+                .collect::<BoltResult<Vec<_>>>()?;
+            let out = (0..n_rows)
+                .map(|i| {
+                    let mut acc = String::new();
+                    for c in &cols {
+                        acc.push_str(c[i].as_deref()?);
+                    }
+                    Some(acc)
+                })
+                .collect();
+            Ok(HostColumn::Utf8(out))
         }
     }
 }
