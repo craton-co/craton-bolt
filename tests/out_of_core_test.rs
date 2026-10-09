@@ -104,6 +104,17 @@ fn partitioned_group_by_is_exact() {
     e.register_table("fact", fact(N)).unwrap();
     e.register_table("dim", dim()).unwrap();
     let before = e.memory_stats();
+    let plan = e
+        .explain_sql("SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM fact GROUP BY g ORDER BY g")
+        .unwrap();
+    assert!(
+        plan.contains("Execution: out of core — partitioned GROUP BY on 'fact' (g)"),
+        "{plan}"
+    );
+    assert_eq!(
+        e.memory_stats().out_of_core_statements,
+        before.out_of_core_statements
+    );
 
     let out = e
         .sql("SELECT g, SUM(v) AS sv, COUNT(*) AS n FROM fact GROUP BY g ORDER BY g")
@@ -147,6 +158,13 @@ fn grace_join_matches_in_memory_semantics() {
     e.register_table("a", fact(N)).unwrap();
     e.register_table("b", fact2(N)).unwrap();
     let ooc = e.memory_stats().out_of_core_statements;
+    let plan = e
+        .explain_sql("SELECT COUNT(*) FROM a JOIN b ON a.k = b.k2")
+        .unwrap();
+    assert!(
+        plan.contains("grace hash join of 'a' (k) with 'b' (k2)"),
+        "{plan}"
+    );
     let inner = e
         .sql("SELECT COUNT(*) AS n, SUM(b.tag) AS t FROM a JOIN b ON a.k = b.k2")
         .unwrap()
@@ -187,6 +205,13 @@ fn distinct_and_external_sort() {
     let expect: BTreeSet<(i64, i64)> = (0..N).map(|k| (k % 97, k % 13)).collect();
     assert_eq!(d.num_rows(), expect.len());
 
+    let plan = e
+        .explain_sql("SELECT k, v FROM fact WHERE v < 10 ORDER BY v DESC, k LIMIT 5")
+        .unwrap();
+    assert!(
+        plan.contains("external sort of 'fact'") && plan.contains("(top-k runs)"),
+        "{plan}"
+    );
     let top = e
         .sql("SELECT k, v FROM fact WHERE v < 10 ORDER BY v DESC, k LIMIT 5")
         .unwrap()

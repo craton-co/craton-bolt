@@ -5,6 +5,15 @@ All notable changes to this project will be documented here. The format follows 
 ## [Unreleased]
 
 ### Fixed
+- **`COUNT(*)` grouped by a string (or temporal / decimal / boolean) key
+  failed** with "Bool/Utf8 in pre outputs not yet supported": the literal
+  feed forced the aggregate pre-kernel, which cannot carry such a key. It now
+  counts through a non-nullable column, or binds the input with a synthetic
+  row column.
+- **A `Utf8` column projected next to a computed column failed** (`SELECT
+  name, price * 2 FROM t` → "Utf8 not supported in PTX codegen yet"); such
+  projections now evaluate on the host over a passthrough of the columns
+  they read, as predicated ones already did.
 - **Lazy and storage tables re-uploaded to the GPU on every query.** Overlay
   tables carry no host revisions, so `ensure_gpu_table` never took its cache
   hit for them; the cached copy is now reused while the overlay holds the
@@ -84,6 +93,22 @@ All notable changes to this project will be documented here. The format follows 
   [LIMIT]` run on spilled hash partitions / sorted runs with the ordinary GPU
   operators. `Counter::SpillFilesWritten` / `SpillBytesWritten` /
   `StorageChunksRead` / `StorageChunksPruned`.
+- **Hive partitioning, clustering, statistics-driven selectivity.**
+  `ParquetTable::open` on a `key=value` directory tree adds partition columns
+  pruned like any zone map; `COMPACT TABLE t ORDER BY (cols)` /
+  `Engine::compact_table(name, Some(cols))` sorts a catalog table on a
+  recorded clustering key; storage statistics and `ANALYZE` results refine
+  the optimizer's filter / join selectivity.
+- **Streaming ingestion and a compaction policy.** `Engine::insert_batch`
+  (positional, cast, catalog-aware) and `Engine::ingest_stream` (buffers a
+  batch stream into one immutable file per flush); `EngineBuilder::auto_compact
+  (max_files)` compacts a catalog table once appends exceed the threshold.
+- **Flight SQL over a shared `Database`.** `FlightSqlServer::from_database`
+  answers through a read-only session and awaits results, so concurrent
+  clients no longer block tonic worker threads on an engine mutex.
+- **`EXPLAIN` shows data access and memory decisions**: a `Storage scans:`
+  section (chunks / columns each storage table would read) and the
+  out-of-core strategy a statement would use.
 - **Sessions.** `Database` owns the engine on a runtime thread; cloneable
   `Session`s submit from any thread (`sql`, `submit` → `PendingResult` with
   `wait` / `Future` / cancel-on-drop, `try_submit`), read-only sessions,

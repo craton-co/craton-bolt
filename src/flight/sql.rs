@@ -276,6 +276,27 @@ pub fn execute_flight_command(
     })
 }
 
+/// [`execute_flight_command`] against a [`Session`](crate::Session) of a
+/// shared [`Database`](crate::Database): the statement is queued to the
+/// database's runtime thread and awaited (no thread blocks while it runs).
+/// Use a read-only session for client-facing endpoints.
+pub async fn execute_flight_command_on(
+    session: &crate::exec::session::Session,
+    cmd: &[u8],
+    config: &FlightSqlConfig,
+) -> Result<SqlCommandResult, Status> {
+    let command = decode_command(cmd)?;
+    let sql = statement_sql(command)?;
+    let batch = session.submit(&sql).await.map_err(bolt_err_to_status)?;
+    enforce_result_caps(&batch, config)?;
+    let schema = batch.schema();
+    Ok(SqlCommandResult {
+        schema,
+        batches: vec![batch],
+        ticket_cmd: bytes::Bytes::copy_from_slice(cmd),
+    })
+}
+
 /// Decode a Flight SQL command and recover just its result [`SchemaRef`].
 ///
 /// There is no cheap "plan-only, get schema" entry point on the engine today,

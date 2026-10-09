@@ -321,6 +321,34 @@ fn concat(schema: Option<SchemaRef>, batches: &[RecordBatch]) -> BoltResult<Opti
         .map_err(|e| BoltError::Other(format!("out-of-core: concatenating results: {e}")))
 }
 
+/// A qualifying partitioned GROUP BY / DISTINCT.
+struct GroupPlan {
+    table: String,
+    keys: Vec<String>,
+    est: usize,
+}
+
+/// A qualifying grace hash join.
+struct JoinPlan {
+    a: String,
+    b: String,
+    keys_a: Vec<String>,
+    keys_b: Vec<String>,
+    est: usize,
+}
+
+/// A qualifying external sort.
+struct SortPlan<'p> {
+    limit: Option<(usize, usize)>,
+    input: &'p LogicalPlan,
+    sort_exprs: &'p [crate::plan::logical_plan::SortExpr],
+    table: String,
+    est: usize,
+    out_schema: Schema,
+    keys: Vec<(usize, SortOptions)>,
+    run_rows: usize,
+}
+
 impl Engine {
     /// Effective out-of-core threshold: the smaller configured budget.
     fn ooc_budget(&self) -> Option<usize> {
@@ -456,54 +484,14 @@ impl Engine {
         eph: &Ephemeral<'_>,
         depth: usize,
     ) -> BoltResult<Option<LogicalPlan>> {
-        let (input, keys, all_streamable): (&LogicalPlan, Vec<String>, bool) = match node {
-            LogicalPlan::Aggregate {
-                input,
-                group_by,
-                aggregates,
-            } => {
-                let keys: Option<Vec<String>> = group_by
-                    .iter()
-                    .map(|e| column_name(e).map(str::to_string))
-                    .collect();
-                match keys {
-                    Some(k) if !k.is_empty() => (input, k, aggregates.iter().all(streamable)),
-                    _ => return Ok(None),
-                }
-            }
-            LogicalPlan::Distinct { input } => {
-                let keys = input.schema()?.fields.into_iter().map(|f| f.name).collect();
-                (input, keys, false)
-            }
-            _ => return Ok(None),
-        };
-        let Some(resolved) = keys
-            .iter()
-            .map(|k| resolve_base_column(input, k, true))
-            .collect::<Option<Vec<(String, String)>>>()
+        let Some(GroupPlan {
+            table,
+            keys: key_cols,
+            est,
+        }) = self.qualify_group(node, budget)?
         else {
             return Ok(None);
         };
-        let table = resolved[0].0.clone();
-        if resolved.iter().any(|(t, _)| *t != table) || count_scans(node, &table) != 1 {
-            return Ok(None);
-        }
-        let Some(est) = self.estimated_table_bytes(&table) else {
-            return Ok(None);
-        };
-        if est <= budget {
-            return Ok(None);
-        }
-        // The morsel path already bounds device memory for these over a
-        // lazily-held table (it keeps the table in host memory, so only when
-        // that fits). In-memory registered tables have no morsel path.
-        let morsel_ok = self.memory_budget_bytes().is_some()
-            && !self.tables.contains_key(&table)
-            && self.host_memory_budget_bytes().is_none_or(|h| est <= h);
-        if all_streamable && !contains_join(input) && morsel_ok {
-            return Ok(None);
-        }
-        let key_cols: Vec<String> = resolved.into_iter().map(|(_, c)| c).collect();
         let parts = partitions_for(est, budget);
         let files = self.partition_table(node, &table, &key_cols, parts, 0x5eed + depth as u64)?;
         let base = self.base_schema(&table)?;
@@ -540,67 +528,23 @@ impl Engine {
             left,
             right,
             join_type,
-            on,
             ..
         } = node
         else {
             return Ok(None);
         };
-        if matches!(join_type, JoinType::Cross) || on.is_empty() {
-            return Ok(None);
-        }
-        let (Some(a), Some(b)) = (single_base_table(left), single_base_table(right)) else {
-            return Ok(None);
-        };
-        let (a, b) = (a.to_string(), b.to_string());
-        let (Some(ea), Some(eb)) = (
-            self.estimated_table_bytes(&a),
-            self.estimated_table_bytes(&b),
-        ) else {
+        let Some(JoinPlan {
+            a,
+            b,
+            keys_a,
+            keys_b,
+            est,
+        }) = self.qualify_join(node, budget)?
+        else {
             return Ok(None);
         };
-        if ea.max(eb) <= budget {
-            return Ok(None);
-        }
-        let mut keys_a = Vec::new();
-        let mut keys_b = Vec::new();
-        for (l, r) in on {
-            let (Some(l), Some(r)) = (column_name(l), column_name(r)) else {
-                return Ok(None);
-            };
-            let pair = match (
-                resolve_base_column(left, l, false),
-                resolve_base_column(right, r, false),
-            ) {
-                (Some(x), Some(y)) => (x.1, y.1),
-                _ => match (
-                    resolve_base_column(left, r, false),
-                    resolve_base_column(right, l, false),
-                ) {
-                    (Some(x), Some(y)) => (x.1, y.1),
-                    _ => return Ok(None),
-                },
-            };
-            keys_a.push(pair.0);
-            keys_b.push(pair.1);
-        }
         let (sa, sb) = (self.table_arrow_schema(&a)?, self.table_arrow_schema(&b)?);
-        for (ka, kb) in keys_a.iter().zip(&keys_b) {
-            let fa = key_family(
-                sa.field_with_name(ka)
-                    .map_err(|e| BoltError::Plan(e.to_string()))?
-                    .data_type(),
-            );
-            let fb = key_family(
-                sb.field_with_name(kb)
-                    .map_err(|e| BoltError::Plan(e.to_string()))?
-                    .data_type(),
-            );
-            if fa.is_none() || fa != fb {
-                return Ok(None);
-            }
-        }
-        let parts = partitions_for(ea + eb, budget);
+        let parts = partitions_for(est, budget);
         let seed = 0x9a7e + depth as u64;
         let files_a = self.partition_table(left, &a, &keys_a, parts, seed)?;
         let files_b = self.partition_table(right, &b, &keys_b, parts, seed)?;
@@ -670,6 +614,204 @@ impl Engine {
         budget: usize,
         eph: &Ephemeral<'_>,
     ) -> BoltResult<Option<QueryHandle>> {
+        let Some(SortPlan {
+            limit,
+            input,
+            sort_exprs,
+            table,
+            out_schema,
+            keys,
+            run_rows,
+            ..
+        }) = self.qualify_sort(plan, budget)?
+        else {
+            return Ok(None);
+        };
+        let base = self.base_schema(&table)?;
+        let mut runs: Vec<RecordBatch> = Vec::new();
+        let mut pending: Vec<RecordBatch> = Vec::new();
+        let mut pending_rows = 0usize;
+        let flush =
+            |pending: &mut Vec<RecordBatch>, runs: &mut Vec<RecordBatch>| -> BoltResult<()> {
+                let Some(rows) = concat(None, pending)? else {
+                    return Ok(());
+                };
+                pending.clear();
+                let e = eph.install(rows);
+                let mut sub = LogicalPlan::Sort {
+                    input: Box::new(rename_scans(input, &table, &e, &base)),
+                    sort_exprs: sort_exprs.to_vec(),
+                };
+                if let Some((l, o)) = limit {
+                    sub = LogicalPlan::Limit {
+                        input: Box::new(sub),
+                        limit: l.saturating_add(o),
+                        offset: 0,
+                    };
+                }
+                let out = self.execute_logical(&sub, true, false)?.into_record_batch();
+                eph.release(&e);
+                if out.num_rows() > 0 {
+                    runs.push(out);
+                }
+                Ok(())
+            };
+        let request = self.request_for(plan, &table);
+        for batch in self.table_batches(&table, &request)? {
+            let batch = batch?;
+            pending_rows += batch.num_rows();
+            pending.push(batch);
+            if pending_rows >= run_rows {
+                flush(&mut pending, &mut runs)?;
+                pending_rows = 0;
+            }
+        }
+        flush(&mut pending, &mut runs)?;
+        let merged = merge_sorted_runs(&runs, &keys, limit)?;
+        let merged = match merged {
+            Some(m) => renamed(m, &out_schema)?,
+            None => RecordBatch::new_empty(
+                crate::exec::schema_convert::plan_schema_to_arrow_schema(&out_schema)?,
+            ),
+        };
+        Ok(Some(QueryHandle::from_record_batch(merged)))
+    }
+
+    /// Whether `node` (an `Aggregate` / `Distinct`) runs as a partitioned
+    /// GROUP BY, and on what.
+    fn qualify_group(&self, node: &LogicalPlan, budget: usize) -> BoltResult<Option<GroupPlan>> {
+        let (input, keys, all_streamable): (&LogicalPlan, Vec<String>, bool) = match node {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
+                let keys: Option<Vec<String>> = group_by
+                    .iter()
+                    .map(|e| column_name(e).map(str::to_string))
+                    .collect();
+                match keys {
+                    Some(k) if !k.is_empty() => (input, k, aggregates.iter().all(streamable)),
+                    _ => return Ok(None),
+                }
+            }
+            LogicalPlan::Distinct { input } => {
+                let keys = input.schema()?.fields.into_iter().map(|f| f.name).collect();
+                (input, keys, false)
+            }
+            _ => return Ok(None),
+        };
+        let Some(resolved) = keys
+            .iter()
+            .map(|k| resolve_base_column(input, k, true))
+            .collect::<Option<Vec<(String, String)>>>()
+        else {
+            return Ok(None);
+        };
+        let table = resolved[0].0.clone();
+        if resolved.iter().any(|(t, _)| *t != table) || count_scans(node, &table) != 1 {
+            return Ok(None);
+        }
+        let Some(est) = self.estimated_table_bytes(&table) else {
+            return Ok(None);
+        };
+        if est <= budget {
+            return Ok(None);
+        }
+        // The morsel path already bounds device memory for these over a
+        // lazily-held table (it keeps the table in host memory, so only when
+        // that fits). In-memory registered tables have no morsel path.
+        let morsel_ok = self.memory_budget_bytes().is_some()
+            && !self.tables.contains_key(&table)
+            && self.host_memory_budget_bytes().is_none_or(|h| est <= h);
+        if all_streamable && !contains_join(input) && morsel_ok {
+            return Ok(None);
+        }
+        let keys = resolved.into_iter().map(|(_, c)| c).collect();
+        Ok(Some(GroupPlan { table, keys, est }))
+    }
+
+    /// Whether `node` (a `Join`) runs as a grace hash join, and on what.
+    fn qualify_join(&self, node: &LogicalPlan, budget: usize) -> BoltResult<Option<JoinPlan>> {
+        let LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            ..
+        } = node
+        else {
+            return Ok(None);
+        };
+        if matches!(join_type, JoinType::Cross) || on.is_empty() {
+            return Ok(None);
+        }
+        let (Some(a), Some(b)) = (single_base_table(left), single_base_table(right)) else {
+            return Ok(None);
+        };
+        let (a, b) = (a.to_string(), b.to_string());
+        let (Some(ea), Some(eb)) = (
+            self.estimated_table_bytes(&a),
+            self.estimated_table_bytes(&b),
+        ) else {
+            return Ok(None);
+        };
+        if ea.max(eb) <= budget {
+            return Ok(None);
+        }
+        let mut keys_a = Vec::new();
+        let mut keys_b = Vec::new();
+        for (l, r) in on {
+            let (Some(l), Some(r)) = (column_name(l), column_name(r)) else {
+                return Ok(None);
+            };
+            let pair = match (
+                resolve_base_column(left, l, false),
+                resolve_base_column(right, r, false),
+            ) {
+                (Some(x), Some(y)) => (x.1, y.1),
+                _ => match (
+                    resolve_base_column(left, r, false),
+                    resolve_base_column(right, l, false),
+                ) {
+                    (Some(x), Some(y)) => (x.1, y.1),
+                    _ => return Ok(None),
+                },
+            };
+            keys_a.push(pair.0);
+            keys_b.push(pair.1);
+        }
+        let (sa, sb) = (self.table_arrow_schema(&a)?, self.table_arrow_schema(&b)?);
+        for (ka, kb) in keys_a.iter().zip(&keys_b) {
+            let fa = key_family(
+                sa.field_with_name(ka)
+                    .map_err(|e| BoltError::Plan(e.to_string()))?
+                    .data_type(),
+            );
+            let fb = key_family(
+                sb.field_with_name(kb)
+                    .map_err(|e| BoltError::Plan(e.to_string()))?
+                    .data_type(),
+            );
+            if fa.is_none() || fa != fb {
+                return Ok(None);
+            }
+        }
+        Ok(Some(JoinPlan {
+            est: ea + eb,
+            a,
+            b,
+            keys_a,
+            keys_b,
+        }))
+    }
+
+    /// Whether the root of `plan` runs as an external sort.
+    fn qualify_sort<'p>(
+        &self,
+        plan: &'p LogicalPlan,
+        budget: usize,
+    ) -> BoltResult<Option<SortPlan<'p>>> {
         let (limit, sort) = match plan {
             LogicalPlan::Limit {
                 input,
@@ -723,54 +865,81 @@ impl Engine {
             .max(1);
         let row_bytes = (est / rows_total).max(1);
         let run_rows = (budget / 2 / row_bytes).max(1024);
-        let base = self.base_schema(&table)?;
-        let mut runs: Vec<RecordBatch> = Vec::new();
-        let mut pending: Vec<RecordBatch> = Vec::new();
-        let mut pending_rows = 0usize;
-        let flush =
-            |pending: &mut Vec<RecordBatch>, runs: &mut Vec<RecordBatch>| -> BoltResult<()> {
-                let Some(rows) = concat(None, pending)? else {
-                    return Ok(());
+        Ok(Some(SortPlan {
+            limit,
+            input,
+            sort_exprs,
+            table,
+            est,
+            out_schema,
+            keys,
+            run_rows,
+        }))
+    }
+
+    /// How `plan` would run out of core, for `EXPLAIN` (`None` when it would
+    /// not). Describes the first node the executor would take.
+    pub(crate) fn describe_out_of_core(&self, plan: &LogicalPlan) -> BoltResult<Option<String>> {
+        let Some(budget) = self.ooc_budget() else {
+            return Ok(None);
+        };
+        if let Some(p) = self.qualify_sort(plan, budget)? {
+            return Ok(Some(format!(
+                "external sort of '{}' (~{} bytes, budget {budget}): sorted runs of {} rows, k-way merge{}",
+                p.table,
+                p.est,
+                p.run_rows,
+                if p.limit.is_some() { " (top-k runs)" } else { "" }
+            )));
+        }
+        self.describe_first(plan, budget, 0)
+    }
+
+    fn describe_first(
+        &self,
+        plan: &LogicalPlan,
+        budget: usize,
+        depth: usize,
+    ) -> BoltResult<Option<String>> {
+        if depth > crate::plan::sql_frontend::MAX_RECURSION_DEPTH {
+            return Ok(None);
+        }
+        if matches!(
+            plan,
+            LogicalPlan::Aggregate { .. } | LogicalPlan::Distinct { .. }
+        ) {
+            if let Some(g) = self.qualify_group(plan, budget)? {
+                let what = if matches!(plan, LogicalPlan::Distinct { .. }) {
+                    "DISTINCT"
+                } else {
+                    "GROUP BY"
                 };
-                pending.clear();
-                let e = eph.install(rows);
-                let mut sub = LogicalPlan::Sort {
-                    input: Box::new(rename_scans(input, &table, &e, &base)),
-                    sort_exprs: sort_exprs.clone(),
-                };
-                if let Some((l, o)) = limit {
-                    sub = LogicalPlan::Limit {
-                        input: Box::new(sub),
-                        limit: l.saturating_add(o),
-                        offset: 0,
-                    };
-                }
-                let out = self.execute_logical(&sub, true, false)?.into_record_batch();
-                eph.release(&e);
-                if out.num_rows() > 0 {
-                    runs.push(out);
-                }
-                Ok(())
-            };
-        let request = self.request_for(plan, &table);
-        for batch in self.table_batches(&table, &request)? {
-            let batch = batch?;
-            pending_rows += batch.num_rows();
-            pending.push(batch);
-            if pending_rows >= run_rows {
-                flush(&mut pending, &mut runs)?;
-                pending_rows = 0;
+                return Ok(Some(format!(
+                    "partitioned {what} on '{}' ({}) — ~{} bytes, budget {budget}, {} spill partitions",
+                    g.table,
+                    g.keys.join(", "),
+                    g.est,
+                    partitions_for(g.est, budget)
+                )));
             }
         }
-        flush(&mut pending, &mut runs)?;
-        let merged = merge_sorted_runs(&runs, &keys, limit)?;
-        let merged = match merged {
-            Some(m) => renamed(m, &out_schema)?,
-            None => RecordBatch::new_empty(
-                crate::exec::schema_convert::plan_schema_to_arrow_schema(&out_schema)?,
-            ),
-        };
-        Ok(Some(QueryHandle::from_record_batch(merged)))
+        for child in plan.children() {
+            if let Some(d) = self.describe_first(child, budget, depth + 1)? {
+                return Ok(Some(d));
+            }
+        }
+        if let Some(j) = self.qualify_join(plan, budget)? {
+            return Ok(Some(format!(
+                "grace hash join of '{}' ({}) with '{}' ({}) — ~{} bytes, budget {budget}, {} spill partitions",
+                j.a,
+                j.keys_a.join(", "),
+                j.b,
+                j.keys_b.join(", "),
+                j.est,
+                partitions_for(j.est, budget)
+            )));
+        }
+        Ok(None)
     }
 
     /// Plan-level base schema of `table` (no rewriter-synthesised columns).

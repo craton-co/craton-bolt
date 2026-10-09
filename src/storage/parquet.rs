@@ -5,6 +5,14 @@
 //! **row group** is a scan chunk: its footer statistics (min / max / null
 //! count) are the zone map [`crate::storage::scan`] prunes with, and only the
 //! columns a query reads are decoded. Footers are read once, at open.
+//!
+//! A directory laid out Hive-style (`year=2024/month=7/part-0.parquet`)
+//! yields **partition columns** after the file columns, typed `Int64` when
+//! every value is an integer and `Utf8` otherwise
+//! (`__HIVE_DEFAULT_PARTITION__` is NULL). A file's partition values are
+//! exact statistics of each of its row groups (min = max = value), so a
+//! filter on a partition column prunes whole partitions without opening
+//! their files.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -25,6 +33,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::error::{BoltError, BoltResult};
+use crate::plan::logical_plan::Literal;
 use crate::plan::logical_plan::Schema;
 use crate::storage::stats::{array_value, ColumnStatistics, TableStatistics};
 use crate::storage::table::{widen_to_schema, BatchIter, ScanSelection, StorageTable};
@@ -41,8 +50,11 @@ fn perr(ctx: &str, e: impl std::fmt::Display) -> BoltError {
 struct ParquetFile {
     path: PathBuf,
     metadata: ArrowReaderMetadata,
-    /// Table column ordinal → root column ordinal in this file.
+    /// Table column ordinal → root column ordinal in this file (file columns
+    /// only; partition columns follow them in the table schema).
     column_map: Vec<usize>,
+    /// Value of each partition column for this file.
+    partition_values: Vec<Option<Literal>>,
 }
 
 /// A table backed by Parquet files. See the [module docs](self).
@@ -55,6 +67,68 @@ pub struct ParquetTable {
     chunks: Vec<(usize, usize)>,
     stats: Vec<TableStatistics>,
     skipped_columns: Vec<String>,
+    /// Trailing schema columns that come from Hive-style directory names.
+    partition_columns: usize,
+}
+
+/// Hive's marker for a NULL partition value.
+const HIVE_NULL: &str = "__HIVE_DEFAULT_PARTITION__";
+
+/// Decode Hive's `%XX` escapes in a partition value.
+fn hive_unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A Parquet file found under a table directory, with the `key=value`
+/// directory segments of its relative path.
+type FoundFile = (PathBuf, Vec<(String, String)>);
+
+/// Every `*.parquet` file under `dir` (recursively, sorted), skipping hidden
+/// and `_`-prefixed entries.
+fn walk_parquet(dir: &Path) -> BoltResult<Vec<FoundFile>> {
+    fn rec(dir: &Path, segs: &[(String, String)], out: &mut Vec<FoundFile>) -> BoltResult<()> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| perr(&format!("reading directory {}", dir.display()), e))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        entries.sort();
+        for p in entries {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name.starts_with('_') {
+                continue;
+            }
+            if p.is_dir() {
+                let mut next = segs.to_vec();
+                if let Some((k, v)) = name.split_once('=') {
+                    next.push((k.to_string(), hive_unescape(v)));
+                }
+                rec(&p, &next, out)?;
+            } else if p
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("parquet"))
+            {
+                out.push((p, segs.to_vec()));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    rec(dir, &[], &mut out)?;
+    Ok(out)
 }
 
 /// Map a file column type onto the engine's type, if it has one.
@@ -90,31 +164,41 @@ fn normalize_type(dt: &ArrowDataType) -> Option<ArrowDataType> {
 }
 
 impl ParquetTable {
-    /// Open a Parquet file, or every `*.parquet` file of a directory (sorted
-    /// by name, non-recursive).
+    /// Open a Parquet file, or every `*.parquet` file under a directory
+    /// (recursively, sorted; hidden and `_`-prefixed entries skipped). A
+    /// Hive-style `key=value` directory layout adds partition columns (see
+    /// the [module docs](self)).
     pub fn open(path: impl AsRef<Path>) -> BoltResult<Self> {
         let path = path.as_ref();
-        let files = if path.is_dir() {
-            let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-                .map_err(|e| perr(&format!("reading directory {}", path.display()), e))?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.extension()
-                        .is_some_and(|x| x.eq_ignore_ascii_case("parquet"))
-                })
-                .collect();
-            files.sort();
-            if files.is_empty() {
+        if !path.is_dir() {
+            return Self::from_files(&[path.to_path_buf()]);
+        }
+        let found = walk_parquet(path)?;
+        if found.is_empty() {
+            return Err(BoltError::Plan(format!(
+                "no .parquet files under directory {}",
+                path.display()
+            )));
+        }
+        let keys: Vec<String> = found[0].1.iter().map(|(k, _)| k.clone()).collect();
+        for (p, segs) in &found {
+            if segs.len() != keys.len() || segs.iter().zip(&keys).any(|((k, _), want)| k != want) {
                 return Err(BoltError::Plan(format!(
-                    "no .parquet files in directory {}",
-                    path.display()
+                    "inconsistent partition layout: {} does not have partition keys {keys:?}",
+                    p.display()
                 )));
             }
-            files
-        } else {
-            vec![path.to_path_buf()]
-        };
-        Self::from_files(&files)
+        }
+        let files: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
+        let values: Vec<Vec<Option<String>>> = found
+            .into_iter()
+            .map(|(_, segs)| {
+                segs.into_iter()
+                    .map(|(_, v)| (v != HIVE_NULL).then_some(v))
+                    .collect()
+            })
+            .collect();
+        Self::open_partitioned(&files, &keys, &values)
     }
 
     /// Open a table over `files`, which must share column names and
@@ -122,6 +206,14 @@ impl ParquetTable {
     /// whose type the engine cannot represent (nested, binary, unsigned
     /// 64-bit, …) are left out and listed by [`ParquetTable::skipped_columns`].
     pub fn from_files(files: &[PathBuf]) -> BoltResult<Self> {
+        Self::open_partitioned(files, &[], &vec![Vec::new(); files.len()])
+    }
+
+    fn open_partitioned(
+        files: &[PathBuf],
+        keys: &[String],
+        values: &[Vec<Option<String>>],
+    ) -> BoltResult<Self> {
         if files.is_empty() {
             return Err(BoltError::Plan(
                 "a Parquet table needs at least one file".into(),
@@ -152,7 +244,33 @@ impl ParquetTable {
         for name in &skipped_columns {
             log::warn!("Parquet table: column '{name}' has an unsupported type and is skipped");
         }
-        let mut t = Self::build(Arc::new(ArrowSchema::new(fields)), metas)?;
+        // Partition columns: Int64 when every value is an integer.
+        let mut part_values: Vec<Vec<Option<Literal>>> = vec![Vec::new(); files.len()];
+        for (ki, key) in keys.iter().enumerate() {
+            if fields.iter().any(|f| f.name() == key) {
+                return Err(BoltError::Plan(format!(
+                    "partition column '{key}' also exists in the Parquet files"
+                )));
+            }
+            let raw: Vec<&Option<String>> = values.iter().map(|v| &v[ki]).collect();
+            let ints = raw
+                .iter()
+                .all(|v| v.as_ref().is_none_or(|s| s.parse::<i64>().is_ok()));
+            let nullable = raw.iter().any(|v| v.is_none());
+            let dt = if ints {
+                ArrowDataType::Int64
+            } else {
+                ArrowDataType::Utf8
+            };
+            fields.push(ArrowField::new(key, dt, nullable));
+            for (fi, v) in raw.into_iter().enumerate() {
+                part_values[fi].push(v.as_ref().map(|s| match s.parse::<i64>() {
+                    Ok(n) if ints => Literal::Int64(n),
+                    _ => Literal::Utf8(s.clone()),
+                }));
+            }
+        }
+        let mut t = Self::build(Arc::new(ArrowSchema::new(fields)), metas, part_values)?;
         t.skipped_columns = skipped_columns;
         Ok(t)
     }
@@ -168,21 +286,28 @@ impl ParquetTable {
                 .map_err(|e| perr(&format!("reading Parquet footer of {}", p.display()), e))?;
             metas.push((p.clone(), meta));
         }
-        Self::build(schema, metas)
+        let n = metas.len();
+        Self::build(schema, metas, vec![Vec::new(); n])
     }
 
+    /// `part_values[file]` holds that file's values of the trailing
+    /// partition columns of `arrow_schema`.
     fn build(
         arrow_schema: SchemaRef,
         metas: Vec<(PathBuf, ArrowReaderMetadata)>,
+        part_values: Vec<Vec<Option<Literal>>>,
     ) -> BoltResult<Self> {
         let schema = crate::exec::engine_support::arrow_schema_to_plan_schema(&arrow_schema)?;
+        let n_part = part_values.first().map_or(0, Vec::len);
+        let n_file = arrow_schema.fields().len() - n_part;
         let mut out_files = Vec::with_capacity(metas.len());
         let mut chunks = Vec::new();
         let mut stats = Vec::new();
-        for (fi, (path, meta)) in metas.into_iter().enumerate() {
+        for (fi, ((path, meta), partition_values)) in metas.into_iter().zip(part_values).enumerate()
+        {
             let file_schema = meta.schema().clone();
-            let mut column_map = Vec::with_capacity(arrow_schema.fields().len());
-            for f in arrow_schema.fields() {
+            let mut column_map = Vec::with_capacity(n_file);
+            for f in arrow_schema.fields().iter().take(n_file) {
                 let idx = file_schema.index_of(f.name()).map_err(|_| {
                     BoltError::Plan(format!(
                         "Parquet file {} has no column '{}'",
@@ -203,7 +328,16 @@ impl ParquetTable {
             }
             let file_stats = row_group_statistics(&meta, &arrow_schema, &column_map)
                 .map_err(|e| perr(&format!("Parquet statistics of {}", path.display()), e))?;
-            for (rg, s) in file_stats.into_iter().enumerate() {
+            for (rg, mut s) in file_stats.into_iter().enumerate() {
+                // A partition value is exact for every row of the file.
+                for v in &partition_values {
+                    s.columns.push(ColumnStatistics {
+                        null_count: Some(if v.is_some() { 0 } else { s.row_count }),
+                        min: v.clone(),
+                        max: v.clone(),
+                        distinct_estimate: Some(u64::from(v.is_some())),
+                    });
+                }
                 chunks.push((fi, rg));
                 stats.push(s);
             }
@@ -211,6 +345,7 @@ impl ParquetTable {
                 path,
                 metadata: meta,
                 column_map,
+                partition_values,
             });
         }
         Ok(ParquetTable {
@@ -220,7 +355,17 @@ impl ParquetTable {
             chunks,
             stats,
             skipped_columns: Vec::new(),
+            partition_columns: n_part,
         })
+    }
+
+    /// Names of the Hive partition columns (the schema's trailing columns).
+    pub fn partition_columns(&self) -> Vec<&str> {
+        let n = self.arrow_schema.fields().len();
+        self.arrow_schema.fields()[n - self.partition_columns..]
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect()
     }
 
     /// Columns of the files that the table leaves out (unsupported types).
@@ -324,10 +469,11 @@ impl StorageTable for ParquetTable {
         }
         let files = self.files.clone();
         let schema = Arc::clone(&self.arrow_schema);
+        let n_file = schema.fields().len() - self.partition_columns;
         let iter = per_file
             .into_iter()
             .flat_map(move |(fi, rgs)| -> BatchIter {
-                match open_reader(&files[fi], &rgs, &read_columns, &schema) {
+                match open_reader(&files[fi], &rgs, &read_columns, &schema, n_file) {
                     Ok(it) => it,
                     Err(e) => Box::new(std::iter::once(Err(e))),
                 }
@@ -336,16 +482,37 @@ impl StorageTable for ParquetTable {
     }
 }
 
+/// A column holding `v` in each of `n` rows.
+fn constant_column(dt: &ArrowDataType, v: &Option<Literal>, n: usize) -> arrow_array::ArrayRef {
+    match v {
+        Some(Literal::Int64(x)) => Arc::new(arrow_array::Int64Array::from(vec![*x; n])),
+        Some(Literal::Utf8(s)) => Arc::new(arrow_array::StringArray::from(vec![s.as_str(); n])),
+        _ => arrow_array::new_null_array(dt, n),
+    }
+}
+
 fn open_reader(
     file: &ParquetFile,
     row_groups: &[usize],
     read_columns: &[usize],
     schema: &SchemaRef,
+    n_file: usize,
 ) -> BoltResult<BatchIter> {
     let f =
         File::open(&file.path).map_err(|e| perr(&format!("opening {}", file.path.display()), e))?;
     let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(f, file.metadata.clone());
-    let roots: BTreeSet<usize> = read_columns.iter().map(|&c| file.column_map[c]).collect();
+    let mut roots: BTreeSet<usize> = read_columns
+        .iter()
+        .filter(|&&c| c < n_file)
+        .map(|&c| file.column_map[c])
+        .collect();
+    if roots.is_empty() {
+        // Only partition columns were asked for; decode one file column for
+        // the row counts.
+        if let Some(&first) = file.column_map.first() {
+            roots.insert(first);
+        }
+    }
     let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
     let reader = builder
         .with_row_groups(row_groups.to_vec())
@@ -356,12 +523,23 @@ fn open_reader(
     let schema = Arc::clone(schema);
     let read_columns = read_columns.to_vec();
     let path = file.path.clone();
+    let partition_values = file.partition_values.clone();
     Ok(Box::new(reader.map(move |batch| {
         let batch = batch.map_err(|e| perr(&format!("decoding {}", path.display()), e))?;
         let mut cols = Vec::with_capacity(read_columns.len());
         let mut fields = Vec::with_capacity(read_columns.len());
         for &c in &read_columns {
             let field = schema.field(c);
+            if c >= n_file {
+                let n = batch.num_rows();
+                cols.push(constant_column(
+                    field.data_type(),
+                    &partition_values[c - n_file],
+                    n,
+                ));
+                fields.push(field.clone());
+                continue;
+            }
             let src = batch.column_by_name(field.name()).ok_or_else(|| {
                 BoltError::Other(format!("Parquet reader lost column '{}'", field.name()))
             })?;
@@ -546,6 +724,54 @@ mod tests {
         let b = t.read(&all).unwrap().next().unwrap().unwrap();
         assert_eq!(b.column(1).as_string::<i32>().value(1), "v1");
         assert_eq!(b.column(2).data_type(), &ArrowDataType::Int32);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hive_partitions_become_prunable_columns() {
+        let dir = temp_dir("hive");
+        for (y, m) in [
+            ("2024", "1"),
+            ("2024", "2"),
+            ("2025", "1"),
+            ("__HIVE_DEFAULT_PARTITION__", "1"),
+        ] {
+            let d = dir.join(format!("year={y}")).join(format!("month={m}"));
+            std::fs::create_dir_all(&d).unwrap();
+            write_parquet(
+                &d.join("part-0.parquet"),
+                &[batch(0, 10)],
+                &Default::default(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("_SUCCESS"), b"").unwrap();
+        let t = ParquetTable::open(&dir).unwrap();
+        assert_eq!(t.partition_columns(), vec!["year", "month"]);
+        assert_eq!(t.chunk_count(), 4);
+        let year = t.schema().index_of("year").unwrap();
+        let req = ScanRequest {
+            columns: Some([0, year].into_iter().collect()),
+            filters: vec![vec![PrunePredicate::Compare {
+                column: year,
+                op: PruneOp::Eq,
+                value: Literal::Int64(2024),
+            }]],
+        };
+        let sel = t.plan_scan(&req);
+        assert_eq!(sel.chunks.len(), 2, "only the year=2024 partitions");
+        let batches: Vec<RecordBatch> = t.read(&sel).unwrap().map(Result::unwrap).collect();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 20);
+        let y = batches[0].column(year).as_primitive::<Int64Type>();
+        assert!(y.iter().all(|v| v == Some(2024)));
+        // The NULL partition reads as NULL.
+        let null_sel = t.plan_scan(&ScanRequest {
+            columns: None,
+            filters: vec![vec![PrunePredicate::IsNull { column: year }]],
+        });
+        assert_eq!(null_sel.chunks.len(), 1);
+        let b = t.read(&null_sel).unwrap().next().unwrap().unwrap();
+        assert_eq!(b.column(year).null_count(), 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -204,6 +204,15 @@ fn catalog_survives_restart_and_time_travels() {
         assert_eq!(e.catalog().unwrap().table("sales").unwrap().files.len(), 2);
         assert_eq!(affected(e.execute_sql("COMPACT TABLE sales").unwrap()), 1);
         assert_eq!(scalar_i64(&e, "SELECT SUM(amount) FROM sales"), 100);
+        // Clustered compaction records its key.
+        e.execute_sql("COMPACT TABLE sales ORDER BY (region, id)")
+            .unwrap();
+        let meta = e.catalog().unwrap().table("sales").unwrap();
+        assert_eq!(
+            meta.cluster_by,
+            vec!["region".to_string(), "id".to_string()]
+        );
+        assert_eq!(scalar_i64(&e, "SELECT SUM(amount) FROM sales"), 100);
         e.execute_sql("ANALYZE sales").unwrap();
         let st = e.table_statistics("sales").unwrap();
         assert_eq!(st.columns[1].distinct_estimate, Some(3));
@@ -225,7 +234,7 @@ fn catalog_survives_restart_and_time_travels() {
     {
         let mut e = Engine::builder().database(&dir).build().expect("ctx");
         let removed = affected(e.execute_sql("VACUUM").unwrap());
-        assert_eq!(removed, 2, "the two pre-compaction files");
+        assert_eq!(removed, 3, "the files the two compactions replaced");
         assert_eq!(e.catalog().unwrap().snapshots().unwrap().len(), 1);
         assert_eq!(scalar_i64(&e, "SELECT SUM(amount) FROM sales"), 100);
         e.execute_sql("DROP TABLE sales").unwrap();
@@ -234,6 +243,56 @@ fn catalog_survives_restart_and_time_travels() {
         let e = Engine::builder().database(&dir).build().expect("ctx");
         assert!(e.table_names().is_empty());
     }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+#[ignore = "gpu:e2e — Rust-API ingestion and the compaction policy"]
+fn ingestion_api_and_auto_compaction() {
+    let dir = temp_dir("ingest");
+    let mut e = Engine::builder()
+        .database(&dir)
+        .auto_compact(3)
+        .build()
+        .expect("ctx");
+    e.execute_sql("CREATE TABLE m (k BIGINT NOT NULL, tag VARCHAR)")
+        .unwrap();
+    let rows = |lo: i64| {
+        RecordBatch::try_new(
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("b", arrow_schema::DataType::Utf8, true),
+            ])),
+            vec![
+                std::sync::Arc::new(arrow_array::Int32Array::from(
+                    (lo as i32..lo as i32 + 10).collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(arrow_array::StringArray::from(vec!["x"; 10])),
+            ],
+        )
+        .unwrap()
+    };
+    // Positional, cast (Int32 → BIGINT).
+    assert_eq!(e.insert_batch("m", rows(0)).unwrap(), 10);
+    // 7 batches of 10 rows, flushed every 25 rows → 3 commits.
+    let v0 = e.catalog().unwrap().version();
+    let n = e
+        .ingest_stream("m", (1..8).map(|i| Ok(rows(i * 10))), 25)
+        .unwrap();
+    assert_eq!(n, 70);
+    assert_eq!(
+        e.catalog().unwrap().version() - v0,
+        3 + 1,
+        "3 flushes + 1 auto-compaction"
+    );
+    assert!(e.catalog().unwrap().table("m").unwrap().files.len() <= 3);
+    assert_eq!(scalar_i64(&e, "SELECT COUNT(*) FROM m"), 80);
+    assert_eq!(scalar_i64(&e, "SELECT SUM(k) FROM m"), (0..80).sum::<i64>());
+    // Read-only targets refuse.
+    e.execute_sql("CREATE MATERIALIZED VIEW mv AS SELECT COUNT(*) AS n FROM m")
+        .unwrap();
+    assert!(e.insert_batch("mv", rows(0)).is_err());
+    drop(e);
     std::fs::remove_dir_all(dir).ok();
 }
 

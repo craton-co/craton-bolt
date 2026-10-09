@@ -241,8 +241,10 @@ impl Engine {
         for (name, rows) in self.storage_row_counts() {
             row_counts.entry(name).or_insert(rows);
         }
+        let columns = self.planner_column_statistics();
         Arc::new(crate::plan::StatsEstimator::new(EngineTableStats {
             row_counts,
+            columns,
         }))
     }
 
@@ -557,7 +559,56 @@ impl Engine {
         let compiled = self
             .compiler(&registry)
             .compile(&plan, true, Subqueries::Defer)?;
-        Ok(render_explain(&compiled))
+        drop(registry);
+        let mut out = render_explain(&compiled);
+        out.push_str(&self.explain_resources(&plan)?);
+        Ok(out)
+    }
+
+    /// The `EXPLAIN` sections about data access and memory: each storage
+    /// table's pruned scan (decided from statistics; nothing is read) and
+    /// whether the statement would run out of core.
+    fn explain_resources(&self, plan: &LogicalPlan) -> BoltResult<String> {
+        let mut out = String::new();
+        let (tree, nested) = split_scan_tables(plan);
+        let mut tables: Vec<String> = tree
+            .iter()
+            .chain(&nested)
+            .filter(|t| self.storage_table(t).is_some())
+            .cloned()
+            .collect();
+        tables.sort();
+        tables.dedup();
+        if !tables.is_empty() {
+            let requests = self.storage_scan_requests(plan, &tables, &nested);
+            out.push_str(
+                "Storage scans:
+",
+            );
+            for t in &tables {
+                let table = self.storage_table(t).expect("filtered above");
+                let req = requests.get(t).cloned().unwrap_or_default();
+                let sel = table.plan_scan(&req);
+                let cols = match &sel.columns {
+                    Some(c) => format!("{} of {} columns", c.len(), table.schema().fields.len()),
+                    None => "all columns".to_string(),
+                };
+                out.push_str(&format!(
+                    "  {t}: {} of {} chunks (~{} rows), {cols}
+",
+                    sel.chunks.len(),
+                    sel.chunks_total,
+                    sel.rows
+                ));
+            }
+        }
+        if let Some(d) = self.describe_out_of_core(plan)? {
+            out.push_str(&format!(
+                "Execution: out of core — {d}
+"
+            ));
+        }
+        Ok(out)
     }
 
     /// Execute an already-built [`LogicalPlan`] and return a [`QueryHandle`].
@@ -711,9 +762,7 @@ mod tests {
             dict,
             rewrites,
             optimize,
-            estimator: Arc::new(crate::plan::StatsEstimator::new(EngineTableStats {
-                row_counts: Default::default(),
-            })),
+            estimator: Arc::new(crate::plan::StatsEstimator::new(EngineTableStats::default())),
         }
     }
 

@@ -165,6 +165,11 @@ impl Engine {
         if let Some(t) = self.storage_table(name) {
             return Ok(t.statistics());
         }
+        if let Some((v, s)) = self.analyzed.borrow().get(name) {
+            if self.table_version(name) == Some(*v) {
+                return Ok(s.clone());
+            }
+        }
         if let Some(batches) = self.tables.get(name) {
             return Ok(TableStatistics::from_batches(batches));
         }
@@ -203,6 +208,50 @@ impl Engine {
             )));
         }
         Ok(())
+    }
+
+    /// Per-column planner statistics of every table that has them: storage
+    /// tables (chunk metadata, or the catalog's `ANALYZE` record) and
+    /// in-memory tables analysed since their last change.
+    pub(crate) fn planner_column_statistics(
+        &self,
+    ) -> HashMap<String, HashMap<String, crate::plan::statistics::ColumnStats>> {
+        let mut out = HashMap::new();
+        for (name, e) in self.storage_tables.borrow().iter() {
+            #[cfg(feature = "storage")]
+            if let Some(s) = self
+                .catalog
+                .as_ref()
+                .and_then(|c| c.table(name))
+                .and_then(|t| t.analyzed.clone())
+            {
+                out.insert(
+                    name.clone(),
+                    crate::exec::engine_provider::planner_column_stats(e.table.schema(), &s),
+                );
+                continue;
+            }
+            let s = e.table.statistics();
+            out.insert(
+                name.clone(),
+                crate::exec::engine_provider::planner_column_stats(e.table.schema(), &s),
+            );
+        }
+        for (name, (version, s)) in self.analyzed.borrow().iter() {
+            if out.contains_key(name) || self.table_version(name) != Some(*version) {
+                continue;
+            }
+            if let Ok(arrow) = self.table_arrow_schema(name) {
+                if let Ok(schema) = crate::exec::engine_support::arrow_schema_to_plan_schema(&arrow)
+                {
+                    out.insert(
+                        name.clone(),
+                        crate::exec::engine_provider::planner_column_stats(&schema, s),
+                    );
+                }
+            }
+        }
+        out
     }
 
     /// Row counts of the storage tables, for the optimizer's estimator.

@@ -130,14 +130,61 @@ impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
 pub(crate) struct EngineTableStats {
     /// Table name → total registered row count.
     pub(crate) row_counts: HashMap<String, usize>,
+    /// Table name → per-column statistics (NDV, null count, bounds) where
+    /// known: storage-table chunk metadata and `ANALYZE` results. They refine
+    /// filter / join selectivity beyond the row count.
+    pub(crate) columns: HashMap<String, HashMap<String, crate::plan::statistics::ColumnStats>>,
 }
 
 impl crate::plan::statistics::StatsProvider for EngineTableStats {
     fn table_stats(&self, name: &str) -> Option<crate::plan::statistics::TableStats> {
-        self.row_counts
-            .get(name)
-            .map(|&n| crate::plan::statistics::TableStats::new(n))
+        let rows = *self.row_counts.get(name)?;
+        let mut ts = crate::plan::statistics::TableStats::new(rows);
+        if let Some(cols) = self.columns.get(name) {
+            ts.per_column = cols.clone();
+        }
+        Some(ts)
     }
+}
+
+/// Planner [`ColumnStats`](crate::plan::statistics::ColumnStats) per column
+/// name from storage-layer statistics over `schema`.
+pub(crate) fn planner_column_stats(
+    schema: &crate::plan::logical_plan::Schema,
+    stats: &crate::storage::TableStatistics,
+) -> HashMap<String, crate::plan::statistics::ColumnStats> {
+    use crate::plan::logical_plan::Literal as L;
+    use crate::plan::statistics::{ColumnStats, ScalarValue};
+    let scalar = |l: &Option<L>| -> Option<ScalarValue> {
+        Some(match l.as_ref()? {
+            L::Bool(b) => ScalarValue::Bool(*b),
+            L::Int32(v) => ScalarValue::Int(*v as i64),
+            L::Int64(v) => ScalarValue::Int(*v),
+            L::Date32(v) => ScalarValue::Int(*v as i64),
+            L::Timestamp(v, _, _) => ScalarValue::Int(*v),
+            L::Float32(v) => ScalarValue::Float(*v as f64),
+            L::Float64(v) => ScalarValue::Float(*v),
+            L::Decimal128(v, _, s) => ScalarValue::Float(*v as f64 / 10f64.powi(*s as i32)),
+            L::Utf8(s) => ScalarValue::Str(s.clone()),
+            L::Null => return None,
+        })
+    };
+    schema
+        .fields
+        .iter()
+        .zip(&stats.columns)
+        .map(|(f, c)| {
+            (
+                f.name.clone(),
+                ColumnStats {
+                    null_count: c.null_count.unwrap_or(0) as usize,
+                    ndv: c.distinct_estimate.map(|n| n as usize),
+                    min: scalar(&c.min),
+                    max: scalar(&c.max),
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -350,5 +397,61 @@ mod tests {
         stats.row_counts.insert("t".to_string(), 100);
         assert!(stats.table_stats("t").is_some());
         assert!(stats.table_stats("absent").is_none());
+    }
+
+    /// Storage statistics refine filter selectivity: a range predicate over a
+    /// column with known bounds, and an equality over one with a known NDV.
+    #[test]
+    fn column_statistics_refine_selectivity() {
+        use crate::plan::logical_plan::{
+            BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
+        };
+        use crate::storage::{ColumnStatistics, TableStatistics};
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("g", DataType::Int64, false),
+        ]);
+        let st = TableStatistics {
+            row_count: 1000,
+            byte_size: 0,
+            columns: vec![
+                ColumnStatistics {
+                    null_count: Some(0),
+                    min: Some(Literal::Int64(0)),
+                    max: Some(Literal::Int64(999)),
+                    distinct_estimate: Some(1000),
+                },
+                ColumnStatistics {
+                    null_count: Some(0),
+                    min: Some(Literal::Int64(0)),
+                    max: Some(Literal::Int64(3)),
+                    distinct_estimate: Some(4),
+                },
+            ],
+        };
+        let mut stats = EngineTableStats::default();
+        stats.row_counts.insert("t".into(), 1000);
+        stats
+            .columns
+            .insert("t".into(), planner_column_stats(&schema, &st));
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema,
+        };
+        let filter = |op, col: &str, v| LogicalPlan::Filter {
+            input: Box::new(scan.clone()),
+            predicate: Expr::Binary {
+                op,
+                left: Box::new(Expr::Column(col.into())),
+                right: Box::new(Expr::Literal(Literal::Int64(v))),
+            },
+        };
+        let est = |p: &LogicalPlan| crate::plan::statistics::estimate_rows(p, &stats).unwrap();
+        // k >= 900 → ~10% of 1000 rows (the default would be 30%).
+        let r = est(&filter(BinaryOp::GtEq, "k", 900));
+        assert!((90..=110).contains(&r), "{r}");
+        // g = 2 → 1 / NDV(4) = 25% (the default would be 10%).
+        assert_eq!(est(&filter(BinaryOp::Eq, "g", 2)), 250);
     }
 }

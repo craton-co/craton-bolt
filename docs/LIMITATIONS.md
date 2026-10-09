@@ -76,7 +76,9 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   many threads or clients, wrap it in a `Database` and hand out `Session`s:
   statements are queued and executed **one at a time** in arrival order on
   the shared runtime (no concurrent kernel execution across queries, no
-  per-session resource limits beyond the queue capacity). Multi-GPU /
+  per-session resource limits beyond the queue capacity). The Flight SQL
+  server can front a `Database` (`FlightSqlServer::from_database`); it then
+  serves queries only (a read-only session). Multi-GPU /
   multi-context concurrency (per-context pools, streams, and caches) is
   post-1.0 work.
 
@@ -183,12 +185,17 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 - **Parquet types.** Columns of nested, binary, unsigned-64 or other
   non-engine types are skipped (`ParquetTable::skipped_columns`); narrow
   integers widen to `Int32` / `Int64`, large / view strings and string
-  dictionaries read as `Utf8`. External tables are read-only.
+  dictionaries read as `Utf8`. External tables are read-only. Hive-style
+  `key=value` directories become partition columns typed `Int64` or `Utf8`
+  only (no date / decimal partition values), and every file must use the
+  same partition keys.
 - **Statistics.** Chunk statistics come from Parquet footers (or are
   computed for in-memory chunks); table-level distinct estimates merged
   from chunks are lower bounds until `ANALYZE` records exact HyperLogLog
-  estimates. Statistics feed pruning and join-order row counts; there is no
-  selectivity-based cost model yet.
+  estimates. In-memory tables have column statistics only after `ANALYZE`
+  (until their next change). Statistics drive pruning and the optimizer's
+  filter / join selectivity (bounds, distinct counts, null counts → join
+  order); there is no cost-based choice between CPU and GPU execution.
 - **Materialized views** refresh in full (no incremental maintenance) and
   are never substituted into queries automatically. A view in a catalog may
   read only catalog tables. `on_commit` refresh happens on the
