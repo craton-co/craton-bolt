@@ -116,3 +116,25 @@ fn string_functions_next_to_computed_columns() {
         .sum();
     assert_eq!(n, 6);
 }
+
+#[test]
+#[ignore = "gpu:e2e — APPROX_COUNT_DISTINCT / APPROX_DISTINCT"]
+fn approx_distinct_counts() {
+    let e = engine();
+    let out = e
+        .sql("SELECT APPROX_COUNT_DISTINCT(s) FROM t")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 3);
+    let g = e
+        .sql("SELECT k, APPROX_DISTINCT(s) AS d FROM t GROUP BY k")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(g.num_rows(), 4);
+    assert!(g
+        .column(1)
+        .as_primitive::<Int64Type>()
+        .values()
+        .iter()
+        .all(|&d| d == 3));
+}

@@ -828,7 +828,7 @@ fn parse_uncached(sql: &str, provider: &dyn TableProvider) -> BoltResult<Logical
     guard_sql_size(sql)?;
 
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let stmts = parse_statements(&dialect, sql)?;
     lower_statements(stmts, provider)
 }
 
@@ -907,6 +907,31 @@ fn is_set_op_root(plan: &LogicalPlan) -> bool {
 /// the offending token is. A zero-width span is documented as legal on
 /// [`BoltError::SqlWithSpan`] and editor consumers typically render it
 /// as a single-character squiggle at the position.
+/// Parse `sql` and normalise it: `APPROX_COUNT_DISTINCT(x)` /
+/// `APPROX_DISTINCT(x)` become `COUNT(DISTINCT x)`. An exact distinct count is
+/// a valid answer to an approximate one, and it then reuses every
+/// `COUNT(DISTINCT)` execution path (scalar, grouped, under `HAVING`).
+fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<Statement>> {
+    use sqlparser::ast::{
+        DuplicateTreatment, Expr as SqlExpr, FunctionArguments, Ident, ObjectName,
+    };
+    let mut stmts =
+        Parser::parse_sql(dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let _ = sqlparser::ast::visit_expressions_mut(&mut stmts, |e| {
+        if let SqlExpr::Function(f) = e {
+            let name = f.name.to_string().to_ascii_uppercase();
+            if name == "APPROX_COUNT_DISTINCT" || name == "APPROX_DISTINCT" {
+                if let FunctionArguments::List(list) = &mut f.args {
+                    f.name = ObjectName(vec![Ident::new("COUNT")]);
+                    list.duplicate_treatment = Some(DuplicateTreatment::Distinct);
+                }
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    Ok(stmts)
+}
+
 pub(crate) fn parse_error_to_bolt_error(e: ParserError, sql: &str) -> BoltError {
     let rendered = e.to_string();
     match extract_location_suffix(&rendered) {
@@ -1322,7 +1347,7 @@ pub(crate) fn classify_query(sql: &str, provider: &dyn TableProvider) -> BoltRes
     }
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let stmts = parse_statements(&dialect, sql)?;
     if let [Statement::Query(query)] = stmts.as_slice() {
         let query = query.as_ref();
         if matches!(&query.with, Some(with) if with.recursive) {
@@ -2015,8 +2040,7 @@ pub fn plan_values_query(
 ) -> BoltResult<Option<ValuesQueryPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         return Ok(None);
     }
@@ -2395,8 +2419,7 @@ pub fn plan_generate_series_query(
 ) -> BoltResult<Option<GenerateSeriesQueryPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         return Ok(None);
     }
@@ -2658,8 +2681,7 @@ pub fn plan_distinct_on(
 ) -> BoltResult<Option<DistinctOnPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         return Ok(None);
     }
@@ -2878,8 +2900,7 @@ pub fn plan_count_distinct_groupby(
 ) -> BoltResult<Option<CountDistinctGroupByPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         // Let the ordinary pipeline produce the canonical multi-statement error.
         return Ok(None);
@@ -3436,8 +3457,7 @@ pub fn plan_multi_agg_groupby(
 ) -> BoltResult<Option<MultiAggGroupByPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         return Ok(None);
     }
@@ -3991,8 +4011,7 @@ pub fn plan_recursive_cte(
 ) -> BoltResult<Option<RecursiveQueryPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         return Err(BoltError::Sql(format!(
             "expected exactly one statement, got {}",
@@ -4024,8 +4043,7 @@ pub fn plan_lateral_apply(
 ) -> BoltResult<Option<LateralApplyPlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         // Defer the canonical multi-statement error to the ordinary pipeline.
         return Ok(None);
@@ -4330,8 +4348,7 @@ pub fn plan_correlated_where(
 ) -> BoltResult<Option<CorrelatedWherePlan>> {
     guard_sql_size(sql)?;
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let mut stmts = parse_statements(&dialect, sql)?;
     if stmts.len() != 1 {
         return Ok(None);
     }
@@ -4671,8 +4688,7 @@ fn build_scalar_test_query(conjunct: &SqlExpr) -> BoltResult<Query> {
     // `lateral_corr_subquery`).
     let sql = format!("SELECT true AS __corr_test FROM {LATERAL_OUTER_TABLE}");
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, &sql).map_err(|e| parse_error_to_bolt_error(e, &sql))?;
+    let mut stmts = parse_statements(&dialect, &sql)?;
     let stmt = stmts.remove(0);
     let mut query = match stmt {
         Statement::Query(q) => *q,
@@ -5133,8 +5149,7 @@ impl LateralRefMap {
 fn lateral_corr_subquery(synth: &str) -> BoltResult<SqlExpr> {
     let sql = format!("SELECT {synth} FROM {LATERAL_OUTER_TABLE}");
     let dialect = GenericDialect {};
-    let mut stmts =
-        Parser::parse_sql(&dialect, &sql).map_err(|e| parse_error_to_bolt_error(e, &sql))?;
+    let mut stmts = parse_statements(&dialect, &sql)?;
     let stmt = stmts.remove(0);
     let query = match stmt {
         Statement::Query(q) => q,
