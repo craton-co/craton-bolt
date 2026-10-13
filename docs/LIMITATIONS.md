@@ -202,6 +202,11 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   `execute_sql` path, not inside `Engine::sql`.
 - **Temporary tables are engine-wide**, including across the `Session`s of
   one `Database`.
+- **No secondary indexes.** Scans skip data by zone maps (min / max / null
+  count per row group or chunk), Hive partitions and clustering; there are no
+  bloom filters or B-trees. Storage is the local filesystem (no object-store
+  backends), and materialized views refresh manually or on commit (no
+  scheduled refresh).
 
 ## Known performance gaps
 

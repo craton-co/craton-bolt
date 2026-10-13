@@ -122,6 +122,8 @@ All notable changes to this project will be documented here. The format follows 
 - **Flight SQL over a shared `Database`.** `FlightSqlServer::from_database`
   answers through a read-only session and awaits results, so concurrent
   clients no longer block tonic worker threads on an engine mutex.
+- **`APPROX_COUNT_DISTINCT(x)` / `APPROX_DISTINCT(x)`**, answered exactly
+  through the `COUNT(DISTINCT)` paths (parse-time rewrite).
 - **`EXPLAIN` shows data access and memory decisions**: a `Storage scans:`
   section (chunks / columns each storage table would read) and the
   out-of-core strategy a statement would use.
