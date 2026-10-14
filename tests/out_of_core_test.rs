@@ -293,3 +293,163 @@ fn device_budget_evicts_idle_tables() {
     let a2 = e.sql("SELECT SUM(v) FROM t1").unwrap().into_record_batch();
     assert_eq!(i64s(&a2, 0), i64s(&a, 0));
 }
+
+/// `(h, v)`: 70% of the rows share `h = 0`, the rest are distinct.
+fn skewed(n: i64) -> RecordBatch {
+    let h: Vec<i64> = (0..n).map(|i| if i % 10 < 7 { 0 } else { i }).collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("h", ArrowDataType::Int64, false),
+        ArrowField::new("v", ArrowDataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(h)),
+            Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "gpu:e2e — over-budget partitions are split again (key skew)"]
+fn skewed_partitions_are_split_again() {
+    let mut e = budget_engine();
+    e.register_table("s", skewed(N)).unwrap();
+    e.register_table("b", fact2(N)).unwrap();
+    let before = e.memory_stats();
+    let out = e
+        .sql("SELECT h, COUNT(*) AS n, SUM(v) AS sv FROM s GROUP BY h ORDER BY h")
+        .unwrap()
+        .into_record_batch();
+    let mut expect: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for i in 0..N {
+        let h = if i % 10 < 7 { 0 } else { i };
+        let x = expect.entry(h).or_insert((0, 0));
+        x.0 += 1;
+        x.1 += i;
+    }
+    assert_eq!(i64s(&out, 0), expect.keys().copied().collect::<Vec<_>>());
+    assert_eq!(
+        i64s(&out, 1),
+        expect.values().map(|x| x.0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        i64s(&out, 2),
+        expect.values().map(|x| x.1).collect::<Vec<_>>()
+    );
+    let mid = e.memory_stats();
+    assert!(mid.out_of_core_statements > before.out_of_core_statements);
+    assert!(mid.repartitions > before.repartitions, "{mid:?}");
+
+    // Grace join with the skewed side: b.k2 = 0 matches every hot row.
+    let j = e
+        .sql("SELECT COUNT(*) AS n, SUM(b.tag) AS t FROM s JOIN b ON s.h = b.k2")
+        .unwrap()
+        .into_record_batch();
+    let mut n = 0i64;
+    let mut t = 0i64;
+    for i in 0..N {
+        let h = if i % 10 < 7 { 0 } else { i };
+        // b.k2 = 2k (k < N), tag = k % 5.
+        if h % 2 == 0 && h / 2 < N {
+            n += 1;
+            t += (h / 2) % 5;
+        }
+    }
+    assert_eq!(i64s(&j, 0), vec![n]);
+    assert_eq!(i64s(&j, 1), vec![t]);
+    assert!(e.memory_stats().repartitions > mid.repartitions);
+}
+
+#[test]
+#[ignore = "gpu:e2e — row-wise scans over the host budget, and sql_stream"]
+fn row_wise_scans_run_in_chunks_and_stream() {
+    let dir = std::env::temp_dir().join(format!("bolt-ooc-rw-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = craton_bolt::storage::ParquetWriteOptions {
+        row_group_rows: 10_000,
+        ..Default::default()
+    };
+    craton_bolt::storage::write_parquet(&dir.join("f.parquet"), &[fact(N)], &opts).unwrap();
+    let mut e = Engine::builder()
+        .host_memory_budget(BUDGET)
+        .spill_dir(dir.join("spill"))
+        .build()
+        .expect("ctx");
+    e.register_parquet("pq", dir.join("f.parquet")).unwrap();
+    let plan = e
+        .explain_sql("SELECT k FROM pq WHERE v >= 0 LIMIT 9")
+        .unwrap();
+    assert!(plan.contains("chunked row-wise scan of 'pq'"), "{plan}");
+    assert!(plan.contains("stops at the LIMIT"), "{plan}");
+    let plan = e.explain_sql("SELECT SUM(v), AVG(v) FROM pq").unwrap();
+    assert!(plan.contains("partial aggregates of 'pq'"), "{plan}");
+    // Every row passes: far more than the budget at once.
+    let all = e
+        .sql("SELECT k, v + 1 AS w FROM pq WHERE v >= 0")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(all.num_rows() as i64, N);
+    assert_eq!(
+        i64s(&all, 1).iter().sum::<i64>(),
+        (0..N).map(|k| k % 1000 + 1).sum::<i64>()
+    );
+    assert!(e.memory_stats().host_reserved <= BUDGET);
+    let lim = e
+        .sql("SELECT k FROM pq WHERE g = 3 LIMIT 5 OFFSET 2")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(i64s(&lim, 0), vec![197, 294, 391, 488, 585]);
+
+    // The same rows as a stream of bounded batches.
+    let stream = e.sql_stream("SELECT k, s FROM pq WHERE g < 10").unwrap();
+    assert!(stream.is_incremental());
+    let mut batches = 0;
+    let mut rows = 0i64;
+    let mut sum = 0i64;
+    for b in stream {
+        let b = b.unwrap();
+        batches += 1;
+        rows += b.num_rows() as i64;
+        sum += i64s(&b, 0).iter().sum::<i64>();
+    }
+    let expect: Vec<i64> = (0..N).filter(|k| k % 97 < 10).collect();
+    assert!(batches > 1, "{batches}");
+    assert_eq!(rows, expect.len() as i64);
+    assert_eq!(sum, expect.iter().sum::<i64>());
+    // LIMIT stops early; non-row-wise queries arrive as one batch.
+    let first: Vec<RecordBatch> = e
+        .sql_stream("SELECT k FROM pq LIMIT 3")
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(first.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    let agg = e.sql_stream("SELECT COUNT(*) FROM pq").unwrap();
+    assert!(!agg.is_incremental());
+    let agg: Vec<RecordBatch> = agg.collect::<Result<_, _>>().unwrap();
+    assert_eq!(i64s(&agg[0], 0), vec![N]);
+    // Scalar aggregates over the over-budget scan merge per-chunk partials.
+    let s = e
+        .sql("SELECT COUNT(*) AS n, SUM(v) AS sv, MIN(k) AS lo, MAX(k) AS hi, AVG(v) AS av               FROM pq WHERE g < 50")
+        .unwrap()
+        .into_record_batch();
+    let rows: Vec<i64> = (0..N).filter(|k| k % 97 < 50).collect();
+    let sv: i64 = rows.iter().map(|k| k % 1000).sum();
+    assert_eq!(i64s(&s, 0), vec![rows.len() as i64]);
+    assert_eq!(i64s(&s, 1), vec![sv]);
+    assert_eq!(i64s(&s, 2), vec![rows[0]]);
+    assert_eq!(i64s(&s, 3), vec![*rows.last().unwrap()]);
+    let av = s
+        .column(4)
+        .as_primitive::<arrow_array::types::Float64Type>()
+        .value(0);
+    assert!((av - sv as f64 / rows.len() as f64).abs() < 1e-9, "{av}");
+    // No chunk can match.
+    let z = e
+        .sql("SELECT COUNT(*) AS n FROM pq WHERE v > 5000")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(i64s(&z, 0), vec![0]);
+    std::fs::remove_dir_all(&dir).ok();
+}
