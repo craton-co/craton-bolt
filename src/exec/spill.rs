@@ -41,6 +41,14 @@ pub(crate) struct SpillFile {
 }
 
 impl SpillFile {
+    /// Stream the batches back one at a time.
+    pub(crate) fn batches(&self) -> BoltResult<Box<dyn Iterator<Item = BoltResult<RecordBatch>>>> {
+        let f = File::open(&self.path).map_err(|e| ioe(self.path.display(), e))?;
+        let reader = FileReader::try_new(f, None).map_err(|e| ioe(self.path.display(), e))?;
+        let path = self.path.display().to_string();
+        Ok(Box::new(reader.map(move |b| b.map_err(|e| ioe(&path, e)))))
+    }
+
     /// Read every batch back.
     pub(crate) fn read_all(&self) -> BoltResult<Vec<RecordBatch>> {
         let f = File::open(&self.path).map_err(|e| ioe(self.path.display(), e))?;

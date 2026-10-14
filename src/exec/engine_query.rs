@@ -184,6 +184,16 @@ fn reject_table_statement(query: &str) -> BoltResult<()> {
     Ok(())
 }
 
+/// The generic logical plan of `query` for [`Engine::sql_stream`]
+/// (`None` for host-orchestrated shapes, which run through `sql`).
+pub(crate) fn classify_for_stream(engine: &Engine, query: &str) -> BoltResult<Option<LogicalPlan>> {
+    reject_table_statement(query)?;
+    Ok(match classify_query(query, &engine.provider)? {
+        QueryShape::Generic(plan) => Some(plan),
+        _ => None,
+    })
+}
+
 /// `true` if `plan` still carries a scalar / IN subquery anywhere.
 ///
 /// Reuses the resolver's own walker (so "what counts as a subquery" cannot

@@ -77,6 +77,8 @@ pub struct MemoryStats {
     pub evictions: u64,
     /// Statements executed out of core.
     pub out_of_core_statements: u64,
+    /// Over-budget partitions split again (key skew).
+    pub repartitions: u64,
 }
 
 /// See the [module docs](self).
@@ -89,6 +91,7 @@ pub struct MemoryGovernor {
     spilled_bytes: AtomicU64,
     evictions: AtomicU64,
     ooc_statements: AtomicU64,
+    repartitions: AtomicU64,
 }
 
 impl std::fmt::Debug for MemoryGovernor {
@@ -132,6 +135,7 @@ impl MemoryGovernor {
             spilled_bytes: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             ooc_statements: AtomicU64::new(0),
+            repartitions: AtomicU64::new(0),
         })
     }
 
@@ -237,6 +241,10 @@ impl MemoryGovernor {
         self.ooc_statements.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_repartition(&self) {
+        self.repartitions.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Current accounting.
     pub fn stats(&self) -> MemoryStats {
         MemoryStats {
@@ -248,6 +256,7 @@ impl MemoryGovernor {
             spilled_bytes: self.spilled_bytes.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             out_of_core_statements: self.ooc_statements.load(Ordering::Relaxed),
+            repartitions: self.repartitions.load(Ordering::Relaxed),
         }
     }
 }
