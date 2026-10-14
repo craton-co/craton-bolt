@@ -171,9 +171,10 @@ fn reject_table_statement(query: &str) -> BoltResult<()> {
         .next()
         .unwrap_or("")
         .to_ascii_uppercase();
-    const STATEMENTS: [&str; 13] = [
+    const STATEMENTS: [&str; 20] = [
         "CREATE", "INSERT", "DROP", "TRUNCATE", "COPY", "ANALYZE", "SHOW", "DESCRIBE", "DESC",
-        "COMPACT", "VACUUM", "REFRESH", "DELETE",
+        "COMPACT", "VACUUM", "REFRESH", "DELETE", "UPDATE", "ALTER", "BEGIN", "START", "COMMIT",
+        "ROLLBACK", "END",
     ];
     if STATEMENTS.contains(&first.as_str()) {
         return Err(BoltError::Plan(format!(

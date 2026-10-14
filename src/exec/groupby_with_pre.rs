@@ -611,6 +611,13 @@ fn run_pre_stage(
 
     // -- (Option B) Detect input validity, plumb through KernelSpec.
     //    See `agg_with_pre::run_pre_stage` for the design rationale.
+    // An input the kernel reads validity of (`IS NULL`) gets a mask even
+    // when it has no NULLs, so the kernel's validity parameters line up.
+    for (i, col) in input_cols.iter_mut().enumerate() {
+        if spec.input_has_validity.get(i).copied().unwrap_or(false) && !col.has_validity() {
+            col.ensure_validity(n_rows)?;
+        }
+    }
     let input_has_validity: Vec<bool> = input_cols.iter().map(|c| c.has_validity()).collect();
     let any_input_validity: bool = input_has_validity.iter().any(|b| *b);
     let output_has_validity: Vec<bool> = if any_input_validity {
@@ -708,23 +715,26 @@ fn run_pre_stage(
 
     // -- Optional predicate kernel: builds a u8 keep-mask we download.
     let host_mask: Option<Vec<bool>> = if spec.predicate.is_some() {
+        // Same validity flags as the projection kernel: an `IS NULL`
+        // predicate reads the flagged inputs' masks (after the mask output).
+        let pred_spec = KernelSpec {
+            input_has_validity: input_has_validity.clone(),
+            ..spec.clone()
+        };
         let pred_module = module_cache::get_or_build_module(
             module_path!(),
-            format!("predicate_kernel:{}:{:?}", PRE_PREDICATE_ENTRY, spec),
+            format!("predicate_kernel:{}:{:?}", PRE_PREDICATE_ENTRY, pred_spec),
             None,
-            || crate::jit::scan_kernel::compile_predicate_kernel(spec, PRE_PREDICATE_ENTRY),
+            || crate::jit::scan_kernel::compile_predicate_kernel(&pred_spec, PRE_PREDICATE_ENTRY),
         )?;
         let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
 
         let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
         let input_ptrs: Vec<CUdeviceptr> = input_cols.iter().map(|c| c.device_ptr()).collect();
-        // GroupBy pre-stage predicate kernel: same situation as
-        // `agg_with_pre`. The planner doesn't lower `Op::IsNullCheck`
-        // through this aggregate predicate path today (only the projection-
-        // scan-chain path uses it), so we pass an empty validity slice and
-        // the scan_kernel emits the legacy no-validity param layout
-        // bit-for-bit. See the matching comment in `agg_with_pre.rs`.
-        let validity_ptrs: Vec<CUdeviceptr> = Vec::new();
+        let validity_ptrs: Vec<CUdeviceptr> = input_cols
+            .iter()
+            .filter_map(|c| c.validity_device_ptr())
+            .collect();
         crate::exec::compact::launch_predicate_kernel(
             pred_function,
             &input_ptrs,
@@ -2473,6 +2483,15 @@ impl PreCol {
     /// True iff this `PreCol` carries a per-row validity bitmap.
     fn has_validity(&self) -> bool {
         self.valid_mask.is_some()
+    }
+
+    /// Attach an all-valid mask (for a kernel that reads this input's
+    /// validity although it has no NULLs).
+    fn ensure_validity(&mut self, n_rows: usize) -> BoltResult<()> {
+        if self.valid_mask.is_none() {
+            self.valid_mask = Some(GpuVec::<u8>::from_slice(&vec![1u8; n_rows])?);
+        }
+        Ok(())
     }
 
     /// Download the column to host and verify the length matches `n_rows`.

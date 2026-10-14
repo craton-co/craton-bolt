@@ -138,3 +138,56 @@ fn approx_distinct_counts() {
         .iter()
         .all(|&d| d == 3));
 }
+
+/// Aggregates filtered by `IS NULL` / `IS NOT NULL` read garbage validity
+/// pointers in the fused pre-stage predicate kernel (CUDA "invalid argument"
+/// or an access violation).
+#[test]
+#[ignore = "gpu:e2e — aggregates under an IS NULL filter"]
+fn aggregates_filtered_by_is_null() {
+    let mut e = Engine::new().expect("ctx");
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", ArrowDataType::Int64, false),
+        ArrowField::new("g", ArrowDataType::Int32, false),
+        ArrowField::new("n", ArrowDataType::Float64, true),
+        ArrowField::new("full", ArrowDataType::Float64, true),
+    ]));
+    let b = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+            Arc::new(Int32Array::from(vec![0, 0, 1, 1, 2, 2])),
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                None,
+                Some(2.0),
+                None,
+                None,
+                Some(3.0),
+            ])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+        ],
+    )
+    .unwrap();
+    e.register_table("t", b).unwrap();
+    let one = |sql: &str| -> i64 {
+        e.sql(sql)
+            .unwrap()
+            .into_record_batch()
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .value(0)
+    };
+    assert_eq!(one("SELECT COUNT(*) FROM t WHERE n IS NULL"), 3);
+    assert_eq!(one("SELECT COUNT(a) FROM t WHERE n IS NOT NULL"), 3);
+    assert_eq!(one("SELECT SUM(a) FROM t WHERE n IS NULL"), 2 + 4 + 5);
+    // A nullable column without NULLs.
+    assert_eq!(one("SELECT COUNT(*) FROM t WHERE full IS NULL"), 0);
+    assert_eq!(one("SELECT SUM(a) FROM t WHERE full IS NOT NULL"), 21);
+    let g = e
+        .sql("SELECT g, SUM(a) AS s FROM t WHERE n IS NULL GROUP BY g ORDER BY g")
+        .unwrap()
+        .into_record_batch();
+    let s: Vec<i64> = g.column(1).as_primitive::<Int64Type>().values().to_vec();
+    assert_eq!(s, vec![2, 4, 5]);
+}
