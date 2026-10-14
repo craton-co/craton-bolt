@@ -23,6 +23,12 @@
 //!
 //! One process writes a catalog at a time (`_bolt/LOCK`, created
 //! exclusively and removed when the writer closes).
+//!
+//! **Transactions.** Between [`Catalog::begin`] and
+//! [`Catalog::commit_transaction`] changes apply to the in-memory manifest
+//! only; the commit publishes them as **one** snapshot, and
+//! [`Catalog::rollback_transaction`] discards them (their data files are
+//! unreferenced, for [`Catalog::vacuum`] to remove).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -217,6 +223,8 @@ pub struct Catalog {
     manifest: Manifest,
     lock: Option<WriterLock>,
     write_options: ParquetWriteOptions,
+    /// The last published manifest while a transaction is open.
+    txn_base: Option<Manifest>,
 }
 
 impl Catalog {
@@ -258,6 +266,7 @@ impl Catalog {
             manifest,
             lock: Some(lock),
             write_options: ParquetWriteOptions::default(),
+            txn_base: None,
         })
     }
 
@@ -274,6 +283,7 @@ impl Catalog {
             manifest,
             lock: None,
             write_options: ParquetWriteOptions::default(),
+            txn_base: None,
         })
     }
 
@@ -559,6 +569,137 @@ impl Catalog {
         })
     }
 
+    /// Replace the files of managed table `name`: drop the data files whose
+    /// paths are in `remove` and add `add` as new files, in one snapshot
+    /// (`DELETE` / `UPDATE` rewrite only the files they touch). The table's
+    /// clustering is kept only when no file is added.
+    pub fn rewrite_files(
+        &mut self,
+        name: &str,
+        remove: &[String],
+        add: &[RecordBatch],
+    ) -> BoltResult<()> {
+        self.writable()?;
+        let meta = self.require(name)?;
+        if !matches!(meta.kind, TableKind::Managed) {
+            return Err(BoltError::Plan(format!(
+                "table '{name}' is external and read-only"
+            )));
+        }
+        let id = meta.id;
+        let mut next = self.manifest.clone();
+        let version = next.version + 1;
+        let files = self.write_files(id, version, add)?;
+        let t = next.tables.get_mut(name).expect("checked");
+        t.files.retain(|f| !remove.contains(&f.path));
+        if !files.is_empty() {
+            t.cluster_by.clear();
+        }
+        t.files.extend(files);
+        t.table_version += 1;
+        t.analyzed = None;
+        self.commit(next)
+    }
+
+    /// Replace managed table `name`'s schema and rows (schema evolution:
+    /// `ALTER TABLE` rewrites the table under its new columns). `cluster_by`
+    /// becomes the recorded clustering key.
+    pub fn replace_table(
+        &mut self,
+        name: &str,
+        schema: &Schema,
+        batches: &[RecordBatch],
+        cluster_by: Vec<String>,
+    ) -> BoltResult<()> {
+        self.writable()?;
+        let meta = self.require(name)?;
+        if !matches!(meta.kind, TableKind::Managed) {
+            return Err(BoltError::Plan(format!(
+                "table '{name}' is external and read-only"
+            )));
+        }
+        let id = meta.id;
+        let columns = columns_meta(schema)?;
+        let mut next = self.manifest.clone();
+        let version = next.version + 1;
+        let files = self.write_files(id, version, batches)?;
+        let t = next.tables.get_mut(name).expect("checked");
+        t.columns = columns;
+        t.files = files;
+        t.cluster_by = cluster_by;
+        t.table_version += 1;
+        t.analyzed = None;
+        self.commit(next)
+    }
+
+    /// Rename table `old` to `new` (its data files stay where they are).
+    pub fn rename_table(&mut self, old: &str, new: &str) -> BoltResult<()> {
+        self.writable()?;
+        self.require(old)?;
+        if self.manifest.tables.contains_key(new) || self.manifest.views.contains_key(new) {
+            return Err(BoltError::Plan(format!(
+                "catalog already has a table named '{new}'"
+            )));
+        }
+        if let Some((v, _)) = self
+            .manifest
+            .views
+            .iter()
+            .find(|(_, v)| v.dependencies.iter().any(|d| d == old))
+        {
+            return Err(BoltError::Plan(format!(
+                "materialized view '{v}' reads '{old}'; drop it before renaming the table"
+            )));
+        }
+        let mut next = self.manifest.clone();
+        let mut t = next.tables.remove(old).expect("checked");
+        t.table_version += 1;
+        next.tables.insert(new.to_string(), t);
+        self.commit(next)
+    }
+
+    /// Start a transaction: later changes stay unpublished until
+    /// [`Catalog::commit_transaction`].
+    pub fn begin(&mut self) -> BoltResult<()> {
+        self.writable()?;
+        if self.txn_base.is_some() {
+            return Err(BoltError::Plan("a transaction is already open".into()));
+        }
+        self.txn_base = Some(self.manifest.clone());
+        Ok(())
+    }
+
+    /// `true` while a transaction is open.
+    pub fn in_transaction(&self) -> bool {
+        self.txn_base.is_some()
+    }
+
+    /// Publish the open transaction's changes as one snapshot (nothing is
+    /// written when it changed nothing).
+    pub fn commit_transaction(&mut self) -> BoltResult<()> {
+        let base = self
+            .txn_base
+            .take()
+            .ok_or_else(|| BoltError::Plan("no transaction is open".into()))?;
+        if self.manifest == base {
+            return Ok(());
+        }
+        // On failure nothing was published: the transaction is gone and the
+        // catalog is back at its last snapshot.
+        let next = std::mem::replace(&mut self.manifest, base);
+        self.commit(next)
+    }
+
+    /// Discard the open transaction's changes.
+    pub fn rollback_transaction(&mut self) -> BoltResult<()> {
+        let base = self
+            .txn_base
+            .take()
+            .ok_or_else(|| BoltError::Plan("no transaction is open".into()))?;
+        self.manifest = base;
+        Ok(())
+    }
+
     /// Create or replace materialized view `name`.
     pub fn put_view(&mut self, name: &str, view: ViewMeta) -> BoltResult<()> {
         self.writable()?;
@@ -595,6 +736,13 @@ impl Catalog {
     /// references.
     pub fn vacuum(&mut self, keep_snapshots: usize) -> BoltResult<VacuumReport> {
         self.writable()?;
+        if self.txn_base.is_some() {
+            // The open transaction's files are not referenced by any
+            // published manifest yet.
+            return Err(BoltError::Plan(
+                "VACUUM cannot run inside a transaction".into(),
+            ));
+        }
         let keep = keep_snapshots.max(1);
         let snaps = self.snapshots()?;
         let mut report = VacuumReport::default();
@@ -666,8 +814,15 @@ impl Catalog {
         fs::create_dir_all(self.root.join(&rel_dir)).map_err(|e| io_err(&rel_dir, e))?;
         // One file per append keeps snapshots cheap; the writer splits it
         // into row groups for pruning. (`compact` rewrites many into few.)
-        let rel = format!("{rel_dir}/part-{version:09}-0.parquet");
-        let path = self.root.join(&rel);
+        // Inside a transaction several changes share one snapshot number.
+        let (rel, path) = (0u32..)
+            .map(|k| {
+                let rel = format!("{rel_dir}/part-{version:09}-{k}.parquet");
+                let path = self.root.join(&rel);
+                (rel, path)
+            })
+            .find(|(_, p)| !p.exists())
+            .expect("an unused file name");
         let rows = write_parquet(&path, &batches, &self.write_options)?;
         let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let stats = ParquetTable::open(&path)?.statistics();
@@ -681,8 +836,15 @@ impl Catalog {
 
     /// Durably publish `next` as the new current snapshot.
     fn commit(&mut self, mut next: Manifest) -> BoltResult<()> {
-        next.version = self.manifest.version + 1;
         next.format = FORMAT_VERSION;
+        if let Some(base) = &self.txn_base {
+            // Inside a transaction: the change becomes visible to this
+            // catalog only, published by `commit_transaction`.
+            next.version = base.version + 1;
+            self.manifest = next;
+            return Ok(());
+        }
+        next.version = self.manifest.version + 1;
         let path = manifest_path(&self.root, next.version);
         let text =
             serde_json::to_vec_pretty(&next).map_err(|e| io_err("serialising manifest", e))?;
@@ -695,6 +857,21 @@ impl Catalog {
         self.manifest = next;
         Ok(())
     }
+}
+
+/// Column metadata of `schema`.
+fn columns_meta(schema: &Schema) -> BoltResult<Vec<ColumnMeta>> {
+    schema
+        .fields
+        .iter()
+        .map(|f| {
+            Ok(ColumnMeta {
+                name: f.name.clone(),
+                dtype: dtype_to_text(f.dtype)?,
+                nullable: f.nullable,
+            })
+        })
+        .collect()
 }
 
 /// Concatenate `batches` and sort the rows on the `key` columns (ascending,

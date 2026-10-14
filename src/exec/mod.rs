@@ -22,12 +22,14 @@ pub mod aggregate;
 pub mod compact;
 mod engine_agg_impl;
 pub(crate) mod engine_ddl;
+mod engine_dml;
 mod engine_join_impl;
 pub(crate) mod engine_ooc;
 mod engine_query;
 pub(crate) mod engine_storage;
 mod engine_streaming_impl;
 mod engine_string_impl;
+pub(crate) mod engine_txn;
 pub(crate) mod engine_views;
 /// Shared async-memcpy / pinned-host-buffer helpers for executors.
 /// Lifted out of `exec::aggregate` so filter, GROUP BY, joins

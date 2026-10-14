@@ -186,6 +186,29 @@ fn concat_or_empty(schema: SchemaRef, batches: &[RecordBatch]) -> BoltResult<Rec
     }
 }
 
+/// `true` for the statements [`Engine::try_maintenance_statement`] handles.
+fn is_maintenance_statement(sql: &str) -> bool {
+    let upper: Vec<String> = sql
+        .split_whitespace()
+        .take(6)
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
+    let w: Vec<&str> = upper.iter().map(String::as_str).collect();
+    let n = sql.split_whitespace().count();
+    matches!(
+        (w.as_slice(), n),
+        (["COMPACT", "TABLE", ..], _)
+            | (["VACUUM", ..], 1..=3)
+            | (["REFRESH", "MATERIALIZED", "VIEW", ..], 4)
+            | (["ANALYZE", ..], 2)
+            | (["ANALYZE", "TABLE", ..], 3)
+            | (["DESCRIBE" | "DESC", ..], 2)
+            | (["DESCRIBE" | "DESC", "TABLE", ..], 3)
+            | (["DROP", "MATERIALIZED", "VIEW", ..], 4)
+            | (["DROP", "MATERIALIZED", "VIEW", "IF", "EXISTS", ..], 6)
+    )
+}
+
 /// File format of a `COPY` target.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CopyFormat {
@@ -213,19 +236,32 @@ impl Engine {
     /// | `SHOW TABLES` / `DESCRIBE t` | |
     /// | `COMPACT TABLE t` / `VACUUM [KEEP n]` | catalog tables only |
     /// | `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'on_commit')] AS SELECT ...`, `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW v` | see [`Engine::view_status`] |
+    /// | `DELETE FROM t [WHERE ...]` / `UPDATE t SET c = expr, ... [WHERE ...]` | rewrites the affected files |
+    /// | `ALTER TABLE t ADD [COLUMN] c type [DEFAULT e]`, `DROP [COLUMN] c`, `RENAME [COLUMN] a TO b`, `ALTER [COLUMN] c TYPE t \| SET NOT NULL \| DROP NOT NULL`, `RENAME TO u` | |
+    /// | `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` | see [`Engine::begin_transaction`] |
     ///
     /// Without a file-format option, `COPY` infers it from the file
     /// extension (`.csv` → CSV with a header, anything else → Parquet).
     ///
-    /// Each statement commits on its own; a failing statement leaves the
-    /// tables as the previous statement left them, and later statements do
-    /// not run.
+    /// Outside a transaction each statement commits on its own; a failing
+    /// statement leaves the tables as the previous statement left them, and
+    /// later statements do not run. Inside one (see the
+    /// [`engine_txn`](crate::exec::engine_txn) docs) a failure aborts the
+    /// transaction.
     pub fn execute_sql(&mut self, sql: &str) -> BoltResult<QueryHandle> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
-        if let Some(h) = self.try_maintenance_statement(trimmed) {
-            return self.count_statement(|_| h);
+        if is_maintenance_statement(trimmed) {
+            self.ensure_transaction_usable()?;
+            let r = self.count_statement(|e| {
+                e.try_maintenance_statement(trimmed).unwrap_or_else(|| {
+                    Err(BoltError::Sql(format!("malformed statement: {trimmed}")))
+                })
+            });
+            if r.is_err() {
+                self.abort_transaction_on_error();
+            }
+            return r;
         }
-        self.refresh_stale_on_commit_views()?;
         crate::plan::sql_frontend::guard_sql_size(sql)?;
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)
             .map_err(|e| crate::plan::sql_frontend::parse_error_to_bolt_error(e, sql))?;
@@ -234,16 +270,54 @@ impl Engine {
         }
         let mut last = None;
         for stmt in stmts {
-            // Catch up on-commit views with changes made through the Rust
-            // registration API since the last statement.
-            self.refresh_stale_on_commit_views()?;
-            last = Some(match stmt {
-                // `sql()` does its own query accounting.
-                Statement::Query(_) => self.sql(&stmt.to_string())?,
-                other => self.count_statement(|e| e.execute_statement(other))?,
-            });
+            let control = matches!(
+                stmt,
+                Statement::StartTransaction { .. }
+                    | Statement::Commit { .. }
+                    | Statement::Rollback { .. }
+            );
+            if control {
+                last = Some(self.count_statement(|e| e.transaction_statement(stmt))?);
+                continue;
+            }
+            self.ensure_transaction_usable()?;
+            let r = (|| {
+                // Catch up on-commit views with changes made through the
+                // Rust registration API since the last statement.
+                self.refresh_stale_on_commit_views()?;
+                match stmt {
+                    // `sql()` does its own query accounting.
+                    Statement::Query(_) => self.sql(&stmt.to_string()),
+                    other => self.count_statement(|e| e.execute_statement(other)),
+                }
+            })();
+            match r {
+                Ok(h) => last = Some(h),
+                Err(e) => {
+                    self.abort_transaction_on_error();
+                    return Err(e);
+                }
+            }
         }
         Ok(last.expect("at least one statement"))
+    }
+
+    /// `BEGIN` / `COMMIT` / `ROLLBACK`.
+    fn transaction_statement(&mut self, stmt: Statement) -> BoltResult<QueryHandle> {
+        match stmt {
+            Statement::StartTransaction { modifier: None, .. } => self.begin_transaction()?,
+            Statement::Commit { chain: false } => self.commit_transaction()?,
+            Statement::Rollback {
+                chain: false,
+                savepoint: None,
+            } => self.rollback_transaction()?,
+            other => {
+                return Err(BoltError::Sql(format!(
+                    "transaction statement not supported: {other}"
+                )))
+            }
+        }
+        Ok(status(0))
     }
 
     /// `QueriesTotal` / `QueriesFailed` accounting for a non-query statement.
@@ -445,6 +519,7 @@ impl Engine {
                                     "table '{name}' does not exist"
                                 )));
                             }
+                            self.ensure_droppable_in_transaction(&name)?;
                             self.drop_table(&name)?;
                         }
                         ObjectType::View => {
@@ -465,6 +540,26 @@ impl Engine {
                 }
                 Ok(status(0))
             }
+            Statement::Delete(d) => self.execute_delete(d).map(status),
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+            } => self
+                .execute_update(table, assignments, from, selection, returning)
+                .map(status),
+            Statement::AlterTable {
+                name,
+                if_exists,
+                operations,
+                location: None,
+                on_cluster: None,
+                only: false,
+            } => self
+                .execute_alter_table(&name, if_exists, operations)
+                .map(|()| status(0)),
             Statement::Truncate { table_names, .. } => {
                 for t in &table_names {
                     self.truncate_table(&object_name(&t.name))?;

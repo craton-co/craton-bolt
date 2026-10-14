@@ -29,6 +29,14 @@
 //!
 //! Temporary tables (`CREATE TEMP TABLE`) are database-wide: every session
 //! sees them, and they disappear when the database closes.
+//!
+//! **Transactions.** A `BEGIN` ... `COMMIT` belongs to the session that ran
+//! `BEGIN`. While it is open, other sessions' statements wait in arrival
+//! order and run once it ends, so every session sees either all of a
+//! transaction's changes or none (serializable execution). A waiting
+//! statement fails after [`Database::set_transaction_wait`] (default 30 s).
+//! When the last handle of a session drops with its transaction still open,
+//! the transaction is rolled back.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -44,10 +52,33 @@ use arrow_array::RecordBatch;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::engine::{Engine, EngineBuilder};
 
-type Job = Box<dyn FnOnce(&mut Engine) + Send>;
+/// Unit of work for the runtime thread.
+struct Job {
+    /// Submitting session (`None`: [`Database::with_engine`] and internal
+    /// jobs).
+    session: Option<u64>,
+    queued: Instant,
+    run: Box<dyn FnOnce(&mut Engine) + Send>,
+    /// Report that the job will not run.
+    fail: Box<dyn FnOnce(BoltError) + Send>,
+}
+
+impl Job {
+    fn new(session: Option<u64>, run: impl FnOnce(&mut Engine) + Send + 'static) -> Job {
+        Job {
+            session,
+            queued: Instant::now(),
+            run: Box::new(run),
+            fail: Box::new(|_| {}),
+        }
+    }
+}
 
 /// Default capacity of the statement queue.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+
+/// Default time a statement waits for another session's transaction.
+pub const DEFAULT_TRANSACTION_WAIT: Duration = Duration::from_secs(30);
 
 /// Counters of a [`Database`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -84,6 +115,8 @@ struct Inner {
     // drop (and join the runtime) from the runtime thread itself.
     counters: Arc<Counters>,
     next_session: AtomicU64,
+    /// Transaction wait limit in nanoseconds, read by the runtime thread.
+    txn_wait_nanos: Arc<AtomicU64>,
 }
 
 impl Inner {
@@ -144,6 +177,8 @@ impl Database {
     pub fn open_with_capacity(builder: EngineBuilder, capacity: usize) -> BoltResult<Database> {
         let (tx, rx) = mpsc::sync_channel::<Job>(capacity.max(1));
         let (ready_tx, ready_rx) = mpsc::channel::<BoltResult<()>>();
+        let txn_wait_nanos = Arc::new(AtomicU64::new(DEFAULT_TRANSACTION_WAIT.as_nanos() as u64));
+        let wait_limit = Arc::clone(&txn_wait_nanos);
         let worker = std::thread::Builder::new()
             .name("bolt-runtime".into())
             .spawn(move || {
@@ -157,9 +192,7 @@ impl Database {
                         return;
                     }
                 };
-                while let Ok(job) = rx.recv() {
-                    job(&mut engine);
-                }
+                run_jobs(&mut engine, &rx, &wait_limit);
             })
             .map_err(|e| BoltError::Other(format!("starting the runtime thread: {e}")))?;
         match ready_rx.recv() {
@@ -181,6 +214,7 @@ impl Database {
                 worker: Mutex::new(Some(worker)),
                 counters: Arc::new(Counters::default()),
                 next_session: AtomicU64::new(1),
+                txn_wait_nanos,
             }),
         })
     }
@@ -188,12 +222,26 @@ impl Database {
     /// Open a new session.
     pub fn session(&self) -> Session {
         self.inner.counters.sessions.fetch_add(1, Ordering::Relaxed);
+        let id = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
         Session {
+            _guard: Arc::new(SessionGuard {
+                inner: Arc::clone(&self.inner),
+                id,
+            }),
             inner: Arc::clone(&self.inner),
-            id: self.inner.next_session.fetch_add(1, Ordering::Relaxed),
+            id,
             settings: Arc::new(Mutex::new(SessionSettings::default())),
             statements: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// How long a statement waits for another session's open transaction
+    /// before failing (default [`DEFAULT_TRANSACTION_WAIT`]).
+    pub fn set_transaction_wait(&self, limit: Duration) {
+        self.inner.txn_wait_nanos.store(
+            limit.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Run `f` with exclusive access to the engine on the runtime thread
@@ -204,7 +252,7 @@ impl Database {
         F: FnOnce(&mut Engine) -> R + Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
-        let job: Job = Box::new(move |e| {
+        let job = Job::new(None, move |e| {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(e)));
             let _ = tx.send(r);
         });
@@ -242,6 +290,86 @@ impl Database {
     }
 }
 
+/// `true` when `job` may run while `holder` holds a transaction.
+fn may_run(holder: Option<Option<u64>>, job: &Job) -> bool {
+    match holder {
+        None => true,
+        Some(owner) => owner == job.session,
+    }
+}
+
+/// The runtime loop: run jobs in arrival order, holding back other
+/// sessions' jobs while a transaction is open.
+fn run_jobs(engine: &mut Engine, rx: &mpsc::Receiver<Job>, wait_limit: &AtomicU64) {
+    let mut deferred: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+    let mut connected = true;
+    loop {
+        let holder = engine.transaction_holder();
+        if holder.is_none() {
+            if let Some(job) = deferred.pop_front() {
+                run_job(engine, job);
+                continue;
+            }
+        }
+        if !connected {
+            if holder.is_some() {
+                // Every handle is gone: nobody can end the transaction.
+                let _ = engine.rollback_transaction();
+                continue;
+            }
+            return;
+        }
+        // Fail jobs that waited too long for the transaction.
+        let limit = Duration::from_nanos(wait_limit.load(Ordering::Relaxed));
+        let mut i = 0;
+        while i < deferred.len() {
+            if deferred[i].queued.elapsed() >= limit {
+                let job = deferred.remove(i).expect("index in range");
+                (job.fail)(BoltError::Plan(format!(
+                    "timed out after {limit:?} waiting for another session's transaction"
+                )));
+            } else {
+                i += 1;
+            }
+        }
+        let next = match deferred.iter().map(|j| j.queued).min() {
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            Some(oldest) => rx.recv_timeout(limit.saturating_sub(oldest.elapsed())),
+        };
+        match next {
+            Ok(job) if may_run(holder, &job) => run_job(engine, job),
+            Ok(job) => deferred.push_back(job),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => connected = false,
+        }
+    }
+}
+
+fn run_job(engine: &mut Engine, job: Job) {
+    engine.current_session = job.session;
+    (job.run)(engine);
+    engine.current_session = None;
+}
+
+/// Rolls back the session's open transaction when its last handle drops.
+struct SessionGuard {
+    inner: Arc<Inner>,
+    id: u64,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let id = self.id;
+        if let Ok(tx) = self.inner.sender() {
+            let _ = tx.send(Job::new(Some(id), move |e| {
+                if e.transaction_holder() == Some(Some(id)) {
+                    let _ = e.rollback_transaction();
+                }
+            }));
+        }
+    }
+}
+
 fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
     p.downcast_ref::<&str>()
         .map(|s| s.to_string())
@@ -261,6 +389,9 @@ pub struct SessionSettings {
 /// session's settings and counters.
 #[derive(Clone)]
 pub struct Session {
+    // Declared first: its drop (which may queue a rollback) runs while
+    // `inner` still keeps the runtime alive.
+    _guard: Arc<SessionGuard>,
     inner: Arc<Inner>,
     id: u64,
     settings: Arc<Mutex<SessionSettings>>,
@@ -285,6 +416,17 @@ struct Shared {
     slot: Mutex<Slot>,
     ready: std::sync::Condvar,
     cancelled: AtomicBool,
+}
+
+impl Shared {
+    fn deliver(&self, result: BoltResult<RecordBatch>) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.result = Some(result);
+        if let Some(w) = slot.waker.take() {
+            w.wake();
+        }
+        self.ready.notify_all();
+    }
 }
 
 /// The eventual result of a [`Session::submit`]ted statement.
@@ -431,10 +573,12 @@ impl Session {
             cancelled: AtomicBool::new(false),
         });
         let worker_side = Arc::clone(&shared);
+        let fail_side = Arc::clone(&shared);
         let counters = Arc::clone(&self.inner.counters);
+        let fail_counters = Arc::clone(&self.inner.counters);
         let sql = sql.to_string();
         let queued = Instant::now();
-        let job: Job = Box::new(move |engine: &mut Engine| {
+        let run = move |engine: &mut Engine| {
             let c = &counters;
             if worker_side.cancelled.load(Ordering::Acquire) {
                 c.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -462,13 +606,19 @@ impl Session {
             if result.is_err() {
                 c.failed.fetch_add(1, Ordering::Relaxed);
             }
-            let mut slot = worker_side.slot.lock().unwrap_or_else(|p| p.into_inner());
-            slot.result = Some(result);
-            if let Some(w) = slot.waker.take() {
-                w.wake();
-            }
-            worker_side.ready.notify_all();
-        });
+            worker_side.deliver(result);
+        };
+        let fail = move |e: BoltError| {
+            fail_counters.statements.fetch_add(1, Ordering::Relaxed);
+            fail_counters.failed.fetch_add(1, Ordering::Relaxed);
+            fail_side.deliver(Err(e));
+        };
+        let job = Job {
+            session: Some(self.id),
+            queued,
+            run: Box::new(run),
+            fail: Box::new(fail),
+        };
         Ok((job, PendingResult { shared }))
     }
 }
