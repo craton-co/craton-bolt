@@ -468,6 +468,10 @@ impl Engine {
             .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
         match shape {
             QueryShape::Generic(plan) => {
+                // A fresh materialized view of this very query.
+                if let Some(h) = self.answer_from_view(&plan)? {
+                    return Ok(h);
+                }
                 // Out-of-core results depend on the budget path taken and
                 // are not cached.
                 if let Some(h) = self.timed_ooc(&plan)? {
@@ -635,6 +639,12 @@ impl Engine {
                     sel.rows
                 ));
             }
+        }
+        if let Some(v) = self.matching_view(plan) {
+            out.push_str(&format!(
+                "Answered from materialized view '{v}' (fresh)
+"
+            ));
         }
         if let Some(t) = self.explain_tier(plan) {
             out.push_str(&t);

@@ -292,7 +292,32 @@ fn split_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
             split_and(left, out);
             split_and(right, out);
         }
-        other => out.push(other),
+        other => match three_valued_condition(other) {
+            Some(c) => split_and(c, out),
+            None => out.push(other),
+        },
+    }
+}
+
+/// `c` for the frontend's three-valued wrapper `CASE WHEN c THEN true WHEN
+/// NOT c THEN false ELSE NULL END` (an `IN` list): as a filter it keeps
+/// exactly the rows where `c` is TRUE.
+fn three_valued_condition(e: &Expr) -> Option<&Expr> {
+    let Expr::Case {
+        branches,
+        else_branch,
+    } = e
+    else {
+        return None;
+    };
+    let [(c, Expr::Literal(Literal::Bool(true))), (_, Expr::Literal(Literal::Bool(false)))] =
+        branches.as_slice()
+    else {
+        return None;
+    };
+    match else_branch.as_deref() {
+        None | Some(Expr::Literal(Literal::Null)) => Some(c),
+        _ => None,
     }
 }
 
@@ -548,6 +573,40 @@ mod tests {
             predicate: mixed,
         };
         assert!(scan_requests(&plan, &["t"])["t"].filters.is_empty());
+    }
+
+    #[test]
+    fn three_valued_in_list_wrapper_is_prunable() {
+        // The frontend's strict-3VL form of `a IN (1, 4)`.
+        let c = bin(
+            BinaryOp::Or,
+            bin(BinaryOp::Eq, col("a"), lit(1)),
+            bin(BinaryOp::Eq, col("a"), lit(4)),
+        );
+        let wrapped = Expr::Case {
+            branches: vec![
+                (c.clone(), Expr::Literal(Literal::Bool(true))),
+                (
+                    Expr::Unary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(c),
+                    },
+                    Expr::Literal(Literal::Bool(false)),
+                ),
+            ],
+            else_branch: Some(Box::new(Expr::Literal(Literal::Null))),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(None)),
+            predicate: wrapped,
+        };
+        assert_eq!(
+            scan_requests(&plan, &["t"])["t"].filters,
+            vec![vec![PrunePredicate::InList {
+                column: 0,
+                values: vec![Literal::Int64(1), Literal::Int64(4)]
+            }]]
+        );
     }
 
     #[test]

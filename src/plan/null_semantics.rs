@@ -14,9 +14,9 @@
 //!   which the projection path stores as a hidden validity output.
 //!
 //! An expression that reads no nullable column and no NULL literal is left
-//! untouched (the emitted kernel is unchanged). Constructs without a rule
-//! here are reported as unsupported, and the caller evaluates the statement
-//! on the host instead.
+//! untouched (the emitted kernel is unchanged). Every construct the codegen
+//! lowers has a rule; others (subqueries, function calls) are reported as
+//! unsupported and left to the codegen, which rejects them.
 
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::{BinaryOp, DataType, Expr, Literal, Schema, UnaryOp};

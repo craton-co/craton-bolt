@@ -1278,6 +1278,8 @@ pub struct Engine {
     pub(crate) catalog: Option<crate::storage::Catalog>,
     /// When statements may run on the host tier (see `crate::exec::cost`).
     pub(crate) tier_policy: crate::exec::cost::TierPolicy,
+    /// Answer queries from fresh materialized views with the same plan.
+    pub(crate) view_rewrite: bool,
     /// Tier cost estimates (replaced by `calibrate_cost_model`).
     pub(crate) cost_model: RefCell<Arc<dyn crate::exec::cost::CostModel>>,
     /// Open `BEGIN` ... `COMMIT` transaction (see `engine_txn`).
@@ -1335,6 +1337,7 @@ pub struct EngineBuilder {
     auto_compact_files: Option<usize>,
     tier_policy: crate::exec::cost::TierPolicy,
     cost_model: Option<Arc<dyn crate::exec::cost::CostModel>>,
+    view_rewrite: bool,
     /// Persistent catalog directory to open (see [`EngineBuilder::database`]).
     #[cfg(feature = "storage")]
     database: Option<std::path::PathBuf>,
@@ -1366,6 +1369,7 @@ impl EngineBuilder {
             auto_compact_files: None,
             tier_policy: crate::exec::cost::TierPolicy::GpuFirst,
             cost_model: None,
+            view_rewrite: true,
             #[cfg(feature = "storage")]
             database: None,
             #[cfg(feature = "storage")]
@@ -1413,6 +1417,13 @@ impl EngineBuilder {
     /// clustering key. Off by default (`COMPACT TABLE` runs it by hand).
     pub fn auto_compact(mut self, max_files: usize) -> Self {
         self.auto_compact_files = Some(max_files.max(1));
+        self
+    }
+
+    /// Answer a query from a fresh materialized view whose defining query
+    /// has the same plan (default on). See [`crate::exec::engine_views`].
+    pub fn view_rewrite(mut self, enabled: bool) -> Self {
+        self.view_rewrite = enabled;
         self
     }
 
@@ -1652,6 +1663,7 @@ impl EngineBuilder {
             #[cfg(feature = "storage")]
             catalog: None,
             tier_policy: self.tier_policy,
+            view_rewrite: self.view_rewrite,
             cost_model: RefCell::new(
                 self.cost_model
                     .clone()
@@ -4166,6 +4178,7 @@ impl Engine {
                         crate::exec::aggregate::execute_aggregate(phys, &batch)?
                     }
                 };
+                let out = self.null_empty_groups(phys, out)?;
                 Ok(QueryHandle::from_record_batch(out))
             }
             // ----- wave-7 dispatch -----

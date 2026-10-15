@@ -119,11 +119,13 @@ pub enum Counter {
     SpillBytesWritten = 9,
     /// Statements the cost model ran on the host tier.
     HostTierQueries = 10,
+    /// Queries answered from a materialized view.
+    ViewRewrites = 11,
 }
 
 impl Counter {
     /// All counters in declaration / snapshot order.
-    pub const ALL: [Counter; 11] = [
+    pub const ALL: [Counter; 12] = [
         Counter::QueriesTotal,
         Counter::QueriesFailed,
         Counter::PtxCacheHits,
@@ -135,6 +137,7 @@ impl Counter {
         Counter::SpillFilesWritten,
         Counter::SpillBytesWritten,
         Counter::HostTierQueries,
+        Counter::ViewRewrites,
     ];
 
     /// Stable snake_case name, suitable as a metric key (no `craton_` prefix —
@@ -152,6 +155,7 @@ impl Counter {
             Counter::SpillFilesWritten => "spill_files_written",
             Counter::SpillBytesWritten => "spill_bytes_written",
             Counter::HostTierQueries => "host_tier_queries",
+            Counter::ViewRewrites => "view_rewrites",
         }
     }
 
@@ -174,6 +178,7 @@ impl Counter {
             Counter::SpillFilesWritten => "Spill files written by out-of-core execution.",
             Counter::SpillBytesWritten => "Bytes written to spill files by out-of-core execution.",
             Counter::HostTierQueries => "Statements the cost model ran on the host tier.",
+            Counter::ViewRewrites => "Queries answered from a materialized view.",
         }
     }
 }
@@ -696,7 +701,7 @@ mod tests {
     #[test]
     fn counter_names_match_variants() {
         // Spot-check a couple and the full count.
-        assert_eq!(Counter::ALL.len(), 11);
+        assert_eq!(Counter::ALL.len(), 12);
         assert_eq!(Counter::QueriesTotal.as_str(), "queries_total");
         assert_eq!(Counter::HostTierQueries.as_str(), "host_tier_queries");
         assert_eq!(Counter::SpillBytesWritten.as_str(), "spill_bytes_written");

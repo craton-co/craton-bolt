@@ -22,6 +22,14 @@ All notable changes to this project will be documented here. The format follows 
   refuses an accumulator wider than its buffer.
 - **`COUNT(col)` / `AVG(col)` through the aggregate pre-stage counted NULL
   rows** of a nullable `col` (e.g. `COUNT(f) ... WHERE k > 3`).
+- **Grouped `SUM` / `MIN` / `MAX` of a group with only NULL values
+  returned the accumulator's identity** (`0`, `i64::MAX`, `inf`, `NaN`)
+  instead of NULL. When an aggregate's input holds NULLs, a companion
+  `COUNT(input)` of the same plan now marks the empty groups.
+- **Several aggregates of one column under a predicate failed** (`SUM(v),
+  MIN(v) ... WHERE ...` → "duplicate pre output name"), and **grouped float
+  `MIN` / `MAX` under a predicate** failed ("MIN/MAX over float not yet
+  supported"; now folded on the host).
 - **Aggregates filtered by `IS [NOT] NULL` read garbage validity pointers**
   in the fused pre-stage predicate kernel (CUDA "invalid argument" or an
   access violation): the predicate kernel now receives the validity
@@ -126,6 +134,25 @@ All notable changes to this project will be documented here. The format follows 
   merge per-chunk partials — both used to fail with a memory error.
   `Engine::sql_stream` / `ResultStream` yield such a query's result chunk
   group by chunk group, so a large result is never held at once.
+- **Bloom-filter pruning.** `write_parquet` (and so every catalog data
+  file) writes Parquet bloom filters for integer, date and string columns
+  with at least 1024 distinct values (`ParquetWriteOptions::bloom_filters`,
+  on by default); `ParquetTable::plan_scan` tests them for `=` / `IN`
+  predicates, skipping row groups whose zone maps cannot rule the value out.
+  `IN` lists (the frontend's three-valued `CASE` form) now prune by zone map
+  too.
+- **Materialized views: incremental and scheduled refresh, query
+  rewrite.** A durable view `SELECT keys, SUM / COUNT / MIN / MAX(...) FROM
+  t [WHERE ...] GROUP BY keys` over a catalog table that only gained files
+  refreshes from the new files, merging partial aggregates
+  (`ViewStatus::incremental` / `last_refresh_incremental`;
+  `ViewMeta::base_files`). `WITH (refresh = 'every 5 minutes')`
+  (`RefreshMode::Scheduled`, `RefreshPolicy::Scheduled`) refreshes a stale
+  view at most once per interval — before `execute_sql` statements, in
+  `Engine::refresh_due_views`, and on the `Database` runtime. A query whose
+  plan equals a fresh view's defining query is answered from the view
+  (`EngineBuilder::view_rewrite`, `Counter::ViewRewrites`; `EXPLAIN` says
+  so).
 - **Cost-based CPU / GPU tier selection** (`exec::cost`). `CostModel`
   (`estimate(&CostInputs) -> OperatorCost`: host and device time, H2D / D2H
   bytes, peak device bytes, compile time), the linear `DefaultCostModel`,

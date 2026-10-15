@@ -141,6 +141,11 @@ pub enum RefreshPolicy {
     Manual,
     /// Refreshed automatically after a statement changes a base table.
     OnCommit,
+    /// Refreshed when stale and at least `seconds` after its last refresh.
+    Scheduled {
+        /// Minimum interval between refreshes.
+        seconds: u64,
+    },
 }
 
 /// Catalog entry for a materialized view.
@@ -156,6 +161,15 @@ pub struct ViewMeta {
     pub refresh: RefreshPolicy,
     /// Managed table holding the view's rows.
     pub backing_table: String,
+    /// Wall-clock time of the last refresh, milliseconds since the Unix
+    /// epoch.
+    #[serde(default)]
+    pub refreshed_at_ms: Option<u64>,
+    /// Data files of each catalog base table at the last refresh: when a
+    /// base table has only gained files since, the view refreshes
+    /// incrementally from the new ones.
+    #[serde(default)]
+    pub base_files: BTreeMap<String, Vec<String>>,
 }
 
 /// A complete catalog snapshot.

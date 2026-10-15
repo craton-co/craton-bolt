@@ -211,17 +211,24 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   covers row-wise statements and scalar aggregates over one table whose
   expressions the host evaluator supports; joins, `GROUP BY` and windows
   always take the GPU path where it exists.
-- **Materialized views** refresh in full (no incremental maintenance) and
-  are never substituted into queries automatically. A view in a catalog may
-  read only catalog tables. `on_commit` refresh happens on the
-  `execute_sql` path, not inside `Engine::sql`.
+- **Materialized views.** Incremental refresh covers `SUM` / `COUNT` /
+  `MIN` / `MAX` (with or without `GROUP BY`, no `HAVING`, no computed
+  outputs) over one catalog table that changed only by appends; everything
+  else refreshes in full. A query is answered from a view only when its plan
+  equals the view's defining query exactly (no subsumption or partial
+  matching) and the view is fresh. A view in a catalog may read only catalog
+  tables. `on_commit` and scheduled refresh happen on the `execute_sql`
+  path (and the `Database` runtime), not inside `Engine::sql`; scheduled
+  views need such activity to be refreshed.
 - **Temporary tables are engine-wide**, including across the `Session`s of
   one `Database`.
-- **No secondary indexes.** Scans skip data by zone maps (min / max / null
-  count per row group or chunk), Hive partitions and clustering; there are no
-  bloom filters or B-trees. Storage is the local filesystem (no object-store
-  backends), and materialized views refresh manually or on commit (no
-  scheduled refresh).
+- **Indexes are pruning structures only.** Scans skip data by zone maps
+  (min / max / null count per row group or chunk), Hive partitions,
+  clustering, and Parquet bloom filters for `=` / `IN` on integer, date and
+  string columns (written by the engine for columns with at least 1024
+  distinct values; read from any Parquet file that has them). There are no
+  B-trees or row-level lookups. Storage is the local filesystem (no
+  object-store backends).
 
 ## Known performance gaps
 
@@ -238,9 +245,8 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 These are real, code-level behaviors to be aware of:
 
 - **NULLs in GPU kernels.** Predicates and outputs over nullable columns are
-  compiled with explicit validity checks (`plan::null_semantics`); an
-  expression without a rule there (e.g. a function call over a nullable
-  column inside a fused kernel) is evaluated on the host instead.
+  compiled with explicit validity checks (`plan::null_semantics`), which
+  cost one validity load per nullable column read.
 - **Placement is explicit.** `PhysicalPlan::planned_execution_tier()` and
   `QueryHandle::planned_execution_tier()` report `Gpu`, `Host`, or `Hybrid`.
   Runtime-dependent supported paths are classified `Hybrid` up front.

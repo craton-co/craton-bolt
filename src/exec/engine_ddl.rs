@@ -283,8 +283,12 @@ impl Engine {
             self.ensure_transaction_usable()?;
             let r = (|| {
                 // Catch up on-commit views with changes made through the
-                // Rust registration API since the last statement.
+                // Rust registration API since the last statement, and
+                // scheduled views whose interval passed.
                 self.refresh_stale_on_commit_views()?;
+                if self.txn.is_none() {
+                    self.refresh_due_views()?;
+                }
                 match stmt {
                     // `sql()` does its own query accounting.
                     Statement::Query(_) => self.sql(&stmt.to_string()),
@@ -1120,13 +1124,38 @@ fn view_refresh_policy(
         if !k.trim().eq_ignore_ascii_case("refresh") {
             return Err(BoltError::Sql(format!("unsupported view option {text}")));
         }
-        mode = match v.trim().trim_matches('\'').to_ascii_lowercase().as_str() {
+        let v = v.trim().trim_matches('\'').to_ascii_lowercase();
+        mode = match v.as_str() {
             "manual" => RefreshMode::Manual,
             "on_commit" => RefreshMode::OnCommit,
-            other => return Err(BoltError::Sql(format!("unknown refresh policy '{other}'"))),
+            other => match parse_interval(other) {
+                Some(d) => RefreshMode::Scheduled(d),
+                None => {
+                    return Err(BoltError::Sql(format!(
+                        "unknown refresh policy '{other}' (manual, on_commit, or \
+                         'every <n> seconds|minutes|hours')"
+                    )))
+                }
+            },
         };
     }
     Ok(mode)
+}
+
+/// `every <n> second(s) | minute(s) | hour(s)`.
+fn parse_interval(text: &str) -> Option<std::time::Duration> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let ["every", n, unit] = words.as_slice() else {
+        return None;
+    };
+    let n: u64 = n.parse().ok().filter(|&n| n > 0)?;
+    let secs = match unit.trim_end_matches('s') {
+        "second" | "sec" => n,
+        "minute" | "min" => n.checked_mul(60)?,
+        "hour" => n.checked_mul(3600)?,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_secs(secs))
 }
 
 fn copy_format(

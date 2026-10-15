@@ -177,7 +177,7 @@ fn with_children(plan: &LogicalPlan, mut children: Vec<LogicalPlan>) -> LogicalP
 
 /// Point every scan of `from` in `plan` at `to` (whose columns are `from`'s
 /// base columns).
-fn rename_scans(plan: &LogicalPlan, from: &str, to: &str, base: &Schema) -> LogicalPlan {
+pub(crate) fn rename_scans(plan: &LogicalPlan, from: &str, to: &str, base: &Schema) -> LogicalPlan {
     match plan {
         LogicalPlan::Scan {
             table, projection, ..
@@ -266,7 +266,7 @@ fn resolve_base_column(
 
 /// The one base table of a row-wise chain (filters / projections over a
 /// single scan).
-fn single_base_table(plan: &LogicalPlan) -> Option<&str> {
+pub(crate) fn single_base_table(plan: &LogicalPlan) -> Option<&str> {
     match plan {
         LogicalPlan::Scan { table, .. } => Some(table),
         LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {

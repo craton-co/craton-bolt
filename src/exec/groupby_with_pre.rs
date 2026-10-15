@@ -1766,9 +1766,15 @@ fn run_typed_agg(
         }
         (DataType::Float32, HostColValues::F32(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
-                return Err(BoltError::Other(
-                    "MIN/MAX over float not yet supported".into(),
-                ));
+                // No float atomic min / max on the device: fold on the host.
+                return Ok(AccDownload::F32(host_group_minmax(
+                    op,
+                    host,
+                    validity,
+                    host_keys,
+                    keys_table,
+                    identity_f32(op),
+                )?));
             }
             let filtered: Vec<f32> = filter_by_validity(host, validity);
             let input_gpu = GpuVec::<f32>::from_slice_async(&filtered, stream.raw())?;
@@ -1790,9 +1796,14 @@ fn run_typed_agg(
         }
         (DataType::Float64, HostColValues::F64(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
-                return Err(BoltError::Other(
-                    "MIN/MAX over float not yet supported".into(),
-                ));
+                return Ok(AccDownload::F64(host_group_minmax(
+                    op,
+                    host,
+                    validity,
+                    host_keys,
+                    keys_table,
+                    identity_f64(op),
+                )?));
             }
             let filtered: Vec<f64> = filter_by_validity(host, validity);
             let input_gpu = GpuVec::<f64>::from_slice_async(&filtered, stream.raw())?;
@@ -1825,6 +1836,38 @@ fn run_typed_agg(
 
 /// Return a `Vec<T>` containing `host[i]` only where `validity[i]` is `true`.
 /// If `validity` is `None` (fast path / no NULLs), the full slice is cloned.
+/// Grouped MIN / MAX of a float column on the host: one accumulator per
+/// entry of `keys_table` (the distinct group keys), NULL rows skipped,
+/// `identity` for a group without values (like the device kernels).
+fn host_group_minmax<T: Copy + PartialOrd>(
+    op: ReduceOp,
+    host: &[T],
+    validity: Option<&[bool]>,
+    host_keys: &[i64],
+    keys_table: &GpuVec<i64>,
+    identity: T,
+) -> BoltResult<Vec<T>> {
+    let keys = keys_table.to_vec()?;
+    let slot: HashMap<i64, usize> = keys.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+    let mut acc = vec![identity; keys.len()];
+    for (r, &x) in host.iter().enumerate() {
+        if validity.is_some_and(|v| !v[r]) {
+            continue;
+        }
+        let Some(&s) = host_keys.get(r).and_then(|k| slot.get(k)) else {
+            continue;
+        };
+        let better = match op {
+            ReduceOp::Min => x < acc[s],
+            _ => x > acc[s],
+        };
+        if better {
+            acc[s] = x;
+        }
+    }
+    Ok(acc)
+}
+
 fn filter_by_validity<T: Copy>(host: &[T], validity: Option<&[bool]>) -> Vec<T> {
     match validity {
         Some(mask) => host
