@@ -185,6 +185,12 @@ v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What
 - Memory governor (host / device budgets, eviction) and out-of-core
   `GROUP BY` / `DISTINCT` / grace hash join / external sort through spill
   files; a shared runtime (`Database`) serving concurrent `Session`s.
+- `DELETE` / `UPDATE` / `ALTER TABLE` and `BEGIN` / `COMMIT` / `ROLLBACK`
+  (one catalog snapshot per transaction, session-owned through a
+  `Database`); skew repartitioning, chunked over-budget scans and scalar
+  aggregates, `Engine::sql_stream`; an opt-in cost-based CPU / GPU tier
+  choice (`CostModel`, calibration, `EXPLAIN` estimates); SQL NULL semantics
+  in the fused GPU kernels.
 
 ## Beyond 0.9 — toward 1.0 (next)
 

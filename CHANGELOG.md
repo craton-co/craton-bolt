@@ -5,6 +5,27 @@ All notable changes to this project will be documented here. The format follows 
 ## [Unreleased]
 
 ### Fixed
+- **GPU kernels ignored SQL NULLs of nullable primitive columns.** A NULL
+  read as `0`: `WHERE i < 5` kept the rows where `i` is NULL, computed outputs
+  (`i + 1`, `CASE WHEN i < 10 ...`) and filtered projections returned values
+  where NULL was due, and `NOT` / `OR` / `CASE` gave non-Kleene answers.
+  Predicates and outputs over nullable columns are now rewritten into
+  explicit validity checks before codegen (`plan::null_semantics`): a
+  predicate compiles as "is TRUE", each output gets a hidden validity output
+  the executor applies, and aggregate feeds that are not NULL-strict are
+  computed as columns first. `CASE` without `ELSE` (and NULL arms) now runs
+  on the GPU too.
+- **`SUM(Int32)` through the aggregate pre-stage wrote its `i64` block
+  partials into an `i32` buffer**: only the first 256 rows were summed and
+  the rest was an out-of-bounds device write (e.g. `SELECT COUNT(*), SUM(i)
+  FROM t`). The input is widened before the reduction, and the reduction
+  refuses an accumulator wider than its buffer.
+- **`COUNT(col)` / `AVG(col)` through the aggregate pre-stage counted NULL
+  rows** of a nullable `col` (e.g. `COUNT(f) ... WHERE k > 3`).
+- **Aggregates filtered by `IS [NOT] NULL` read garbage validity pointers**
+  in the fused pre-stage predicate kernel (CUDA "invalid argument" or an
+  access violation): the predicate kernel now receives the validity
+  parameters it is compiled for.
 - **`ORDER BY` a column the SELECT list does not output failed** (`SELECT v
   FROM t ORDER BY k` → "Unable to get field named k"): the projection now
   carries the sort columns as hidden outputs and a final projection restores
@@ -80,6 +101,40 @@ All notable changes to this project will be documented here. The format follows 
   `GROUP BY <utf8 key>` under a predicate, execute (see `AggregateOverInput`).
 
 ### Added
+- **`DELETE`, `UPDATE`, `ALTER TABLE`.** `DELETE FROM t [WHERE ...]` and
+  `UPDATE t SET c = expr, ... [WHERE ...]` (subqueries see the table as it
+  was) rewrite only the catalog files whose zone maps may match, in one
+  snapshot; in-memory tables are rebuilt. `ALTER TABLE` supports `ADD
+  [COLUMN] [IF NOT EXISTS] c type [NOT NULL] [DEFAULT e]`, `DROP [COLUMN]`,
+  `RENAME [COLUMN] a TO b`, `ALTER [COLUMN] c [SET DATA] TYPE t | SET NOT
+  NULL | DROP NOT NULL` and `RENAME TO`. `Catalog::rewrite_files`,
+  `replace_table`, `rename_table`.
+- **Transactions.** `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`,
+  `ROLLBACK` (`Engine::begin_transaction` / `commit_transaction` /
+  `rollback_transaction` / `in_transaction`): a catalog publishes the
+  transaction's changes as one snapshot; `ROLLBACK` restores catalog and
+  in-memory tables, views and registrations. A failing statement aborts the
+  transaction. Through a `Database` a transaction belongs to its session:
+  other sessions' statements wait for it (`Database::set_transaction_wait`,
+  default 30 s), and a dropped session rolls back. `Catalog::begin` /
+  `commit_transaction` / `rollback_transaction`.
+- **Out of core, more shapes.** Over-budget partitions (key skew) are split
+  again with a new hash seed, up to three levels
+  (`MemoryStats::repartitions`). A row-wise scan of a storage table larger
+  than the host budget runs over bounded chunk groups (stopping at a
+  `LIMIT`), and `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` without `GROUP BY`
+  merge per-chunk partials — both used to fail with a memory error.
+  `Engine::sql_stream` / `ResultStream` yield such a query's result chunk
+  group by chunk group, so a large result is never held at once.
+- **Cost-based CPU / GPU tier selection** (`exec::cost`). `CostModel`
+  (`estimate(&CostInputs) -> OperatorCost`: host and device time, H2D / D2H
+  bytes, peak device bytes, compile time), the linear `DefaultCostModel`,
+  `Engine::calibrate_cost_model` (measures it on the device),
+  `EngineBuilder::tier_policy` / `cost_model`, `Engine::set_tier_policy`.
+  Under `TierPolicy::CostBased` row-wise statements and scalar aggregates the
+  host evaluator supports run on the host when cheaper (small or
+  non-resident inputs); `EXPLAIN` prints the estimate and the chosen tier;
+  `Counter::HostTierQueries`. The default stays `TierPolicy::GpuFirst`.
 - **Storage layer (`storage` feature, on by default).** `storage::StorageTable`
   — chunked data with per-chunk `TableStatistics` — is scanned per
   statement: a `ScanRequest` derived from the optimized plan (read columns +

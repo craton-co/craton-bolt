@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type};
-use arrow_array::{Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::Engine;
@@ -190,4 +190,72 @@ fn aggregates_filtered_by_is_null() {
         .into_record_batch();
     let s: Vec<i64> = g.column(1).as_primitive::<Int64Type>().values().to_vec();
     assert_eq!(s, vec![2, 4, 5]);
+}
+
+/// Two GPU NULL bugs over nullable primitive columns: comparisons treated a
+/// NULL as 0 (`WHERE i < 5` kept NULL rows, computed outputs lost their
+/// NULLs), and `SUM(Int32)` through the aggregate pre-stage wrote its i64
+/// block partials into an i32 buffer (only the first 256 rows were summed;
+/// the rest was an out-of-bounds device write). `COUNT(col)` there also
+/// counted NULLs.
+#[test]
+#[ignore = "gpu:e2e — NULLs in GPU predicates, projections and aggregates"]
+fn gpu_nulls_in_predicates_projections_and_sums() {
+    let mut e = Engine::new().expect("ctx");
+    let n = 1000i64;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", ArrowDataType::Int64, false),
+        ArrowField::new("i", ArrowDataType::Int32, true),
+    ]));
+    let i: Vec<Option<i32>> = (0..n)
+        .map(|x| (x % 7 != 3).then_some((x % 50) as i32 - 20))
+        .collect();
+    let b = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from((0..n).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(i.clone())),
+        ],
+    )
+    .unwrap();
+    e.register_table("t", b).unwrap();
+    let one = |sql: &str| -> i64 {
+        e.sql(sql)
+            .unwrap()
+            .into_record_batch()
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .value(0)
+    };
+    let valid: Vec<i64> = i.iter().flatten().map(|&v| v as i64).collect();
+    assert_eq!(
+        one("SELECT COUNT(*) FROM t WHERE i < 5"),
+        valid.iter().filter(|&&v| v < 5).count() as i64
+    );
+    assert_eq!(one("SELECT SUM(i) FROM t"), valid.iter().sum::<i64>());
+    let s = e
+        .sql("SELECT COUNT(*) AS n, COUNT(i) AS c, SUM(i) AS s FROM t")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(s.column(0).as_primitive::<Int64Type>().value(0), n);
+    assert_eq!(
+        s.column(1).as_primitive::<Int64Type>().value(0),
+        valid.len() as i64
+    );
+    assert_eq!(
+        s.column(2).as_primitive::<Int64Type>().value(0),
+        valid.iter().sum::<i64>()
+    );
+    assert_eq!(
+        one("SELECT COUNT(i) FROM t WHERE k > 3"),
+        (4..n).filter(|x| x % 7 != 3).count() as i64
+    );
+    let p = e
+        .sql("SELECT k, i + 1 AS j FROM t WHERE k < 10")
+        .unwrap()
+        .into_record_batch();
+    let j = arrow::compute::cast(p.column(1), &ArrowDataType::Int64).unwrap();
+    let j = j.as_primitive::<Int64Type>();
+    assert!(j.is_null(3), "i is NULL at k = 3");
+    assert_eq!(j.value(4), 4 - 20 + 1);
 }

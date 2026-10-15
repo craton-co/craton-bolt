@@ -20,9 +20,11 @@ pub(crate) mod engine_support;
 // reserved placeholders for follow-up extraction (see their module docs).
 pub mod aggregate;
 pub mod compact;
+pub mod cost;
 mod engine_agg_impl;
 pub(crate) mod engine_ddl;
 mod engine_dml;
+mod engine_host;
 mod engine_join_impl;
 pub(crate) mod engine_ooc;
 mod engine_query;

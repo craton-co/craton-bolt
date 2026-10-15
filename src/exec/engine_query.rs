@@ -301,6 +301,9 @@ impl Engine {
             if let Some(h) = self.timed_ooc(plan)? {
                 return Ok(h);
             }
+            if let Some(h) = self.timed_host_tier(plan)? {
+                return Ok(h);
+            }
         }
         let phys = self.prepare_physical(plan, user_rewrites, top_level)?;
         if top_level {
@@ -318,6 +321,21 @@ impl Engine {
         }
         let start = Instant::now();
         let result = self.try_out_of_core(plan);
+        if matches!(result, Ok(Some(_)) | Err(_)) {
+            crate::metrics::metrics()
+                .observe_duration(crate::metrics::Phase::Execute, start.elapsed());
+        }
+        result
+    }
+
+    /// Host-tier execution of a top-level plan when the cost model prefers
+    /// it (see `crate::exec::cost`), timed as `Execute`.
+    fn timed_host_tier(&self, plan: &LogicalPlan) -> BoltResult<Option<QueryHandle>> {
+        if self.tier_policy != crate::exec::cost::TierPolicy::CostBased {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let result = self.try_host_tier(plan, false);
         if matches!(result, Ok(Some(_)) | Err(_)) {
             crate::metrics::metrics()
                 .observe_duration(crate::metrics::Phase::Execute, start.elapsed());
@@ -453,6 +471,11 @@ impl Engine {
                 // Out-of-core results depend on the budget path taken and
                 // are not cached.
                 if let Some(h) = self.timed_ooc(&plan)? {
+                    return Ok(h);
+                }
+                // Neither are host-tier ones (the GPU plan is cached once the
+                // cost model picks the GPU).
+                if let Some(h) = self.timed_host_tier(&plan)? {
                     return Ok(h);
                 }
                 let phys = self.prepare_physical(&plan, true, true)?;
@@ -613,6 +636,10 @@ impl Engine {
                 ));
             }
         }
+        if let Some(t) = self.explain_tier(plan) {
+            out.push_str(&t);
+            out.push('\n');
+        }
         if let Some(d) = self.describe_out_of_core(plan)? {
             out.push_str(&format!(
                 "Execution: out of core — {d}
@@ -672,6 +699,12 @@ pub(crate) struct CompiledPlanCache {
 }
 
 impl CompiledPlanCache {
+    /// Forget every cached plan (the tier decision changed).
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
     fn get(&mut self, key: &CompiledPlanKey) -> Option<PhysicalPlan> {
         match self.map.get(key) {
             Some(p) => {

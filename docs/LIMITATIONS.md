@@ -146,19 +146,23 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   working sets for row-wise scans and distributive / algebraic aggregates
   over lazily-held tables, and `GROUP BY` / `DISTINCT` / equi-joins /
   `ORDER BY [LIMIT]` over a larger input run **out of core** through spill
-  files. Residual limits:
-  - every statement's **result** is one host batch (an `ORDER BY` without
-    `LIMIT` over a huge input returns all rows in host memory), and so is
-    each out-of-core node's intermediate result (e.g. a grace-join output);
+  files; a row-wise scan (`SELECT ... WHERE ... [LIMIT]`) of a storage table
+  larger than the host budget runs over bounded chunk groups, and so do
+  `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` without `GROUP BY` (per-chunk
+  partials, merged). Residual limits:
+  - `Engine::sql` returns one host batch; `Engine::sql_stream` yields a
+    row-wise query's result chunk group by chunk group, but any other shape
+    (e.g. an `ORDER BY` without `LIMIT` over a huge input) still arrives as
+    one batch, and so does each out-of-core node's intermediate result
+    (e.g. a grace-join output);
   - out-of-core partitioning needs the grouping / join keys to be plain
     columns of one base table (through filters, pass-through projections
     and — for `GROUP BY` — joins on which that table is preserved); other
-    shapes, windows, set operations, non-equi joins and scalar aggregates
-    without a streaming form materialise their input;
-  - a partition that is still over budget (heavy key skew) is executed
-    anyway — there is no recursive repartitioning;
-  - a plain row-wise scan (`SELECT ... WHERE ...`) of a storage table whose
-    pruned rows exceed the host budget fails with `BoltError::Memory`.
+    shapes, windows, set operations, non-equi joins, and `VARIANCE` /
+    `STDDEV` without `GROUP BY` materialise their input;
+  - an over-budget partition (key skew) is split again with a new hash seed
+    up to three times; a partition whose rows all share one key cannot be
+    split and is executed as it is.
 - **Appends rebuild the dictionary union.** Each `register_batch` append
   coalesces the table and rebuilds string dictionaries over all rows, so N
   appends cost O(N × table). Bulk-load with one `register_table_stream` call
@@ -175,10 +179,18 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 ## Storage, catalog and statements
 
-- **Append-only tables.** `INSERT`, `COPY ... FROM` and `CREATE TABLE AS`
-  add rows; there is no `UPDATE`, `DELETE`, `MERGE` or `ALTER TABLE` (no
-  schema evolution), and no multi-statement transactions — each statement
-  commits (and in a catalog, snapshots) on its own.
+- **Changes rewrite data.** `DELETE` / `UPDATE` rewrite the catalog files
+  their predicate's zone maps may match (in-memory tables are rebuilt), and
+  `ALTER TABLE` (other than `RENAME TO`) rewrites the whole table: there are
+  no deletion vectors or in-place updates, so a change touching a few rows
+  of a large file costs a rewrite of that file. `MERGE`, `UPDATE ... FROM`,
+  `DELETE ... USING` and `RETURNING` are not supported; column changes are
+  refused while a materialized view reads the table.
+- **Transactions are single-writer and serializable by queueing.** One
+  transaction is open per engine; through a `Database` it belongs to its
+  session and other sessions' statements wait for it (there is no MVCC
+  concurrency between transactions). No savepoints. `VACUUM` and dropping a
+  lazy stream are refused inside a transaction.
 - **One writer per catalog.** `_bolt/LOCK` admits a single writing engine;
   a crashed writer leaves the lock file to remove by hand. Snapshots opened
   with `database_snapshot` are read-only.
@@ -195,7 +207,10 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   estimates. In-memory tables have column statistics only after `ANALYZE`
   (until their next change). Statistics drive pruning and the optimizer's
   filter / join selectivity (bounds, distinct counts, null counts → join
-  order); there is no cost-based choice between CPU and GPU execution.
+  order). The cost-based CPU / GPU choice (`TierPolicy::CostBased`, opt-in)
+  covers row-wise statements and scalar aggregates over one table whose
+  expressions the host evaluator supports; joins, `GROUP BY` and windows
+  always take the GPU path where it exists.
 - **Materialized views** refresh in full (no incremental maintenance) and
   are never substituted into queries automatically. A view in a catalog may
   read only catalog tables. `on_commit` refresh happens on the
@@ -222,6 +237,10 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 These are real, code-level behaviors to be aware of:
 
+- **NULLs in GPU kernels.** Predicates and outputs over nullable columns are
+  compiled with explicit validity checks (`plan::null_semantics`); an
+  expression without a rule there (e.g. a function call over a nullable
+  column inside a fused kernel) is evaluated on the host instead.
 - **Placement is explicit.** `PhysicalPlan::planned_execution_tier()` and
   `QueryHandle::planned_execution_tier()` report `Gpu`, `Host`, or `Hybrid`.
   Runtime-dependent supported paths are classified `Hybrid` up front.

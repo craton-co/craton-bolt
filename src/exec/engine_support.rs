@@ -745,6 +745,45 @@ pub(crate) fn build_count_rows_batch(
 /// materialised column back into the output `RecordBatch`. Mirrors the
 /// `arrow_array_to_host_column` shape in `filter.rs` (the inverse
 /// direction).
+/// Apply a projection kernel's hidden validity outputs
+/// (`plan::null_semantics::HIDDEN_VALIDITY_PREFIX<j>`, a Bool per row: `false`
+/// = output `j` is NULL there) to the visible outputs, and drop them. The
+/// hidden outputs follow the visible ones.
+pub(crate) fn apply_hidden_validity(
+    mut arrays: Vec<ArrayRef>,
+    outputs: &[crate::plan::ColumnIO],
+) -> BoltResult<Vec<ArrayRef>> {
+    let prefix = crate::plan::null_semantics::HIDDEN_VALIDITY_PREFIX;
+    let hidden: Vec<(usize, usize)> = outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(k, io)| {
+            io.name
+                .strip_prefix(prefix)
+                .and_then(|j| j.parse().ok())
+                .map(|j| (k, j))
+        })
+        .collect();
+    let Some(&(first, _)) = hidden.first() else {
+        return Ok(arrays);
+    };
+    for &(k, j) in &hidden {
+        let valid = arrays
+            .get(k)
+            .and_then(|a| a.as_any().downcast_ref::<arrow_array::BooleanArray>())
+            .ok_or_else(|| BoltError::Other("hidden validity output is not Bool".into()))?;
+        let null_rows = arrow::compute::not(valid)
+            .map_err(|e| BoltError::Other(format!("applying output validity: {e}")))?;
+        let target = arrays
+            .get(j)
+            .ok_or_else(|| BoltError::Other("hidden validity output without target".into()))?;
+        arrays[j] = arrow::compute::nullif(target.as_ref(), &null_rows)
+            .map_err(|e| BoltError::Other(format!("applying output validity: {e}")))?;
+    }
+    arrays.truncate(first);
+    Ok(arrays)
+}
+
 pub(crate) fn host_column_to_arrow_array(
     col: crate::exec::expr_agg::HostColumn,
 ) -> BoltResult<ArrayRef> {

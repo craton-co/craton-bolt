@@ -13,9 +13,9 @@ This document maps Craton Bolt's source tree to the runtime pipeline, and explai
 
 | Layer | Directory | Role |
 |---|---|---|
-| Query front door | `src/exec/engine.rs`, `src/exec/engine_query.rs`, `src/exec/engine_ddl.rs` | `Engine` / `EngineBuilder`, table registration, the one compile pipeline (`QueryCompiler`), `sql` / `explain_sql` / `run_logical_plan`, and `execute_sql` for DDL / DML / `COPY` / `ANALYZE` / maintenance statements |
+| Query front door | `src/exec/engine.rs`, `src/exec/engine_query.rs`, `src/exec/engine_ddl.rs`, `src/exec/engine_dml.rs`, `src/exec/engine_txn.rs` | `Engine` / `EngineBuilder`, table registration, the one compile pipeline (`QueryCompiler`), `sql` / `explain_sql` / `run_logical_plan`, and `execute_sql` for DDL / DML / `COPY` / `ANALYZE` / maintenance statements and transactions |
 | Storage | `src/storage/`, `src/exec/engine_storage.rs`, `src/exec/engine_views.rs` | the `StorageTable` scan contract with per-chunk statistics and zone-map pruning, Parquet tables and writer, the persistent snapshot-versioned `Catalog`, materialized views |
-| Resources | `src/exec/memory.rs`, `src/exec/engine_ooc.rs`, `src/exec/spill.rs`, `src/exec/session.rs` | the memory governor (host / device budgets, evictions), out-of-core execution through spill files, and the shared runtime (`Database`) serving `Session`s |
+| Resources | `src/exec/memory.rs`, `src/exec/engine_ooc.rs`, `src/exec/spill.rs`, `src/exec/session.rs`, `src/exec/cost.rs`, `src/exec/engine_host.rs` | the memory governor (host / device budgets, evictions), out-of-core execution through spill files, the shared runtime (`Database`) serving `Session`s, and the cost-based CPU / GPU tier choice |
 | Planning | `src/plan/` | SQL frontend (sqlparser → `LogicalPlan`, shape classification), `DataFrame` builder, logical optimizer, physical lowering to the SSA-shaped IR |
 | Execution | `src/exec/` | per-shape GPU / host executors (projection, aggregates, GROUP BY tiers, joins, sort, distinct, windows, set ops, strings), dictionary registry, device tables, streaming / morsel machinery |
 | Code generation | `src/jit/` | one PTX emitter per kernel family, in-process + disk PTX caches, module loading |
@@ -171,11 +171,21 @@ Float MIN/MAX over `Float32` / `Float64` has no native `atom.global.min/max.f*` 
 
 `Engine::execute_sql(&mut self)` runs one or more `;`-separated statements: queries go through `sql`; `CREATE TABLE [AS]`, `CREATE EXTERNAL TABLE`, `INSERT`, `DROP`, `TRUNCATE`, `COPY` (Parquet / CSV), `ANALYZE`, `SHOW TABLES`, `DESCRIBE`, `COMPACT TABLE`, `VACUUM` and the materialized-view statements are handled in `engine_ddl` / `engine_views`. Without a catalog, tables are in-memory. With `EngineBuilder::database(dir)` a `storage::Catalog` is attached: every change writes immutable Parquet files and then commits a new JSON manifest (the full table list with per-file statistics) by atomic rename of `_bolt/CURRENT`; each manifest is a snapshot (`database_snapshot(dir, v)` opens one read-only), a writer lock admits one writer, `COMPACT` rewrites a table's files, and `VACUUM` drops old snapshots and unreferenced files. Catalog tables are registered as storage tables, so they are scanned with pruning. A materialized view is a table plus its defining query, its base tables and their data versions at the last refresh (`view_status` reports staleness; `on_commit` views refresh after statements that change a base table); in a catalog its definition is part of the snapshot.
 
+`DELETE` / `UPDATE` (`engine_dml`) evaluate the predicate as a query (`CASE WHEN p THEN 1 ELSE 0 END`) over the affected rows — for a catalog table, only the files whose per-file statistics may match — and commit the rewritten files and the untouched ones as one snapshot (`Catalog::rewrite_files`); `ALTER TABLE` rewrites the table under its new schema (`Catalog::replace_table`). Transactions (`engine_txn`) put the catalog in a mode where commits update its in-memory manifest only (`Catalog::begin`); `COMMIT` publishes the result as one manifest, `ROLLBACK` restores the manifest and the engine state (in-memory tables, views, registrations, data versions) captured at `BEGIN`. The `Database` runtime holds back other sessions' jobs while a session's transaction is open.
+
 ### Memory governance and out-of-core execution
 
 `exec::memory::MemoryGovernor` holds the host budget (`host_memory_budget`) and device budget (`memory_budget`). Installed storage scans hold host reservations and are evicted least-recently-used to fit the host budget; resident GPU tables are evicted least-recently-used *between statements* (never while an executor may hold device pointers) to fit the device budget; registered `MemoryConsumer`s are asked to spill last.
 
-A statement whose input table exceeds the budget, in a shape the morsel path does not bound, runs out of core (`engine_ooc`): the large table is streamed (never installed whole), hash-partitioned on the relevant columns into Arrow IPC spill files (`spill.rs`, type-normalised hashing so independently partitioned join sides align; NULL keys in partition 0), and the ordinary compiled operators run on one partition at a time under an ephemeral overlay name. `GROUP BY` / `DISTINCT` partition on the grouping columns (through joins on which the large table is preserved) — groups never span partitions, so any aggregate is exact; equi-joins run as a grace hash join; `ORDER BY [LIMIT]` over a row-wise scan sorts bounded runs (top-k under a LIMIT) and merges them with the Arrow row format. The executed node is replaced by a scan of its result and the rest of the plan continues, possibly going out of core again.
+A statement whose input table exceeds the budget, in a shape the morsel path does not bound, runs out of core (`engine_ooc`): the large table is streamed (never installed whole), hash-partitioned on the relevant columns into Arrow IPC spill files (`spill.rs`, type-normalised hashing so independently partitioned join sides align; NULL keys in partition 0), and the ordinary compiled operators run on one partition at a time under an ephemeral overlay name. `GROUP BY` / `DISTINCT` partition on the grouping columns (through joins on which the large table is preserved) — groups never span partitions, so any aggregate is exact; equi-joins run as a grace hash join; `ORDER BY [LIMIT]` over a row-wise scan sorts bounded runs (top-k under a LIMIT) and merges them with the Arrow row format. The executed node is replaced by a scan of its result and the rest of the plan continues, possibly going out of core again. An over-budget partition is re-hashed with a new seed (up to three levels). A row-wise chain over a storage table whose pruned rows exceed the host budget runs over bounded chunk groups of the table (`Engine::sql_stream` yields them lazily), and a scalar `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` over one merges per-chunk partial aggregates.
+
+### Tier selection
+
+`exec::cost` defines `CostModel` (`CostInputs` → `OperatorCost`: host and device time, transfer bytes, compile time) and the linear `DefaultCostModel`, which `Engine::calibrate_cost_model` fits to the device. Under `TierPolicy::CostBased`, a statement of the host tier's shape — filters / projections / sort / limit or a scalar aggregate over one table, with host-evaluable expressions (`engine_host`) — is estimated from its table's statistics and residency and runs on the host evaluator when that is cheaper; any decline at run time falls back to the GPU path. `EXPLAIN` prints the estimate.
+
+### NULL semantics in the fused kernels
+
+The kernel IR computes values; validity bitmaps are read only by `Op::IsNullCheck`. `plan::null_semantics` rewrites predicates and outputs over nullable columns before codegen: a predicate `p` compiles as `T(p)` ("p is TRUE", Kleene `AND` / `OR` / `NOT`, `CASE` conditions tested by `T`); an output `e` compiles as its value plus a hidden Boolean output `known(e)` that the projection executor applies as the column's validity (`engine_support::apply_hidden_validity`). The aggregate pre-stage keeps the kernel's AND-of-inputs output validity, which is exact for NULL-strict feeds; non-strict feeds over nullable columns are computed as columns of a materialised input first.
 
 ### Sessions
 
@@ -224,6 +234,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/agg_with_pre.rs` | Aggregate execution with a pre-projection / filter pass. |
 | `src/exec/aggregate.rs` | Scalar (no GROUP BY) aggregate execution. |
 | `src/exec/compact.rs` | Host-side filter compaction. |
+| `src/exec/cost.rs` | Cost-based CPU / GPU tier selection. |
 | `src/exec/dict_registry.rs` | Per-table dictionary registry that drives the string-literal predicate rewrite. |
 | `src/exec/distinct.rs` | DISTINCT executor — host-side deduplication of a RecordBatch. |
 | `src/exec/engine.rs` | Top-level engine: dispatches per-shape executors (scalar agg, GROUP BY, etc.); performs GPU prefix-scan + gather compaction for filter outputs, or a host-side `arrow::compute::filter` fallback when any output column is Utf8. |
@@ -231,6 +242,8 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/engine_cache_key.rs` | Module-cache key + host-revision snapshot types lifted out of `exec::engine` (pure reorganization; no behavior change). |
 | `src/exec/engine_ddl.rs` | SQL statements that change tables: `CREATE TABLE [AS]`, `CREATE EXTERNAL TABLE`, `INSERT`, `DROP TABLE`, `TRUNCATE`, `COPY`, `ANALYZE`, plus the read-only `SHOW TABLES` / `DESCRIBE` and the catalog-maintenance statements `COMPACT TABLE` and `VACUUM`. |
 | `src/exec/engine_device_col.rs` | Heterogenous owned device output column ([`DeviceCol`]) and its download / staging helpers, lifted out of `exec::engine` (pure reorganization; no behavior change). |
+| `src/exec/engine_dml.rs` | Row and schema changes: `DELETE`, `UPDATE` and `ALTER TABLE`. |
+| `src/exec/engine_host.rs` | The host execution tier chosen by the cost model (see [`crate::exec::cost`]): row-wise statements and scalar aggregates over one table, evaluated with the host expression evaluator. |
 | `src/exec/engine_join_impl.rs` | Reserved sibling module for the join execution / dispatch methods of [`crate::exec::engine::Engine`]. |
 | `src/exec/engine_ooc.rs` | Out-of-core statement execution. |
 | `src/exec/engine_provider.rs` | Planner-facing adapters over the engine's registered tables, lifted out of `exec::engine` (pure reorganization; no behavior change). |
@@ -239,6 +252,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/engine_streaming_impl.rs` | Streaming / morsel-driven execution methods for [`Engine`]. |
 | `src/exec/engine_string_impl.rs` | String-projection execution methods for [`Engine`]. |
 | `src/exec/engine_support.rs` | Standalone free helper functions lifted out of `exec::engine` (pure reorganization; no behavior change). |
+| `src/exec/engine_txn.rs` | Multi-statement transactions: `BEGIN` / `COMMIT` / `ROLLBACK`. |
 | `src/exec/engine_views.rs` | Materialized views. |
 | `src/exec/expr_agg.rs` | Host-side expression evaluator for aggregate inputs. |
 | `src/exec/extended_agg.rs` | Host-side aggregate execution for the dtypes the GPU reduction kernels don't cover: `Bool` (any aggregate) and `Utf8` (COUNT/MIN/MAX only). |
@@ -357,6 +371,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/plan/explain.rs` | Plan introspection / `EXPLAIN`. |
 | `src/plan/logical_plan.rs` | Logical plan AST: schemas, expressions, and relational nodes. |
 | `src/plan/mod.rs` | Logical plan IR, DataFrame builder, SQL frontend, and physical plan. |
+| `src/plan/null_semantics.rs` | SQL NULL semantics for the fused GPU kernels. |
 | `src/plan/optimizer/const_fold.rs` | Constant folding and algebraic simplification of [`Expr`] trees. |
 | `src/plan/optimizer/cost.rs` | Cost model and join-order enumeration for the cost-based optimizer (CBO). |
 | `src/plan/optimizer/expr_util.rs` | Shared expression helpers for the logical optimizer passes. |

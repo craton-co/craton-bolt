@@ -117,11 +117,13 @@ pub enum Counter {
     SpillFilesWritten = 8,
     /// Bytes written to spill files by out-of-core execution.
     SpillBytesWritten = 9,
+    /// Statements the cost model ran on the host tier.
+    HostTierQueries = 10,
 }
 
 impl Counter {
     /// All counters in declaration / snapshot order.
-    pub const ALL: [Counter; 10] = [
+    pub const ALL: [Counter; 11] = [
         Counter::QueriesTotal,
         Counter::QueriesFailed,
         Counter::PtxCacheHits,
@@ -132,6 +134,7 @@ impl Counter {
         Counter::StorageChunksPruned,
         Counter::SpillFilesWritten,
         Counter::SpillBytesWritten,
+        Counter::HostTierQueries,
     ];
 
     /// Stable snake_case name, suitable as a metric key (no `craton_` prefix —
@@ -148,6 +151,7 @@ impl Counter {
             Counter::StorageChunksPruned => "storage_chunks_pruned",
             Counter::SpillFilesWritten => "spill_files_written",
             Counter::SpillBytesWritten => "spill_bytes_written",
+            Counter::HostTierQueries => "host_tier_queries",
         }
     }
 
@@ -169,6 +173,7 @@ impl Counter {
             Counter::StorageChunksPruned => "Storage-table chunks skipped by zone-map pruning.",
             Counter::SpillFilesWritten => "Spill files written by out-of-core execution.",
             Counter::SpillBytesWritten => "Bytes written to spill files by out-of-core execution.",
+            Counter::HostTierQueries => "Statements the cost model ran on the host tier.",
         }
     }
 }
@@ -691,8 +696,9 @@ mod tests {
     #[test]
     fn counter_names_match_variants() {
         // Spot-check a couple and the full count.
-        assert_eq!(Counter::ALL.len(), 10);
+        assert_eq!(Counter::ALL.len(), 11);
         assert_eq!(Counter::QueriesTotal.as_str(), "queries_total");
+        assert_eq!(Counter::HostTierQueries.as_str(), "host_tier_queries");
         assert_eq!(Counter::SpillBytesWritten.as_str(), "spill_bytes_written");
         assert_eq!(Counter::HostFallbacksTotal.as_str(), "host_fallbacks_total");
         // `as usize` discriminants line up with `ALL` ordering.
