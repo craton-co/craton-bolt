@@ -77,6 +77,9 @@ impl Job {
 /// Default capacity of the statement queue.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
+/// How often the runtime checks scheduled materialized views.
+const VIEW_TICK: Duration = Duration::from_millis(500);
+
 /// Default time a statement waits for another session's transaction.
 pub const DEFAULT_TRANSACTION_WAIT: Duration = Duration::from_secs(30);
 
@@ -303,8 +306,16 @@ fn may_run(holder: Option<Option<u64>>, job: &Job) -> bool {
 fn run_jobs(engine: &mut Engine, rx: &mpsc::Receiver<Job>, wait_limit: &AtomicU64) {
     let mut deferred: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     let mut connected = true;
+    let mut last_tick = Instant::now();
     loop {
         let holder = engine.transaction_holder();
+        // Scheduled materialized views, between statements.
+        if holder.is_none() && last_tick.elapsed() >= VIEW_TICK && engine.has_scheduled_views() {
+            last_tick = Instant::now();
+            if let Err(e) = engine.refresh_due_views() {
+                log::warn!("scheduled materialized-view refresh failed: {e}");
+            }
+        }
         if holder.is_none() {
             if let Some(job) = deferred.pop_front() {
                 run_job(engine, job);
@@ -332,9 +343,21 @@ fn run_jobs(engine: &mut Engine, rx: &mpsc::Receiver<Job>, wait_limit: &AtomicU6
                 i += 1;
             }
         }
-        let next = match deferred.iter().map(|j| j.queued).min() {
+        // Wake up for the next view tick while idle.
+        let tick = engine
+            .has_scheduled_views()
+            .then(|| VIEW_TICK.saturating_sub(last_tick.elapsed()));
+        let wait = match (deferred.iter().map(|j| j.queued).min(), tick) {
+            (None, None) => None,
+            (None, Some(t)) => Some(t),
+            (Some(oldest), t) => {
+                let w = limit.saturating_sub(oldest.elapsed());
+                Some(t.map_or(w, |t| t.min(w)))
+            }
+        };
+        let next = match wait {
             None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-            Some(oldest) => rx.recv_timeout(limit.saturating_sub(oldest.elapsed())),
+            Some(w) => rx.recv_timeout(w),
         };
         match next {
             Ok(job) if may_run(holder, &job) => run_job(engine, job),

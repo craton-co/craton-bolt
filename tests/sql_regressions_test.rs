@@ -259,3 +259,107 @@ fn gpu_nulls_in_predicates_projections_and_sums() {
     assert!(j.is_null(3), "i is NULL at k = 3");
     assert_eq!(j.value(4), 4 - 20 + 1);
 }
+
+/// Several aggregates of one column under a predicate (`SUM(v), MIN(v),
+/// MAX(v) ... WHERE ...`) failed: their pre-stage feeds shared the output
+/// name `v` ("duplicate pre output name").
+#[test]
+#[ignore = "gpu:e2e — several aggregates of one column under a predicate"]
+fn repeated_aggregate_column_under_predicate() {
+    let e = engine();
+    let out = e
+        .sql("SELECT k, SUM(v) AS s, MIN(v) AS lo, MAX(v) AS hi FROM t WHERE v > 2 GROUP BY k ORDER BY k")
+        .unwrap()
+        .into_record_batch();
+    let col = |c: usize| {
+        out.column(c)
+            .as_primitive::<Float64Type>()
+            .values()
+            .to_vec()
+    };
+    // k = i % 4, v = i, rows with v > 2: i in 3..12.
+    let mut s = [0.0f64; 4];
+    let mut lo = [f64::MAX; 4];
+    let mut hi = [f64::MIN; 4];
+    for i in 3..12 {
+        let k = i % 4;
+        s[k] += i as f64;
+        lo[k] = lo[k].min(i as f64);
+        hi[k] = hi[k].max(i as f64);
+    }
+    assert_eq!(col(1), s.to_vec());
+    assert_eq!(col(2), lo.to_vec());
+    assert_eq!(col(3), hi.to_vec());
+}
+
+/// A grouped `SUM` / `MIN` / `MAX` over a group whose values are all NULL
+/// returned the accumulator identity (0, `i64::MAX`, `inf`, NaN) instead of
+/// SQL NULL; float `MIN` / `MAX` under a predicate failed ("MIN/MAX over
+/// float not yet supported").
+#[test]
+#[ignore = "gpu:e2e — grouped aggregates of an all-NULL group are NULL"]
+fn grouped_aggregates_of_all_null_groups_are_null() {
+    let mut e = Engine::new().expect("ctx");
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", ArrowDataType::Int64, false),
+        ArrowField::new("g", ArrowDataType::Int64, false),
+        ArrowField::new("f", ArrowDataType::Float64, true),
+        ArrowField::new("i", ArrowDataType::Int64, true),
+    ]));
+    let b = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+            Arc::new(arrow_array::Int64Array::from(vec![1, 1, 2, 2, 3, 3])),
+            Arc::new(Float64Array::from(vec![
+                Some(1.5),
+                Some(-2.0),
+                None,
+                None,
+                Some(7.0),
+                None,
+            ])),
+            Arc::new(arrow_array::Int64Array::from(vec![
+                Some(1),
+                Some(-2),
+                None,
+                None,
+                Some(7),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    e.register_table("t", b).unwrap();
+    let f64s = |b: &RecordBatch, c: usize| -> Vec<Option<f64>> {
+        let a = b.column(c).as_primitive::<Float64Type>();
+        (0..a.len())
+            .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+            .collect()
+    };
+    let i64s = |b: &RecordBatch, c: usize| -> Vec<Option<i64>> {
+        let a = b.column(c).as_primitive::<Int64Type>();
+        (0..a.len())
+            .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+            .collect()
+    };
+    let o = e
+        .sql("SELECT g, MIN(f) AS a, MAX(f) AS b FROM t WHERE k > 0 GROUP BY g ORDER BY g")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(f64s(&o, 1), vec![Some(-2.0), None, Some(7.0)]);
+    assert_eq!(f64s(&o, 2), vec![Some(1.5), None, Some(7.0)]);
+    let o = e
+        .sql("SELECT g, MIN(i) AS a, MAX(i) AS b, SUM(i) AS s, COUNT(i) AS n FROM t GROUP BY g ORDER BY g")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(i64s(&o, 1), vec![Some(-2), None, Some(7)]);
+    assert_eq!(i64s(&o, 2), vec![Some(1), None, Some(7)]);
+    assert_eq!(i64s(&o, 3), vec![Some(-1), None, Some(7)]);
+    assert_eq!(i64s(&o, 4), vec![Some(2), Some(0), Some(1)]);
+    let o = e
+        .sql("SELECT g, MIN(f) AS a FROM t GROUP BY g ORDER BY g")
+        .unwrap()
+        .into_record_batch();
+    assert_eq!(f64s(&o, 1), vec![Some(-2.0), None, Some(7.0)]);
+}

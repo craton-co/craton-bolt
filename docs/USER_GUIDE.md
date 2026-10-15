@@ -251,10 +251,16 @@ assert!(!engine.view_status("by_region")?.fresh);   // after a change to `sales`
 engine.execute_sql("REFRESH MATERIALIZED VIEW by_region")?;
 ```
 
-Views are read like tables (no automatic query rewrite) and refresh in
-full. `on_commit` views refresh after any statement that changes a base
-table (and before the next `execute_sql` statement if a base table changed
-through the Rust API). In a catalog, view definitions and freshness persist.
+Views are read like tables. `on_commit` views refresh after any statement
+that changes a base table (and before the next `execute_sql` statement if a
+base table changed through the Rust API); `WITH (refresh = 'every 10
+minutes')` views refresh when stale, at most once per interval. A view of
+`SUM` / `COUNT` / `MIN` / `MAX` [`GROUP BY`] over one catalog table refreshes
+**incrementally** while the table only grows — only the new data files are
+read and their partial aggregates merged — and in full after any other
+change. A query that plans exactly like a fresh view's defining query is
+answered from the view (`Engine::builder().view_rewrite(false)` turns that
+off). In a catalog, view definitions and freshness persist.
 
 ---
 

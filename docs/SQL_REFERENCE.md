@@ -711,8 +711,8 @@ changes tables returns one row, `rows_affected`.
 | `COPY t [(cols)] FROM 'file' [(FORMAT ...)]` | Appends; Parquet columns matched by name |
 | `ANALYZE [TABLE] t` | One row per column: row count, null count, min, max, distinct estimate (recorded in the catalog) |
 | `SHOW TABLES`, `DESCRIBE t` | |
-| `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'manual' \| 'on_commit')] AS SELECT ...` | Read like a table; staleness via `Engine::view_status` |
-| `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` | Full refresh |
+| `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'manual' \| 'on_commit' \| 'every <n> seconds\|minutes\|hours')] AS SELECT ...` | Read like a table; staleness via `Engine::view_status`. A query with the same plan as a fresh view is answered from it |
+| `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` | Incremental for `SUM` / `COUNT` / `MIN` / `MAX` [`GROUP BY`] views over an append-only catalog table, full otherwise |
 | `COMPACT TABLE t [ORDER BY (col, ...)]`, `VACUUM [KEEP n]` | Catalog tables only (`EngineBuilder::database`). `ORDER BY` rewrites the table sorted on a clustering key (recorded for later compactions), tightening its zone maps |
 | `DELETE FROM t [AS a] [WHERE ...]` | Rows whose predicate is TRUE are removed (NULL keeps the row). A catalog table rewrites only the files whose zone maps may match; subqueries see the table as it was |
 | `UPDATE t [AS a] SET c = expr, ... [WHERE ...]` | New values are cast to the column types; `NOT NULL` is enforced. No `FROM`, `RETURNING`, or `SET (a, b) = ...` |

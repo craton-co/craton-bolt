@@ -3693,15 +3693,12 @@ fn build_kernel(
 
     // SQL NULL semantics: the kernel computes values only, so predicates
     // and outputs over nullable columns are rewritten into explicit
-    // validity checks. A construct without a rule runs on the host.
+    // validity checks. Every construct the codegen lowers has a rule; one
+    // without (a subquery, a function call) is left as it is, for the
+    // codegen to reject as before.
     let ns = crate::plan::null_semantics::NullSemantics::new(scan_schema);
     let predicate: Option<Expr> = match predicate {
-        Some(p) if ns.touches_nulls(p) => match ns.is_true(p) {
-            Ok(t) => Some(t),
-            Err(_) => {
-                return lower_host_filtered_projection(table, scan_schema, Some(p), projected)
-            }
-        },
+        Some(p) if ns.touches_nulls(p) => Some(ns.is_true(p).unwrap_or_else(|_| p.clone())),
         other => other.cloned(),
     };
     let mut values: Vec<(String, Expr)> = Vec::with_capacity(projected.len());
@@ -3723,14 +3720,7 @@ fn build_kernel(
                     ));
                 }
             }
-            _ => {
-                return lower_host_filtered_projection(
-                    table,
-                    scan_schema,
-                    predicate.as_ref(),
-                    projected,
-                )
-            }
+            _ => values.push((name.clone(), e.clone())),
         }
     }
 
@@ -4407,10 +4397,20 @@ fn lower_aggregate(
         // and `scan_predicate` is already in scan namespace, so go straight
         // to the pure-codegen builder (skipping another round of chain
         // resolution that would double-substitute).
+        // Unique output names: several aggregates may read the same column
+        // (`SUM(v), MIN(v)`); the group keys come first and keep theirs.
+        let mut used_names = std::collections::HashSet::new();
         let named_feed: Vec<(String, Expr)> = feed
             .iter()
             .enumerate()
-            .map(|(i, e)| (output_name_for(e, i), e.clone()))
+            .map(|(i, e)| {
+                let mut name = output_name_for(e, i);
+                if !used_names.insert(name.clone()) {
+                    name = format!("__expr_{i}");
+                    used_names.insert(name.clone());
+                }
+                (name, e.clone())
+            })
             .collect();
         let pre_plan = build_kernel(
             table,

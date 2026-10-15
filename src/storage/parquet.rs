@@ -32,6 +32,11 @@ use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
+/// Cached bloom filters: `(file, row group, leaf column)` → the filter, or
+/// `None` when the column chunk has none.
+type BloomCache =
+    std::collections::HashMap<(usize, usize, usize), Option<parquet::bloom_filter::Sbbf>>;
+
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::Literal;
 use crate::plan::logical_plan::Schema;
@@ -69,6 +74,8 @@ pub struct ParquetTable {
     skipped_columns: Vec<String>,
     /// Trailing schema columns that come from Hive-style directory names.
     partition_columns: usize,
+    /// Bloom filters read so far (loaded on first use by an equality).
+    blooms: Arc<std::sync::Mutex<BloomCache>>,
 }
 
 /// Hive's marker for a NULL partition value.
@@ -356,6 +363,7 @@ impl ParquetTable {
             stats,
             skipped_columns: Vec::new(),
             partition_columns: n_part,
+            blooms: Arc::new(std::sync::Mutex::new(BloomCache::new())),
         })
     }
 
@@ -436,9 +444,158 @@ fn row_group_statistics(
     Ok(out)
 }
 
+impl ParquetTable {
+    /// `false` when the bloom filter of table column `column` in `chunk`
+    /// proves no row equals `value` (no filter, or a type it cannot test,
+    /// keeps the chunk).
+    fn bloom_may_contain(&self, chunk: usize, column: usize, value: &Literal) -> bool {
+        use parquet::basic::Type as Physical;
+        let (fi, rg) = self.chunks[chunk];
+        let Some(file) = self.files.get(fi) else {
+            return true;
+        };
+        let Some(&root) = file.column_map.get(column) else {
+            // A partition column: no filter.
+            return true;
+        };
+        let schema_descr = file.metadata.metadata().file_metadata().schema_descr();
+        let name = file.metadata.schema().field(root).name().clone();
+        let Some(leaf) = (0..schema_descr.num_columns()).find(|&i| {
+            let c = schema_descr.column(i);
+            c.path().parts().len() == 1 && c.path().parts()[0] == name
+        }) else {
+            return true;
+        };
+        let physical = schema_descr.column(leaf).physical_type();
+        let mut cache = self.blooms.lock().unwrap_or_else(|p| p.into_inner());
+        if !cache.contains_key(&(fi, rg, leaf)) {
+            // Load every row group's filter of this column at once.
+            let loaded = (|| -> Option<Vec<Option<parquet::bloom_filter::Sbbf>>> {
+                use parquet::file::reader::FileReader;
+                let f = File::open(&file.path).ok()?;
+                let props = parquet::file::properties::ReaderProperties::builder()
+                    .set_read_bloom_filter(true)
+                    .build();
+                let opts = parquet::file::serialized_reader::ReadOptionsBuilder::new()
+                    .with_reader_properties(props)
+                    .build();
+                let reader =
+                    parquet::file::serialized_reader::SerializedFileReader::new_with_options(
+                        f, opts,
+                    )
+                    .ok()?;
+                (0..reader.num_row_groups())
+                    .map(|g| {
+                        reader
+                            .get_row_group(g)
+                            .ok()
+                            .map(|r| r.get_column_bloom_filter(leaf).cloned())
+                    })
+                    .collect()
+            })();
+            let n = file.metadata.metadata().num_row_groups();
+            let loaded = loaded.unwrap_or_else(|| vec![None; n]);
+            for (g, b) in loaded.into_iter().enumerate() {
+                cache.insert((fi, g, leaf), b);
+            }
+        }
+        let Some(Some(bloom)) = cache.get(&(fi, rg, leaf)) else {
+            return true;
+        };
+        match (physical, value) {
+            (Physical::INT64, Literal::Int64(v)) => bloom.check(v),
+            (Physical::INT64, Literal::Int32(v)) => bloom.check(&i64::from(*v)),
+            (Physical::INT32, Literal::Int32(v)) | (Physical::INT32, Literal::Date32(v)) => {
+                bloom.check(v)
+            }
+            // A value outside i32 cannot be stored in an INT32 column.
+            (Physical::INT32, Literal::Int64(v)) => {
+                i32::try_from(*v).is_ok_and(|v| bloom.check(&v))
+            }
+            (Physical::BYTE_ARRAY, Literal::Utf8(s)) => bloom.check(&s.as_str()),
+            _ => true,
+        }
+    }
+}
+
+/// Columns of `batches` worth a bloom filter: integer, date and string
+/// columns with many distinct values (where min / max zone maps are weak).
+fn bloom_columns(batches: &[RecordBatch]) -> Vec<(String, u64)> {
+    use arrow_schema::DataType as D;
+    let stats = TableStatistics::from_batches(batches);
+    let Some(first) = batches.first() else {
+        return Vec::new();
+    };
+    first
+        .schema()
+        .fields()
+        .iter()
+        .zip(&stats.columns)
+        .filter(|(f, _)| {
+            matches!(
+                f.data_type(),
+                D::Int32 | D::Int64 | D::Date32 | D::Utf8 | D::LargeUtf8
+            )
+        })
+        .filter_map(|(f, s)| {
+            let ndv = s.distinct_estimate?;
+            (ndv >= BLOOM_MIN_DISTINCT).then(|| (f.name().clone(), ndv))
+        })
+        .collect()
+}
+
+/// Columns with fewer distinct values get no bloom filter.
+const BLOOM_MIN_DISTINCT: u64 = 1024;
+
 impl StorageTable for ParquetTable {
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Zone maps first; then, for each candidate row group, the bloom
+    /// filters of the columns an equality / `IN` predicate tests.
+    fn plan_scan(&self, request: &crate::storage::ScanRequest) -> ScanSelection {
+        use crate::storage::scan::{PruneOp, PrunePredicate};
+        let mut chunks = Vec::new();
+        let (mut rows, mut bytes) = (0u64, 0u64);
+        for c in 0..self.chunks.len() {
+            let s = &self.stats[c];
+            if !request.chunk_may_match(&s.columns, s.row_count) {
+                continue;
+            }
+            let bloom_ok = request.filters.is_empty()
+                || request.filters.iter().any(|conj| {
+                    conj.iter().all(|p| {
+                        if !p.may_match(&s.columns, s.row_count) {
+                            return false;
+                        }
+                        match p {
+                            PrunePredicate::Compare {
+                                column,
+                                op: PruneOp::Eq,
+                                value,
+                            } => self.bloom_may_contain(c, *column, value),
+                            PrunePredicate::InList { column, values } => {
+                                values.iter().any(|v| self.bloom_may_contain(c, *column, v))
+                            }
+                            _ => true,
+                        }
+                    })
+                });
+            if !bloom_ok {
+                continue;
+            }
+            chunks.push(c);
+            rows += s.row_count;
+            bytes += s.byte_size;
+        }
+        ScanSelection {
+            chunks,
+            columns: request.columns.clone(),
+            chunks_total: self.chunks.len(),
+            rows,
+            bytes,
+        }
     }
 
     fn chunk_count(&self) -> usize {
@@ -565,6 +722,10 @@ pub struct ParquetWriteOptions {
     pub row_group_rows: usize,
     /// zstd level (1–22). Default 3.
     pub zstd_level: i32,
+    /// Write bloom filters for integer, date and string columns with at
+    /// least 1024 distinct values, so equality predicates can skip row
+    /// groups their zone maps cannot (default `true`).
+    pub bloom_filters: bool,
 }
 
 impl Default for ParquetWriteOptions {
@@ -572,6 +733,7 @@ impl Default for ParquetWriteOptions {
         ParquetWriteOptions {
             row_group_rows: 128 * 1024,
             zstd_level: 3,
+            bloom_filters: true,
         }
     }
 }
@@ -589,11 +751,22 @@ pub fn write_parquet(
         .ok_or_else(|| BoltError::Plan("write_parquet: no batches".into()))?;
     let schema = first.schema();
     let level = ZstdLevel::try_new(options.zstd_level).map_err(|e| perr("zstd level", e))?;
-    let props = WriterProperties::builder()
+    let mut props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(level))
         .set_max_row_group_size(options.row_group_rows.max(1))
-        .set_statistics_enabled(EnabledStatistics::Chunk)
-        .build();
+        .set_statistics_enabled(EnabledStatistics::Chunk);
+    if options.bloom_filters {
+        // A row group holds at most `row_group_rows` distinct values.
+        let per_group = options.row_group_rows.max(1) as u64;
+        for (name, ndv) in bloom_columns(batches) {
+            let col = parquet::schema::types::ColumnPath::from(name.as_str());
+            props = props
+                .set_column_bloom_filter_enabled(col.clone(), true)
+                .set_column_bloom_filter_fpp(col.clone(), 0.01)
+                .set_column_bloom_filter_ndv(col, ndv.min(per_group).max(1));
+        }
+    }
+    let props = props.build();
     let tmp = path.with_extension("parquet.tmp");
     let result = (|| -> BoltResult<u64> {
         let f = File::create(&tmp).map_err(|e| perr(&format!("creating {}", tmp.display()), e))?;

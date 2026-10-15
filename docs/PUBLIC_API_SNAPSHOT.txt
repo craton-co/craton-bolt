@@ -512,6 +512,7 @@ pub fn craton_bolt::exec::engine::Engine::table_statistics(&self, &str) -> crato
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::create_view(&mut self, &str, &str, craton_bolt::RefreshMode, bool) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::drop_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::refresh_due_views(&mut self) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::exec::engine::Engine::refresh_view(&mut self, &str) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::view_exists(&self, &str) -> bool
 pub fn craton_bolt::exec::engine::Engine::view_names(&self) -> alloc::vec::Vec<alloc::string::String>
@@ -537,6 +538,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::view_rewrite(self, bool) -> Self
 pub struct craton_bolt::exec::engine::QueryHandle
 impl craton_bolt::exec::engine::QueryHandle
 pub fn craton_bolt::exec::engine::QueryHandle::into_record_batch(self) -> arrow_array::record_batch::RecordBatch
@@ -1190,6 +1192,7 @@ pub fn craton_bolt::exec::engine::Engine::table_statistics(&self, &str) -> crato
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::create_view(&mut self, &str, &str, craton_bolt::RefreshMode, bool) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::drop_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::refresh_due_views(&mut self) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::exec::engine::Engine::refresh_view(&mut self, &str) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::view_exists(&self, &str) -> bool
 pub fn craton_bolt::exec::engine::Engine::view_names(&self) -> alloc::vec::Vec<alloc::string::String>
@@ -1215,6 +1218,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::view_rewrite(self, bool) -> Self
 pub struct craton_bolt::exec::PinnedBudget
 impl craton_bolt::exec::streaming::PinnedBudget
 pub fn craton_bolt::exec::streaming::PinnedBudget::fits(&self, usize) -> bool
@@ -1685,8 +1689,9 @@ pub craton_bolt::metrics::Counter::SpillBytesWritten = 9
 pub craton_bolt::metrics::Counter::SpillFilesWritten = 8
 pub craton_bolt::metrics::Counter::StorageChunksPruned = 7
 pub craton_bolt::metrics::Counter::StorageChunksRead = 6
+pub craton_bolt::metrics::Counter::ViewRewrites = 11
 impl craton_bolt::metrics::Counter
-pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 11]
+pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 12]
 pub const fn craton_bolt::metrics::Counter::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Counter::help(self) -> &'static str
 #[non_exhaustive] #[repr(usize)] pub enum craton_bolt::metrics::Phase
@@ -2863,6 +2868,8 @@ pub mod craton_bolt::storage::catalog
 pub enum craton_bolt::storage::catalog::RefreshPolicy
 pub craton_bolt::storage::catalog::RefreshPolicy::Manual
 pub craton_bolt::storage::catalog::RefreshPolicy::OnCommit
+pub craton_bolt::storage::catalog::RefreshPolicy::Scheduled
+pub craton_bolt::storage::catalog::RefreshPolicy::Scheduled::seconds: u64
 pub enum craton_bolt::storage::catalog::TableKind
 pub craton_bolt::storage::catalog::TableKind::External
 pub craton_bolt::storage::catalog::TableKind::External::location: alloc::string::String
@@ -2931,9 +2938,11 @@ pub craton_bolt::storage::catalog::VacuumReport::files_removed: usize
 pub craton_bolt::storage::catalog::VacuumReport::manifests_removed: usize
 pub struct craton_bolt::storage::catalog::ViewMeta
 pub craton_bolt::storage::catalog::ViewMeta::backing_table: alloc::string::String
+pub craton_bolt::storage::catalog::ViewMeta::base_files: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub craton_bolt::storage::catalog::ViewMeta::base_versions: alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>
 pub craton_bolt::storage::catalog::ViewMeta::dependencies: alloc::vec::Vec<alloc::string::String>
 pub craton_bolt::storage::catalog::ViewMeta::refresh: craton_bolt::storage::catalog::RefreshPolicy
+pub craton_bolt::storage::catalog::ViewMeta::refreshed_at_ms: core::option::Option<u64>
 pub craton_bolt::storage::catalog::ViewMeta::sql: alloc::string::String
 pub fn craton_bolt::storage::catalog::dtype_from_text(&str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::DataType>
 pub fn craton_bolt::storage::catalog::dtype_to_text(craton_bolt::plan::logical_plan::DataType) -> craton_bolt::BoltResult<alloc::string::String>
@@ -2955,6 +2964,7 @@ pub fn craton_bolt::storage::parquet::ParquetTable::read(&self, &craton_bolt::st
 pub fn craton_bolt::storage::parquet::ParquetTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
 pub fn craton_bolt::storage::parquet::ParquetTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
 pub struct craton_bolt::storage::parquet::ParquetWriteOptions
+pub craton_bolt::storage::parquet::ParquetWriteOptions::bloom_filters: bool
 pub craton_bolt::storage::parquet::ParquetWriteOptions::row_group_rows: usize
 pub craton_bolt::storage::parquet::ParquetWriteOptions::zstd_level: i32
 impl core::default::Default for craton_bolt::storage::parquet::ParquetWriteOptions
@@ -3081,6 +3091,8 @@ pub fn craton_bolt::storage::scan::PrunePredicate::may_match(&self, &[craton_bol
 pub enum craton_bolt::storage::RefreshPolicy
 pub craton_bolt::storage::RefreshPolicy::Manual
 pub craton_bolt::storage::RefreshPolicy::OnCommit
+pub craton_bolt::storage::RefreshPolicy::Scheduled
+pub craton_bolt::storage::RefreshPolicy::Scheduled::seconds: u64
 pub struct craton_bolt::storage::Catalog
 impl craton_bolt::storage::catalog::Catalog
 pub fn craton_bolt::storage::catalog::Catalog::append(&mut self, &str, &[arrow_array::record_batch::RecordBatch]) -> craton_bolt::BoltResult<()>
@@ -3146,6 +3158,7 @@ pub fn craton_bolt::storage::parquet::ParquetTable::read(&self, &craton_bolt::st
 pub fn craton_bolt::storage::parquet::ParquetTable::schema(&self) -> &craton_bolt::plan::logical_plan::Schema
 pub fn craton_bolt::storage::parquet::ParquetTable::statistics(&self) -> craton_bolt::storage::stats::TableStatistics
 pub struct craton_bolt::storage::ParquetWriteOptions
+pub craton_bolt::storage::ParquetWriteOptions::bloom_filters: bool
 pub craton_bolt::storage::ParquetWriteOptions::row_group_rows: usize
 pub craton_bolt::storage::ParquetWriteOptions::zstd_level: i32
 impl core::default::Default for craton_bolt::storage::parquet::ParquetWriteOptions
@@ -3237,8 +3250,9 @@ pub craton_bolt::Counter::SpillBytesWritten = 9
 pub craton_bolt::Counter::SpillFilesWritten = 8
 pub craton_bolt::Counter::StorageChunksPruned = 7
 pub craton_bolt::Counter::StorageChunksRead = 6
+pub craton_bolt::Counter::ViewRewrites = 11
 impl craton_bolt::metrics::Counter
-pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 11]
+pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 12]
 pub const fn craton_bolt::metrics::Counter::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Counter::help(self) -> &'static str
 pub enum craton_bolt::ExecutionTier
@@ -3386,6 +3400,7 @@ pub const fn craton_bolt::metrics::Phase::help(self) -> &'static str
 #[non_exhaustive] pub enum craton_bolt::RefreshMode
 pub craton_bolt::RefreshMode::Manual
 pub craton_bolt::RefreshMode::OnCommit
+pub craton_bolt::RefreshMode::Scheduled(core::time::Duration)
 pub enum craton_bolt::TableSource
 pub craton_bolt::TableSource::Materialized(alloc::vec::Vec<arrow_array::record_batch::RecordBatch>)
 pub craton_bolt::TableSource::Streaming(craton_bolt::exec::streaming::BatchProducer)
@@ -3504,6 +3519,7 @@ pub fn craton_bolt::exec::engine::Engine::table_statistics(&self, &str) -> crato
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::create_view(&mut self, &str, &str, craton_bolt::RefreshMode, bool) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::drop_view(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::refresh_due_views(&mut self) -> craton_bolt::BoltResult<usize>
 pub fn craton_bolt::exec::engine::Engine::refresh_view(&mut self, &str) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::view_exists(&self, &str) -> bool
 pub fn craton_bolt::exec::engine::Engine::view_names(&self) -> alloc::vec::Vec<alloc::string::String>
@@ -3529,6 +3545,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::view_rewrite(self, bool) -> Self
 pub struct craton_bolt::GpuBuffer<T: bytemuck::pod::Pod>
 impl craton_bolt::cuda::buffer::GpuBuffer<u8>
 pub fn craton_bolt::cuda::buffer::GpuBuffer<u8>::from_arrow_bytes(&arrow_buffer::buffer::immutable::Buffer) -> craton_bolt::BoltResult<craton_bolt::cuda::buffer::GpuBuffer<u8>>
@@ -3685,7 +3702,10 @@ pub craton_bolt::SessionSettings::read_only: bool
 #[non_exhaustive] pub struct craton_bolt::ViewStatus
 pub craton_bolt::ViewStatus::dependencies: alloc::vec::Vec<alloc::string::String>
 pub craton_bolt::ViewStatus::fresh: bool
+pub craton_bolt::ViewStatus::incremental: bool
+pub craton_bolt::ViewStatus::last_refresh_incremental: bool
 pub craton_bolt::ViewStatus::refresh: craton_bolt::RefreshMode
+pub craton_bolt::ViewStatus::refreshed_at: core::option::Option<std::time::SystemTime>
 pub craton_bolt::ViewStatus::stale_dependencies: alloc::vec::Vec<alloc::string::String>
 pub trait craton_bolt::CostModel: core::marker::Send + core::marker::Sync + core::fmt::Debug
 pub fn craton_bolt::CostModel::estimate(&self, &craton_bolt::exec::cost::CostInputs) -> craton_bolt::exec::cost::OperatorCost

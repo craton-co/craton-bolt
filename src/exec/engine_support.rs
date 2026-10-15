@@ -801,6 +801,158 @@ pub(crate) fn host_column_to_arrow_array(
     })
 }
 
+impl crate::exec::engine::Engine {
+    /// SQL NULL for a grouped `SUM` / `MIN` / `MAX` whose group has no
+    /// non-NULL input value. The GROUP BY executors leave such a group at
+    /// the accumulator's identity (0, the type's extreme, or NaN); when the
+    /// aggregate's input really holds NULLs, a companion `COUNT(input)` of
+    /// the same plan finds the empty groups.
+    pub(crate) fn null_empty_groups(
+        &self,
+        phys: &crate::plan::PhysicalPlan,
+        out: RecordBatch,
+    ) -> BoltResult<RecordBatch> {
+        use crate::plan::logical_plan::AggregateExpr;
+        let crate::plan::PhysicalPlan::Aggregate {
+            table,
+            pre,
+            aggregate,
+        } = phys
+        else {
+            return Ok(out);
+        };
+        let n_keys = aggregate.group_by.len();
+        if n_keys == 0 || out.num_rows() == 0 {
+            return Ok(out);
+        }
+        let targets: Vec<(usize, crate::plan::Expr)> = aggregate
+            .aggregates
+            .iter()
+            .enumerate()
+            .filter_map(|(j, a)| match a {
+                AggregateExpr::Sum(e) | AggregateExpr::Min(e) | AggregateExpr::Max(e) => {
+                    Some((j, e.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if targets.is_empty() || out.num_columns() != n_keys + aggregate.aggregates.len() {
+            return Ok(out);
+        }
+        // Only when the inputs hold NULLs at all.
+        let batch = self.materialize_table(table)?;
+        let inputs: Vec<&str> = match pre {
+            Some(p) => p.inputs.iter().map(|c| c.name.as_str()).collect(),
+            None => aggregate.inputs.iter().map(|c| c.name.as_str()).collect(),
+        };
+        if !inputs
+            .iter()
+            .any(|n| batch.column_by_name(n).is_some_and(|c| c.null_count() > 0))
+        {
+            return Ok(out);
+        }
+        drop(batch);
+        let mut spec = aggregate.clone();
+        spec.aggregates = targets
+            .iter()
+            .map(|(_, e)| AggregateExpr::Count(e.clone()))
+            .collect();
+        let mut fields: Vec<crate::plan::logical_plan::Field> =
+            aggregate.output_schema.fields[..n_keys].to_vec();
+        for (j, _) in &targets {
+            fields.push(crate::plan::logical_plan::Field::new(
+                format!("__bolt_nonnull_{j}"),
+                crate::plan::logical_plan::DataType::Int64,
+                false,
+            ));
+        }
+        spec.output_schema = crate::plan::logical_plan::Schema::new(fields);
+        let count_plan = crate::plan::PhysicalPlan::Aggregate {
+            table: table.clone(),
+            pre: pre.clone(),
+            aggregate: spec,
+        };
+        let counts = self.execute(&count_plan)?.into_record_batch();
+        // Match groups by their key values.
+        let sort_fields: Vec<arrow::row::SortField> = out.columns()[..n_keys]
+            .iter()
+            .map(|c| arrow::row::SortField::new(c.data_type().clone()))
+            .collect();
+        let conv = arrow::row::RowConverter::new(sort_fields)
+            .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))?;
+        let key_cols = |b: &RecordBatch| -> BoltResult<Vec<ArrayRef>> {
+            b.columns()[..n_keys]
+                .iter()
+                .zip(out.columns())
+                .map(|(c, want)| {
+                    if c.data_type() == want.data_type() {
+                        Ok(Arc::clone(c))
+                    } else {
+                        arrow::compute::cast(c, want.data_type())
+                            .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))
+                    }
+                })
+                .collect()
+        };
+        let count_rows = conv
+            .convert_columns(&key_cols(&counts)?)
+            .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))?;
+        let out_rows = conv
+            .convert_columns(&key_cols(&out)?)
+            .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))?;
+        let index: std::collections::HashMap<Vec<u8>, usize> = (0..count_rows.num_rows())
+            .map(|i| (count_rows.row(i).as_ref().to_vec(), i))
+            .collect();
+        let mut columns = out.columns().to_vec();
+        let mut changed = vec![false; columns.len()];
+        for (t, (j, _)) in targets.iter().enumerate() {
+            let c = arrow::compute::cast(counts.column(n_keys + t), &arrow_schema::DataType::Int64)
+                .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))?;
+            let c = c
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .expect("cast to Int64");
+            let empty: arrow_array::BooleanArray = (0..out.num_rows())
+                .map(|r| {
+                    let n = index.get(out_rows.row(r).as_ref()).map_or(0, |&i| {
+                        if arrow_array::Array::is_null(c, i) {
+                            0
+                        } else {
+                            c.value(i)
+                        }
+                    });
+                    Some(n == 0)
+                })
+                .collect();
+            if empty.true_count() == 0 {
+                continue;
+            }
+            let col = n_keys + j;
+            columns[col] = arrow::compute::nullif(columns[col].as_ref(), &empty)
+                .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))?;
+            changed[col] = true;
+        }
+        if !changed.iter().any(|c| *c) {
+            return Ok(out);
+        }
+        let fields: Vec<arrow_schema::Field> = out
+            .schema()
+            .fields()
+            .iter()
+            .zip(&changed)
+            .map(|(f, c)| {
+                if *c {
+                    f.as_ref().clone().with_nullable(true)
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+            .map_err(|e| BoltError::Other(format!("grouped NULLs: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Host-only tests for the incremental-cache row helpers and the schema /
