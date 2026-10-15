@@ -3590,6 +3590,20 @@ fn build_projection_kernel(
     predicate: Option<&Expr>,
     projected: &[(String, Expr)],
 ) -> BoltResult<PhysicalPlan> {
+    build_kernel(table, scan_schema, predicate, projected, true)
+}
+
+/// [`build_projection_kernel`]; `hidden_validity` selects how outputs over
+/// nullable columns get their NULLs (see [`crate::plan::null_semantics`]):
+/// hidden validity outputs (projections), or the kernel's AND-of-inputs
+/// output validity (the aggregate pre-stage, whose feeds are strict).
+fn build_kernel(
+    table: &str,
+    scan_schema: &Schema,
+    predicate: Option<&Expr>,
+    projected: &[(String, Expr)],
+    hidden_validity: bool,
+) -> BoltResult<PhysicalPlan> {
     // Host-materialised passthrough escape hatch.
     //
     // The fused GPU scan/projection codegen has no register class for `Utf8`
@@ -3677,9 +3691,52 @@ fn build_projection_kernel(
         return lower_host_filtered_projection(table, scan_schema, predicate, projected);
     }
 
+    // SQL NULL semantics: the kernel computes values only, so predicates
+    // and outputs over nullable columns are rewritten into explicit
+    // validity checks. A construct without a rule runs on the host.
+    let ns = crate::plan::null_semantics::NullSemantics::new(scan_schema);
+    let predicate: Option<Expr> = match predicate {
+        Some(p) if ns.touches_nulls(p) => match ns.is_true(p) {
+            Ok(t) => Some(t),
+            Err(_) => {
+                return lower_host_filtered_projection(table, scan_schema, Some(p), projected)
+            }
+        },
+        other => other.cloned(),
+    };
+    let mut values: Vec<(String, Expr)> = Vec::with_capacity(projected.len());
+    let mut validity: Vec<(String, Expr)> = Vec::new();
+    for (i, (name, e)) in projected.iter().enumerate() {
+        if !ns.touches_nulls(e) || !hidden_validity {
+            // Pre-stage feeds are strict (non-strict ones are materialised
+            // by `lower_aggregate`): their NULLs are the AND of the inputs'.
+            values.push((name.clone(), e.clone()));
+            continue;
+        }
+        match (ns.value(e), ns.known(e)) {
+            (Ok(v), Ok(k)) => {
+                values.push((name.clone(), v));
+                if let Some(k) = k {
+                    validity.push((
+                        format!("{}{i}", crate::plan::null_semantics::HIDDEN_VALIDITY_PREFIX),
+                        k,
+                    ));
+                }
+            }
+            _ => {
+                return lower_host_filtered_projection(
+                    table,
+                    scan_schema,
+                    predicate.as_ref(),
+                    projected,
+                )
+            }
+        }
+    }
+
     let mut cg = Codegen::new(scan_schema);
 
-    let predicate_reg = if let Some(pred) = predicate {
+    let predicate_reg = if let Some(pred) = predicate.as_ref() {
         let v = cg.emit_expr(pred)?;
         if v.dtype != DataType::Bool {
             return Err(BoltError::Type(format!(
@@ -3692,9 +3749,9 @@ fn build_projection_kernel(
         None
     };
 
-    let mut outputs = Vec::with_capacity(projected.len());
-    let mut output_fields = Vec::with_capacity(projected.len());
-    for (i, (name, expr)) in projected.iter().enumerate() {
+    let mut outputs = Vec::with_capacity(values.len() + validity.len());
+    let mut output_fields = Vec::with_capacity(values.len());
+    for (i, (name, expr)) in values.iter().enumerate() {
         let value = cg.emit_expr(expr)?;
         cg.emit_store(value, i)?;
         outputs.push(ColumnIO {
@@ -3702,6 +3759,16 @@ fn build_projection_kernel(
             dtype: value.dtype,
         });
         output_fields.push(Field::new(name.clone(), value.dtype, true));
+    }
+    // Hidden validity outputs follow the visible ones; the executor applies
+    // them and drops them (`output_schema` lists only the visible outputs).
+    for (j, (name, expr)) in validity.iter().enumerate() {
+        let value = cg.emit_expr(expr)?;
+        cg.emit_store(value, values.len() + j)?;
+        outputs.push(ColumnIO {
+            name: name.clone(),
+            dtype: crate::plan::null_semantics::VALIDITY_DTYPE,
+        });
     }
 
     let kernel = cg.finish(outputs, predicate_reg);
@@ -3906,6 +3973,77 @@ fn aggregate_needs_materialized_input(
     Ok(feeds_non_numeric && resolved.predicate.is_some())
 }
 
+/// An aggregate's input plan with its group keys and aggregates.
+type AggregateParts = (LogicalPlan, Vec<Expr>, Vec<AggregateExpr>);
+
+/// Name of the `k`-th feed column [`materialize_nonstrict_feeds`] adds.
+const FEED_COLUMN_PREFIX: &str = "__bolt_feed_";
+
+/// `input` extended with a column per non-strict group key / aggregate
+/// input over nullable columns, and the keys / aggregates reading those
+/// columns instead; `None` when every feed is strict.
+fn materialize_nonstrict_feeds(
+    input: &LogicalPlan,
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+) -> BoltResult<Option<AggregateParts>> {
+    let schema = input.schema()?;
+    let ns = crate::plan::null_semantics::NullSemantics::new(&schema);
+    let nonstrict = |e: &Expr| !ns.is_strict(e) && !matches!(e, Expr::Literal(_));
+    if !group_by.iter().any(nonstrict)
+        && !aggregates
+            .iter()
+            .any(|a| !is_count_star(a) && nonstrict(aggregate_input_expr(a)))
+    {
+        return Ok(None);
+    }
+    let mut exprs: Vec<Expr> = schema
+        .fields
+        .iter()
+        .filter(|f| !(f.name.starts_with("__idx_") || f.name.starts_with("__rank_")))
+        .map(|f| Expr::Column(f.name.clone()))
+        .collect();
+    let mut k = 0usize;
+    let mut feed = |e: &Expr, exprs: &mut Vec<Expr>| -> Expr {
+        let name = format!("{FEED_COLUMN_PREFIX}{k}");
+        k += 1;
+        exprs.push(Expr::Alias(Box::new(e.clone()), name.clone()));
+        Expr::Column(name)
+    };
+    let keys: Vec<Expr> = group_by
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            if nonstrict(g) {
+                // Keep the key's output name.
+                let name = crate::plan::logical_plan::group_key_output_name(g, i);
+                Expr::Alias(Box::new(feed(g, &mut exprs)), name)
+            } else {
+                g.clone()
+            }
+        })
+        .collect();
+    let aggs: Vec<AggregateExpr> = aggregates
+        .iter()
+        .map(|a| {
+            let e = aggregate_input_expr(a);
+            if !is_count_star(a) && nonstrict(e) {
+                rebuild_agg_with_input(a, feed(e, &mut exprs))
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    Ok(Some((
+        LogicalPlan::Project {
+            input: Box::new(input.clone()),
+            exprs,
+        },
+        keys,
+        aggs,
+    )))
+}
+
 /// `COUNT(*)`: the frontend's `COUNT(<non-NULL literal>)`.
 fn is_count_star(a: &AggregateExpr) -> bool {
     matches!(a, AggregateExpr::Count(Expr::Literal(l)) if !matches!(l, Literal::Null))
@@ -4091,6 +4229,29 @@ fn lower_aggregate(
     if aggregate_needs_materialized_input(input, group_by, aggregates)? {
         return lower_aggregate_over_input(input, group_by, aggregates, depth);
     }
+    // A feed whose NULLs are not "NULL if any input is" (`CASE`, `AND` /
+    // `OR`, `IS NULL`, a NULL literal) over nullable columns: compute it as a
+    // column of the materialised input, where its NULLs are exact.
+    if let Some((with_feeds, keys, aggs)) =
+        materialize_nonstrict_feeds(input, group_by, aggregates)?
+    {
+        let mut lowered = lower_aggregate_over_input(&with_feeds, &keys, &aggs, depth)?;
+        // The output keeps the original aggregate's column names.
+        let want = plan.schema()?;
+        if let PhysicalPlan::AggregateOverInput { aggregate, .. } = &mut lowered {
+            if let PhysicalPlan::Aggregate {
+                aggregate: spec, ..
+            } = aggregate.as_mut()
+            {
+                if spec.output_schema.fields.len() == want.fields.len() {
+                    for (f, w) in spec.output_schema.fields.iter_mut().zip(&want.fields) {
+                        f.name = w.name.clone();
+                    }
+                }
+            }
+        }
+        return Ok(lowered);
+    }
     // `COUNT(*)` reaches the planner as `COUNT(<literal>)`, a computed feed
     // that needs the aggregate pre-kernel — which cannot output a `Utf8` /
     // `Bool` / temporal / decimal group key. Count through a non-nullable
@@ -4251,8 +4412,13 @@ fn lower_aggregate(
             .enumerate()
             .map(|(i, e)| (output_name_for(e, i), e.clone()))
             .collect();
-        let pre_plan =
-            build_projection_kernel(table, scan_schema, scan_predicate.as_ref(), &named_feed)?;
+        let pre_plan = build_kernel(
+            table,
+            scan_schema,
+            scan_predicate.as_ref(),
+            &named_feed,
+            false,
+        )?;
         let (pre_kernel, _pre_schema) = match pre_plan {
             PhysicalPlan::Projection {
                 kernel,

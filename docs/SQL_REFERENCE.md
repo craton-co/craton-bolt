@@ -697,8 +697,8 @@ SELECT ... FROM <table>
 
 `Engine::execute_sql` (and `Session::sql`) run these in addition to queries;
 `Engine::sql` runs queries only and points at `execute_sql` for the rest.
-Each statement commits on its own; a statement that changes tables returns
-one row, `rows_affected`.
+Outside a transaction each statement commits on its own; a statement that
+changes tables returns one row, `rows_affected`.
 
 | Statement | Notes |
 |---|---|
@@ -714,15 +714,33 @@ one row, `rows_affected`.
 | `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'manual' \| 'on_commit')] AS SELECT ...` | Read like a table; staleness via `Engine::view_status` |
 | `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` | Full refresh |
 | `COMPACT TABLE t [ORDER BY (col, ...)]`, `VACUUM [KEEP n]` | Catalog tables only (`EngineBuilder::database`). `ORDER BY` rewrites the table sorted on a clustering key (recorded for later compactions), tightening its zone maps |
+| `DELETE FROM t [AS a] [WHERE ...]` | Rows whose predicate is TRUE are removed (NULL keeps the row). A catalog table rewrites only the files whose zone maps may match; subqueries see the table as it was |
+| `UPDATE t [AS a] SET c = expr, ... [WHERE ...]` | New values are cast to the column types; `NOT NULL` is enforced. No `FROM`, `RETURNING`, or `SET (a, b) = ...` |
+| `ALTER TABLE [IF EXISTS] t ADD [COLUMN] [IF NOT EXISTS] c type [NOT NULL] [DEFAULT expr]` | Existing rows get the default (or NULL; `NOT NULL` needs a default) |
+| `ALTER TABLE t DROP [COLUMN] [IF EXISTS] c`, `RENAME [COLUMN] a TO b`, `ALTER [COLUMN] c [SET DATA] TYPE type \| SET NOT NULL \| DROP NOT NULL` | Rewrites the table; refused while a materialized view reads it |
+| `ALTER TABLE t RENAME TO u` | Refused while a materialized view reads it |
+| `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` | See below |
 
 With a catalog attached, tables (other than `TEMP`) and materialized views
 are durable and every change is a new catalog snapshot.
 
+**Transactions.** Between `BEGIN` and `COMMIT` statements see their own
+changes; a catalog publishes them all as **one** snapshot at `COMMIT`, and
+`ROLLBACK` restores the catalog and in-memory tables, views and table
+registrations to their state at `BEGIN`. A failing statement aborts the
+transaction: later statements fail until `ROLLBACK` (a `COMMIT` then rolls
+back and reports it). `VACUUM` and dropping a lazy stream table are refused
+inside a transaction; savepoints, `SET TRANSACTION` and `AND CHAIN` are not
+supported. Through a `Database`, a transaction belongs to the session that
+began it and other sessions' statements wait for it to end.
+
 `EXPLAIN` output (`Engine::explain_sql`) ends with a `Storage scans:`
 section — per storage table, the chunks and columns the statement would read
-after pruning (decided from statistics, nothing is read) — and, under a
-memory budget, an `Execution: out of core — ...` line naming the
-partitioned / grace-join / external-sort strategy the statement would use.
+after pruning (decided from statistics, nothing is read) — a `Tier:` line
+with the cost model's host / GPU estimate for statements the host tier can
+run (see `exec::cost`), and, under a memory budget, an `Execution: out of
+core — ...` line naming the partitioned / grace-join / external-sort /
+chunked-scan / partial-aggregate strategy the statement would use.
 
 ## What's NOT supported
 
@@ -777,7 +795,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - `INTO`, table-valued functions **other than `generate_series`** (`unnest`, etc.), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `SETTINGS`, and the trailing `FORMAT` output clause (distinct from the supported `CAST(... FORMAT '<pattern>')` expression — see the CASE / CAST section). (`FETCH` and T-SQL `TOP` now fold into `LIMIT`, `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, `PREWHERE` is folded into `WHERE`, and `generate_series(...)` and `VALUES` are supported row sources — see the [generate_series](#generate_series) and [VALUES](#values-as-a-row-source) sections. Residuals: `FETCH` / `TOP` with `PERCENT` or `WITH TIES`, and a `TOP` combined with `LIMIT` / `FETCH`.)
 - (`GROUP BY ALL` / `ROLLUP` / `CUBE` / `GROUPING SETS` / `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` and the `GROUPING()` / `GROUPING_ID()` indicators are now **supported** — see [GROUP BY](#group-by). Residuals: more than 12 grouping columns, and `GROUPING()` without a grouping construct.)
 - `SELECT AS STRUCT/VALUE`.
-- `UPDATE`, `DELETE`, `MERGE`, `ALTER TABLE` (tables are append-only), plain (non-materialized) `CREATE VIEW`, and multi-statement transactions (`BEGIN` / `COMMIT`). The supported statements are listed under [Statements](#statements).
+- `MERGE`, plain (non-materialized) `CREATE VIEW`, savepoints, and `DELETE ... USING` / `UPDATE ... FROM` / `RETURNING`. (`UPDATE`, `DELETE`, `ALTER TABLE` and `BEGIN` / `COMMIT` / `ROLLBACK` are **supported** — see [Statements](#statements).)
 - `SELECT` without a `FROM` clause (`SELECT 1`); select from `(VALUES (1)) AS v(x)` instead.
 
 ### Validity propagation

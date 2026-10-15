@@ -676,6 +676,12 @@ was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
 | New default feature `storage` (Parquet, catalog) adds the `parquet` / `serde` / `serde_json` dependencies | Additive (build) | `default-features = false, features = ["cudarc"]` keeps the previous dependency set |
 | `Engine::sql` given a DDL / DML statement reports "run with `Engine::execute_sql`" | Behavioural (error text) | Run statements through `execute_sql` |
 | `Engine::execute_sql`, storage tables, catalog, materialized views, memory budgets / out-of-core execution, `Database` / `Session` | Additive | — |
+| GPU predicates / projections over nullable columns follow SQL NULL semantics (a comparison with NULL is not TRUE; computed outputs keep NULLs) | Behavioural (bug fix) | Results that relied on NULL reading as 0 change |
+| `SUM(Int32)` / `COUNT(col)` / `AVG(col)` through the aggregate pre-stage are exact | Behavioural (bug fix) | — |
+| `DELETE` / `UPDATE` / `ALTER TABLE` / transactions, `Engine::sql_stream`, cost-based tier selection (opt-in) | Additive | — |
+| Through a `Database`, a session's open transaction makes other sessions' statements wait | Behavioural | Commit or roll back promptly; tune `Database::set_transaction_wait` |
+| `Engine::sql` rejects `UPDATE` / `ALTER` / `BEGIN` / `COMMIT` / `ROLLBACK` / `END` like other statements | Behavioural (error text) | Run them through `execute_sql` |
+| `MemoryStats` gains `repartitions`; `Counter` gains `HostTierQueries` | Additive (`#[non_exhaustive]`) | — |
 
 ## Quick upgrade checklist
 

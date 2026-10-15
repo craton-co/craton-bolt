@@ -1276,6 +1276,10 @@ pub struct Engine {
     /// Persistent catalog attached with [`EngineBuilder::database`].
     #[cfg(feature = "storage")]
     pub(crate) catalog: Option<crate::storage::Catalog>,
+    /// When statements may run on the host tier (see `crate::exec::cost`).
+    pub(crate) tier_policy: crate::exec::cost::TierPolicy,
+    /// Tier cost estimates (replaced by `calibrate_cost_model`).
+    pub(crate) cost_model: RefCell<Arc<dyn crate::exec::cost::CostModel>>,
     /// Open `BEGIN` ... `COMMIT` transaction (see `engine_txn`).
     pub(crate) txn: Option<crate::exec::engine_txn::Transaction>,
     /// Session whose statement is running (set by the `Database` runtime).
@@ -1329,6 +1333,8 @@ pub struct EngineBuilder {
     spill_dir: Option<std::path::PathBuf>,
     /// Compaction policy (see [`EngineBuilder::auto_compact`]).
     auto_compact_files: Option<usize>,
+    tier_policy: crate::exec::cost::TierPolicy,
+    cost_model: Option<Arc<dyn crate::exec::cost::CostModel>>,
     /// Persistent catalog directory to open (see [`EngineBuilder::database`]).
     #[cfg(feature = "storage")]
     database: Option<std::path::PathBuf>,
@@ -1358,6 +1364,8 @@ impl EngineBuilder {
             host_memory_budget_bytes: None,
             spill_dir: None,
             auto_compact_files: None,
+            tier_policy: crate::exec::cost::TierPolicy::GpuFirst,
+            cost_model: None,
             #[cfg(feature = "storage")]
             database: None,
             #[cfg(feature = "storage")]
@@ -1405,6 +1413,22 @@ impl EngineBuilder {
     /// clustering key. Off by default (`COMPACT TABLE` runs it by hand).
     pub fn auto_compact(mut self, max_files: usize) -> Self {
         self.auto_compact_files = Some(max_files.max(1));
+        self
+    }
+
+    /// When statements may run on the host instead of the GPU (default
+    /// [`TierPolicy::GpuFirst`](crate::exec::cost::TierPolicy::GpuFirst)).
+    /// See [`crate::exec::cost`].
+    pub fn tier_policy(mut self, policy: crate::exec::cost::TierPolicy) -> Self {
+        self.tier_policy = policy;
+        self
+    }
+
+    /// Cost model for [`TierPolicy::CostBased`](crate::exec::cost::TierPolicy::CostBased)
+    /// (default [`DefaultCostModel`](crate::exec::cost::DefaultCostModel); see
+    /// also [`Engine::calibrate_cost_model`]).
+    pub fn cost_model(mut self, model: Arc<dyn crate::exec::cost::CostModel>) -> Self {
+        self.cost_model = Some(model);
         self
     }
 
@@ -1627,6 +1651,12 @@ impl EngineBuilder {
             lru_tick: std::cell::Cell::new(0),
             #[cfg(feature = "storage")]
             catalog: None,
+            tier_policy: self.tier_policy,
+            cost_model: RefCell::new(
+                self.cost_model
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(crate::exec::cost::DefaultCostModel::default())),
+            ),
             txn: None,
             current_session: None,
             _ctx: ctx,
@@ -4863,6 +4893,10 @@ impl Engine {
             }
             full
         };
+
+        // NULLs of outputs over nullable columns arrive as hidden validity
+        // outputs (see `plan::null_semantics`).
+        let arrays = crate::exec::engine_support::apply_hidden_validity(arrays, &kernel.outputs)?;
 
         // 9. Build the result RecordBatch (Materialize phase).
         let materialize_start = Instant::now();

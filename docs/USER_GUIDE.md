@@ -216,7 +216,19 @@ let v = engine.catalog().unwrap().version();
 let old = Engine::builder().database_snapshot("/var/lib/bolt/warehouse", v - 1).build()?; // read-only
 ```
 
-Each statement commits on its own (append-only; no `UPDATE` / `DELETE`).
+`DELETE`, `UPDATE` and `ALTER TABLE` rewrite the affected data (a catalog
+table only the files whose zone maps may match), and transactions group
+statements into one snapshot:
+
+```rust
+engine.execute_sql("UPDATE t SET v = v * 1.1 WHERE k BETWEEN 100 AND 200")?;
+engine.execute_sql("DELETE FROM t WHERE v IS NULL")?;
+engine.execute_sql("ALTER TABLE t ADD COLUMN tag VARCHAR DEFAULT 'none'")?;
+engine.execute_sql("BEGIN; INSERT INTO t SELECT * FROM staging; DELETE FROM staging; COMMIT")?;
+```
+
+Outside a transaction each statement commits on its own; inside one, a
+failure aborts it until `ROLLBACK`.
 `COMPACT TABLE t` merges a table's files — `COMPACT TABLE t ORDER BY (day,
 region)` also sorts it on a clustering key, so each row group covers a narrow
 key range and range filters prune most of it; `VACUUM [KEEP n]` deletes old
@@ -263,9 +275,30 @@ larger than the budget runs **out of core**: the table is hash-partitioned
 into spill files and the normal GPU operators run on one partition at a
 time — `GROUP BY` / `DISTINCT` (exact for every aggregate), equi-joins
 (grace hash join, all join types), and `ORDER BY [LIMIT]` (sorted runs,
-k-way merge). Simple aggregates over lazily-held tables keep using the
-single-pass morsel path. Results are always one host batch. See
-[`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
+k-way merge). An over-budget partition (key skew) is split again with a new
+hash seed. A filter / projection over a storage table larger than the host
+budget runs over bounded chunk groups, and `COUNT` / `SUM` / `MIN` / `MAX` /
+`AVG` without `GROUP BY` merge per-chunk partials. Simple aggregates over
+lazily-held tables keep using the single-pass morsel path.
+
+`Engine::sql` returns one host batch. To consume a large row-wise result
+without holding it at once, stream it:
+
+```rust
+for batch in engine.sql_stream("SELECT id, amount FROM sales WHERE amount > 100")? {
+    write_out(&batch?)?;            // one chunk group's rows at a time
+}
+```
+
+See [`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
+
+**CPU or GPU.** By default every statement the GPU path supports runs
+there. With `Engine::builder().tier_policy(TierPolicy::CostBased)`, a
+`CostModel` estimates each row-wise statement or scalar aggregate on both
+tiers — transfers, launches, compilation, per-row throughput — and small or
+non-resident inputs run on the host when that is cheaper.
+`engine.calibrate_cost_model()` measures the model's constants on the
+device; `EXPLAIN` shows the estimate (`Tier: ...`).
 
 ---
 
@@ -291,6 +324,9 @@ db.with_engine(|e| e.table_names())?;                          // non-SQL engine
 Statements run one at a time in arrival order on the shared GPU runtime;
 dropping a `PendingResult` before its statement starts cancels it, and a
 panic fails only its own statement. `Database::stats()` reports queue waits.
+A `BEGIN` ... `COMMIT` belongs to its session: other sessions' statements
+wait until it ends (failing after `Database::set_transaction_wait`, 30 s by
+default), and dropping the session rolls it back.
 
 With the `flight` feature, `FlightSqlServer::from_database(&db)` serves the
 same database over Arrow Flight SQL: client queries go through a read-only

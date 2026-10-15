@@ -5,6 +5,7 @@
 pub mod dataframe;
 pub mod explain;
 pub mod logical_plan;
+pub(crate) mod null_semantics;
 pub mod optimizer;
 pub mod physical_plan;
 pub mod rewrite;

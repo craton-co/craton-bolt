@@ -869,9 +869,12 @@ fn resolve_agg_input_col<'a>(
             )));
         }
         let col = &compacted.cols[idx];
-        // Fast path: the pre kernel output has no NULL bitmap, so every
-        // row is a "non-NULL" row for aggregate purposes.
-        let n = col.len();
+        // Fast path: the pre output column itself. Its NULLs (an input's,
+        // propagated by the kernel) are in its validity bitmap.
+        let n = match &col.validity {
+            Some(v) => v.iter().filter(|b| **b != 0).count(),
+            None => col.len(),
+        };
         return Ok(ResolvedHostCol::Borrowed { col, non_null: n });
     }
 
@@ -1057,6 +1060,12 @@ fn reduce_host_col(op: ReduceOp, col: &HostCol) -> BoltResult<Scalar> {
     // is None, so the all-valid fast path pays zero cost.
     let stripped = strip_nulls_borrowed(col);
     match &stripped.values {
+        // SUM(Int32) accumulates in i64 partials: widen before the upload so
+        // the partial buffer has the accumulator's width.
+        HostColValues::I32(v) if op == ReduceOp::Sum => {
+            let wide: Vec<i64> = v.iter().map(|&x| i64::from(x)).collect();
+            reduce_host_slice::<i64>(op, DataType::Int64, &wide)
+        }
         HostColValues::I32(v) => reduce_host_slice::<i32>(op, DataType::Int32, v),
         HostColValues::I64(v) => reduce_host_slice::<i64>(op, DataType::Int64, v),
         HostColValues::F32(v) => reduce_host_slice::<f32>(op, DataType::Float32, v),
@@ -1254,6 +1263,14 @@ where
     // 0-row degenerate case: skip the launch entirely and return the identity.
     if n_rows == 0 {
         return T::identity_scalar(op, dtype);
+    }
+    // The kernel writes one accumulator per block; `partials` is sized for
+    // `T`, so the accumulator must be `T` too (a widening reduction would
+    // write past the buffer).
+    if crate::jit::agg_kernels::reduction_output_dtype(op, dtype) != dtype {
+        return Err(BoltError::Other(format!(
+            "internal: {op:?} over {dtype:?} accumulates in a wider type; widen the input first"
+        )));
     }
 
     let block = BLOCK_SIZE;
