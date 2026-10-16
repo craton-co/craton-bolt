@@ -354,10 +354,10 @@ supported alternatives):
   tables** `(SELECT ...) AS alias` are **supported** — alias required;
   **`LATERAL` derived tables** are now **supported** too; column-list aliases
   `AS d(x, y)` remain rejected.)
-- **Non-default window frames** (custom bounds, `GROUPS`, anything other than
-  the default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`). (`QUALIFY`, the
-  named `WINDOW` clause, and `OVER <named_window>` are now **supported** — see
-  below.)
+- **`GROUPS` window frames and `RANGE` frames with a value offset.**
+  (`ROWS` frames with literal offsets and `RANGE` frames bounded by
+  `UNBOUNDED` / `CURRENT ROW` are **supported**; so are `QUALIFY`, the named
+  `WINDOW` clause, and `OVER <named_window>` — see below.)
 - **Table-valued functions** *except* `generate_series(start, stop[, step])`,
   which is now **supported** in `FROM` — see below. Other TVFs (`unnest`, etc.)
   remain rejected: they would need a function-as-table-source mechanism, and

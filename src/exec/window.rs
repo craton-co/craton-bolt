@@ -57,7 +57,9 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
-use crate::plan::logical_plan::{DataType, Expr, Schema, SortExpr, WindowExpr, WindowFunc};
+use crate::plan::logical_plan::{
+    DataType, Expr, FrameBound, FrameUnits, Schema, SortExpr, WindowExpr, WindowFrame, WindowFunc,
+};
 
 /// Execute a window node host-side, appending one column per `window_exprs`
 /// entry to the input batch.
@@ -78,10 +80,19 @@ pub fn execute_window(
     // device, or `--features cuda-stub` — in which case we fall through to the
     // host executor below. Any *successful* GPU result must match the host
     // path bit-for-bit (same NULL grouping, same RANGE-frame peer semantics).
-    match gpu::try_execute_window_gpu(&input, window_exprs, partition_by, order_by, output_schema) {
-        Ok(Some(handle)) => return Ok(handle),
-        Ok(None) => { /* decline -> host fallback */ }
-        Err(e) => return Err(e),
+    // The GPU path implements only the default frame.
+    if window_exprs.iter().all(|w| w.frame.is_none()) {
+        match gpu::try_execute_window_gpu(
+            &input,
+            window_exprs,
+            partition_by,
+            order_by,
+            output_schema,
+        ) {
+            Ok(Some(handle)) => return Ok(handle),
+            Ok(None) => { /* decline -> host fallback */ }
+            Err(e) => return Err(e),
+        }
     }
 
     let batch = input.into_record_batch();
@@ -139,8 +150,15 @@ pub fn execute_window(
     // 2. Compute each window column (in original row order).
     let mut appended: Vec<ArrayRef> = Vec::with_capacity(window_exprs.len());
     for (we, of) in window_exprs.iter().zip(appended_fields) {
-        let arr =
-            compute_window_column(&batch, &perm, &part_keys, &order_keys, &we.func, of.dtype)?;
+        let arr = compute_window_column(
+            &batch,
+            &perm,
+            &part_keys,
+            &order_keys,
+            &we.func,
+            we.frame.as_ref(),
+            of.dtype,
+        )?;
         appended.push(arr);
     }
 
@@ -214,6 +232,7 @@ fn compute_window_column(
     part_keys: &[KeyColumn],
     order_keys: &[KeyColumn],
     func: &WindowFunc,
+    frame: Option<&WindowFrame>,
     out_dtype: DataType,
 ) -> BoltResult<ArrayRef> {
     let n_rows = batch.num_rows();
@@ -242,6 +261,7 @@ fn compute_window_column(
             order_keys,
             agg_input.as_ref(),
             func,
+            frame,
             &mut out,
         )?;
 
@@ -259,6 +279,7 @@ fn compute_partition(
     order_keys: &[KeyColumn],
     agg_input: Option<&NumericColumn>,
     func: &WindowFunc,
+    frame: Option<&WindowFrame>,
     out: &mut ResultBuilder,
 ) -> BoltResult<()> {
     match func {
@@ -303,7 +324,103 @@ fn compute_partition(
                     func.sql_name()
                 ))
             })?;
-            compute_running_aggregate(rows, order_keys, input, func, out)?;
+            match frame {
+                Some(f) => compute_framed_aggregate(rows, order_keys, input, func, f, out)?,
+                None => compute_running_aggregate(rows, order_keys, input, func, out)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Aggregate window under an explicit frame. For row `p` of the partition
+/// the frame is the inclusive position range `[lo(p), hi(p)]` (empty when
+/// `lo > hi`); both ends are non-decreasing in `p`. A frame that starts at
+/// `UNBOUNDED PRECEDING` is folded forward and one that ends at `UNBOUNDED
+/// FOLLOWING` backward, in one pass each; a frame bounded on both sides is
+/// folded per row.
+fn compute_framed_aggregate(
+    rows: &[usize],
+    order_keys: &[KeyColumn],
+    input: &NumericColumn,
+    func: &WindowFunc,
+    frame: &WindowFrame,
+    out: &mut ResultBuilder,
+) -> BoltResult<()> {
+    let n = rows.len() as i64;
+    // First / last position of each position's peer group (RANGE bounds).
+    let (peer_lo, peer_hi): (Vec<i64>, Vec<i64>) = {
+        let mut lo = vec![0i64; rows.len()];
+        let mut hi = vec![0i64; rows.len()];
+        let mut idx = 0usize;
+        while idx < rows.len() {
+            let mut end = idx + 1;
+            while end < rows.len() && order_keys.iter().all(|k| k.eq_rows(rows[idx], rows[end])) {
+                end += 1;
+            }
+            for p in idx..end {
+                lo[p] = idx as i64;
+                hi[p] = end as i64 - 1;
+            }
+            idx = end;
+        }
+        (lo, hi)
+    };
+    let range = frame.units == FrameUnits::Range;
+    let pos = |b: FrameBound, p: usize, is_start: bool| -> i64 {
+        let pi = p as i64;
+        match b {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::UnboundedFollowing => n - 1,
+            FrameBound::CurrentRow if range => {
+                if is_start {
+                    peer_lo[p]
+                } else {
+                    peer_hi[p]
+                }
+            }
+            FrameBound::CurrentRow => pi,
+            FrameBound::Preceding(k) => pi.saturating_sub(k.min(i64::MAX as u64) as i64),
+            FrameBound::Following(k) => pi.saturating_add(k.min(i64::MAX as u64) as i64),
+        }
+    };
+    let bounds = |p: usize| -> (i64, i64) {
+        let lo = pos(frame.start, p, true).max(0);
+        let hi = pos(frame.end, p, false).min(n - 1);
+        (lo, hi)
+    };
+    if frame.start == FrameBound::UnboundedPreceding {
+        let mut acc = Accumulator::new(func);
+        let mut next = 0i64;
+        for p in 0..rows.len() {
+            let (_, hi) = bounds(p);
+            while next <= hi {
+                acc.push(input.get(rows[next as usize]))?;
+                next += 1;
+            }
+            out.set_from_accumulator(rows[p], acc.value())?;
+        }
+    } else if frame.end == FrameBound::UnboundedFollowing {
+        let mut acc = Accumulator::new(func);
+        let mut next = n - 1;
+        for p in (0..rows.len()).rev() {
+            let (lo, _) = bounds(p);
+            while next >= lo {
+                acc.push(input.get(rows[next as usize]))?;
+                next -= 1;
+            }
+            out.set_from_accumulator(rows[p], acc.value())?;
+        }
+    } else {
+        for p in 0..rows.len() {
+            let (lo, hi) = bounds(p);
+            let mut acc = Accumulator::new(func);
+            let mut i = lo;
+            while i <= hi {
+                acc.push(input.get(rows[i as usize]))?;
+                i += 1;
+            }
+            out.set_from_accumulator(rows[p], acc.value())?;
         }
     }
     Ok(())
@@ -1901,6 +2018,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::RowNumber,
             output_name: "rn".into(),
+            frame: None,
         }];
         let os = out_schema(
             &[("k", DataType::Utf8), ("v", DataType::Int32)],
@@ -1953,10 +2071,12 @@ mod tests {
             WindowExpr {
                 func: WindowFunc::Rank,
                 output_name: "rk".into(),
+                frame: None,
             },
             WindowExpr {
                 func: WindowFunc::DenseRank,
                 output_name: "dr".into(),
+                frame: None,
             },
         ];
         let os = out_schema(
@@ -2001,6 +2121,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Sum(col("v")),
             output_name: "sum_v".into(),
+            frame: None,
         }];
         // SUM(Int32) widens to Int64.
         let os = out_schema(
@@ -2034,6 +2155,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Sum(col("v")),
             output_name: "rs".into(),
+            frame: None,
         }];
         let os = out_schema(&[("v", DataType::Int32)], &[("rs", DataType::Int64)]);
         let out = execute_window(h, &wexprs, &[], &[order("v")], &os)
@@ -2068,6 +2190,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Avg(col("v")),
             output_name: "avg_v".into(),
+            frame: None,
         }];
         let os = out_schema(
             &[("k", DataType::Utf8), ("v", DataType::Int32)],
@@ -2102,6 +2225,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Count(col("v")),
             output_name: "cnt".into(),
+            frame: None,
         }];
         let os = out_schema(
             &[("k", DataType::Utf8), ("v", DataType::Int64)],
@@ -2141,6 +2265,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Sum(col("v")),
             output_name: "s".into(),
+            frame: None,
         }];
         // No ORDER BY -> whole partition is one peer group; every row sees the
         // full sum.
@@ -2163,10 +2288,12 @@ mod tests {
             WindowExpr {
                 func: WindowFunc::Min(col("v")),
                 output_name: "mn".into(),
+                frame: None,
             },
             WindowExpr {
                 func: WindowFunc::Max(col("v")),
                 output_name: "mx".into(),
+                frame: None,
             },
         ];
         let os = out_schema(
@@ -2190,6 +2317,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Sum(col("v")),
             output_name: "s".into(),
+            frame: None,
         }];
         let os = out_schema(&[("v", DataType::Int64)], &[("s", DataType::Int64)]);
         // `QueryHandle` (the Ok variant) does not implement `Debug`, so we
@@ -2223,10 +2351,12 @@ mod tests {
             WindowExpr {
                 func: WindowFunc::Min(col("v")),
                 output_name: "mn".into(),
+                frame: None,
             },
             WindowExpr {
                 func: WindowFunc::Max(col("v")),
                 output_name: "mx".into(),
+                frame: None,
             },
         ];
         let os = out_schema(
@@ -2253,6 +2383,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::Min(col("v")),
             output_name: "mn".into(),
+            frame: None,
         }];
         let os = out_schema(&[("v", DataType::Float64)], &[("mn", DataType::Float64)]);
         let out = execute_window(h, &wexprs, &[], &[], &os)
@@ -2277,6 +2408,7 @@ mod tests {
         let wexprs = vec![WindowExpr {
             func: WindowFunc::RowNumber,
             output_name: "rn".into(),
+            frame: None,
         }];
         let os = out_schema(&[("v", DataType::Int32)], &[("rn", DataType::Int64)]);
         let out = execute_window(h, &wexprs, &[], &[order("v")], &os)
@@ -2490,6 +2622,7 @@ mod tests {
             let wexprs = vec![WindowExpr {
                 func: WindowFunc::RowNumber,
                 output_name: "rn".into(),
+                frame: None,
             }];
             let os = out_schema(
                 &[("k", DataType::Int32), ("v", DataType::Int32)],
@@ -2622,10 +2755,12 @@ mod tests {
                 WindowExpr {
                     func: WindowFunc::Rank,
                     output_name: "rk".into(),
+                    frame: None,
                 },
                 WindowExpr {
                     func: WindowFunc::DenseRank,
                     output_name: "dr".into(),
+                    frame: None,
                 },
             ];
             let os = out_schema(
@@ -2671,6 +2806,7 @@ mod tests {
             let wexprs = vec![WindowExpr {
                 func: WindowFunc::Sum(col("v")),
                 output_name: "rs".into(),
+                frame: None,
             }];
             let os = out_schema(
                 &[("k", DataType::Int32), ("v", DataType::Int32)],
@@ -2717,6 +2853,7 @@ mod tests {
             let wexprs = vec![WindowExpr {
                 func: WindowFunc::Count(col("v")),
                 output_name: "cnt".into(),
+                frame: None,
             }];
             let os = out_schema(
                 &[("k", DataType::Int64), ("v", DataType::Int64)],

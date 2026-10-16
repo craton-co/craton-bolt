@@ -15,11 +15,10 @@
 //! ```
 //!
 //! What we ALSO pin, runnable on CI without a GPU, is the *frontend contract*
-//! for non-default frames: the SQL parser (`craton_bolt::plan::parse_sql`) is a
-//! pure host path, so the "explicit ROWS / GROUPS frame is rejected" tests run
-//! everywhere (no `#[ignore]`). `window.rs` documents that the frontend rejects
-//! any non-default frame, and `sql_frontend::reject_non_default_frame` is the
-//! gate; these tests lock that rejection in place.
+//! for frames: the SQL parser (`craton_bolt::plan::parse_sql`) is a pure host
+//! path, so the "unsupported frame is rejected" tests run everywhere (no
+//! `#[ignore]`): `GROUPS`, `RANGE` with a value offset, and a start bound
+//! after the end bound (`sql_frontend::lower_window_frame`).
 //!
 //! ## Truth table (standard SQL / DuckDB semantics asserted)
 //!
@@ -423,13 +422,13 @@ fn null_orders_last_under_desc() {
 }
 
 // ===========================================================================
-// Frontend contract: non-default frames are rejected (HOST-reachable, no GPU).
+// Frontend contract: unsupported frames are rejected (HOST-reachable, no GPU).
 // ===========================================================================
 //
-// `window.rs` only implements the default RANGE/ROWS UNBOUNDED-PRECEDING frame
-// and documents that the frontend rejects everything else. The rejection lives
-// in `sql_frontend::reject_non_default_frame`, reached purely through
-// `parse_sql` (no CUDA context), so these run on CI without a GPU.
+// `ROWS` frames with literal offsets and `RANGE` frames bounded by UNBOUNDED /
+// CURRENT ROW are supported; the rest is rejected in
+// `sql_frontend::lower_window_frame`, reached purely through `parse_sql` (no
+// CUDA context), so these run on CI without a GPU.
 
 /// A single-column provider for the host-only parse checks.
 fn frame_provider() -> MemTableProvider {
@@ -437,26 +436,31 @@ fn frame_provider() -> MemTableProvider {
     MemTableProvider::new().with_table("t", schema)
 }
 
-/// An explicit `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` frame is NOT the
-/// default UNBOUNDED-PRECEDING frame and must be rejected with a clear SQL
-/// error — never silently computed as the default frame (which would give a
-/// wrong running aggregate).
+/// A `RANGE` frame with a value offset (`RANGE BETWEEN 1 PRECEDING AND
+/// CURRENT ROW`) and an inverted frame are rejected with a clear SQL error;
+/// `ROWS` frames with offsets parse.
 #[test]
-fn explicit_rows_frame_is_rejected() {
+fn unsupported_frames_are_rejected() {
     let provider = frame_provider();
-    let err = match parse_sql(
+    for sql in [
+        "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t",
+        "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
+        "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN v PRECEDING AND CURRENT ROW) FROM t",
+    ] {
+        match parse_sql(sql, &provider) {
+            Ok(_) => panic!("{sql}: must be rejected"),
+            Err(BoltError::Sql(msg)) => assert!(msg.contains("frame"), "{sql}: {msg}"),
+            Err(other) => panic!("{sql}: expected BoltError::Sql, got {other:?}"),
+        }
+    }
+    for sql in [
         "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-        &provider,
-    ) {
-        Ok(_) => panic!("explicit ROWS frame must be rejected, got Ok"),
-        Err(e) => e,
-    };
-    match err {
-        BoltError::Sql(msg) => assert!(
-            msg.contains("frame"),
-            "rejection must mention the unsupported frame; got: {msg}"
-        ),
-        other => panic!("expected BoltError::Sql for ROWS frame, got {other:?}"),
+        "SELECT AVG(v) OVER (ORDER BY v ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING) FROM t",
+        "SELECT MAX(v) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t",
+        "SELECT COUNT(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t",
+    ] {
+        parse_sql(sql, &provider).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 
@@ -491,4 +495,194 @@ fn default_frame_parses_cleanly() {
         .expect("default-frame window must parse");
     parse_sql("SELECT ROW_NUMBER() OVER (ORDER BY v) FROM t", &provider)
         .expect("ROW_NUMBER default-frame must parse");
+}
+
+// ===========================================================================
+// Explicit frames (GPU-built engine; the window itself runs on the host).
+// ===========================================================================
+
+/// `(g, k, v)` rows ordered by `k` within `g`; `v` has a NULL and ties in `k`.
+fn framed_engine() -> Engine {
+    let mut e = Engine::new().expect("ctx");
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("g", ArrowDataType::Int32, false),
+        ArrowField::new("k", ArrowDataType::Int32, false),
+        ArrowField::new("v", ArrowDataType::Int32, true),
+    ]));
+    let g = vec![1, 1, 1, 1, 1, 2, 2, 2];
+    let k = vec![1, 2, 2, 3, 4, 1, 2, 3];
+    let v = vec![
+        Some(10),
+        Some(20),
+        None,
+        Some(40),
+        Some(50),
+        Some(1),
+        Some(2),
+        Some(3),
+    ];
+    let b = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(g)),
+            Arc::new(Int32Array::from(k)),
+            Arc::new(Int32Array::from(v)),
+        ],
+    )
+    .unwrap();
+    e.register_table("t", b).unwrap();
+    e
+}
+
+/// Values of column `c` as `Option<f64>`, rows ordered by `(g, k, v)`.
+fn ordered(e: &Engine, select: &str) -> Vec<Option<f64>> {
+    let b = e
+        .sql(&format!("{select} FROM t ORDER BY g, k, v NULLS LAST"))
+        .unwrap()
+        .into_record_batch();
+    let c = arrow::compute::cast(b.column(b.num_columns() - 1), &ArrowDataType::Float64).unwrap();
+    let a = c.as_any().downcast_ref::<Float64Array>().unwrap();
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
+}
+
+#[test]
+#[ignore = "gpu:e2e"]
+fn rows_frames_slide_within_partitions() {
+    let e = framed_engine();
+    // Partition 1 values in order: 10, 20, NULL, 40, 50 (the NULL sorts
+    // after 20 inside the k = 2 tie); partition 2: 1, 2, 3.
+    let w =
+        "OVER (PARTITION BY g ORDER BY k, v NULLS LAST ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)";
+    let s = ordered(&e, &format!("SELECT g, k, v, SUM(v) {w} AS s"));
+    assert_eq!(
+        s,
+        vec![
+            Some(30.0),
+            Some(30.0),
+            Some(60.0),
+            Some(90.0),
+            Some(90.0),
+            Some(3.0),
+            Some(6.0),
+            Some(5.0)
+        ]
+    );
+    let c = ordered(&e, &format!("SELECT g, k, v, COUNT(v) {w} AS c"));
+    assert_eq!(
+        c,
+        [2, 2, 2, 2, 2, 2, 3, 2]
+            .iter()
+            .map(|&x| Some(x as f64))
+            .collect::<Vec<_>>()
+    );
+    // Trailing frame; the first row's frame is just itself.
+    let a = ordered(
+        &e,
+        "SELECT g, k, v, AVG(v) OVER (PARTITION BY g ORDER BY k, v NULLS LAST \
+         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a",
+    );
+    assert_eq!(
+        a,
+        vec![
+            Some(10.0),
+            Some(15.0),
+            Some(15.0),
+            Some(30.0),
+            Some(45.0),
+            Some(1.0),
+            Some(1.5),
+            Some(2.0)
+        ]
+    );
+    // A frame entirely before the partition is empty: SUM NULL, COUNT 0.
+    let p = ordered(
+        &e,
+        "SELECT g, k, v, SUM(v) OVER (PARTITION BY g ORDER BY k, v NULLS LAST \
+         ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING) AS p",
+    );
+    assert_eq!(
+        p,
+        vec![
+            None,
+            None,
+            Some(10.0),
+            Some(30.0),
+            Some(20.0),
+            None,
+            None,
+            Some(1.0)
+        ]
+    );
+}
+
+#[test]
+#[ignore = "gpu:e2e"]
+fn unbounded_and_range_frames() {
+    let e = framed_engine();
+    let whole = ordered(
+        &e,
+        "SELECT g, k, v, MAX(v) OVER (PARTITION BY g ROWS BETWEEN UNBOUNDED PRECEDING \
+         AND UNBOUNDED FOLLOWING) AS m",
+    );
+    assert_eq!(
+        whole,
+        [50, 50, 50, 50, 50, 3, 3, 3]
+            .iter()
+            .map(|&x| Some(x as f64))
+            .collect::<Vec<_>>()
+    );
+    // Reverse running minimum.
+    let tail = ordered(
+        &e,
+        "SELECT g, k, v, MIN(v) OVER (PARTITION BY g ORDER BY k, v NULLS LAST \
+         ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS m",
+    );
+    assert_eq!(
+        tail,
+        vec![
+            Some(10.0),
+            Some(20.0),
+            Some(40.0),
+            Some(40.0),
+            Some(50.0),
+            Some(1.0),
+            Some(2.0),
+            Some(3.0)
+        ]
+    );
+    // RANGE CURRENT ROW .. UNBOUNDED FOLLOWING: the k = 2 peers share a frame.
+    let r = ordered(
+        &e,
+        "SELECT g, k, v, SUM(v) OVER (PARTITION BY g ORDER BY k \
+         RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS r",
+    );
+    assert_eq!(
+        r,
+        vec![
+            Some(120.0),
+            Some(110.0),
+            Some(110.0),
+            Some(90.0),
+            Some(50.0),
+            Some(6.0),
+            Some(5.0),
+            Some(3.0)
+        ]
+    );
+    // ROWS UNBOUNDED PRECEDING .. CURRENT ROW excludes later peers, unlike
+    // the default RANGE frame.
+    let rows = ordered(
+        &e,
+        "SELECT g, k, v, COUNT(*) OVER (PARTITION BY g ORDER BY k \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS c",
+    );
+    let range = ordered(
+        &e,
+        "SELECT g, k, v, COUNT(*) OVER (PARTITION BY g ORDER BY k) AS c",
+    );
+    assert_eq!(rows[1].unwrap() + rows[2].unwrap(), 2.0 + 3.0);
+    assert_eq!(range[1], Some(3.0));
+    assert_eq!(range[2], Some(3.0));
 }

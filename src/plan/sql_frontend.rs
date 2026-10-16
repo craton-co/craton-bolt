@@ -8167,6 +8167,7 @@ fn plan_select(
                 let we = WindowExpr {
                     func: pw.func,
                     output_name: out_name.clone(),
+                    frame: pw.frame,
                 };
                 let group_idx = window_groups.iter().position(|g| {
                     window_specs_eq(&g.partition_by, &g.order_by, &pw.partition_by, &pw.order_by)
@@ -9518,6 +9519,8 @@ struct ParsedWindow {
     partition_by: Vec<Expr>,
     /// `ORDER BY` keys within the partition (lowered).
     order_by: Vec<SortExpr>,
+    /// Explicit frame (`None` = the default frame).
+    frame: Option<crate::plan::logical_plan::WindowFrame>,
 }
 
 /// Recognise a top-level window-function call: `func(...) OVER (...)`.
@@ -9607,12 +9610,12 @@ fn try_window(
             &resolved
         }
     };
-    // Frame handling: only the SQL default frame is supported (RANGE/ROWS
-    // UNBOUNDED PRECEDING [AND CURRENT ROW]). Anything else is rejected
-    // cleanly so we never silently compute the wrong frame.
-    if let Some(frame) = &spec.window_frame {
-        reject_non_default_frame(frame, &fname)?;
-    }
+    // Frame: `ROWS` with literal offsets, or `RANGE` bounded by `UNBOUNDED`
+    // / `CURRENT ROW`; the default frame lowers to `None`.
+    let frame = match &spec.window_frame {
+        Some(f) => lower_window_frame(f, &fname)?,
+        None => None,
+    };
 
     let partition_by = spec
         .partition_by
@@ -9655,10 +9658,17 @@ fn try_window(
         }
     };
 
+    // Ranking functions are defined over the whole partition order; a frame
+    // does not apply to them.
+    let frame = match func {
+        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+        _ => frame,
+    };
     Ok(Some(ParsedWindow {
         func,
         partition_by,
         order_by,
+        frame,
     }))
 }
 
@@ -9736,39 +9746,94 @@ fn sql_expr_contains_window(e: &SqlExpr, depth: usize) -> BoltResult<bool> {
     Ok(any)
 }
 
-/// Reject any window frame that isn't the SQL default
-/// (`RANGE/ROWS [BETWEEN] UNBOUNDED PRECEDING [AND CURRENT ROW]`). The
-/// executor only implements the default `RANGE UNBOUNDED PRECEDING AND
-/// CURRENT ROW` frame, so an explicit exotic frame must error rather than be
-/// silently mis-evaluated.
-fn reject_non_default_frame(frame: &sqlparser::ast::WindowFrame, fname: &str) -> BoltResult<()> {
-    // Units may be ROWS or RANGE; both collapse to the same default-frame
-    // behaviour here because the only start bound we accept is UNBOUNDED
-    // PRECEDING (under which ROWS and RANGE agree). GROUPS is rejected.
-    if matches!(frame.units, WindowFrameUnits::Groups) {
-        return Err(BoltError::Sql(format!(
-            "unsupported: GROUPS frame on window function {fname}"
-        )));
-    }
-    // start_bound must be UNBOUNDED PRECEDING (`Preceding(None)`).
-    if !matches!(frame.start_bound, WindowFrameBound::Preceding(None)) {
-        return Err(BoltError::Sql(format!(
-            "unsupported window frame on {fname}: only the default \
-             'UNBOUNDED PRECEDING [AND CURRENT ROW]' frame is supported"
-        )));
-    }
-    // end_bound, if present, must be CURRENT ROW (the default).
-    match &frame.end_bound {
-        None => {}
-        Some(WindowFrameBound::CurrentRow) => {}
-        Some(_) => {
+/// Lower a window frame. `None` for the SQL default (`RANGE / ROWS
+/// UNBOUNDED PRECEDING [AND CURRENT ROW]`). `GROUPS`, `RANGE` with a value
+/// offset, a non-literal offset, and a start bound after the end bound are
+/// rejected.
+fn lower_window_frame(
+    frame: &sqlparser::ast::WindowFrame,
+    fname: &str,
+) -> BoltResult<Option<crate::plan::logical_plan::WindowFrame>> {
+    use crate::plan::logical_plan::{FrameBound, FrameUnits, WindowFrame};
+    let units = match frame.units {
+        WindowFrameUnits::Rows => FrameUnits::Rows,
+        WindowFrameUnits::Range => FrameUnits::Range,
+        WindowFrameUnits::Groups => {
             return Err(BoltError::Sql(format!(
-                "unsupported window frame on {fname}: only 'UNBOUNDED PRECEDING \
-                 AND CURRENT ROW' is supported"
+                "unsupported: GROUPS frame on window function {fname}"
+            )))
+        }
+    };
+    let offset = |e: &Option<Box<SqlExpr>>| -> BoltResult<Option<u64>> {
+        match e {
+            None => Ok(None),
+            Some(e) => match e.as_ref() {
+                SqlExpr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                    n.parse::<u64>().map(Some).map_err(|_| {
+                        BoltError::Sql(format!(
+                            "window frame offset on {fname} must be a non-negative integer, got {n}"
+                        ))
+                    })
+                }
+                other => Err(BoltError::Sql(format!(
+                    "window frame offset on {fname} must be an integer literal, got {other}"
+                ))),
+            },
+        }
+    };
+    let bound = |b: &WindowFrameBound| -> BoltResult<FrameBound> {
+        let fb = match b {
+            WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+            WindowFrameBound::Preceding(e) => match offset(e)? {
+                None => FrameBound::UnboundedPreceding,
+                Some(n) => FrameBound::Preceding(n),
+            },
+            WindowFrameBound::Following(e) => match offset(e)? {
+                None => FrameBound::UnboundedFollowing,
+                Some(n) => FrameBound::Following(n),
+            },
+        };
+        if units == FrameUnits::Range
+            && matches!(fb, FrameBound::Preceding(_) | FrameBound::Following(_))
+        {
+            return Err(BoltError::Sql(format!(
+                "unsupported window frame on {fname}: RANGE with a value offset \
+                 (use ROWS, or RANGE UNBOUNDED / CURRENT ROW bounds)"
             )));
         }
+        Ok(fb)
+    };
+    let start = bound(&frame.start_bound)?;
+    let end = match &frame.end_bound {
+        Some(b) => bound(b)?,
+        None => FrameBound::CurrentRow,
+    };
+    // Offset from the current row: preceding < current < following.
+    let at = |b: FrameBound| -> i128 {
+        match b {
+            FrameBound::UnboundedPreceding => i128::MIN,
+            FrameBound::Preceding(n) => -i128::from(n),
+            FrameBound::CurrentRow => 0,
+            FrameBound::Following(n) => i128::from(n),
+            FrameBound::UnboundedFollowing => i128::MAX,
+        }
+    };
+    if start == FrameBound::UnboundedFollowing
+        || end == FrameBound::UnboundedPreceding
+        || at(start) > at(end)
+    {
+        return Err(BoltError::Sql(format!(
+            "invalid window frame on {fname}: the start bound follows the end bound"
+        )));
     }
-    Ok(())
+    if start == FrameBound::UnboundedPreceding && end == FrameBound::CurrentRow {
+        // The default frame (ROWS and RANGE agree only under RANGE peers;
+        // a ROWS frame excludes later peers).
+        if units == FrameUnits::Range {
+            return Ok(None);
+        }
+    }
+    Ok(Some(WindowFrame { units, start, end }))
 }
 
 /// Lower a window-spec ORDER BY list into our `SortExpr`s. Identical default
@@ -13960,10 +14025,10 @@ mod wave7_tests {
     #[test]
     fn window_explicit_frame_rejected() {
         let err = parse(
-            "SELECT SUM(b) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
+            "SELECT SUM(b) OVER (ORDER BY b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
             &provider(),
         )
-        .expect_err("explicit non-default frame must be rejected");
+        .expect_err("a RANGE frame with a value offset must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("frame"),
