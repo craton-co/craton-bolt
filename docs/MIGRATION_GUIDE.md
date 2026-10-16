@@ -681,7 +681,11 @@ was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
 | `DELETE` / `UPDATE` / `ALTER TABLE` / transactions, `Engine::sql_stream`, cost-based tier selection (opt-in) | Additive | — |
 | Through a `Database`, a session's open transaction makes other sessions' statements wait | Behavioural | Commit or roll back promptly; tune `Database::set_transaction_wait` |
 | `Engine::sql` rejects `UPDATE` / `ALTER` / `BEGIN` / `COMMIT` / `ROLLBACK` / `END` like other statements | Behavioural (error text) | Run them through `execute_sql` |
-| `MemoryStats` gains `repartitions`; `Counter` gains `HostTierQueries` | Additive (`#[non_exhaustive]`) | — |
+| `MemoryStats` gains `repartitions`; `Counter` gains `HostTierQueries`, `ViewRewrites` | Additive (`#[non_exhaustive]`) | — |
+| `plan::WindowExpr` gains `frame: Option<WindowFrame>` | Breaking for struct literals | Add `frame: None` (the default frame) |
+| `storage::ParquetWriteOptions` gains `bloom_filters` (default `true`); `catalog::ViewMeta` gains `refreshed_at_ms` / `base_files`; `RefreshPolicy` / `RefreshMode` gain `Scheduled` | Breaking for struct literals / exhaustive matches | Use `..Default::default()`; add a match arm |
+| A query that plans like a fresh materialized view's defining query is answered from the view | Behavioural | `EngineBuilder::view_rewrite(false)` to opt out |
+| Grouped `SUM` / `MIN` / `MAX` of an all-NULL group return NULL | Behavioural (bug fix) | — |
 
 ## Quick upgrade checklist
 

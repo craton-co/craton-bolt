@@ -2329,6 +2329,45 @@ pub struct WindowExpr {
     pub func: WindowFunc,
     /// Output column name appended to the input schema.
     pub output_name: String,
+    /// Explicit frame of an aggregate window; `None` is the SQL default
+    /// (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`). Ranking
+    /// functions ignore it.
+    pub frame: Option<WindowFrame>,
+}
+
+/// Unit of a [`WindowFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnits {
+    /// Physical rows.
+    Rows,
+    /// Peer groups of the window `ORDER BY` (rows with equal keys).
+    Range,
+}
+
+/// One bound of a [`WindowFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    /// `UNBOUNDED PRECEDING`.
+    UnboundedPreceding,
+    /// `n PRECEDING` (rows only).
+    Preceding(u64),
+    /// `CURRENT ROW` (for `RANGE`: the current row's peer group).
+    CurrentRow,
+    /// `n FOLLOWING` (rows only).
+    Following(u64),
+    /// `UNBOUNDED FOLLOWING`.
+    UnboundedFollowing,
+}
+
+/// The rows an aggregate window function folds for each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowFrame {
+    /// `ROWS` or `RANGE`.
+    pub units: FrameUnits,
+    /// Start bound.
+    pub start: FrameBound,
+    /// End bound.
+    pub end: FrameBound,
 }
 
 /// A single ORDER BY entry: an expression plus direction / null placement.

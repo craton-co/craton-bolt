@@ -1933,6 +1933,15 @@ pub craton_bolt::plan::logical_plan::FormatToken::Second
 pub craton_bolt::plan::logical_plan::FormatToken::Year4
 impl craton_bolt::plan::logical_plan::FormatToken
 pub fn craton_bolt::plan::logical_plan::FormatToken::is_intraday(self) -> bool
+pub enum craton_bolt::plan::logical_plan::FrameBound
+pub craton_bolt::plan::logical_plan::FrameBound::CurrentRow
+pub craton_bolt::plan::logical_plan::FrameBound::Following(u64)
+pub craton_bolt::plan::logical_plan::FrameBound::Preceding(u64)
+pub craton_bolt::plan::logical_plan::FrameBound::UnboundedFollowing
+pub craton_bolt::plan::logical_plan::FrameBound::UnboundedPreceding
+pub enum craton_bolt::plan::logical_plan::FrameUnits
+pub craton_bolt::plan::logical_plan::FrameUnits::Range
+pub craton_bolt::plan::logical_plan::FrameUnits::Rows
 pub enum craton_bolt::plan::logical_plan::JoinType
 pub craton_bolt::plan::logical_plan::JoinType::Cross
 pub craton_bolt::plan::logical_plan::JoinType::FullOuter
@@ -2080,8 +2089,13 @@ pub craton_bolt::plan::logical_plan::SortExpr::descending: bool
 pub craton_bolt::plan::logical_plan::SortExpr::expr: craton_bolt::plan::logical_plan::Expr
 pub craton_bolt::plan::logical_plan::SortExpr::nulls_first: bool
 pub struct craton_bolt::plan::logical_plan::WindowExpr
+pub craton_bolt::plan::logical_plan::WindowExpr::frame: core::option::Option<craton_bolt::plan::logical_plan::WindowFrame>
 pub craton_bolt::plan::logical_plan::WindowExpr::func: craton_bolt::plan::logical_plan::WindowFunc
 pub craton_bolt::plan::logical_plan::WindowExpr::output_name: alloc::string::String
+pub struct craton_bolt::plan::logical_plan::WindowFrame
+pub craton_bolt::plan::logical_plan::WindowFrame::end: craton_bolt::plan::logical_plan::FrameBound
+pub craton_bolt::plan::logical_plan::WindowFrame::start: craton_bolt::plan::logical_plan::FrameBound
+pub craton_bolt::plan::logical_plan::WindowFrame::units: craton_bolt::plan::logical_plan::FrameUnits
 pub fn craton_bolt::plan::logical_plan::col(impl core::convert::Into<alloc::string::String>) -> craton_bolt::plan::logical_plan::Expr
 pub fn craton_bolt::plan::logical_plan::date_trunc_output_dtype(craton_bolt::plan::logical_plan::DateTruncUnit, craton_bolt::plan::logical_plan::DataType) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::DataType>
 pub fn craton_bolt::plan::logical_plan::extract_output_dtype(craton_bolt::plan::logical_plan::DateField, craton_bolt::plan::logical_plan::DataType) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::DataType>

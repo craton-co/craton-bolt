@@ -134,6 +134,12 @@ All notable changes to this project will be documented here. The format follows 
   merge per-chunk partials — both used to fail with a memory error.
   `Engine::sql_stream` / `ResultStream` yield such a query's result chunk
   group by chunk group, so a large result is never held at once.
+- **Window frames.** `ROWS BETWEEN <bound> AND <bound>` (`UNBOUNDED` /
+  `n PRECEDING` / `CURRENT ROW` / `n FOLLOWING`) and `RANGE BETWEEN` with
+  `UNBOUNDED` / `CURRENT ROW` bounds for `SUM` / `AVG` / `MIN` / `MAX` /
+  `COUNT` windows (`WindowExpr::frame`, `WindowFrame`, `FrameBound`,
+  `FrameUnits`); checked against DuckDB in the differential lane. `GROUPS`
+  and value-offset `RANGE` frames are still rejected.
 - **Bloom-filter pruning.** `write_parquet` (and so every catalog data
   file) writes Parquet bloom filters for integer, date and string columns
   with at least 1024 distinct values (`ParquetWriteOptions::bloom_filters`,

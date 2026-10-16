@@ -920,3 +920,33 @@ fn diff_string_compound_predicate() {
         }],
     );
 }
+
+/// Window frames and SQL NULL semantics against DuckDB (cases added with
+/// the `ROWS` / `RANGE` frame support and the GPU NULL-semantics fix).
+#[test]
+#[ignore = "gpu:e2e"]
+fn diff_window_frames_and_null_semantics() {
+    let cases = [
+        "SELECT k, v, SUM(v) OVER (PARTITION BY k ORDER BY v NULLS LAST ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS s FROM t",
+        "SELECT k, v, COUNT(v) OVER (PARTITION BY k ORDER BY v NULLS LAST ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS c FROM t",
+        "SELECT k, v, MAX(v) OVER (PARTITION BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS m FROM t",
+        "SELECT k, v, AVG(v) OVER (PARTITION BY k ORDER BY v NULLS LAST ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS a FROM t",
+        "SELECT k, v + 1 AS w, v < 0 AS neg FROM t WHERE v < 10",
+        "SELECT k, CASE WHEN v < 0 THEN 1 ELSE 0 END AS c FROM t",
+        "SELECT COUNT(*) AS n FROM t WHERE v < 5 OR k = 3",
+        "SELECT COUNT(*) AS n FROM t WHERE NOT (v > 0)",
+        "SELECT k, COUNT(v) AS c, SUM(v) AS s, MIN(v) AS lo FROM t WHERE v > -20 GROUP BY k",
+        "SELECT k, MIN(v) AS lo, SUM(v) AS s, COUNT(v) AS c FROM t WHERE k < 2 AND (v IS NULL OR v > 100000) GROUP BY k",
+    ];
+    for (i, sql) in cases.iter().enumerate() {
+        diff_query(
+            &format!("diff_window_frames_and_null_semantics[{i}]"),
+            sql,
+            &[TableSpec {
+                name: "t",
+                ddl_cols: "k INTEGER NOT NULL, v DOUBLE",
+                batch: t_with_nulls(256),
+            }],
+        );
+    }
+}
