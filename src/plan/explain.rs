@@ -458,6 +458,44 @@ pub fn format_mutual_recursive_cte(
 /// the `Left:` sub-header renders the LEFT relation, `Lateral:` the per-row
 /// (correlation-rewritten) subplan, and `Outer:` the OUTER query template run
 /// over the applied relation.
+/// Render an [`AsOfJoinPlan`](crate::plan::sql_frontend::AsOfJoinPlan).
+pub fn format_asof_join(p: &crate::plan::sql_frontend::AsOfJoinPlan) -> String {
+    let mut out = String::new();
+    let col = |s: &crate::plan::Schema, i: usize| {
+        s.fields.get(i).map_or("?".to_string(), |f| f.name.clone())
+    };
+    let ls = p
+        .left
+        .schema()
+        .unwrap_or_else(|_| crate::plan::Schema::new(Vec::new()));
+    let rs = p
+        .right
+        .schema()
+        .unwrap_or_else(|_| crate::plan::Schema::new(Vec::new()));
+    let op = match p.op {
+        crate::plan::sql_frontend::AsOfOp::Ge => ">=",
+        crate::plan::sql_frontend::AsOfOp::Gt => ">",
+        crate::plan::sql_frontend::AsOfOp::Le => "<=",
+        crate::plan::sql_frontend::AsOfOp::Lt => "<",
+    };
+    let keys: Vec<String> = p
+        .keys
+        .iter()
+        .map(|(l, r)| format!("{} = {}", col(&ls, *l), col(&rs, *r)))
+        .collect();
+    let _ = writeln!(
+        out,
+        "AsOfJoin: left.{} {op} right.{} keys=[{}] (left rows kept, at most one match each)",
+        col(&ls, p.left_time),
+        col(&rs, p.right_time),
+        keys.join(", ")
+    );
+    let _ = writeln!(out, "Left:\n{}", format_logical(&p.left));
+    let _ = writeln!(out, "Right:\n{}", format_logical(&p.right));
+    let _ = write!(out, "Post:\n{}", format_logical(&p.post));
+    out
+}
+
 pub fn format_lateral_apply(la: &crate::plan::sql_frontend::LateralApplyPlan) -> String {
     let mut out = String::new();
     let kind = if la.left_join { "LEFT" } else { "INNER" };

@@ -22,6 +22,7 @@ pub mod aggregate;
 pub mod compact;
 pub mod cost;
 mod engine_agg_impl;
+mod engine_asof;
 pub(crate) mod engine_ddl;
 mod engine_dml;
 mod engine_host;

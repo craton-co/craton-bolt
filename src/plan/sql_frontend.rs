@@ -1269,6 +1269,8 @@ pub(crate) enum QueryShape {
     Recursive(RecursiveQueryPlan),
     /// `FROM <left>, LATERAL (<subquery>)`.
     Lateral(LateralApplyPlan),
+    /// `FROM <left> ASOF JOIN <right> MATCH_CONDITION (...) [ON ...]`.
+    AsOf(AsOfJoinPlan),
     /// A correlated `EXISTS` / `NOT EXISTS` / scalar subquery in `WHERE`.
     CorrelatedWhere(CorrelatedWherePlan),
     /// A `VALUES` row source.
@@ -1356,6 +1358,9 @@ pub(crate) fn classify_query(sql: &str, provider: &dyn TableProvider) -> BoltRes
         }
         if let Some(p) = plan_lateral_apply_query(query, provider)? {
             return Ok(QueryShape::Lateral(p));
+        }
+        if let Some(p) = plan_asof_join_query(query, provider)? {
+            return Ok(QueryShape::AsOf(p));
         }
         if let Some(p) = plan_correlated_where_query(query, provider)? {
             return Ok(QueryShape::CorrelatedWhere(p));
@@ -4315,6 +4320,320 @@ fn plan_lateral_apply_query(
     }))
 }
 
+/// How an [`AsOfJoinPlan`] compares the left row's time to the right rows'
+/// (`left.t <op> right.t`, after normalising the `MATCH_CONDITION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsOfOp {
+    /// `left.t >= right.t`: the latest right row at or before the left row.
+    Ge,
+    /// `left.t > right.t`: the latest right row strictly before.
+    Gt,
+    /// `left.t <= right.t`: the earliest right row at or after.
+    Le,
+    /// `left.t < right.t`: the earliest right row strictly after.
+    Lt,
+}
+
+/// `SELECT ... FROM <left> ASOF JOIN <right> MATCH_CONDITION (l.t >= r.t)
+/// [ON l.k = r.k AND ...]`: each left row is matched with at most one right
+/// row — among those with equal keys, the closest one satisfying the match
+/// condition — and kept with NULL right columns when there is none
+/// (Snowflake's ASOF JOIN semantics).
+///
+/// The engine runs [`Self::left`] and [`Self::right`], matches them on the
+/// host (right rows grouped by key and sorted by time, one binary search per
+/// left row), binds the result under [`LATERAL_APPLY_RESULT_TABLE`] and runs
+/// [`Self::post`] over it.
+#[derive(Debug, Clone)]
+pub struct AsOfJoinPlan {
+    /// Every FROM item before the ASOF JOIN.
+    pub left: LogicalPlan,
+    /// The ASOF JOIN's right relation.
+    pub right: LogicalPlan,
+    /// Equality keys: `(left column, right column)` ordinals.
+    pub keys: Vec<(usize, usize)>,
+    /// Left time column ordinal.
+    pub left_time: usize,
+    /// Right time column ordinal.
+    pub right_time: usize,
+    /// Match direction.
+    pub op: AsOfOp,
+    /// Schema of the matched relation: left ++ right, duplicate names
+    /// disambiguated like a JOIN's output.
+    pub combined_schema: Schema,
+    /// Output schema of [`Self::left`] (key / time ordinals index it).
+    pub left_schema: Schema,
+    /// Output schema of [`Self::right`] (key / time ordinals index it).
+    pub right_schema: Schema,
+    /// The query's SELECT / WHERE / GROUP BY / ORDER BY / LIMIT over the
+    /// matched relation.
+    pub post: LogicalPlan,
+}
+
+/// Detect a top-level single `SELECT` whose FROM ends in an `ASOF JOIN`.
+fn plan_asof_join_query(
+    query: &Query,
+    provider: &dyn TableProvider,
+) -> BoltResult<Option<AsOfJoinPlan>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let select = select.as_ref();
+    let is_asof = |j: &sqlparser::ast::Join| matches!(j.join_operator, JoinOperator::AsOf { .. });
+    let count: usize = select
+        .from
+        .iter()
+        .map(|t| t.joins.iter().filter(|j| is_asof(j)).count())
+        .sum();
+    if count == 0 {
+        return Ok(None);
+    }
+    if query.with.is_some() {
+        return Err(BoltError::Sql(
+            "unsupported: WITH combined with ASOF JOIN".into(),
+        ));
+    }
+    if count > 1 {
+        return Err(BoltError::Sql(
+            "unsupported: more than one ASOF JOIN in FROM".into(),
+        ));
+    }
+    let last_idx = select.from.len() - 1;
+    let Some(asof) = select.from[last_idx].joins.last().filter(|j| is_asof(j)) else {
+        return Err(BoltError::Sql(
+            "unsupported: ASOF JOIN must be the last join of the FROM clause".into(),
+        ));
+    };
+    let JoinOperator::AsOf {
+        match_condition,
+        constraint,
+    } = &asof.join_operator
+    else {
+        unreachable!("is_asof matched");
+    };
+    let ctes = CteScope::new();
+    let (left_plan, left_resolver) =
+        build_left_relation(select, last_idx, provider, &ctes, |_| false)?;
+    // Resolver ordinals index the full left schema; the matched relation
+    // keeps only real columns (no synthesised dictionary columns).
+    let left_full = left_plan.schema()?;
+    let real = |f: &Field| !(f.name.starts_with("__idx_") || f.name.starts_with("__rank_"));
+    let left_schema = Schema::new(
+        left_full
+            .fields
+            .iter()
+            .filter(|f| real(f))
+            .cloned()
+            .collect(),
+    );
+    let left_pos = |full: usize| -> BoltResult<usize> {
+        let name = &left_full.fields[full].name;
+        left_schema
+            .index_of(name)
+            .map_err(|_| BoltError::Sql(format!("ASOF JOIN cannot use column '{name}'")))
+    };
+    let (right_plan, right_qualifier, _) = lower_table_factor(&asof.relation, provider, &ctes, 1)?;
+    let right_full = right_plan.schema()?;
+    let right_schema = Schema::new(
+        right_full
+            .fields
+            .iter()
+            .filter(|f| real(f))
+            .cloned()
+            .collect(),
+    );
+
+    // Which side (and column) an identifier names.
+    #[derive(Clone, Copy)]
+    enum Side {
+        Left(usize),
+        Right(usize),
+    }
+    let right_index = |c: &str| -> Option<usize> {
+        right_schema
+            .fields
+            .iter()
+            .position(|f| f.name == c)
+            .or_else(|| {
+                right_schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name.eq_ignore_ascii_case(c))
+            })
+    };
+    let side_of = |e: &SqlExpr| -> BoltResult<Side> {
+        let mut e = e;
+        while let SqlExpr::Nested(inner) = e {
+            e = inner;
+        }
+        let (qualifier, column) = match e {
+            SqlExpr::Identifier(c) => (None, c.value.clone()),
+            SqlExpr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                Some(parts[parts.len() - 2].value.clone()),
+                parts[parts.len() - 1].value.clone(),
+            ),
+            other => {
+                return Err(BoltError::Sql(format!(
+                    "ASOF JOIN conditions compare columns; got {other}"
+                )))
+            }
+        };
+        let left = |q: Option<String>| {
+            left_resolver.resolve_correlation(&crate::plan::subquery::CorrRef {
+                qualifier: q.map(|q| q.to_ascii_lowercase()),
+                column: column.clone(),
+            })
+        };
+        match qualifier {
+            Some(q) if q.eq_ignore_ascii_case(&right_qualifier) => right_index(&column)
+                .map(Side::Right)
+                .ok_or_else(|| BoltError::Sql(format!("unknown column {q}.{column}"))),
+            Some(q) => left(Some(q)).and_then(left_pos).map(Side::Left),
+            None => match (left(None).and_then(left_pos).ok(), right_index(&column)) {
+                (Some(l), None) => Ok(Side::Left(l)),
+                (None, Some(r)) => Ok(Side::Right(r)),
+                (Some(_), Some(_)) => Err(BoltError::Sql(format!(
+                    "ambiguous column '{column}' in ASOF JOIN condition"
+                ))),
+                (None, None) => Err(BoltError::Sql(format!("unknown column '{column}'"))),
+            },
+        }
+    };
+
+    // MATCH_CONDITION (l.t <op> r.t), either way round.
+    let mut mc = match_condition;
+    while let SqlExpr::Nested(inner) = mc {
+        mc = inner;
+    }
+    let SqlExpr::BinaryOp { left, op, right } = mc else {
+        return Err(BoltError::Sql(
+            "ASOF JOIN MATCH_CONDITION must compare a left and a right column \
+             with >=, >, <= or <"
+                .into(),
+        ));
+    };
+    let base = match op {
+        BinaryOperator::GtEq => AsOfOp::Ge,
+        BinaryOperator::Gt => AsOfOp::Gt,
+        BinaryOperator::LtEq => AsOfOp::Le,
+        BinaryOperator::Lt => AsOfOp::Lt,
+        other => {
+            return Err(BoltError::Sql(format!(
+                "ASOF JOIN MATCH_CONDITION must use >=, >, <= or <, not {other}"
+            )))
+        }
+    };
+    let flip = |o: AsOfOp| match o {
+        AsOfOp::Ge => AsOfOp::Le,
+        AsOfOp::Gt => AsOfOp::Lt,
+        AsOfOp::Le => AsOfOp::Ge,
+        AsOfOp::Lt => AsOfOp::Gt,
+    };
+    let (left_time, right_time, op) = match (side_of(left)?, side_of(right)?) {
+        (Side::Left(l), Side::Right(r)) => (l, r, base),
+        (Side::Right(r), Side::Left(l)) => (l, r, flip(base)),
+        _ => {
+            return Err(BoltError::Sql(
+                "ASOF JOIN MATCH_CONDITION must compare a left column with a right column".into(),
+            ))
+        }
+    };
+
+    // Equality keys.
+    let mut keys = Vec::new();
+    match constraint {
+        JoinConstraint::None => {}
+        JoinConstraint::On(e) => {
+            let mut conj = Vec::new();
+            fn split<'e>(e: &'e SqlExpr, out: &mut Vec<&'e SqlExpr>) {
+                match e {
+                    SqlExpr::Nested(inner) => split(inner, out),
+                    SqlExpr::BinaryOp {
+                        left,
+                        op: BinaryOperator::And,
+                        right,
+                    } => {
+                        split(left, out);
+                        split(right, out);
+                    }
+                    other => out.push(other),
+                }
+            }
+            split(e, &mut conj);
+            for c in conj {
+                let SqlExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Eq,
+                    right,
+                } = c
+                else {
+                    return Err(BoltError::Sql(format!(
+                        "ASOF JOIN ON supports only column equalities joined by AND; got {c}"
+                    )));
+                };
+                match (side_of(left)?, side_of(right)?) {
+                    (Side::Left(l), Side::Right(r)) | (Side::Right(r), Side::Left(l)) => {
+                        keys.push((l, r))
+                    }
+                    _ => {
+                        return Err(BoltError::Sql(
+                            "ASOF JOIN ON must compare a left column with a right column".into(),
+                        ))
+                    }
+                }
+            }
+        }
+        JoinConstraint::Using(cols) => {
+            for c in cols {
+                let l = left_pos(left_resolver.resolve_correlation(
+                    &crate::plan::subquery::CorrRef {
+                        qualifier: None,
+                        column: c.value.clone(),
+                    },
+                )?)?;
+                let r = right_index(&c.value)
+                    .ok_or_else(|| BoltError::Sql(format!("unknown column '{}'", c.value)))?;
+                keys.push((l, r));
+            }
+        }
+        JoinConstraint::Natural => {
+            return Err(BoltError::Sql("unsupported: NATURAL ASOF JOIN".into()))
+        }
+    }
+
+    // An unmatched left row gets NULL right columns.
+    let right_nullable = Schema::new(
+        right_schema
+            .fields
+            .iter()
+            .map(|f| Field::new(f.name.clone(), f.dtype, true))
+            .collect(),
+    );
+    let (combined_schema, right_output_names) =
+        combine_lateral_schemas(&left_schema, &right_nullable);
+    let post = build_lateral_post(
+        select,
+        query,
+        &left_resolver,
+        &right_qualifier,
+        &right_schema,
+        &right_output_names,
+        &combined_schema,
+    )?;
+    Ok(Some(AsOfJoinPlan {
+        left: left_plan,
+        right: right_plan,
+        keys,
+        left_time,
+        right_time,
+        op,
+        combined_schema,
+        left_schema,
+        right_schema,
+        post,
+    }))
+}
+
 /// Require that a JOIN constraint is exactly `ON true` (the only predicate a
 /// `JOIN LATERAL` apply models — it produces the correlated cross product, so a
 /// residual join predicate is out of scope). `USING` / `NATURAL` / a non-`true`
@@ -4766,10 +5085,8 @@ fn build_corr_where_post(
             },
         )?;
         if !sort_exprs.is_empty() {
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                sort_exprs,
-            };
+            // A sort key may read a column the SELECT list does not output.
+            plan = sort_with_hidden_columns(plan, sort_exprs)?;
         }
     }
     if !query.limit_by.is_empty() {
@@ -5030,10 +5347,8 @@ fn build_lateral_post(
             },
         )?;
         if !sort_exprs.is_empty() {
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                sort_exprs,
-            };
+            // A sort key may read a column the SELECT list does not output.
+            plan = sort_with_hidden_columns(plan, sort_exprs)?;
         }
     }
     if !query.limit_by.is_empty() {
@@ -17141,6 +17456,7 @@ mod classify_query_tests {
         match shape {
             QueryShape::Recursive(_) => "recursive",
             QueryShape::Lateral(_) => "lateral",
+            QueryShape::AsOf(_) => "asof",
             QueryShape::CorrelatedWhere(_) => "correlated-where",
             QueryShape::Values(_) => "values",
             QueryShape::GenerateSeries(_) => "generate-series",

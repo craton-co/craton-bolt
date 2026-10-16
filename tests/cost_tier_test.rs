@@ -122,6 +122,11 @@ fn explain_and_declines() {
     e.register_table("t", table()).unwrap();
     let plan = e.explain_sql("SELECT k FROM t WHERE i > 0").unwrap();
     assert!(plan.contains("Tier: host"), "{plan}");
+    assert!(plan.contains("Memory: streaming"), "{plan}");
+    let plan = e
+        .explain_sql("SELECT i, COUNT(*) FROM t GROUP BY i")
+        .unwrap();
+    assert!(plan.contains("Memory: partitionable"), "{plan}");
     // Empty input: the GPU path's semantics decide.
     let before = metrics().counter(Counter::HostTierQueries).get();
     let z = e
