@@ -22,6 +22,16 @@ All notable changes to this project will be documented here. The format follows 
   refuses an accumulator wider than its buffer.
 - **`COUNT(col)` / `AVG(col)` through the aggregate pre-stage counted NULL
   rows** of a nullable `col` (e.g. `COUNT(f) ... WHERE k > 3`).
+- **`ORDER BY` a column the SELECT list does not output failed in LATERAL
+  and correlated-`WHERE` queries** ("column not found"); their outer
+  templates now carry hidden sort columns like ordinary queries.
+- **A `DATE` / `TIMESTAMP` column passed through a fused projection kernel
+  failed** ("Date/Timestamp output column lowering pending") — e.g. a bare
+  scan feeding a host-orchestrated query; such projections run on the host.
+  (A *computed* temporal output still cannot leave a kernel.)
+- **A grouped aggregate with a string key and a computed input over a
+  table without dictionaries failed** ("build_projection_kernel returned
+  non-Projection"); the inputs are now computed as columns first.
 - **Grouped `SUM` / `MIN` / `MAX` of a group with only NULL values
   returned the accumulator's identity** (`0`, `i64::MAX`, `inf`, `NaN`)
   instead of NULL. When an aggregate's input holds NULLs, a companion
@@ -134,6 +144,16 @@ All notable changes to this project will be documented here. The format follows 
   merge per-chunk partials — both used to fail with a memory error.
   `Engine::sql_stream` / `ResultStream` yield such a query's result chunk
   group by chunk group, so a large result is never held at once.
+- **`MemoryBehavior`** (crate root): `PhysicalPlan::memory_behavior` /
+  `memory_profile` / `children` classify each operator as streaming,
+  bounded-state, spillable, partitionable or fully materializing — the
+  classification the out-of-core executor acts on; `EXPLAIN` prints the
+  plan's profile (`Memory: ...`).
+- **`ASOF JOIN`** (`FROM l ASOF JOIN r MATCH_CONDITION (l.t >= r.t) [ON l.k
+  = r.k ...]`): each left row with the closest right row by time within
+  equal keys, NULL-padded when none (Snowflake semantics); `>=` / `>` /
+  `<=` / `<`, integer / float / date / timestamp times. Host matching in
+  `O((L + R) log R)`; `EXPLAIN` renders the `AsOfJoin` step.
 - **Window frames.** `ROWS BETWEEN <bound> AND <bound>` (`UNBOUNDED` /
   `n PRECEDING` / `CURRENT ROW` / `n FOLLOWING`) and `RANGE BETWEEN` with
   `UNBOUNDED` / `CURRENT ROW` bounds for `SUM` / `AVG` / `MIN` / `MAX` /

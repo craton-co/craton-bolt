@@ -364,6 +364,10 @@ supported alternatives):
   the engine scans only registered tables / CTEs / derived tables.
 - **`CONNECT BY`**, **`CLUSTER` / `DISTRIBUTE` / `SORT BY`**, **`INTO`**.
 - **`GLOBAL JOIN`** (ClickHouse extension).
+- **`ASOF JOIN` beyond its supported shape**: more than one per query, not
+  the last join of the FROM clause, combined with `WITH`, `NATURAL`, an
+  `ON` that is not a conjunction of column equalities, or an unqualified
+  column in `MATCH_CONDITION` (the parser requires `t.col`).
 - **`SUM(Date32 / Timestamp)`** — undefined in SQL; rejected by design.
 
 The following are now **supported** (they were previously listed here as

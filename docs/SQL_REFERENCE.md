@@ -693,6 +693,17 @@ SELECT ... FROM <table>
 - SQL NULL semantics on keys: `NULL = NULL` is `UNKNOWN`, so NULL-keyed rows never match. For OUTER joins they still emit on the preserved side with the opposite side NULL-padded.
 - Every shape has a GPU fast path with a host fallback (`src/exec/join.rs` dispatches to `src/exec/gpu_join.rs`): `INNER` (`try_gpu_inner_join`), `LEFT`/`RIGHT`/`FULL` (`try_gpu_outer_join`), and `CROSS` (`execute_cross_join_on_gpu`). The GPU paths are gated (dtype, NULL-freedom, cardinality / cell-count windows); a gate miss or kernel decline transparently falls back to the host hash-join (or host cartesian product for CROSS).
 
+### ASOF JOIN
+
+```
+SELECT ... FROM <left items> ASOF JOIN <table> [AS r]
+  MATCH_CONDITION (l.t {>= | > | <= | <} r.t)
+  [ON l.k = r.k [AND ...] | USING (k, ...)]
+  [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]
+```
+
+Each left row is matched with **at most one** right row: among the right rows with equal keys, the one whose time is closest while satisfying the match condition (`>=`: the latest at or before the left time; `>`: strictly before; `<=` / `<`: the earliest at or after / strictly after). A left row without a match is kept, with NULL right columns (Snowflake semantics). NULL keys or times never match. Times may be integer, float, `DATE` or `TIMESTAMP` columns; columns in `MATCH_CONDITION` must be qualified (`t.tt >= q.qt`). Executed on the host in `O((L + R) log R)` (right rows hashed by key and sorted by time, one binary search per left row); the rest of the query runs as usual over the matched relation. One ASOF JOIN per query, as the last join of the FROM clause, without `WITH`.
+
 ## Statements
 
 `Engine::execute_sql` (and `Session::sql`) run these in addition to queries;
@@ -736,7 +747,9 @@ began it and other sessions' statements wait for it to end.
 
 `EXPLAIN` output (`Engine::explain_sql`) ends with a `Storage scans:`
 section — per storage table, the chunks and columns the statement would read
-after pruning (decided from statistics, nothing is read) — a `Tier:` line
+after pruning (decided from statistics, nothing is read) — a `Memory:` line
+with the plan's most demanding operator class (`PhysicalPlan::memory_profile`:
+streaming, bounded state, spillable, partitionable, fully materializing), a `Tier:` line
 with the cost model's host / GPU estimate for statements the host tier can
 run (see `exec::cost`), and, under a memory budget, an `Execution: out of
 core — ...` line naming the partitioned / grace-join / external-sort /

@@ -1777,6 +1777,7 @@ pub fn craton_bolt::plan::dataframe::sum(craton_bolt::plan::logical_plan::Expr) 
 pub fn craton_bolt::plan::dataframe::var_pop(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
 pub fn craton_bolt::plan::dataframe::var_samp(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
 pub mod craton_bolt::plan::explain
+pub fn craton_bolt::plan::explain::format_asof_join(&craton_bolt::plan::sql_frontend::AsOfJoinPlan) -> alloc::string::String
 pub fn craton_bolt::plan::explain::format_correlated_where(&craton_bolt::plan::sql_frontend::CorrelatedWherePlan) -> alloc::string::String
 pub fn craton_bolt::plan::explain::format_count_distinct_groupby(&craton_bolt::plan::sql_frontend::CountDistinctGroupByPlan) -> alloc::string::String
 pub fn craton_bolt::plan::explain::format_distinct_on(&craton_bolt::plan::sql_frontend::DistinctOnPlan) -> alloc::string::String
@@ -2226,6 +2227,16 @@ pub enum craton_bolt::plan::physical_plan::ExecutionTier
 pub craton_bolt::plan::physical_plan::ExecutionTier::Gpu
 pub craton_bolt::plan::physical_plan::ExecutionTier::Host
 pub craton_bolt::plan::physical_plan::ExecutionTier::Hybrid
+#[non_exhaustive] pub enum craton_bolt::plan::physical_plan::MemoryBehavior
+pub craton_bolt::plan::physical_plan::MemoryBehavior::BoundedState
+pub craton_bolt::plan::physical_plan::MemoryBehavior::BoundedState::estimated_bytes: usize
+pub craton_bolt::plan::physical_plan::MemoryBehavior::FullyMaterializing
+pub craton_bolt::plan::physical_plan::MemoryBehavior::Partitionable
+pub craton_bolt::plan::physical_plan::MemoryBehavior::Spillable
+pub craton_bolt::plan::physical_plan::MemoryBehavior::Streaming
+impl craton_bolt::plan::physical_plan::MemoryBehavior
+pub fn craton_bolt::plan::physical_plan::MemoryBehavior::label(self) -> &'static str
+pub fn craton_bolt::plan::physical_plan::MemoryBehavior::max(self, craton_bolt::plan::physical_plan::MemoryBehavior) -> craton_bolt::plan::physical_plan::MemoryBehavior
 pub enum craton_bolt::plan::physical_plan::StringLengthOutput
 pub craton_bolt::plan::physical_plan::StringLengthOutput::Length
 pub craton_bolt::plan::physical_plan::StringLengthOutput::Length::source: alloc::string::String
@@ -2265,6 +2276,11 @@ impl craton_bolt::plan::rewrite::PlanRewrite for craton_bolt::plan::optimizer::p
 pub fn craton_bolt::plan::optimizer::projection_pruning::ProjectionPruning::name(&self) -> &str
 pub fn craton_bolt::plan::optimizer::projection_pruning::ProjectionPruning::rewrite(&self, craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::LogicalPlan>
 pub mod craton_bolt::plan::sql_frontend
+pub enum craton_bolt::plan::sql_frontend::AsOfOp
+pub craton_bolt::plan::sql_frontend::AsOfOp::Ge
+pub craton_bolt::plan::sql_frontend::AsOfOp::Gt
+pub craton_bolt::plan::sql_frontend::AsOfOp::Le
+pub craton_bolt::plan::sql_frontend::AsOfOp::Lt
 pub enum craton_bolt::plan::sql_frontend::CdAgg
 pub craton_bolt::plan::sql_frontend::CdAgg::Avg
 pub craton_bolt::plan::sql_frontend::CdAgg::Avg::base_col: usize
@@ -2292,6 +2308,17 @@ pub craton_bolt::plan::sql_frontend::CorrWhereKind::Scalar
 pub enum craton_bolt::plan::sql_frontend::RecursiveQueryPlan
 pub craton_bolt::plan::sql_frontend::RecursiveQueryPlan::Mutual(craton_bolt::plan::sql_frontend::MutualRecursiveCtePlan)
 pub craton_bolt::plan::sql_frontend::RecursiveQueryPlan::Single(craton_bolt::plan::sql_frontend::RecursiveCtePlan)
+pub struct craton_bolt::plan::sql_frontend::AsOfJoinPlan
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::combined_schema: craton_bolt::plan::logical_plan::Schema
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::keys: alloc::vec::Vec<(usize, usize)>
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::left: craton_bolt::plan::logical_plan::LogicalPlan
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::left_schema: craton_bolt::plan::logical_plan::Schema
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::left_time: usize
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::op: craton_bolt::plan::sql_frontend::AsOfOp
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::post: craton_bolt::plan::logical_plan::LogicalPlan
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::right: craton_bolt::plan::logical_plan::LogicalPlan
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::right_schema: craton_bolt::plan::logical_plan::Schema
+pub craton_bolt::plan::sql_frontend::AsOfJoinPlan::right_time: usize
 pub struct craton_bolt::plan::sql_frontend::CorrelatedWherePlan
 pub craton_bolt::plan::sql_frontend::CorrelatedWherePlan::corr_left_indices: alloc::vec::Vec<usize>
 pub craton_bolt::plan::sql_frontend::CorrelatedWherePlan::kind: craton_bolt::plan::subquery::CorrWhereKind
@@ -2727,6 +2754,16 @@ pub craton_bolt::plan::LogicalPlan::Window::partition_by: alloc::vec::Vec<craton
 pub craton_bolt::plan::LogicalPlan::Window::window_exprs: alloc::vec::Vec<craton_bolt::plan::logical_plan::WindowExpr>
 impl craton_bolt::plan::logical_plan::LogicalPlan
 pub fn craton_bolt::plan::logical_plan::LogicalPlan::schema(&self) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
+#[non_exhaustive] pub enum craton_bolt::plan::MemoryBehavior
+pub craton_bolt::plan::MemoryBehavior::BoundedState
+pub craton_bolt::plan::MemoryBehavior::BoundedState::estimated_bytes: usize
+pub craton_bolt::plan::MemoryBehavior::FullyMaterializing
+pub craton_bolt::plan::MemoryBehavior::Partitionable
+pub craton_bolt::plan::MemoryBehavior::Spillable
+pub craton_bolt::plan::MemoryBehavior::Streaming
+impl craton_bolt::plan::physical_plan::MemoryBehavior
+pub fn craton_bolt::plan::physical_plan::MemoryBehavior::label(self) -> &'static str
+pub fn craton_bolt::plan::physical_plan::MemoryBehavior::max(self, craton_bolt::plan::physical_plan::MemoryBehavior) -> craton_bolt::plan::physical_plan::MemoryBehavior
 pub enum craton_bolt::plan::ScalarFnKind
 pub craton_bolt::plan::ScalarFnKind::Concat
 pub craton_bolt::plan::ScalarFnKind::Initcap
@@ -3387,6 +3424,16 @@ pub craton_bolt::LogicalPlan::Window::partition_by: alloc::vec::Vec<craton_bolt:
 pub craton_bolt::LogicalPlan::Window::window_exprs: alloc::vec::Vec<craton_bolt::plan::logical_plan::WindowExpr>
 impl craton_bolt::plan::logical_plan::LogicalPlan
 pub fn craton_bolt::plan::logical_plan::LogicalPlan::schema(&self) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
+#[non_exhaustive] pub enum craton_bolt::MemoryBehavior
+pub craton_bolt::MemoryBehavior::BoundedState
+pub craton_bolt::MemoryBehavior::BoundedState::estimated_bytes: usize
+pub craton_bolt::MemoryBehavior::FullyMaterializing
+pub craton_bolt::MemoryBehavior::Partitionable
+pub craton_bolt::MemoryBehavior::Spillable
+pub craton_bolt::MemoryBehavior::Streaming
+impl craton_bolt::plan::physical_plan::MemoryBehavior
+pub fn craton_bolt::plan::physical_plan::MemoryBehavior::label(self) -> &'static str
+pub fn craton_bolt::plan::physical_plan::MemoryBehavior::max(self, craton_bolt::plan::physical_plan::MemoryBehavior) -> craton_bolt::plan::physical_plan::MemoryBehavior
 pub enum craton_bolt::MemoryKind
 pub craton_bolt::MemoryKind::Device
 pub craton_bolt::MemoryKind::Host

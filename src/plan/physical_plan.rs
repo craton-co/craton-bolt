@@ -30,6 +30,61 @@ pub enum ExecutionTier {
     Hybrid,
 }
 
+/// How an operator's memory grows with its input — the classification the
+/// out-of-core executor acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryBehavior {
+    /// One morsel in, one morsel out (filters, projections, `UNION ALL`).
+    Streaming,
+    /// A fixed amount of state regardless of input size (scalar aggregates,
+    /// `LIMIT`).
+    BoundedState {
+        /// Approximate state size.
+        estimated_bytes: usize,
+    },
+    /// Hash-partitionable on its keys: over budget it runs one spilled
+    /// partition at a time (`GROUP BY`, `DISTINCT`, equi-joins).
+    Partitionable,
+    /// Runs as sorted runs merged from spill files over budget (`ORDER BY`).
+    Spillable,
+    /// Needs its whole input at once (windows, set operations, non-equi and
+    /// cross joins, aggregates over a materialised input).
+    FullyMaterializing,
+}
+
+impl MemoryBehavior {
+    fn rank(self) -> u8 {
+        match self {
+            MemoryBehavior::Streaming => 0,
+            MemoryBehavior::BoundedState { .. } => 1,
+            MemoryBehavior::Spillable => 2,
+            MemoryBehavior::Partitionable => 3,
+            MemoryBehavior::FullyMaterializing => 4,
+        }
+    }
+
+    /// The more demanding of two behaviours.
+    pub fn max(self, other: MemoryBehavior) -> MemoryBehavior {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// Short label (`EXPLAIN`).
+    pub fn label(self) -> &'static str {
+        match self {
+            MemoryBehavior::Streaming => "streaming",
+            MemoryBehavior::BoundedState { .. } => "bounded state",
+            MemoryBehavior::Spillable => "spillable (sorted runs)",
+            MemoryBehavior::Partitionable => "partitionable (hash partitions)",
+            MemoryBehavior::FullyMaterializing => "fully materializing",
+        }
+    }
+}
+
 impl ExecutionTier {
     fn with_host_stage(self) -> Self {
         match self {
@@ -1331,6 +1386,74 @@ impl PhysicalPlan {
     /// host fallback. Operators whose supported implementation is
     /// data-dependent are classified as [`ExecutionTier::Hybrid`] up front, so
     /// callers never have to infer placement from environment variables.
+    /// How this node's own state grows with its input (children not
+    /// included; see [`PhysicalPlan::memory_profile`] for the whole plan).
+    pub fn memory_behavior(&self) -> MemoryBehavior {
+        match self {
+            PhysicalPlan::Projection { .. }
+            | PhysicalPlan::Project { .. }
+            | PhysicalPlan::Filter { .. }
+            | PhysicalPlan::Union { .. }
+            | PhysicalPlan::StringLength { .. }
+            | PhysicalPlan::StringProject { .. }
+            | PhysicalPlan::StringLikeFilter { .. } => MemoryBehavior::Streaming,
+            PhysicalPlan::Limit { limit, offset, .. } => MemoryBehavior::BoundedState {
+                estimated_bytes: limit.saturating_add(*offset).saturating_mul(64),
+            },
+            PhysicalPlan::CountRows { .. } => MemoryBehavior::BoundedState { estimated_bytes: 8 },
+            PhysicalPlan::Aggregate { aggregate, .. } if aggregate.group_by.is_empty() => {
+                MemoryBehavior::BoundedState {
+                    estimated_bytes: aggregate.aggregates.len().max(1) * 32,
+                }
+            }
+            PhysicalPlan::Aggregate { .. } | PhysicalPlan::Distinct { .. } => {
+                MemoryBehavior::Partitionable
+            }
+            PhysicalPlan::Join { on, .. } if !on.is_empty() => MemoryBehavior::Partitionable,
+            PhysicalPlan::Sort { .. } => MemoryBehavior::Spillable,
+            PhysicalPlan::Join { .. }
+            | PhysicalPlan::Window { .. }
+            | PhysicalPlan::SetOp { .. }
+            | PhysicalPlan::AggregateOverInput { .. } => MemoryBehavior::FullyMaterializing,
+        }
+    }
+
+    /// The most demanding [`MemoryBehavior`] of any node in the plan. A
+    /// plan whose profile is streaming or bounded runs in memory
+    /// proportional to its morsels, not its input.
+    pub fn memory_profile(&self) -> MemoryBehavior {
+        let own = self.memory_behavior();
+        self.children()
+            .into_iter()
+            .map(PhysicalPlan::memory_profile)
+            .fold(own, MemoryBehavior::max)
+    }
+
+    /// Direct inputs of this node.
+    pub fn children(&self) -> Vec<&PhysicalPlan> {
+        match self {
+            PhysicalPlan::Projection { .. }
+            | PhysicalPlan::Aggregate { .. }
+            | PhysicalPlan::StringLength { .. }
+            | PhysicalPlan::StringProject { .. } => Vec::new(),
+            PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Window { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::CountRows { input, .. }
+            | PhysicalPlan::StringLikeFilter { input, .. } => vec![input.as_ref()],
+            PhysicalPlan::Union { inputs } => inputs.iter().collect(),
+            PhysicalPlan::SetOp { left, right, .. } | PhysicalPlan::Join { left, right, .. } => {
+                vec![left.as_ref(), right.as_ref()]
+            }
+            PhysicalPlan::AggregateOverInput {
+                input, aggregate, ..
+            } => vec![input.as_ref(), aggregate.as_ref()],
+        }
+    }
+
     pub fn planned_execution_tier(&self) -> ExecutionTier {
         match self {
             // A fused primitive projection is the one fully device-compute
@@ -3690,6 +3813,19 @@ fn build_kernel(
     if projection_needs_host_columns(scan_schema, projected) {
         return lower_host_filtered_projection(table, scan_schema, predicate, projected);
     }
+    // A Date32 / Timestamp column passed through cannot be downloaded from
+    // the projection kernel yet; evaluate the projection on the host.
+    if hidden_validity
+        && projected.iter().any(|(_, e)| {
+            matches!(peel_aliases(e), Expr::Column(_))
+                && matches!(
+                    e.dtype(scan_schema),
+                    Ok(DataType::Date32) | Ok(DataType::Timestamp(_, _))
+                )
+        })
+    {
+        return lower_host_filtered_projection(table, scan_schema, predicate, projected);
+    }
 
     // SQL NULL semantics: the kernel computes values only, so predicates
     // and outputs over nullable columns are rewritten into explicit
@@ -3969,6 +4105,30 @@ type AggregateParts = (LogicalPlan, Vec<Expr>, Vec<AggregateExpr>);
 /// Name of the `k`-th feed column [`materialize_nonstrict_feeds`] adds.
 const FEED_COLUMN_PREFIX: &str = "__bolt_feed_";
 
+/// Lower the aggregate `plan` over [`AggregateParts`] from
+/// [`materialize_feeds`], keeping `plan`'s output column names.
+fn lower_materialized_feeds(
+    plan: &LogicalPlan,
+    (with_feeds, keys, aggs): AggregateParts,
+    depth: usize,
+) -> BoltResult<PhysicalPlan> {
+    let mut lowered = lower_aggregate_over_input(&with_feeds, &keys, &aggs, depth)?;
+    let want = plan.schema()?;
+    if let PhysicalPlan::AggregateOverInput { aggregate, .. } = &mut lowered {
+        if let PhysicalPlan::Aggregate {
+            aggregate: spec, ..
+        } = aggregate.as_mut()
+        {
+            if spec.output_schema.fields.len() == want.fields.len() {
+                for (f, w) in spec.output_schema.fields.iter_mut().zip(&want.fields) {
+                    f.name = w.name.clone();
+                }
+            }
+        }
+    }
+    Ok(lowered)
+}
+
 /// `input` extended with a column per non-strict group key / aggregate
 /// input over nullable columns, and the keys / aggregates reading those
 /// columns instead; `None` when every feed is strict.
@@ -3980,6 +4140,20 @@ fn materialize_nonstrict_feeds(
     let schema = input.schema()?;
     let ns = crate::plan::null_semantics::NullSemantics::new(&schema);
     let nonstrict = |e: &Expr| !ns.is_strict(e) && !matches!(e, Expr::Literal(_));
+    materialize_feeds(input, group_by, aggregates, &nonstrict)
+}
+
+/// `input` extended with a column per group key / aggregate input that
+/// `pick` selects, and the keys / aggregates reading those columns instead;
+/// `None` when it selects none.
+fn materialize_feeds(
+    input: &LogicalPlan,
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    pick: &dyn Fn(&Expr) -> bool,
+) -> BoltResult<Option<AggregateParts>> {
+    let schema = input.schema()?;
+    let nonstrict = |e: &Expr| pick(e);
     if !group_by.iter().any(nonstrict)
         && !aggregates
             .iter()
@@ -4222,25 +4396,8 @@ fn lower_aggregate(
     // A feed whose NULLs are not "NULL if any input is" (`CASE`, `AND` /
     // `OR`, `IS NULL`, a NULL literal) over nullable columns: compute it as a
     // column of the materialised input, where its NULLs are exact.
-    if let Some((with_feeds, keys, aggs)) =
-        materialize_nonstrict_feeds(input, group_by, aggregates)?
-    {
-        let mut lowered = lower_aggregate_over_input(&with_feeds, &keys, &aggs, depth)?;
-        // The output keeps the original aggregate's column names.
-        let want = plan.schema()?;
-        if let PhysicalPlan::AggregateOverInput { aggregate, .. } = &mut lowered {
-            if let PhysicalPlan::Aggregate {
-                aggregate: spec, ..
-            } = aggregate.as_mut()
-            {
-                if spec.output_schema.fields.len() == want.fields.len() {
-                    for (f, w) in spec.output_schema.fields.iter_mut().zip(&want.fields) {
-                        f.name = w.name.clone();
-                    }
-                }
-            }
-        }
-        return Ok(lowered);
+    if let Some(parts) = materialize_nonstrict_feeds(input, group_by, aggregates)? {
+        return lower_materialized_feeds(plan, parts, depth);
     }
     // `COUNT(*)` reaches the planner as `COUNT(<literal>)`, a computed feed
     // that needs the aggregate pre-kernel — which cannot output a `Utf8` /
@@ -4425,11 +4582,17 @@ fn lower_aggregate(
                 output_schema,
                 ..
             } => (kernel, output_schema),
-            // `build_projection_kernel` always returns `Projection`.
+            // The pre-kernel cannot carry these feeds (e.g. a `Utf8` key of
+            // a dictionary-less table next to a computed input): compute the
+            // feeds as columns of a materialised input instead.
             _ => {
+                let computed = |e: &Expr| !matches!(e, Expr::Column(_) | Expr::Literal(_));
+                if let Some(parts) = materialize_feeds(input, group_by, aggregates, &computed)? {
+                    return lower_materialized_feeds(plan, parts, depth);
+                }
                 return Err(BoltError::Plan(
                     "internal: build_projection_kernel returned non-Projection".into(),
-                ))
+                ));
             }
         };
         let inputs: Vec<ColumnIO> = pre_kernel.outputs.clone();

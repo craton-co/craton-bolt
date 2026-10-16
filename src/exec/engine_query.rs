@@ -508,6 +508,7 @@ impl Engine {
                 self.execute_mutual_recursive_cte(&rec)
             }
             QueryShape::Lateral(la) => self.execute_lateral_apply(&la),
+            QueryShape::AsOf(p) => self.execute_asof_join(&p),
             QueryShape::CorrelatedWhere(cw) => self.execute_correlated_where(&cw),
             QueryShape::Values(vp) => self.execute_values_query(&vp),
             QueryShape::GenerateSeries(gp) => self.execute_generate_series_query(&gp),
@@ -562,6 +563,7 @@ impl Engine {
                     fmt::format_lateral_apply(&la),
                 ))
             }
+            QueryShape::AsOf(p) => return Ok(special("ASOF join plan", fmt::format_asof_join(&p))),
             QueryShape::CorrelatedWhere(cw) => {
                 return Ok(special(
                     "Correlated WHERE plan",
@@ -599,6 +601,9 @@ impl Engine {
             .compile(&plan, true, Subqueries::Defer)?;
         drop(registry);
         let mut out = render_explain(&compiled);
+        if let Ok(phys) = crate::plan::physical_plan::lower(&compiled.plan) {
+            out.push_str(&format!("Memory: {}\n", phys.memory_profile().label()));
+        }
         out.push_str(&self.explain_resources(&plan)?);
         Ok(out)
     }
