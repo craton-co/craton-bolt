@@ -354,10 +354,11 @@ supported alternatives):
   tables** `(SELECT ...) AS alias` are **supported** — alias required;
   **`LATERAL` derived tables** are now **supported** too; column-list aliases
   `AS d(x, y)` remain rejected.)
-- **`GROUPS` window frames and `RANGE` frames with a value offset.**
-  (`ROWS` frames with literal offsets and `RANGE` frames bounded by
-  `UNBOUNDED` / `CURRENT ROW` are **supported**; so are `QUALIFY`, the named
-  `WINDOW` clause, and `OVER <named_window>` — see below.)
+- **Window frame `EXCLUDE`**, `RANGE` offsets in months or years, and a
+  `RANGE` offset over more than one `ORDER BY` key. (`ROWS`, `GROUPS` and
+  `RANGE` frames, including numeric and `INTERVAL` offsets, are
+  **supported**; so are `QUALIFY`, the named `WINDOW` clause, and
+  `OVER <named_window>` — see below.)
 - **Table-valued functions** *except* `generate_series(start, stop[, step])`,
   which is now **supported** in `FROM` — see below. Other TVFs (`unnest`, etc.)
   remain rejected: they would need a function-as-table-source mechanism, and
@@ -365,9 +366,8 @@ supported alternatives):
 - **`CONNECT BY`**, **`CLUSTER` / `DISTRIBUTE` / `SORT BY`**, **`INTO`**.
 - **`GLOBAL JOIN`** (ClickHouse extension).
 - **`ASOF JOIN` beyond its supported shape**: more than one per query, not
-  the last join of the FROM clause, combined with `WITH`, `NATURAL`, an
-  `ON` that is not a conjunction of column equalities, or an unqualified
-  column in `MATCH_CONDITION` (the parser requires `t.col`).
+  the last join of the FROM clause, combined with `WITH`, `NATURAL`, or an
+  `ON` that is not a conjunction of column equalities.
 - **`SUM(Date32 / Timestamp)`** — undefined in SQL; rejected by design.
 
 The following are now **supported** (they were previously listed here as

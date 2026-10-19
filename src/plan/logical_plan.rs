@@ -2340,29 +2340,50 @@ pub struct WindowExpr {
 pub enum FrameUnits {
     /// Physical rows.
     Rows,
-    /// Peer groups of the window `ORDER BY` (rows with equal keys).
+    /// Values of the window `ORDER BY` key: `CURRENT ROW` is the current
+    /// row's peer group, `n PRECEDING` / `FOLLOWING` the rows whose key lies
+    /// within `n` of the current row's.
     Range,
+    /// Peer groups of the window `ORDER BY` (rows with equal keys), counted.
+    Groups,
 }
 
 /// One bound of a [`WindowFrame`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameBound {
     /// `UNBOUNDED PRECEDING`.
     UnboundedPreceding,
-    /// `n PRECEDING` (rows only).
+    /// `n PRECEDING`: `n` rows (`ROWS`) or peer groups (`GROUPS`) back.
     Preceding(u64),
-    /// `CURRENT ROW` (for `RANGE`: the current row's peer group).
+    /// `CURRENT ROW` (for `RANGE` / `GROUPS`: the current row's peer group).
     CurrentRow,
-    /// `n FOLLOWING` (rows only).
+    /// `n FOLLOWING`: `n` rows (`ROWS`) or peer groups (`GROUPS`) ahead.
     Following(u64),
+    /// `<offset> PRECEDING` of a `RANGE` frame.
+    PrecedingValue(RangeOffset),
+    /// `<offset> FOLLOWING` of a `RANGE` frame.
+    FollowingValue(RangeOffset),
     /// `UNBOUNDED FOLLOWING`.
     UnboundedFollowing,
 }
 
+/// The offset of a `RANGE` frame bound, in the window `ORDER BY` key's units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RangeOffset {
+    /// A non-negative number (days for a `DATE` key).
+    Number(f64),
+    /// An `INTERVAL` without months or years, in microseconds (`DATE` and
+    /// `TIMESTAMP` keys).
+    Interval {
+        /// Length in microseconds.
+        micros: i64,
+    },
+}
+
 /// The rows an aggregate window function folds for each row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowFrame {
-    /// `ROWS` or `RANGE`.
+    /// `ROWS`, `RANGE` or `GROUPS`.
     pub units: FrameUnits,
     /// Start bound.
     pub start: FrameBound,

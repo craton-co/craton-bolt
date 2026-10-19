@@ -477,6 +477,29 @@ fn t_with_nulls(n: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(v)]).expect("t_with_nulls batch")
 }
 
+/// Window-frame fixture `t(k INTEGER, g BIGINT, v DOUBLE, f DOUBLE)`: `g`
+/// and `f` repeat (peer groups) and are NULL together; `v` has its own NULLs.
+fn t_frames(n: usize) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", ArrowDataType::Int32, false),
+        ArrowField::new("g", ArrowDataType::Int64, true),
+        ArrowField::new("v", ArrowDataType::Float64, true),
+        ArrowField::new("f", ArrowDataType::Float64, true),
+    ]));
+    let g = |i: usize| (i % 7 != 0).then_some(((i * 13) % 40) as i64);
+    let k: Int32Array = (0..n as i32).map(|i| i % 3).collect();
+    let gs: Int64Array = (0..n).map(g).collect();
+    let v: Float64Array = (0..n)
+        .map(|i| (i % 5 != 0).then_some(i as f64 - 30.0))
+        .collect();
+    let f: Float64Array = (0..n).map(|i| g(i).map(|g| g as f64 * 0.25)).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(k), Arc::new(gs), Arc::new(v), Arc::new(f)],
+    )
+    .expect("t_frames batch")
+}
+
 /// High-volume fixture for the DISTINCT regression. We pack two i32 columns
 /// so that:
 ///   - the cardinality of `(a, b)` is moderate (~256),
@@ -919,6 +942,40 @@ fn diff_string_compound_predicate() {
             batch,
         }],
     );
+}
+
+/// `GROUPS` frames and `RANGE` frames with value offsets against DuckDB:
+/// duplicate and NULL order keys, both directions, integer and float keys,
+/// fractional offsets over an integer key.
+#[test]
+#[ignore = "gpu:e2e"]
+fn diff_window_groups_and_range_offsets() {
+    let w = |agg: &str, spec: &str| format!("SELECT k, g, v, {agg} OVER ({spec}) AS w FROM t");
+    let cases = [
+        w("SUM(v)", "PARTITION BY k ORDER BY g NULLS LAST RANGE BETWEEN 3 PRECEDING AND 2 FOLLOWING"),
+        w("SUM(v)", "PARTITION BY k ORDER BY g DESC NULLS LAST RANGE BETWEEN 5 PRECEDING AND CURRENT ROW"),
+        w("COUNT(v)", "PARTITION BY k ORDER BY g NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 4 PRECEDING"),
+        w("MAX(v)", "PARTITION BY k ORDER BY g NULLS LAST RANGE BETWEEN 2 FOLLOWING AND UNBOUNDED FOLLOWING"),
+        w("MIN(v)", "PARTITION BY k ORDER BY g DESC NULLS FIRST RANGE BETWEEN 1 FOLLOWING AND 6 FOLLOWING"),
+        w("AVG(v)", "ORDER BY f NULLS LAST RANGE BETWEEN 0.5 PRECEDING AND 0.75 FOLLOWING"),
+        w("SUM(v)", "ORDER BY g NULLS FIRST RANGE BETWEEN 1.5 PRECEDING AND 1.5 FOLLOWING"),
+        w("SUM(v)", "PARTITION BY k ORDER BY g NULLS LAST GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING"),
+        w("COUNT(v)", "PARTITION BY k ORDER BY g DESC NULLS FIRST GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING"),
+        w("MAX(v)", "ORDER BY g NULLS LAST GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING"),
+        w("MIN(v)", "PARTITION BY k ORDER BY g NULLS FIRST GROUPS BETWEEN 3 FOLLOWING AND UNBOUNDED FOLLOWING"),
+        w("AVG(v)", "PARTITION BY k ORDER BY g NULLS LAST GROUPS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING"),
+    ];
+    for (i, sql) in cases.iter().enumerate() {
+        diff_query(
+            &format!("diff_window_groups_and_range_offsets[{i}]"),
+            sql,
+            &[TableSpec {
+                name: "t",
+                ddl_cols: "k INTEGER NOT NULL, g BIGINT, v DOUBLE, f DOUBLE",
+                batch: t_frames(300),
+            }],
+        );
+    }
 }
 
 /// Window frames and SQL NULL semantics against DuckDB (cases added with

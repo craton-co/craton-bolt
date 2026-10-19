@@ -113,6 +113,14 @@ fn asof_join_matches_closest_rows() {
             (12, None),
         ]
     );
+    // Unaliased tables and bare columns mean the same query; `sym`, on both
+    // sides, still needs a qualifier.
+    let bare = prices(
+        &e,
+        "SELECT tt, price FROM trades ASOF JOIN quotes \
+         MATCH_CONDITION (tt >= qt) ON trades.sym = quotes.sym ORDER BY trades.sym, tt",
+    );
+    assert_eq!(bare, ge);
 }
 
 #[test]
