@@ -1898,6 +1898,15 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
     if col.dtype() == to {
         return Ok(col);
     }
+    // Temporal values live as their storage: Date32 as `i32` days,
+    // Timestamp as `i64` ticks. An integer result typed temporal (a
+    // passthrough column, `DATE + n`) is already the right value.
+    match (&col, to) {
+        (HostColumn::I32(_), DataType::Date32)
+        | (HostColumn::I64(_), DataType::Timestamp(_, _)) => return Ok(col),
+        (HostColumn::I64(_), DataType::Date32) => return Ok(HostColumn::I32(cast_to_i32(col)?)),
+        _ => {}
+    }
     Ok(match to {
         DataType::Bool => HostColumn::Bool(cast_to_bool(col)?),
         DataType::Int32 => HostColumn::I32(cast_to_i32(col)?),

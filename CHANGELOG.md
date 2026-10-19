@@ -27,8 +27,9 @@ All notable changes to this project will be documented here. The format follows 
   templates now carry hidden sort columns like ordinary queries.
 - **A `DATE` / `TIMESTAMP` column passed through a fused projection kernel
   failed** ("Date/Timestamp output column lowering pending") — e.g. a bare
-  scan feeding a host-orchestrated query; such projections run on the host.
-  (A *computed* temporal output still cannot leave a kernel.)
+  scan feeding a host-orchestrated query. Temporal kernel outputs now
+  download as their `i32` / `i64` storage and get their logical type back, so
+  passthrough, `CASE` and arithmetic outputs stay in the fused kernel.
 - **A grouped aggregate with a string key and a computed input over a
   table without dictionaries failed** ("build_projection_kernel returned
   non-Projection"); the inputs are now computed as columns first.
@@ -124,6 +125,10 @@ All notable changes to this project will be documented here. The format follows 
   PRECEDING` over `DATE` / `TIMESTAMP` keys), checked against DuckDB with
   duplicate and NULL keys in both directions. Window keys may be timestamps
   of any unit.
+- **`DATE ± integer`** (`d + 7`, `30 + d`, `d - n`) → `DATE`, on the GPU and
+  the host evaluator, and **computed `DATE` / `TIMESTAMP` outputs of fused
+  projection kernels** (`CASE WHEN ... THEN d1 ELSE d2 END`, temporal
+  literals, passthrough under predicates) instead of a host detour.
 - **`ASOF JOIN` without table aliases**: `FROM trades ASOF JOIN quotes
   MATCH_CONDITION (tt >= qt)` used to fail to parse (sqlparser read `ASOF` /
   `MATCH_CONDITION` as aliases).

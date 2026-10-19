@@ -749,6 +749,27 @@ pub(crate) fn build_count_rows_batch(
 /// (`plan::null_semantics::HIDDEN_VALIDITY_PREFIX<j>`, a Bool per row: `false`
 /// = output `j` is NULL there) to the visible outputs, and drop them. The
 /// hidden outputs follow the visible ones.
+/// Date32 / Timestamp kernel outputs download as their `i32` / `i64`
+/// storage; give them back the schema's logical type (a zero-copy
+/// reinterpretation).
+pub(crate) fn restore_temporal_types(
+    arrays: Vec<ArrayRef>,
+    schema: &arrow_schema::Schema,
+) -> BoltResult<Vec<ArrayRef>> {
+    use arrow_schema::DataType as A;
+    arrays
+        .into_iter()
+        .zip(schema.fields())
+        .map(|(a, f)| match (a.data_type(), f.data_type()) {
+            (A::Int32, A::Date32) | (A::Int64, A::Timestamp(_, _)) => {
+                arrow::compute::cast(&a, f.data_type())
+                    .map_err(|e| BoltError::Other(format!("temporal output '{}': {e}", f.name())))
+            }
+            _ => Ok(a),
+        })
+        .collect()
+}
+
 pub(crate) fn apply_hidden_validity(
     mut arrays: Vec<ArrayRef>,
     outputs: &[crate::plan::ColumnIO],

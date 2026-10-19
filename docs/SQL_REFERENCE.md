@@ -92,15 +92,15 @@ The plan's `DataType` enum is intentionally small.
 | `Float64`  | `Float64`       |                                                          |
 | `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
 | `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, and `*` lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic. Division is rejected by default because the legacy device implementation does not implement SQL NULL/error semantics; `BOLT_LEGACY_ARITHMETIC=1` explicitly restores that compatibility path. Comparisons are GPU and scale-aligned. Scalar and grouped `SUM`/`MIN`/`MAX`, supported casts, gather/upload, and `CASE` are wired. |
-| `Date32`   | `Date32`        | `DATE '…'` literals; Date−Date and Day-`INTERVAL` arithmetic lower to GPU. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; CAST to/from Date32 (string, etc.): parses; GPU lowering pending. |
-| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. CAST to/from Timestamp: parses; GPU lowering pending. |
+| `Date32`   | `Date32`        | `DATE '…'` literals; `date - date` (→ `Int32` days) and `date ± integer` days (→ `Date32`) lower to the GPU, and computed dates (`CASE`, arithmetic, literals) are fused kernel outputs. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; CAST to/from Date32 (string, etc.): parses; GPU lowering pending. |
+| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` literals; Timestamp−Timestamp arithmetic lowers to GPU, and timestamps passed through or chosen by `CASE` are fused kernel outputs. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. CAST to/from Timestamp: parses; GPU lowering pending. |
 
 `Decimal128`, `Date32`, and `Timestamp` parse, type-check and lower to the GPU
 as described in the per-type notes above (mixed Decimal/integer arithmetic,
 integer↔decimal and decimal-rescale CAST, scale-aligned Decimal comparison,
-and temporal `MIN`/`MAX`). Interval (beyond
-Day-INTERVAL on dates), time-of-day, list, struct, and map are still not
-modelled.
+and temporal `MIN`/`MAX`). `INTERVAL` values in expressions (they are
+accepted as window `RANGE` offsets), time-of-day, list, struct, and map are
+still not modelled.
 
 ## Literals
 
@@ -396,7 +396,7 @@ Rejected residuals: a recursive **anchor** (left of the `UNION`) that references
 - **Ranking**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` (no argument).
 - **Aggregate windows**: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT` over a single bare column argument.
 
-A window function must appear as a **top-level SELECT item** (optionally aliased); a window call nested inside a larger expression is rejected with a clear message. `PARTITION BY` / `ORDER BY` / the aggregate argument must each be a bare column reference (computed keys are rejected host-side). Window partition / order key dtypes supported host-side: `Int32` / `Int64` / `Float32` / `Float64` / `Bool` / `Utf8` / `Date32` / `Timestamp(ns)`; aggregate-input columns must be numeric (`Int32` / `Int64` / `Float32` / `Float64`).
+A window function must appear as a **top-level SELECT item** (optionally aliased); a window call nested inside a larger expression is rejected with a clear message. `PARTITION BY` / `ORDER BY` / the aggregate argument must each be a bare column reference (computed keys are rejected host-side). Window partition / order key dtypes supported host-side: `Int32` / `Int64` / `Float32` / `Float64` / `Bool` / `Utf8` / `Date32` / `Timestamp` (any unit); aggregate-input columns must be numeric (`Int32` / `Int64` / `Float32` / `Float64`).
 
 **Frame**: without a frame clause, the SQL default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` applies: every ordering peer (rows with equal `ORDER BY` keys) sees the same running aggregate; with no `ORDER BY` the whole partition is one peer group, so the aggregate windows report the full-partition value on every row. Explicit frames are supported for the aggregate windows: `ROWS BETWEEN <bound> AND <bound>` with `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` (literal `n`; an empty frame gives NULL, `COUNT` 0), `GROUPS BETWEEN` with the same bounds counting peer groups (rows with equal `ORDER BY` keys; requires an `ORDER BY`), and `RANGE BETWEEN` where `CURRENT ROW` is the row's peer group and `<offset> PRECEDING` / `FOLLOWING` selects the rows whose key lies within the offset of the current row's (one `ORDER BY` key; a non-negative number for numeric keys, a number of days or an `INTERVAL` for `DATE` keys, an `INTERVAL` of fixed length — microseconds to weeks — for `TIMESTAMP` keys; `PRECEDING` follows the sort direction; a NULL key's frame is its peer group). `EXCLUDE`, month / year intervals, and a start bound after the end bound are rejected. Ranking functions ignore the frame. Frames starting at `UNBOUNDED PRECEDING` or ending at `UNBOUNDED FOLLOWING` cost one pass per partition; a frame bounded on both sides folds each row's window (O(rows × frame width)).
 
@@ -800,7 +800,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
   non-standard GPU behavior requires `BOLT_LEGACY_ARITHMETIC=1`.
 
 ### Types and values
-- Time-of-day / general interval (beyond Day-`INTERVAL` on dates) literals and arithmetic. `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
+- Time-of-day and `INTERVAL` literals in expressions (`ts + INTERVAL '1 day'`; use `date + n` for days, and `INTERVAL` window `RANGE` offsets are accepted). `Date32`, `Timestamp`, and `Decimal128` *are* supported (see Data types).
 - Array / list / struct / map types.
 
 ### Clauses and statements
