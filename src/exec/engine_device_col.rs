@@ -75,8 +75,13 @@ impl DeviceCol {
     /// name matching an input column name).
     pub(crate) fn alloc_zeros(dtype: DataType, n: usize) -> BoltResult<Self> {
         match dtype {
-            DataType::Int32 => Ok(DeviceCol::I32(GpuVec::<i32>::zeros(n)?)),
-            DataType::Int64 => Ok(DeviceCol::I64(GpuVec::<i64>::zeros(n)?)),
+            // Date32 is `i32` days and Timestamp `i64` ticks on the device
+            // (as in `GpuColumn`); the engine restores the logical type from
+            // the output schema after download (`restore_temporal_types`).
+            DataType::Int32 | DataType::Date32 => Ok(DeviceCol::I32(GpuVec::<i32>::zeros(n)?)),
+            DataType::Int64 | DataType::Timestamp(_, _) => {
+                Ok(DeviceCol::I64(GpuVec::<i64>::zeros(n)?))
+            }
             DataType::Float32 => Ok(DeviceCol::F32(GpuVec::<f32>::zeros(n)?)),
             DataType::Float64 => Ok(DeviceCol::F64(GpuVec::<f64>::zeros(n)?)),
             DataType::Bool => Ok(DeviceCol::Bool(GpuVec::<u8>::zeros(n)?)),
@@ -98,22 +103,6 @@ impl DeviceCol {
                 // (see the output-allocation loop in `run_kernel`).
                 valid_mask: None,
             }),
-            // PTX codegen for Date32 / Timestamp arithmetic is wired
-            // (see `crate::jit::ptx_gen`), but the device-side download
-            // path is dtype-blind — `DeviceCol::I32::download` always
-            // emits an `Int32Array`, which would silently downgrade a
-            // Date32 output to plain Int32. Keep the engine boundary
-            // rejecting these types until a follow-up wires the
-            // Date32Array / TimestampArray reconstruction. The
-            // physical-plan codegen still produces correct PTX for
-            // `Date32 - Date32` and `Timestamp - Timestamp`; the
-            // top-level engine routes any temporal column through the
-            // host path until then.
-            DataType::Date32 | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
-                "Date/Timestamp output column lowering pending download-path \
-                 wiring (PTX codegen is done; got {:?})",
-                dtype
-            ))),
         }
     }
 

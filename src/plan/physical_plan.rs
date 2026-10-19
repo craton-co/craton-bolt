@@ -2520,6 +2520,30 @@ impl<'a> Codegen<'a> {
             )));
         }
 
+        // DATE +/- integer days: `i32` arithmetic on the day count, labelled
+        // Date32 (the register class is the same).
+        if op_is_arithmetic(op)
+            && temporal_arith_result_dtype(op, l.dtype, r.dtype)? == Some(DataType::Date32)
+        {
+            let mut days = |v: Value| {
+                if v.dtype == DataType::Date32 {
+                    Value::single(v.reg, DataType::Int32)
+                } else {
+                    self.emit_cast(v, DataType::Int32)
+                }
+            };
+            let (lv, rv) = (days(l), days(r));
+            let dst = self.fresh();
+            self.ops.push(Op::Binary {
+                dst,
+                op,
+                lhs: lv.reg,
+                rhs: rv.reg,
+                dtype: DataType::Int32,
+                result_dtype: DataType::Int32,
+            });
+            return Ok(Value::single(dst, DataType::Date32));
+        }
         let (lhs_v, rhs_v, operand_dtype, result_dtype) = if op_is_arithmetic(op) {
             // Date32 / Timestamp arithmetic. Only `Date32 - Date32`
             // (→ Int32) and `Timestamp(u, tz) - Timestamp(u, tz)` (→ Int64
@@ -3813,20 +3837,6 @@ fn build_kernel(
     if projection_needs_host_columns(scan_schema, projected) {
         return lower_host_filtered_projection(table, scan_schema, predicate, projected);
     }
-    // A Date32 / Timestamp column passed through cannot be downloaded from
-    // the projection kernel yet; evaluate the projection on the host.
-    if hidden_validity
-        && projected.iter().any(|(_, e)| {
-            matches!(peel_aliases(e), Expr::Column(_))
-                && matches!(
-                    e.dtype(scan_schema),
-                    Ok(DataType::Date32) | Ok(DataType::Timestamp(_, _))
-                )
-        })
-    {
-        return lower_host_filtered_projection(table, scan_schema, predicate, projected);
-    }
-
     // SQL NULL semantics: the kernel computes values only, so predicates
     // and outputs over nullable columns are rewritten into explicit
     // validity checks. Every construct the codegen lowers has a rule; one

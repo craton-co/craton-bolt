@@ -191,6 +191,9 @@ fn to_arrow(c: HostColumn) -> BoltResult<ArrayRef> {
 }
 
 fn batch_with_schema(schema: &Schema, columns: Vec<ArrayRef>) -> BoltResult<RecordBatch> {
+    // Temporal results arrive as their i32 / i64 storage.
+    let declared = crate::exec::schema_convert::plan_schema_to_arrow_schema(schema)?;
+    let columns = crate::exec::engine_support::restore_temporal_types(columns, &declared)?;
     let fields: Vec<ArrowField> = schema
         .fields
         .iter()

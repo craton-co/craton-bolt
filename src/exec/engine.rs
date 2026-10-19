@@ -4914,6 +4914,7 @@ impl Engine {
         // 9. Build the result RecordBatch (Materialize phase).
         let materialize_start = Instant::now();
         let arrow_schema = plan_schema_to_arrow_schema(output_schema)?;
+        let arrays = crate::exec::engine_support::restore_temporal_types(arrays, &arrow_schema)?;
         let batch_out = RecordBatch::try_new(arrow_schema, arrays)
             .map_err(|e| BoltError::Other(format!("failed to build output RecordBatch: {e}")))?;
         crate::metrics::metrics().observe_duration(

@@ -1887,6 +1887,11 @@ pub(crate) fn date_or_timestamp_arith_result(
     }
     match (op, l, r) {
         (BinaryOp::Sub, Date32, Date32) => Some(Ok(Int32)),
+        // A date plus / minus a number of days. The day count is read as an
+        // `Int32` (a `BIGINT` operand is narrowed).
+        (BinaryOp::Add, Date32, Int32 | Int64)
+        | (BinaryOp::Add, Int32 | Int64, Date32)
+        | (BinaryOp::Sub, Date32, Int32 | Int64) => Some(Ok(Date32)),
         (BinaryOp::Sub, Timestamp(lu, ltz), Timestamp(ru, rtz)) => {
             if lu != ru {
                 return Some(Err(BoltError::Type(format!(
@@ -1907,8 +1912,8 @@ pub(crate) fn date_or_timestamp_arith_result(
         // generic "requires numeric operands" rejection.
         _ => Some(Err(BoltError::Type(format!(
             "arithmetic {op:?} on Date/Timestamp operands ({l:?}, {r:?}) is not \
-             supported; only Date32 - Date32 and Timestamp - Timestamp \
-             (matching unit and tz) are wired in v0.7"
+             supported; only Date32 - Date32, Date32 +/- integer days and \
+             Timestamp - Timestamp (matching unit and tz) are"
         )))),
     }
 }
