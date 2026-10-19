@@ -915,8 +915,9 @@ fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<State
     use sqlparser::ast::{
         DuplicateTreatment, Expr as SqlExpr, FunctionArguments, Ident, ObjectName,
     };
-    let mut stmts =
-        Parser::parse_sql(dialect, sql).map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    let aliased = alias_asof_right_relation(dialect, sql);
+    let mut stmts = Parser::parse_sql(dialect, aliased.as_deref().unwrap_or(sql))
+        .map_err(|e| parse_error_to_bolt_error(e, sql))?;
     let _ = sqlparser::ast::visit_expressions_mut(&mut stmts, |e| {
         if let SqlExpr::Function(f) = e {
             let name = f.name.to_string().to_ascii_uppercase();
@@ -930,6 +931,80 @@ fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<State
         std::ops::ControlFlow::<()>::Continue(())
     });
     Ok(stmts)
+}
+
+/// `<table> ASOF JOIN <table> MATCH_CONDITION (...)` without aliases:
+/// sqlparser would read `ASOF` / `MATCH_CONDITION` as the tables' aliases,
+/// so give each unaliased table its own name as an explicit alias first.
+/// `None` when nothing changes.
+fn alias_asof_right_relation(dialect: &GenericDialect, sql: &str) -> Option<String> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Tokenizer, Word};
+    if !sql.to_ascii_uppercase().contains("MATCH_CONDITION") {
+        return None;
+    }
+    let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+    let is_kw = |t: &Token, k: Keyword| matches!(t, Token::Word(w) if w.keyword == k);
+    let significant: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i], Token::Whitespace(_)))
+        .collect();
+    let mut inserts = Vec::new();
+    for (n, &i) in significant.iter().enumerate() {
+        if !is_kw(&tokens[i], Keyword::ASOF)
+            || !significant.get(n + 1).is_some_and(|&j| is_kw(&tokens[j], Keyword::JOIN))
+        {
+            continue;
+        }
+        // Left: FROM|JOIN|, <word> ( . <word> )* ASOF
+        if let Some(Token::Word(w)) = n.checked_sub(1).map(|p| &tokens[significant[p]]) {
+            let mut p = n - 1;
+            while p >= 2
+                && matches!(tokens[significant[p - 1]], Token::Period)
+                && matches!(tokens[significant[p - 2]], Token::Word(_))
+            {
+                p -= 2;
+            }
+            let opens = p.checked_sub(1).map(|q| &tokens[significant[q]]);
+            if matches!(opens, Some(Token::Comma))
+                || opens.is_some_and(|t| is_kw(t, Keyword::FROM) || is_kw(t, Keyword::JOIN))
+            {
+                inserts.push((i, w.clone()));
+            }
+        }
+        // <word> ( . <word> )* MATCH_CONDITION
+        let mut m = n + 2;
+        let mut last: Option<&Word> = None;
+        loop {
+            match significant.get(m).map(|&j| &tokens[j]) {
+                Some(Token::Word(w)) if w.keyword != Keyword::MATCH_CONDITION => {
+                    last = Some(w);
+                    m += 1;
+                    if matches!(significant.get(m).map(|&j| &tokens[j]), Some(Token::Period)) {
+                        m += 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            break;
+        }
+        if let (Some(w), Some(&j)) = (last, significant.get(m)) {
+            if is_kw(&tokens[j], Keyword::MATCH_CONDITION) {
+                inserts.push((j, w.clone()));
+            }
+        }
+    }
+    if inserts.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + 16);
+    for (i, t) in tokens.iter().enumerate() {
+        if let Some((_, w)) = inserts.iter().find(|(j, _)| *j == i) {
+            out.push_str(&format!("AS {w} "));
+        }
+        out.push_str(&t.to_string());
+    }
+    Some(out)
 }
 
 pub(crate) fn parse_error_to_bolt_error(e: ParserError, sql: &str) -> BoltError {
@@ -9979,6 +10054,27 @@ fn try_window(
         WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
         _ => frame,
     };
+    if let Some(f) = &frame {
+        use crate::plan::logical_plan::{FrameBound, FrameUnits};
+        let fname = func.sql_name();
+        if f.units == FrameUnits::Groups && order_by.is_empty() {
+            return Err(BoltError::Sql(format!(
+                "GROUPS frame on {fname} requires a window ORDER BY"
+            )));
+        }
+        let valued = |b: FrameBound| {
+            matches!(
+                b,
+                FrameBound::PrecedingValue(_) | FrameBound::FollowingValue(_)
+            )
+        };
+        if (valued(f.start) || valued(f.end)) && order_by.len() != 1 {
+            return Err(BoltError::Sql(format!(
+                "RANGE frame with an offset on {fname} requires exactly one window \
+                 ORDER BY key"
+            )));
+        }
+    }
     Ok(Some(ParsedWindow {
         func,
         partition_by,
@@ -10069,54 +10165,66 @@ fn lower_window_frame(
     frame: &sqlparser::ast::WindowFrame,
     fname: &str,
 ) -> BoltResult<Option<crate::plan::logical_plan::WindowFrame>> {
-    use crate::plan::logical_plan::{FrameBound, FrameUnits, WindowFrame};
+    use crate::plan::logical_plan::{FrameBound, FrameUnits, RangeOffset, WindowFrame};
     let units = match frame.units {
         WindowFrameUnits::Rows => FrameUnits::Rows,
         WindowFrameUnits::Range => FrameUnits::Range,
-        WindowFrameUnits::Groups => {
-            return Err(BoltError::Sql(format!(
-                "unsupported: GROUPS frame on window function {fname}"
-            )))
+        WindowFrameUnits::Groups => FrameUnits::Groups,
+    };
+    // A ROWS / GROUPS offset: a count.
+    let count = |e: &SqlExpr| -> BoltResult<u64> {
+        match e {
+            SqlExpr::Value(sqlparser::ast::Value::Number(n, _)) => n.parse::<u64>().map_err(|_| {
+                BoltError::Sql(format!(
+                    "window frame offset on {fname} must be a non-negative integer, got {n}"
+                ))
+            }),
+            other => Err(BoltError::Sql(format!(
+                "window frame offset on {fname} must be an integer literal, got {other}"
+            ))),
         }
     };
-    let offset = |e: &Option<Box<SqlExpr>>| -> BoltResult<Option<u64>> {
+    // A RANGE offset: a number or an INTERVAL.
+    let value = |e: &SqlExpr| -> BoltResult<RangeOffset> {
         match e {
-            None => Ok(None),
-            Some(e) => match e.as_ref() {
-                SqlExpr::Value(sqlparser::ast::Value::Number(n, _)) => {
-                    n.parse::<u64>().map(Some).map_err(|_| {
-                        BoltError::Sql(format!(
-                            "window frame offset on {fname} must be a non-negative integer, got {n}"
-                        ))
-                    })
-                }
-                other => Err(BoltError::Sql(format!(
-                    "window frame offset on {fname} must be an integer literal, got {other}"
-                ))),
-            },
+            SqlExpr::Value(sqlparser::ast::Value::Number(n, _)) => n
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(RangeOffset::Number)
+                .ok_or_else(|| {
+                    BoltError::Sql(format!(
+                        "RANGE frame offset on {fname} must be a non-negative number, got {n}"
+                    ))
+                }),
+            SqlExpr::Interval(iv) => frame_interval_micros(iv)
+                .map(|micros| RangeOffset::Interval { micros })
+                .ok_or_else(|| {
+                    BoltError::Sql(format!(
+                        "RANGE frame offset on {fname}: unsupported interval {e} (use a \
+                         non-negative number of microseconds .. weeks; months and years \
+                         have no fixed length)"
+                    ))
+                }),
+            other => Err(BoltError::Sql(format!(
+                "RANGE frame offset on {fname} must be a number or INTERVAL literal, got {other}"
+            ))),
         }
     };
     let bound = |b: &WindowFrameBound| -> BoltResult<FrameBound> {
-        let fb = match b {
-            WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
-            WindowFrameBound::Preceding(e) => match offset(e)? {
-                None => FrameBound::UnboundedPreceding,
-                Some(n) => FrameBound::Preceding(n),
-            },
-            WindowFrameBound::Following(e) => match offset(e)? {
-                None => FrameBound::UnboundedFollowing,
-                Some(n) => FrameBound::Following(n),
-            },
-        };
-        if units == FrameUnits::Range
-            && matches!(fb, FrameBound::Preceding(_) | FrameBound::Following(_))
-        {
-            return Err(BoltError::Sql(format!(
-                "unsupported window frame on {fname}: RANGE with a value offset \
-                 (use ROWS, or RANGE UNBOUNDED / CURRENT ROW bounds)"
-            )));
-        }
-        Ok(fb)
+        Ok(match (b, units) {
+            (WindowFrameBound::CurrentRow, _) => FrameBound::CurrentRow,
+            (WindowFrameBound::Preceding(None), _) => FrameBound::UnboundedPreceding,
+            (WindowFrameBound::Following(None), _) => FrameBound::UnboundedFollowing,
+            (WindowFrameBound::Preceding(Some(e)), FrameUnits::Range) => {
+                FrameBound::PrecedingValue(value(e)?)
+            }
+            (WindowFrameBound::Following(Some(e)), FrameUnits::Range) => {
+                FrameBound::FollowingValue(value(e)?)
+            }
+            (WindowFrameBound::Preceding(Some(e)), _) => FrameBound::Preceding(count(e)?),
+            (WindowFrameBound::Following(Some(e)), _) => FrameBound::Following(count(e)?),
+        })
     };
     let start = bound(&frame.start_bound)?;
     let end = match &frame.end_bound {
@@ -10124,13 +10232,19 @@ fn lower_window_frame(
         None => FrameBound::CurrentRow,
     };
     // Offset from the current row: preceding < current < following.
-    let at = |b: FrameBound| -> i128 {
+    let at = |b: FrameBound| -> f64 {
+        let v = |o: RangeOffset| match o {
+            RangeOffset::Number(n) => n,
+            RangeOffset::Interval { micros } => micros as f64,
+        };
         match b {
-            FrameBound::UnboundedPreceding => i128::MIN,
-            FrameBound::Preceding(n) => -i128::from(n),
-            FrameBound::CurrentRow => 0,
-            FrameBound::Following(n) => i128::from(n),
-            FrameBound::UnboundedFollowing => i128::MAX,
+            FrameBound::UnboundedPreceding => f64::NEG_INFINITY,
+            FrameBound::Preceding(n) => -(n as f64),
+            FrameBound::PrecedingValue(o) => -v(o),
+            FrameBound::CurrentRow => 0.0,
+            FrameBound::Following(n) => n as f64,
+            FrameBound::FollowingValue(o) => v(o),
+            FrameBound::UnboundedFollowing => f64::INFINITY,
         }
     };
     if start == FrameBound::UnboundedFollowing
@@ -10143,12 +10257,55 @@ fn lower_window_frame(
     }
     if start == FrameBound::UnboundedPreceding && end == FrameBound::CurrentRow {
         // The default frame (ROWS and RANGE agree only under RANGE peers;
-        // a ROWS frame excludes later peers).
-        if units == FrameUnits::Range {
+        // a ROWS frame excludes later peers; GROUPS matches RANGE here).
+        if units != FrameUnits::Rows {
             return Ok(None);
         }
     }
     Ok(Some(WindowFrame { units, start, end }))
+}
+
+/// `INTERVAL '<n> <unit>'` / `INTERVAL '<n>' <unit>` as microseconds, for
+/// units of fixed length (microsecond .. week). `None` otherwise.
+fn frame_interval_micros(iv: &sqlparser::ast::Interval) -> Option<i64> {
+    use sqlparser::ast::{DateTimeField, Value};
+    let text = match iv.value.as_ref() {
+        SqlExpr::Value(Value::SingleQuotedString(s)) => s.clone(),
+        SqlExpr::Value(Value::Number(n, _)) => n.clone(),
+        _ => return None,
+    };
+    let unit_micros = |u: &str| -> Option<f64> {
+        Some(match u.to_ascii_lowercase().trim_end_matches('s') {
+            "microsecond" | "u" => 1.0,
+            "millisecond" | "m" => 1e3,
+            "second" | "sec" => 1e6,
+            "minute" | "min" => 60e6,
+            "hour" | "h" => 3_600e6,
+            "day" | "d" => 86_400e6,
+            "week" | "w" => 604_800e6,
+            _ => return None,
+        })
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let (n, unit): (f64, f64) = match (&iv.leading_field, words.as_slice()) {
+        (None, [n, u]) => (n.parse().ok()?, unit_micros(u)?),
+        (Some(f), [n]) => {
+            let u = match f {
+                DateTimeField::Microsecond | DateTimeField::Microseconds => 1.0,
+                DateTimeField::Millisecond | DateTimeField::Milliseconds => 1e3,
+                DateTimeField::Second => 1e6,
+                DateTimeField::Minute => 60e6,
+                DateTimeField::Hour => 3_600e6,
+                DateTimeField::Day => 86_400e6,
+                DateTimeField::Week(_) => 604_800e6,
+                _ => return None,
+            };
+            (n.parse().ok()?, u)
+        }
+        _ => return None,
+    };
+    let micros = n * unit;
+    (micros.is_finite() && micros >= 0.0 && micros < i64::MAX as f64).then(|| micros.round() as i64)
 }
 
 /// Lower a window-spec ORDER BY list into our `SortExpr`s. Identical default
@@ -14336,19 +14493,32 @@ mod wave7_tests {
         }
     }
 
-    /// An explicit non-default frame is rejected cleanly.
+    /// Frames whose offsets have no meaning are rejected cleanly.
     #[test]
     fn window_explicit_frame_rejected() {
-        let err = parse(
-            "SELECT SUM(b) OVER (ORDER BY b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
-            &provider(),
-        )
-        .expect_err("a RANGE frame with a value offset must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("frame"),
-            "expected a frame-related rejection, got: {msg}"
-        );
+        for sql in [
+            // Two ORDER BY keys: no single value to offset.
+            "SELECT SUM(b) OVER (ORDER BY b, a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
+            // A month has no fixed length.
+            "SELECT SUM(b) OVER (ORDER BY b RANGE BETWEEN INTERVAL '1' MONTH PRECEDING \
+             AND CURRENT ROW) FROM t1",
+            // GROUPS counts peer groups of an ORDER BY.
+            "SELECT SUM(b) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
+            "SELECT SUM(b) OVER (ORDER BY b ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t1",
+        ] {
+            let err = parse(sql, &provider()).expect_err(sql);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("frame"),
+                "expected a frame-related rejection, got: {msg}"
+            );
+        }
+        for sql in [
+            "SELECT SUM(b) OVER (ORDER BY b RANGE BETWEEN 1 PRECEDING AND 2.5 FOLLOWING) FROM t1",
+            "SELECT SUM(b) OVER (ORDER BY b GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t1",
+        ] {
+            parse(sql, &provider()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
     }
 
     /// A window function nested inside a larger expression is rejected
@@ -17597,5 +17767,59 @@ mod classify_query_tests {
             sql: sql.to_string(),
             version: p.schema_version(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod asof_parse_tests {
+    use super::*;
+    use crate::plan::logical_plan::{DataType, Field};
+
+    fn provider() -> MemTableProvider {
+        MemTableProvider::new()
+            .with_table(
+                "trades",
+                Schema::new(vec![
+                    Field::new("sym", DataType::Int32, false),
+                    Field::new("tt", DataType::Int64, false),
+                ]),
+            )
+            .with_table(
+                "quotes",
+                Schema::new(vec![
+                    Field::new("qsym", DataType::Int32, false),
+                    Field::new("qt", DataType::Int64, false),
+                    Field::new("price", DataType::Float64, false),
+                ]),
+            )
+    }
+
+    /// Unaliased tables and bare column names: sqlparser alone would read
+    /// `ASOF` / `MATCH_CONDITION` as table aliases.
+    #[test]
+    fn asof_join_accepts_unaliased_tables_and_bare_columns() {
+        for sql in [
+            "SELECT tt, price FROM trades t ASOF JOIN quotes q MATCH_CONDITION (tt >= qt)",
+            "SELECT tt, price FROM trades ASOF JOIN quotes MATCH_CONDITION (tt >= qt)",
+            "SELECT tt, price FROM trades ASOF JOIN quotes MATCH_CONDITION (qt <= tt) ON sym = qsym",
+            "SELECT trades.tt, quotes.price FROM trades ASOF JOIN quotes \
+             MATCH_CONDITION (trades.tt >= quotes.qt) ON trades.sym = quotes.qsym",
+            "SELECT q.price FROM trades t ASOF JOIN quotes q \
+             MATCH_CONDITION (t.tt >= q.qt) ON t.sym = q.qsym",
+        ] {
+            match classify_query(sql, &provider()) {
+                Ok(QueryShape::AsOf(p)) => {
+                    assert_eq!((p.left_time, p.right_time, p.op), (1, 1, AsOfOp::Ge), "{sql}")
+                }
+                Ok(_) => panic!("{sql}: not planned as ASOF"),
+                Err(e) => panic!("{sql}: {e}"),
+            }
+        }
+        // A string literal mentioning the keywords is left alone.
+        assert!(alias_asof_right_relation(
+            &GenericDialect {},
+            "SELECT 'ASOF JOIN x MATCH_CONDITION' FROM trades"
+        )
+        .is_none());
     }
 }

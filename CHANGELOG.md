@@ -119,6 +119,14 @@ All notable changes to this project will be documented here. The format follows 
   `GROUP BY <utf8 key>` under a predicate, execute (see `AggregateOverInput`).
 
 ### Added
+- **`GROUPS` window frames and `RANGE` frames with value offsets**
+  (`RANGE BETWEEN 5 PRECEDING AND 2.5 FOLLOWING`, `INTERVAL '2 days'
+  PRECEDING` over `DATE` / `TIMESTAMP` keys), checked against DuckDB with
+  duplicate and NULL keys in both directions. Window keys may be timestamps
+  of any unit.
+- **`ASOF JOIN` without table aliases**: `FROM trades ASOF JOIN quotes
+  MATCH_CONDITION (tt >= qt)` used to fail to parse (sqlparser read `ASOF` /
+  `MATCH_CONDITION` as aliases).
 - **`DELETE`, `UPDATE`, `ALTER TABLE`.** `DELETE FROM t [WHERE ...]` and
   `UPDATE t SET c = expr, ... [WHERE ...]` (subqueries see the table as it
   was) rewrite only the catalog files whose zone maps may match, in one

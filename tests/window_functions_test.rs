@@ -17,8 +17,8 @@
 //! What we ALSO pin, runnable on CI without a GPU, is the *frontend contract*
 //! for frames: the SQL parser (`craton_bolt::plan::parse_sql`) is a pure host
 //! path, so the "unsupported frame is rejected" tests run everywhere (no
-//! `#[ignore]`): `GROUPS`, `RANGE` with a value offset, and a start bound
-//! after the end bound (`sql_frontend::lower_window_frame`).
+//! `#[ignore]`): `GROUPS` without an `ORDER BY`, a non-integer `ROWS` offset,
+//! and a start bound after the end bound (`sql_frontend::lower_window_frame`).
 //!
 //! ## Truth table (standard SQL / DuckDB semantics asserted)
 //!
@@ -36,7 +36,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use craton_bolt::plan::{parse_sql, DataType, Field, MemTableProvider, Schema};
@@ -436,14 +439,13 @@ fn frame_provider() -> MemTableProvider {
     MemTableProvider::new().with_table("t", schema)
 }
 
-/// A `RANGE` frame with a value offset (`RANGE BETWEEN 1 PRECEDING AND
-/// CURRENT ROW`) and an inverted frame are rejected with a clear SQL error;
-/// `ROWS` frames with offsets parse.
+/// Inverted frames and offsets that are not counts are rejected with a clear
+/// SQL error; `ROWS`, `GROUPS` and value-offset `RANGE` frames parse.
 #[test]
 fn unsupported_frames_are_rejected() {
     let provider = frame_provider();
     for sql in [
-        "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t",
         "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t",
         "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
         "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN v PRECEDING AND CURRENT ROW) FROM t",
@@ -459,21 +461,23 @@ fn unsupported_frames_are_rejected() {
         "SELECT AVG(v) OVER (ORDER BY v ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING) FROM t",
         "SELECT MAX(v) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t",
         "SELECT COUNT(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t",
+        "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "SELECT SUM(v) OVER (ORDER BY v GROUPS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM t",
     ] {
         parse_sql(sql, &provider).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 
-/// A `GROUPS` frame is explicitly rejected by `reject_non_default_frame`.
+/// A `GROUPS` frame counts peer groups of the window `ORDER BY`, so one
+/// without an `ORDER BY` is rejected.
 #[test]
 fn groups_frame_is_rejected() {
     let provider = frame_provider();
     let err = match parse_sql(
-        "SELECT SUM(v) OVER (ORDER BY v GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
-         FROM t",
+        "SELECT SUM(v) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
         &provider,
     ) {
-        Ok(_) => panic!("GROUPS frame must be rejected, got Ok"),
+        Ok(_) => panic!("GROUPS frame without ORDER BY must be rejected, got Ok"),
         Err(e) => e,
     };
     match err {
@@ -685,4 +689,74 @@ fn unbounded_and_range_frames() {
     assert_eq!(rows[1].unwrap() + rows[2].unwrap(), 2.0 + 3.0);
     assert_eq!(range[1], Some(3.0));
     assert_eq!(range[2], Some(3.0));
+}
+
+/// `RANGE` offsets over `DATE` and `TIMESTAMP` keys: a number of days or an
+/// `INTERVAL`; a NULL key's frame is its peer group.
+#[test]
+#[ignore = "gpu:e2e"]
+fn range_offsets_over_dates_and_timestamps() {
+    let mut e = Engine::new().expect("ctx");
+    let days = vec![Some(0), Some(1), Some(1), Some(3), Some(6), Some(10), None];
+    let hour = 3_600_000_000i64;
+    let ts: Vec<Option<i64>> = days
+        .iter()
+        .enumerate()
+        .map(|(i, d)| d.map(|d| (d as i64 * 24 + i as i64) * hour))
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("d", ArrowDataType::Date32, true),
+        ArrowField::new(
+            "ts",
+            ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            true,
+        ),
+        ArrowField::new("v", ArrowDataType::Int64, false),
+    ]));
+    let b = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(days)),
+            Arc::new(TimestampMicrosecondArray::from(ts)),
+            Arc::new(Int64Array::from((1..=7).collect::<Vec<i64>>())),
+        ],
+    )
+    .unwrap();
+    e.register_table("t", b).unwrap();
+    let run = |w: &str| -> Vec<i64> {
+        let b = e
+            .sql(&format!("SELECT v, {w} AS w FROM t ORDER BY v"))
+            .unwrap()
+            .into_record_batch();
+        let c = arrow::compute::cast(b.column(1), &ArrowDataType::Int64).unwrap();
+        let c = c.as_any().downcast_ref::<Int64Array>().unwrap();
+        c.values().to_vec()
+    };
+    let two_days = vec![1, 6, 6, 9, 5, 6, 7];
+    assert_eq!(
+        run("SUM(v) OVER (ORDER BY d NULLS LAST RANGE BETWEEN INTERVAL '2 days' PRECEDING \
+             AND CURRENT ROW)"),
+        two_days
+    );
+    assert_eq!(
+        run("SUM(v) OVER (ORDER BY d NULLS FIRST RANGE BETWEEN 2 PRECEDING AND CURRENT ROW)"),
+        two_days
+    );
+    // Hours 0, 25, 26, 75, 148, 245, NULL.
+    assert_eq!(
+        run("COUNT(v) OVER (ORDER BY ts NULLS LAST RANGE BETWEEN INTERVAL '50' HOUR PRECEDING \
+             AND CURRENT ROW)"),
+        vec![1, 2, 3, 3, 1, 1, 1]
+    );
+    assert_eq!(
+        run("SUM(v) OVER (ORDER BY ts DESC NULLS LAST RANGE BETWEEN INTERVAL '1 day' \
+             PRECEDING AND INTERVAL '2 hours' FOLLOWING)"),
+        // DESC: preceding = later times. 0h: [−2h, 24h] -> {0}; 25h: [23h, 49h]
+        // -> {25, 26}; 26h: [24h, 50h] -> {25, 26}; ...
+        vec![1, 5, 5, 4, 5, 6, 7]
+    );
+    // A bare number has no unit on a TIMESTAMP key.
+    assert!(e
+        .sql("SELECT SUM(v) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t")
+        .is_err());
 }

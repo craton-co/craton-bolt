@@ -58,7 +58,8 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use crate::error::{BoltError, BoltResult};
 use crate::exec::QueryHandle;
 use crate::plan::logical_plan::{
-    DataType, Expr, FrameBound, FrameUnits, Schema, SortExpr, WindowExpr, WindowFrame, WindowFunc,
+    DataType, Expr, FrameBound, FrameUnits, RangeOffset, Schema, SortExpr, WindowExpr, WindowFrame,
+    WindowFunc,
 };
 
 /// Execute a window node host-side, appending one column per `window_exprs`
@@ -150,6 +151,10 @@ pub fn execute_window(
     // 2. Compute each window column (in original row order).
     let mut appended: Vec<ArrayRef> = Vec::with_capacity(window_exprs.len());
     for (we, of) in window_exprs.iter().zip(appended_fields) {
+        let range_key = match &we.frame {
+            Some(f) if has_value_bound(f) => Some(RangeKey::extract(&batch, &order_by[0], f)?),
+            _ => None,
+        };
         let arr = compute_window_column(
             &batch,
             &perm,
@@ -157,6 +162,7 @@ pub fn execute_window(
             &order_keys,
             &we.func,
             we.frame.as_ref(),
+            range_key.as_ref(),
             of.dtype,
         )?;
         appended.push(arr);
@@ -233,6 +239,7 @@ fn compute_window_column(
     order_keys: &[KeyColumn],
     func: &WindowFunc,
     frame: Option<&WindowFrame>,
+    range_key: Option<&RangeKey>,
     out_dtype: DataType,
 ) -> BoltResult<ArrayRef> {
     let n_rows = batch.num_rows();
@@ -262,6 +269,7 @@ fn compute_window_column(
             agg_input.as_ref(),
             func,
             frame,
+            range_key,
             &mut out,
         )?;
 
@@ -280,6 +288,7 @@ fn compute_partition(
     agg_input: Option<&NumericColumn>,
     func: &WindowFunc,
     frame: Option<&WindowFrame>,
+    range_key: Option<&RangeKey>,
     out: &mut ResultBuilder,
 ) -> BoltResult<()> {
     match func {
@@ -325,7 +334,9 @@ fn compute_partition(
                 ))
             })?;
             match frame {
-                Some(f) => compute_framed_aggregate(rows, order_keys, input, func, f, out)?,
+                Some(f) => {
+                    compute_framed_aggregate(rows, order_keys, input, func, f, range_key, out)?
+                }
                 None => compute_running_aggregate(rows, order_keys, input, func, out)?,
             }
         }
@@ -335,7 +346,8 @@ fn compute_partition(
 
 /// Aggregate window under an explicit frame. For row `p` of the partition
 /// the frame is the inclusive position range `[lo(p), hi(p)]` (empty when
-/// `lo > hi`); both ends are non-decreasing in `p`. A frame that starts at
+/// `lo > hi`); both ends are non-decreasing in `p` (`ROWS` count rows,
+/// `GROUPS` peer groups, `RANGE` offsets compare the order key's value). A frame that starts at
 /// `UNBOUNDED PRECEDING` is folded forward and one that ends at `UNBOUNDED
 /// FOLLOWING` backward, in one pass each; a frame bounded on both sides is
 /// folded per row.
@@ -345,6 +357,7 @@ fn compute_framed_aggregate(
     input: &NumericColumn,
     func: &WindowFunc,
     frame: &WindowFrame,
+    range_key: Option<&RangeKey>,
     out: &mut ResultBuilder,
 ) -> BoltResult<()> {
     let n = rows.len() as i64;
@@ -366,13 +379,32 @@ fn compute_framed_aggregate(
         }
         (lo, hi)
     };
-    let range = frame.units == FrameUnits::Range;
+    let peers = frame.units != FrameUnits::Rows;
+    // GROUPS: each position's peer-group ordinal and the groups' extents.
+    let (group_of, group_lo, group_hi): (Vec<i64>, Vec<i64>, Vec<i64>) =
+        if frame.units == FrameUnits::Groups {
+            let mut of = Vec::with_capacity(rows.len());
+            let (mut glo, mut ghi) = (Vec::new(), Vec::new());
+            for p in 0..rows.len() {
+                if p == 0 || peer_lo[p] == p as i64 {
+                    glo.push(peer_lo[p]);
+                    ghi.push(peer_hi[p]);
+                }
+                of.push(glo.len() as i64 - 1);
+            }
+            (of, glo, ghi)
+        } else {
+            Default::default()
+        };
+    let groups = group_lo.len() as i64;
+    let value_bounds = range_key.map(|k| k.positions(rows, &peer_lo, &peer_hi));
     let pos = |b: FrameBound, p: usize, is_start: bool| -> i64 {
         let pi = p as i64;
+        let k64 = |k: u64| k.min(i64::MAX as u64) as i64;
         match b {
             FrameBound::UnboundedPreceding => 0,
             FrameBound::UnboundedFollowing => n - 1,
-            FrameBound::CurrentRow if range => {
+            FrameBound::CurrentRow if peers => {
                 if is_start {
                     peer_lo[p]
                 } else {
@@ -380,8 +412,33 @@ fn compute_framed_aggregate(
                 }
             }
             FrameBound::CurrentRow => pi,
-            FrameBound::Preceding(k) => pi.saturating_sub(k.min(i64::MAX as u64) as i64),
-            FrameBound::Following(k) => pi.saturating_add(k.min(i64::MAX as u64) as i64),
+            FrameBound::Preceding(k) | FrameBound::Following(k)
+                if frame.units == FrameUnits::Groups =>
+            {
+                let g = if matches!(b, FrameBound::Preceding(_)) {
+                    group_of[p].saturating_sub(k64(k))
+                } else {
+                    group_of[p].saturating_add(k64(k))
+                };
+                match (is_start, g) {
+                    (true, g) if g < 0 => 0,
+                    (true, g) if g >= groups => n,
+                    (true, g) => group_lo[g as usize],
+                    (false, g) if g < 0 => -1,
+                    (false, g) if g >= groups => n - 1,
+                    (false, g) => group_hi[g as usize],
+                }
+            }
+            FrameBound::Preceding(k) => pi.saturating_sub(k64(k)),
+            FrameBound::Following(k) => pi.saturating_add(k64(k)),
+            FrameBound::PrecedingValue(_) | FrameBound::FollowingValue(_) => {
+                let (lo, hi) = value_bounds.as_ref().expect("RANGE key extracted");
+                if is_start {
+                    lo[p]
+                } else {
+                    hi[p]
+                }
+            }
         }
     };
     let bounds = |p: usize| -> (i64, i64) {
@@ -424,6 +481,182 @@ fn compute_framed_aggregate(
         }
     }
     Ok(())
+}
+
+fn has_value_bound(f: &WindowFrame) -> bool {
+    [f.start, f.end].iter().any(|b| {
+        matches!(
+            b,
+            FrameBound::PrecedingValue(_) | FrameBound::FollowingValue(_)
+        )
+    })
+}
+
+/// The window `ORDER BY` key of a `RANGE` frame with value offsets, in a
+/// totally ordered numeric domain where "preceding" means smaller: values of
+/// a descending key are negated, dates and timestamps become nanoseconds.
+/// `None` is NULL (and NaN, which has no distance to anything).
+enum RangeKey {
+    Int {
+        values: Vec<Option<i128>>,
+        start: Option<i128>,
+        end: Option<i128>,
+    },
+    Float {
+        values: Vec<Option<f64>>,
+        start: Option<f64>,
+        end: Option<f64>,
+    },
+}
+
+impl RangeKey {
+    fn extract(batch: &RecordBatch, key: &SortExpr, frame: &WindowFrame) -> BoltResult<Self> {
+        use arrow::compute::cast;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float64Type, Int64Type};
+        use arrow_schema::{DataType as A, TimeUnit};
+        let arr = batch.column(column_index(batch, &key.expr)?);
+        let bad = |what: &str| {
+            BoltError::Sql(format!(
+                "RANGE frame offset {what} on a window ORDER BY key of type {}",
+                arr.data_type()
+            ))
+        };
+        // Nanoseconds per key unit, for temporal keys.
+        let scale: Option<i128> = match arr.data_type() {
+            A::Date32 => Some(86_400 * 1_000_000_000),
+            A::Timestamp(TimeUnit::Second, _) => Some(1_000_000_000),
+            A::Timestamp(TimeUnit::Millisecond, _) => Some(1_000_000),
+            A::Timestamp(TimeUnit::Microsecond, _) => Some(1_000),
+            A::Timestamp(TimeUnit::Nanosecond, _) => Some(1),
+            _ => None,
+        };
+        let is_date = matches!(arr.data_type(), A::Date32);
+        let float = matches!(arr.data_type(), A::Float32 | A::Float64);
+        if !float && scale.is_none() && !arr.data_type().is_integer() {
+            return Err(bad("needs a numeric, DATE or TIMESTAMP key, not one"));
+        }
+        let offset = |b: FrameBound| match b {
+            FrameBound::PrecedingValue(o) | FrameBound::FollowingValue(o) => Some(o),
+            _ => None,
+        };
+        // Signed offset: added to the current row's (ascending) value.
+        let signed = |b: FrameBound| -> f64 {
+            if matches!(b, FrameBound::PrecedingValue(_)) {
+                -1.0
+            } else {
+                1.0
+            }
+        };
+        let to_domain = |b: FrameBound| -> BoltResult<Option<f64>> {
+            let Some(o) = offset(b) else {
+                return Ok(None);
+            };
+            let v = match (o, scale) {
+                (RangeOffset::Number(n), None) => n,
+                (RangeOffset::Number(n), Some(_)) if is_date => n * 86_400e9,
+                (RangeOffset::Number(_), Some(_)) => {
+                    return Err(bad("must be an INTERVAL (not a number)"))
+                }
+                (RangeOffset::Interval { micros }, Some(_)) => micros as f64 * 1e3,
+                (RangeOffset::Interval { .. }, None) => {
+                    return Err(bad("must be a number (not an INTERVAL)"))
+                }
+            };
+            Ok(Some(signed(b) * v))
+        };
+        let (start, end) = (to_domain(frame.start)?, to_domain(frame.end)?);
+        let sign = if key.descending { -1.0 } else { 1.0 };
+        let integral = |o: Option<f64>| o.is_none_or(|v| v.fract() == 0.0);
+        if float || !(integral(start) && integral(end)) {
+            let c = cast(arr, &A::Float64).map_err(arrow_err)?;
+            let c = c.as_primitive::<Float64Type>();
+            let ns = scale.unwrap_or(1) as f64;
+            return Ok(RangeKey::Float {
+                values: (0..c.len())
+                    .map(|i| {
+                        (!c.is_null(i) && !c.value(i).is_nan()).then(|| sign * c.value(i) * ns)
+                    })
+                    .collect(),
+                start,
+                end,
+            });
+        }
+        let ints = match arr.data_type() {
+            A::Date32 => cast(&cast(arr, &A::Int32).map_err(arrow_err)?, &A::Int64),
+            _ => cast(arr, &A::Int64),
+        }
+        .map_err(arrow_err)?;
+        let c = ints.as_primitive::<Int64Type>();
+        let (sign, ns) = (if key.descending { -1 } else { 1 }, scale.unwrap_or(1));
+        Ok(RangeKey::Int {
+            values: (0..c.len())
+                .map(|i| (!c.is_null(i)).then(|| sign * i128::from(c.value(i)) * ns))
+                .collect(),
+            start: start.map(|v| v as i128),
+            end: end.map(|v| v as i128),
+        })
+    }
+
+    /// Frame start / end positions of each position of the partition `rows`
+    /// (only the value-offset bounds are meaningful). A NULL key's frame is
+    /// its peer group.
+    fn positions(
+        &self,
+        rows: &[usize],
+        peer_lo: &[i64],
+        peer_hi: &[i64],
+    ) -> (Vec<i64>, Vec<i64>) {
+        fn run<T: Copy + PartialOrd + std::ops::Add<Output = T>>(
+            vals: Vec<Option<T>>,
+            start: Option<T>,
+            end: Option<T>,
+            peer_lo: &[i64],
+            peer_hi: &[i64],
+        ) -> (Vec<i64>, Vec<i64>) {
+            // NULLs sort together at one end: the keyed rows are contiguous.
+            let first = vals.iter().position(Option::is_some).unwrap_or(vals.len());
+            let last = vals.iter().rposition(Option::is_some).map_or(first, |i| i + 1);
+            let seg: Vec<T> = vals[first..last].iter().map(|v| v.expect("keyed")).collect();
+            let mut lo = vec![0i64; vals.len()];
+            let mut hi = vec![0i64; vals.len()];
+            for (p, v) in vals.iter().enumerate() {
+                match v {
+                    None => {
+                        lo[p] = peer_lo[p];
+                        hi[p] = peer_hi[p];
+                    }
+                    Some(v) => {
+                        if let Some(o) = start {
+                            let t = *v + o;
+                            lo[p] = (first + seg.partition_point(|x| *x < t)) as i64;
+                        }
+                        if let Some(o) = end {
+                            let t = *v + o;
+                            hi[p] = (first + seg.partition_point(|x| *x <= t)) as i64 - 1;
+                        }
+                    }
+                }
+            }
+            (lo, hi)
+        }
+        match self {
+            RangeKey::Int { values, start, end } => run(
+                rows.iter().map(|&r| values[r]).collect(),
+                *start,
+                *end,
+                peer_lo,
+                peer_hi,
+            ),
+            RangeKey::Float { values, start, end } => run(
+                rows.iter().map(|&r| values[r]).collect(),
+                *start,
+                *end,
+                peer_lo,
+                peer_hi,
+            ),
+        }
+    }
 }
 
 /// Running-aggregate window under the default RANGE frame: every row sees the
@@ -812,7 +1045,7 @@ impl KeyColumn {
     fn extract(batch: &RecordBatch, e: &Expr) -> BoltResult<Self> {
         use arrow_array::{
             BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-            StringArray, TimestampNanosecondArray,
+            StringArray,
         };
         use arrow_schema::DataType as A;
 
@@ -856,11 +1089,9 @@ impl KeyColumn {
                         .collect(),
                 )
             }
-            A::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
-                let a = arr
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .unwrap();
+            A::Timestamp(_, _) => {
+                let a = arrow::compute::cast(arr, &A::Int64).map_err(arrow_err)?;
+                let a = a.as_any().downcast_ref::<Int64Array>().unwrap();
                 KeyColumn::Int64(
                     (0..n)
                         .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
@@ -915,7 +1146,7 @@ impl KeyColumn {
                 return Err(BoltError::Other(format!(
                     "window PARTITION BY / ORDER BY key dtype {other:?} is not supported \
                      host-side (supported: Int32/Int64/Float32/Float64/Bool/Utf8/Date32/\
-                     Timestamp(ns))"
+                     Timestamp)"
                 )));
             }
         };
