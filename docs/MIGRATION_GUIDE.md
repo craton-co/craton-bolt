@@ -679,7 +679,7 @@ was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
 | GPU predicates / projections over nullable columns follow SQL NULL semantics (a comparison with NULL is not TRUE; computed outputs keep NULLs) | Behavioural (bug fix) | Results that relied on NULL reading as 0 change |
 | `SUM(Int32)` / `COUNT(col)` / `AVG(col)` through the aggregate pre-stage are exact | Behavioural (bug fix) | — |
 | `DELETE` / `UPDATE` / `ALTER TABLE` / transactions, `Engine::sql_stream`, cost-based tier selection (opt-in) | Additive | — |
-| Through a `Database`, a session's open transaction makes other sessions' statements wait | Behavioural | Commit or roll back promptly; tune `Database::set_transaction_wait` |
+| Through a `Database`, sessions' transactions run concurrently under snapshot isolation (previously other sessions waited); a commit conflicting with an earlier one fails | Behavioural | Retry a transaction that fails with "could not serialize", or call `Database::set_isolation(IsolationLevel::Serializable)` for the previous behaviour |
 | `Engine::sql` rejects `UPDATE` / `ALTER` / `BEGIN` / `COMMIT` / `ROLLBACK` / `END` like other statements | Behavioural (error text) | Run them through `execute_sql` |
 | `MemoryStats` gains `repartitions`; `Counter` gains `HostTierQueries`, `ViewRewrites` | Additive (`#[non_exhaustive]`) | — |
 | `plan::WindowExpr` gains `frame: Option<WindowFrame>` | Breaking for struct literals | Add `frame: None` (the default frame) |

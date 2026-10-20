@@ -330,9 +330,14 @@ db.with_engine(|e| e.table_names())?;                          // non-SQL engine
 Statements run one at a time in arrival order on the shared GPU runtime;
 dropping a `PendingResult` before its statement starts cancels it, and a
 panic fails only its own statement. `Database::stats()` reports queue waits.
-A `BEGIN` ... `COMMIT` belongs to its session: other sessions' statements
-wait until it ends (failing after `Database::set_transaction_wait`, 30 s by
-default), and dropping the session rolls it back.
+A `BEGIN` ... `COMMIT` belongs to its session, and sessions' transactions
+run concurrently under snapshot isolation: each sees the data as of its
+`BEGIN` plus its own changes, and a commit that changed a table another
+transaction committed first fails and rolls back (retry it). With
+`db.set_isolation(IsolationLevel::Serializable)` other sessions' statements
+wait for an open transaction instead (failing after
+`Database::set_transaction_wait`, 30 s by default). Dropping a session rolls
+its transaction back.
 
 With the `flight` feature, `FlightSqlServer::from_database(&db)` serves the
 same database over Arrow Flight SQL: client queries go through a read-only

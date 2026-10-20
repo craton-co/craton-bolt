@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `DELETE`, `UPDATE`, `ALTER TABLE` and `BEGIN` / `COMMIT` / `ROLLBACK`,
-//! over in-memory and catalog tables, and transactions across sessions.
+//! `DELETE`, `UPDATE`, `MERGE`, `ALTER TABLE`, `BEGIN` / `COMMIT` /
+//! `ROLLBACK` and savepoints, over in-memory and catalog tables, and
+//! concurrent transactions across sessions.
 //!
 //! Every test builds an `Engine` (a CUDA context):
 //! `cargo test --test dml_test -- --ignored --test-threads=1`.
@@ -15,7 +16,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch};
 
-use craton_bolt::{Database, Engine, QueryHandle};
+use craton_bolt::{Database, Engine, EngineBuilder, IsolationLevel, QueryHandle, Session};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -326,9 +327,10 @@ fn catalog_transactions() {
 }
 
 #[test]
-#[ignore = "gpu:e2e — a session's transaction holds other sessions back"]
+#[ignore = "gpu:e2e — serializable isolation holds other sessions back"]
 fn session_transactions_are_serializable() {
     let db = Database::open(Engine::builder()).expect("db");
+    db.set_isolation(IsolationLevel::Serializable);
     let a = db.session();
     let b = db.session();
     a.sql("CREATE TABLE t (x BIGINT); INSERT INTO t VALUES (1)")
@@ -355,4 +357,239 @@ fn session_transactions_are_serializable() {
     drop(c);
     let r = b.sql("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(r.column(0).as_primitive::<Int64Type>().value(0), 3);
+}
+
+fn session_scalar(s: &Session, sql: &str) -> i64 {
+    let b = s.sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    b.column(0).as_primitive::<Int64Type>().value(0)
+}
+
+/// Concurrent sessions under snapshot isolation: no waiting, no dirty
+/// reads, private snapshots, merged commits, first committer wins.
+fn concurrent_transactions(builder: EngineBuilder) {
+    let db = Database::open(builder).expect("db");
+    let (a, b, c) = (db.session(), db.session(), db.session());
+    a.sql(
+        "CREATE TABLE t (x BIGINT); INSERT INTO t VALUES (1); \
+         CREATE TABLE u (y BIGINT); INSERT INTO u VALUES (10)",
+    )
+    .unwrap();
+    a.sql("BEGIN; INSERT INTO t VALUES (2)").unwrap();
+    // `b` runs at once and does not see `a`'s uncommitted row.
+    assert_eq!(session_scalar(&b, "SELECT SUM(x) FROM t"), 1);
+    b.sql("BEGIN; INSERT INTO u VALUES (20)").unwrap();
+    assert_eq!(session_scalar(&a, "SELECT SUM(y) FROM u"), 10);
+    assert_eq!(session_scalar(&a, "SELECT SUM(x) FROM t"), 3);
+    b.sql("INSERT INTO t VALUES (100)").unwrap();
+    a.sql("COMMIT").unwrap();
+    // `b` keeps its snapshot: `a`'s commit is invisible to it.
+    assert_eq!(session_scalar(&b, "SELECT SUM(x) FROM t"), 101);
+    assert_eq!(session_scalar(&c, "SELECT SUM(x) FROM t"), 3);
+    // Both changed `t`: `a` committed first, so `b` fails and rolls back.
+    let err = b.sql("COMMIT").unwrap_err().to_string();
+    assert!(err.contains("could not serialize"), "{err}");
+    assert_eq!(session_scalar(&c, "SELECT SUM(y) FROM u"), 10);
+    assert_eq!(session_scalar(&b, "SELECT SUM(x) FROM t"), 3);
+
+    // Disjoint changes merge, in either commit order.
+    a.sql("BEGIN; INSERT INTO t VALUES (3)").unwrap();
+    b.sql("BEGIN; INSERT INTO u VALUES (30); CREATE TABLE w (z BIGINT); INSERT INTO w VALUES (7)")
+        .unwrap();
+    b.sql("COMMIT").unwrap();
+    // `a` still sees `u` as of its BEGIN.
+    assert_eq!(session_scalar(&a, "SELECT SUM(y) FROM u"), 10);
+    a.sql("COMMIT").unwrap();
+    assert_eq!(session_scalar(&c, "SELECT SUM(x) FROM t"), 6);
+    assert_eq!(session_scalar(&c, "SELECT SUM(y) FROM u"), 40);
+    assert_eq!(session_scalar(&c, "SELECT SUM(z) FROM w"), 7);
+
+    // A single statement outside a transaction commits first.
+    a.sql("BEGIN; DELETE FROM u").unwrap();
+    c.sql("INSERT INTO u VALUES (1)").unwrap();
+    assert_eq!(session_scalar(&a, "SELECT COUNT(*) FROM u"), 0);
+    assert!(a.sql("COMMIT").is_err());
+    assert_eq!(session_scalar(&c, "SELECT SUM(y) FROM u"), 41);
+
+    // VACUUM waits for every transaction to end; dropping a session rolls
+    // its transaction back.
+    let d = db.session();
+    d.sql("BEGIN; DELETE FROM t").unwrap();
+    assert!(c.sql("VACUUM").is_err());
+    drop(d);
+    assert_eq!(session_scalar(&c, "SELECT SUM(x) FROM t"), 6);
+}
+
+#[test]
+#[ignore = "gpu:e2e — concurrent snapshot-isolated transactions over in-memory tables"]
+fn concurrent_in_memory_transactions() {
+    concurrent_transactions(Engine::builder());
+}
+
+#[test]
+#[ignore = "gpu:e2e — concurrent snapshot-isolated transactions over a catalog"]
+fn concurrent_catalog_transactions() {
+    let dir = temp_dir("concurrent");
+    concurrent_transactions(Engine::builder().database(&dir));
+    // Everything committed is durable.
+    let e = Engine::builder().database(&dir).build().expect("ctx");
+    assert_eq!(scalar_i64(&e, "SELECT SUM(x) FROM t"), 6);
+    assert_eq!(scalar_i64(&e, "SELECT SUM(y) FROM u"), 41);
+    assert_eq!(scalar_i64(&e, "SELECT SUM(z) FROM w"), 7);
+}
+
+fn savepoints(e: &mut Engine) {
+    seed(e);
+    e.execute_sql("BEGIN; INSERT INTO t VALUES (5, 'z', 50); SAVEPOINT s1; DELETE FROM t")
+        .unwrap();
+    assert_eq!(scalar_i64(e, "SELECT COUNT(*) FROM t"), 0);
+    e.execute_sql("ROLLBACK TO SAVEPOINT s1").unwrap();
+    assert_eq!(scalar_i64(e, "SELECT COUNT(*) FROM t"), 5);
+    // The savepoint survives a rollback to it; later ones are released.
+    e.execute_sql("SAVEPOINT s2; UPDATE t SET v = 0; RELEASE SAVEPOINT s2")
+        .unwrap();
+    assert!(e.execute_sql("ROLLBACK TO s2").is_err());
+    assert_eq!(scalar_i64(e, "SELECT SUM(v) FROM t"), 0);
+    // An error aborts the transaction; rolling back to a savepoint resumes it.
+    assert!(e.execute_sql("INSERT INTO nope VALUES (1)").is_err());
+    assert!(e.execute_sql("SELECT 1 FROM t").is_err());
+    e.execute_sql("ROLLBACK TO s1").unwrap();
+    e.execute_sql("CREATE TABLE side AS SELECT a FROM t; SAVEPOINT s3; DROP TABLE side")
+        .unwrap();
+    e.execute_sql("ROLLBACK TO SAVEPOINT s3").unwrap();
+    assert_eq!(scalar_i64(e, "SELECT COUNT(*) FROM side"), 5);
+    e.execute_sql("COMMIT").unwrap();
+    assert_eq!(scalar_i64(e, "SELECT SUM(a) FROM t"), 15);
+    assert_eq!(scalar_i64(e, "SELECT SUM(v) FROM t"), 120);
+    assert_eq!(scalar_i64(e, "SELECT COUNT(*) FROM side"), 5);
+    assert!(e.execute_sql("SAVEPOINT outside").is_err());
+}
+
+#[test]
+#[ignore = "gpu:e2e — savepoints over in-memory and catalog tables"]
+fn savepoints_roll_back_part_of_a_transaction() {
+    let mut e = Engine::new().expect("ctx");
+    savepoints(&mut e);
+    drop(e);
+    let dir = temp_dir("savepoint");
+    let mut e = Engine::builder().database(&dir).build().expect("ctx");
+    savepoints(&mut e);
+    drop(e);
+    let e = Engine::builder().database(&dir).build().expect("ctx");
+    assert_eq!(scalar_i64(&e, "SELECT SUM(v) FROM t"), 120);
+}
+
+/// `(a, s, v)` rows of `t`, ordered by `a`.
+fn all_rows(e: &Engine) -> Vec<(i64, Option<String>, Option<i64>)> {
+    let b = batch(e.sql("SELECT a, s, v FROM t ORDER BY a").unwrap());
+    let a = b.column(0).as_primitive::<Int64Type>();
+    let s = b.column(1).as_string::<i32>();
+    let v = b.column(2).as_primitive::<Int64Type>();
+    (0..b.num_rows())
+        .map(|i| {
+            (
+                a.value(i),
+                (!s.is_null(i)).then(|| s.value(i).to_string()),
+                (!v.is_null(i)).then(|| v.value(i)),
+            )
+        })
+        .collect()
+}
+
+fn merge(e: &mut Engine) {
+    seed(e);
+    e.execute_sql(
+        "CREATE TABLE src (a BIGINT, s VARCHAR, v BIGINT); \
+         INSERT INTO src VALUES (2, 'b', 200), (3, 'c', 300), (4, 'd', 400), (7, 'g', 700), \
+         (8, 'h', NULL)",
+    )
+    .unwrap();
+    let n = affected(
+        e.execute_sql(
+            "MERGE INTO t USING src ON t.a = src.a \
+             WHEN MATCHED AND src.a = 4 THEN DELETE \
+             WHEN MATCHED THEN UPDATE SET v = src.v + t.a, s = src.s \
+             WHEN NOT MATCHED AND src.v IS NOT NULL THEN INSERT (a, s, v) VALUES (src.a, src.s, src.v) \
+             WHEN NOT MATCHED THEN INSERT VALUES (src.a, 'none', 0)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(n, 5);
+    let s = |x: &str| Some(x.to_string());
+    assert_eq!(
+        all_rows(e),
+        vec![
+            (1, s("x"), Some(10)),
+            (2, s("b"), Some(202)),
+            (3, s("c"), Some(303)),
+            (7, s("g"), Some(700)),
+            (8, s("none"), Some(0)),
+        ]
+    );
+    // Target rows without a source row, with an alias on each side.
+    e.execute_sql("INSERT INTO t VALUES (9, 'q', 9)").unwrap();
+    let n = affected(
+        e.execute_sql(
+            "MERGE INTO t AS tt USING src AS z ON tt.a = z.a \
+             WHEN NOT MATCHED BY SOURCE AND tt.a = 1 THEN UPDATE SET v = -1 \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        )
+        .unwrap(),
+    );
+    assert_eq!(n, 2);
+    assert_eq!(all_rows(e)[0], (1, s("x"), Some(-1)));
+    assert_eq!(all_rows(e).len(), 5);
+    // A source subquery; nothing matches a condition: nothing changes.
+    let n = affected(
+        e.execute_sql(
+            "MERGE INTO t USING (SELECT a FROM src WHERE a > 100) AS q ON t.a = q.a \
+             WHEN MATCHED THEN DELETE",
+        )
+        .unwrap(),
+    );
+    assert_eq!(n, 0);
+    // A target row matched twice is an error; the table is unchanged.
+    e.execute_sql("INSERT INTO src VALUES (2, 'dup', 1)").unwrap();
+    let err = e
+        .execute_sql("MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN UPDATE SET v = 0")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("more than one source row"), "{err}");
+    assert_eq!(all_rows(e)[1], (2, s("b"), Some(202)));
+    // Inside a transaction, rolled back.
+    let n = affected(
+        e.execute_sql(
+            "BEGIN; MERGE INTO t USING src ON t.a = src.a AND src.s = 'dup' \
+             WHEN MATCHED THEN UPDATE SET v = 0",
+        )
+        .unwrap(),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(all_rows(e)[1].2, Some(0));
+    e.execute_sql("ROLLBACK").unwrap();
+    assert_eq!(all_rows(e)[1].2, Some(202));
+    // Malformed clauses.
+    assert!(e
+        .execute_sql("MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN INSERT VALUES (1, 'x', 1)")
+        .is_err());
+    assert!(e
+        .execute_sql("MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN UPDATE SET nope = 1")
+        .is_err());
+}
+
+#[test]
+#[ignore = "gpu:e2e — MERGE over in-memory and catalog tables"]
+fn merge_into() {
+    let mut e = Engine::new().expect("ctx");
+    merge(&mut e);
+    drop(e);
+    let dir = temp_dir("merge");
+    let mut e = Engine::builder().database(&dir).build().expect("ctx");
+    let v = {
+        merge(&mut e);
+        e.catalog().unwrap().version()
+    };
+    drop(e);
+    let e = Engine::builder().database(&dir).build().expect("ctx");
+    assert_eq!(e.catalog().unwrap().version(), v);
+    assert_eq!(all_rows(&e)[0].2, Some(-1));
 }

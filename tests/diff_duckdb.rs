@@ -751,6 +751,41 @@ fn diff_inner_join() {
     );
 }
 
+/// An equi-join plus a residual predicate (a pushed-down `WHERE`, or a
+/// non-equi `ON` conjunct) when both key columns share a name: the residual
+/// path used to compare the left key with itself and return a filtered
+/// cross product.
+#[test]
+#[ignore = "gpu:e2e"]
+fn diff_inner_join_with_residual_predicate() {
+    let (t1, t2) = join_fixture(512);
+    for (i, sql) in [
+        "SELECT t1.k, t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k WHERE t2.w > 10",
+        "SELECT t1.k, t2.w FROM t1 JOIN t2 ON t1.k = t2.k AND t1.v < t2.w",
+        "SELECT COUNT(*) AS n FROM t1 JOIN t2 ON t1.k = t2.k WHERE t1.v > 3 AND t2.w < 50",
+    ]
+    .iter()
+    .enumerate()
+    {
+        diff_query(
+            &format!("diff_inner_join_with_residual_predicate[{i}]"),
+            sql,
+            &[
+                TableSpec {
+                    name: "t1",
+                    ddl_cols: "k INTEGER NOT NULL, v DOUBLE NOT NULL",
+                    batch: t1.clone(),
+                },
+                TableSpec {
+                    name: "t2",
+                    ddl_cols: "k INTEGER NOT NULL, w DOUBLE NOT NULL",
+                    batch: t2.clone(),
+                },
+            ],
+        );
+    }
+}
+
 /// Case 8 — **C5 regression**: GROUP BY with multiple SUMs. The multi-SUM
 /// orchestrator's column-alignment bug (see `tests/tier2_multi_sum_e2e.rs`)
 /// would scatter aggregates into the wrong output column; DuckDB pins the

@@ -152,6 +152,13 @@ pub fn execute_join(
     // predicate is a future extension (current behaviour: reject with a
     // clear message rather than silently produce wrong results).
     if let Some(pred) = filter {
+        // INNER with equi keys and a residual predicate (a pushed-down
+        // `WHERE`, or `ON a = b AND <other>`): hash-join on the keys, then
+        // filter the joined rows.
+        if *join_type == JoinType::Inner && !on.is_empty() {
+            let joined = execute_inner_join(lhs, rhs, on, output_schema)?;
+            return crate::exec::filter::execute_filter(joined, pred);
+        }
         return execute_nested_loop_join(lhs, rhs, *join_type, on, pred, output_schema);
     }
 
@@ -653,7 +660,7 @@ fn execute_nested_loop_join_chunked(
     let pred_ref: &Expr = if on.is_empty() {
         predicate
     } else {
-        composite = fold_equi_into_predicate(on, predicate);
+        composite = fold_equi_into_predicate(on, predicate, &lhs, &rhs, output_schema)?;
         &composite
     };
 
@@ -732,13 +739,34 @@ fn execute_nested_loop_join_chunked(
 /// residual non-equi predicate in one pass. See the dispatch logic in
 /// [`execute_nested_loop_join`] for why this exists despite the planner
 /// never producing mixed shapes.
-fn fold_equi_into_predicate(on: &[(Expr, Expr)], predicate: &Expr) -> Expr {
+///
+/// The keys name columns of their own input; in the joined row a right
+/// column may carry a disambiguated name (`right.a` next to a left `a`), so
+/// each key is renamed to its output column first — otherwise `a = a` would
+/// compare the left column with itself.
+fn fold_equi_into_predicate(
+    on: &[(Expr, Expr)],
+    predicate: &Expr,
+    lhs: &RecordBatch,
+    rhs: &RecordBatch,
+    output_schema: &Schema,
+) -> BoltResult<Expr> {
+    let output = |side: &RecordBatch, offset: usize, e: &Expr, which: &str| -> BoltResult<Expr> {
+        let name = column_name(e, which)?;
+        let i = side.schema().index_of(&name).map_err(|_| {
+            BoltError::Plan(format!("join key '{name}' is not a {which} input column"))
+        })?;
+        let f = output_schema.fields.get(offset + i).ok_or_else(|| {
+            BoltError::Plan("join output schema is narrower than its inputs".into())
+        })?;
+        Ok(Expr::Column(f.name.clone()))
+    };
     let mut acc: Expr = predicate.clone();
     for (l, r) in on.iter() {
         let eq = Expr::Binary {
             op: crate::plan::logical_plan::BinaryOp::Eq,
-            left: Box::new(l.clone()),
-            right: Box::new(r.clone()),
+            left: Box::new(output(lhs, 0, l, "left")?),
+            right: Box::new(output(rhs, lhs.num_columns(), r, "right")?),
         };
         acc = Expr::Binary {
             op: crate::plan::logical_plan::BinaryOp::And,
@@ -746,7 +774,7 @@ fn fold_equi_into_predicate(on: &[(Expr, Expr)], predicate: &Expr) -> Expr {
             right: Box::new(acc),
         };
     }
-    acc
+    Ok(acc)
 }
 
 // ---------- shared helpers ----------------------------------------------

@@ -362,6 +362,7 @@ fn skewed_partitions_are_split_again() {
     assert!(e.memory_stats().repartitions > mid.repartitions);
 }
 
+#[cfg(feature = "storage")]
 #[test]
 #[ignore = "gpu:e2e — row-wise scans over the host budget, and sql_stream"]
 fn row_wise_scans_run_in_chunks_and_stream() {

@@ -1282,8 +1282,19 @@ pub struct Engine {
     pub(crate) view_rewrite: bool,
     /// Tier cost estimates (replaced by `calibrate_cost_model`).
     pub(crate) cost_model: RefCell<Arc<dyn crate::exec::cost::CostModel>>,
-    /// Open `BEGIN` ... `COMMIT` transaction (see `engine_txn`).
+    /// Open `BEGIN` ... `COMMIT` transaction whose state is installed (see
+    /// `engine_txn`).
     pub(crate) txn: Option<crate::exec::engine_txn::Transaction>,
+    /// Other sessions' open transactions, with their latest state.
+    pub(crate) parked: HashMap<
+        Option<u64>,
+        (
+            crate::exec::engine_txn::Transaction,
+            crate::exec::engine_txn::Snapshot,
+        ),
+    >,
+    /// The committed state while a transaction's state is installed.
+    pub(crate) committed: Option<crate::exec::engine_txn::Snapshot>,
     /// Session whose statement is running (set by the `Database` runtime).
     pub(crate) current_session: Option<u64>,
     /// Owned CUDA context — declared after every context-bound resource so it
@@ -1670,6 +1681,8 @@ impl EngineBuilder {
                     .unwrap_or_else(|| Arc::new(crate::exec::cost::DefaultCostModel::default())),
             ),
             txn: None,
+            parked: HashMap::new(),
+            committed: None,
             current_session: None,
             _ctx: ctx,
             _active_engine_permit: active_engine_permit,

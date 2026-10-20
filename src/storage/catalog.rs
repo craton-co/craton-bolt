@@ -230,6 +230,22 @@ pub struct VacuumReport {
     pub files_removed: usize,
 }
 
+/// A catalog's in-memory state: the manifest its readers see and, inside a
+/// transaction, the last published manifest. Engines keep one per open
+/// transaction to run transactions concurrently.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogState {
+    manifest: Manifest,
+    txn_base: Option<Manifest>,
+}
+
+impl CatalogState {
+    /// The manifest readers of this state see.
+    pub(crate) fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+}
+
 /// A persistent catalog. See the [module docs](self).
 #[derive(Debug)]
 pub struct Catalog {
@@ -701,6 +717,69 @@ impl Catalog {
         // On failure nothing was published: the transaction is gone and the
         // catalog is back at its last snapshot.
         let next = std::mem::replace(&mut self.manifest, base);
+        self.commit(next)
+    }
+
+    /// The current in-memory state (see [`CatalogState`]).
+    pub(crate) fn state(&self) -> CatalogState {
+        CatalogState {
+            manifest: self.manifest.clone(),
+            txn_base: self.txn_base.clone(),
+        }
+    }
+
+    /// Install a state captured by [`Catalog::state`].
+    pub(crate) fn set_state(&mut self, state: CatalogState) {
+        self.manifest = state.manifest;
+        self.txn_base = state.txn_base;
+    }
+
+    /// Publish the open transaction over `committed`, the snapshot published
+    /// since it began (by other transactions or single statements): every
+    /// table and view the transaction changed replaces the committed entry,
+    /// everything else stays as committed. A table or view that both the
+    /// transaction and a later commit changed is a write conflict: nothing is
+    /// published and the error names it. Either way the catalog ends outside
+    /// the transaction, at `committed` or the new snapshot.
+    pub(crate) fn commit_concurrent(&mut self, committed: Manifest) -> BoltResult<()> {
+        let base = self
+            .txn_base
+            .take()
+            .ok_or_else(|| BoltError::Plan("no transaction is open".into()))?;
+        let work = std::mem::replace(&mut self.manifest, committed.clone());
+        let mut next = committed.clone();
+        fn merge<V: PartialEq + Clone>(
+            what: &str,
+            base: &BTreeMap<String, V>,
+            work: &BTreeMap<String, V>,
+            committed: &BTreeMap<String, V>,
+            next: &mut BTreeMap<String, V>,
+        ) -> BoltResult<()> {
+            let names: std::collections::BTreeSet<&String> = base.keys().chain(work.keys()).collect();
+            for name in names {
+                let (b, w) = (base.get(name), work.get(name));
+                if b == w {
+                    continue;
+                }
+                if committed.get(name) != b {
+                    return Err(BoltError::Plan(format!(
+                        "could not serialize the transaction: {what} '{name}' was changed by \
+                         a concurrent transaction"
+                    )));
+                }
+                match w {
+                    Some(v) => next.insert(name.clone(), v.clone()),
+                    None => next.remove(name),
+                };
+            }
+            Ok(())
+        }
+        merge("table", &base.tables, &work.tables, &committed.tables, &mut next.tables)?;
+        merge("materialized view", &base.views, &work.views, &committed.views, &mut next.views)?;
+        next.next_table_id = next.next_table_id.max(work.next_table_id);
+        if next == committed {
+            return Ok(());
+        }
         self.commit(next)
     }
 

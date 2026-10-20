@@ -183,14 +183,19 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   their predicate's zone maps may match (in-memory tables are rebuilt), and
   `ALTER TABLE` (other than `RENAME TO`) rewrites the whole table: there are
   no deletion vectors or in-place updates, so a change touching a few rows
-  of a large file costs a rewrite of that file. `MERGE`, `UPDATE ... FROM`,
-  `DELETE ... USING` and `RETURNING` are not supported; column changes are
-  refused while a materialized view reads the table.
-- **Transactions are single-writer and serializable by queueing.** One
-  transaction is open per engine; through a `Database` it belongs to its
-  session and other sessions' statements wait for it (there is no MVCC
-  concurrency between transactions). No savepoints. `VACUUM` and dropping a
-  lazy stream are refused inside a transaction.
+  of a large file costs a rewrite of that file; `MERGE` rewrites the whole
+  target table. `UPDATE ... FROM`, `DELETE ... USING`, `RETURNING` and
+  `MERGE ... INSERT ROW` are not supported; column changes are refused while
+  a materialized view reads the table.
+- **Transactions isolate by snapshot, at table granularity.** Concurrent
+  sessions' transactions each work on a private snapshot; a commit fails if
+  another commit changed one of the same tables or views since it began,
+  even when the rows do not overlap (no row-level conflict detection), and
+  write skew across different tables is possible (use
+  `IsolationLevel::Serializable` to run transactions one at a time). One
+  transaction per session; `SET TRANSACTION` and `AND CHAIN` are not
+  supported. `VACUUM` is refused while any transaction is open, and dropping
+  a lazy stream inside one.
 - **One writer per catalog.** `_bolt/LOCK` admits a single writing engine;
   a crashed writer leaves the lock file to remove by hand. Snapshots opened
   with `database_snapshot` are read-only.

@@ -31,12 +31,17 @@
 //! sees them, and they disappear when the database closes.
 //!
 //! **Transactions.** A `BEGIN` ... `COMMIT` belongs to the session that ran
-//! `BEGIN`. While it is open, other sessions' statements wait in arrival
-//! order and run once it ends, so every session sees either all of a
-//! transaction's changes or none (serializable execution). A waiting
-//! statement fails after [`Database::set_transaction_wait`] (default 30 s).
-//! When the last handle of a session drops with its transaction still open,
-//! the transaction is rolled back.
+//! `BEGIN`, and every session may have one open. Under the default
+//! [`IsolationLevel::Snapshot`] they run concurrently: each statement sees the
+//! state of its own session's transaction (taken at `BEGIN`, plus its own
+//! changes) or, outside one, the committed state; a commit that changed a
+//! table or view another transaction committed first fails and rolls back
+//! (see the [`engine_txn`](crate::exec::engine_txn) docs). Under
+//! [`IsolationLevel::Serializable`] other sessions' statements wait in
+//! arrival order while a transaction is open, so transactions run one at a
+//! time; a waiting statement fails after [`Database::set_transaction_wait`]
+//! (default 30 s). When the last handle of a session drops with its
+//! transaction still open, the transaction is rolled back.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -72,6 +77,19 @@ impl Job {
             fail: Box::new(|_| {}),
         }
     }
+}
+
+/// How the transactions of different sessions interact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum IsolationLevel {
+    /// Transactions run concurrently, each on its own snapshot; conflicting
+    /// commits fail (first committer wins).
+    #[default]
+    Snapshot,
+    /// While one session's transaction is open, other sessions' statements
+    /// wait.
+    Serializable,
 }
 
 /// Default capacity of the statement queue.
@@ -120,6 +138,8 @@ struct Inner {
     next_session: AtomicU64,
     /// Transaction wait limit in nanoseconds, read by the runtime thread.
     txn_wait_nanos: Arc<AtomicU64>,
+    /// [`IsolationLevel::Serializable`], read by the runtime thread.
+    serializable: Arc<AtomicBool>,
 }
 
 impl Inner {
@@ -182,6 +202,8 @@ impl Database {
         let (ready_tx, ready_rx) = mpsc::channel::<BoltResult<()>>();
         let txn_wait_nanos = Arc::new(AtomicU64::new(DEFAULT_TRANSACTION_WAIT.as_nanos() as u64));
         let wait_limit = Arc::clone(&txn_wait_nanos);
+        let serializable = Arc::new(AtomicBool::new(false));
+        let serial = Arc::clone(&serializable);
         let worker = std::thread::Builder::new()
             .name("bolt-runtime".into())
             .spawn(move || {
@@ -195,7 +217,7 @@ impl Database {
                         return;
                     }
                 };
-                run_jobs(&mut engine, &rx, &wait_limit);
+                run_jobs(&mut engine, &rx, &wait_limit, &serial);
             })
             .map_err(|e| BoltError::Other(format!("starting the runtime thread: {e}")))?;
         match ready_rx.recv() {
@@ -218,6 +240,7 @@ impl Database {
                 counters: Arc::new(Counters::default()),
                 next_session: AtomicU64::new(1),
                 txn_wait_nanos,
+                serializable,
             }),
         })
     }
@@ -238,8 +261,19 @@ impl Database {
         }
     }
 
+    /// How sessions' transactions interact (default
+    /// [`IsolationLevel::Snapshot`]). Takes effect for statements submitted
+    /// afterwards.
+    pub fn set_isolation(&self, level: IsolationLevel) {
+        self.inner.serializable.store(
+            level == IsolationLevel::Serializable,
+            Ordering::Relaxed,
+        );
+    }
+
     /// How long a statement waits for another session's open transaction
-    /// before failing (default [`DEFAULT_TRANSACTION_WAIT`]).
+    /// under [`IsolationLevel::Serializable`] before failing (default
+    /// [`DEFAULT_TRANSACTION_WAIT`]).
     pub fn set_transaction_wait(&self, limit: Duration) {
         self.inner.txn_wait_nanos.store(
             limit.as_nanos().min(u64::MAX as u128) as u64,
@@ -301,18 +335,33 @@ fn may_run(holder: Option<Option<u64>>, job: &Job) -> bool {
     }
 }
 
-/// The runtime loop: run jobs in arrival order, holding back other
-/// sessions' jobs while a transaction is open.
-fn run_jobs(engine: &mut Engine, rx: &mpsc::Receiver<Job>, wait_limit: &AtomicU64) {
+/// The runtime loop: run jobs in arrival order; under
+/// [`IsolationLevel::Serializable`], hold back other sessions' jobs while a
+/// transaction is open.
+fn run_jobs(
+    engine: &mut Engine,
+    rx: &mpsc::Receiver<Job>,
+    wait_limit: &AtomicU64,
+    serializable: &AtomicBool,
+) {
     let mut deferred: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     let mut connected = true;
     let mut last_tick = Instant::now();
     loop {
-        let holder = engine.transaction_holder();
-        // Scheduled materialized views, between statements.
+        // The transaction other sessions must wait for, if any.
+        let holder = if serializable.load(Ordering::Relaxed) {
+            engine.transaction_sessions().first().copied()
+        } else {
+            None
+        };
+        // Scheduled materialized views, between statements, over the
+        // committed state.
         if holder.is_none() && last_tick.elapsed() >= VIEW_TICK && engine.has_scheduled_views() {
             last_tick = Instant::now();
-            if let Err(e) = engine.refresh_due_views() {
+            let r = engine
+                .activate_committed()
+                .and_then(|()| engine.refresh_due_views());
+            if let Err(e) = r {
                 log::warn!("scheduled materialized-view refresh failed: {e}");
             }
         }
@@ -323,9 +372,11 @@ fn run_jobs(engine: &mut Engine, rx: &mpsc::Receiver<Job>, wait_limit: &AtomicU6
             }
         }
         if !connected {
-            if holder.is_some() {
+            if let Some(s) = engine.transaction_sessions().first().copied() {
                 // Every handle is gone: nobody can end the transaction.
-                let _ = engine.rollback_transaction();
+                if engine.activate_session(s).is_err() || engine.rollback_transaction().is_err() {
+                    engine.parked.remove(&s);
+                }
                 continue;
             }
             return;
@@ -369,6 +420,11 @@ fn run_jobs(engine: &mut Engine, rx: &mpsc::Receiver<Job>, wait_limit: &AtomicU6
 }
 
 fn run_job(engine: &mut Engine, job: Job) {
+    // The session's transaction state, or the committed one.
+    if let Err(e) = engine.activate_session(job.session) {
+        (job.fail)(e);
+        return;
+    }
     engine.current_session = job.session;
     (job.run)(engine);
     engine.current_session = None;

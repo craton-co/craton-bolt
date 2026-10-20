@@ -5,6 +5,15 @@ All notable changes to this project will be documented here. The format follows 
 ## [Unreleased]
 
 ### Fixed
+- **An inner join with equi keys and a residual predicate returned a filtered
+  cross product** when the key columns shared a name (`... JOIN s ON t.k =
+  s.k WHERE s.x = 1`, or `ON t.k = s.k AND <non-equi>`): the residual path
+  folded the keys back in as `k = k`, comparing the left column with itself.
+  Such joins now hash-join on the keys and filter the result (checked against
+  DuckDB).
+- **Projection pruning dropped right-side columns read only by a join's
+  residual predicate** under a colliding name (`right.s`), so storage scans
+  skipped them and the predicate compared placeholders.
 - **GPU kernels ignored SQL NULLs of nullable primitive columns.** A NULL
   read as `0`: `WHERE i < 5` kept the rows where `i` is NULL, computed outputs
   (`i + 1`, `CASE WHEN i < 10 ...`) and filtered projections returned values
@@ -125,6 +134,19 @@ All notable changes to this project will be documented here. The format follows 
   PRECEDING` over `DATE` / `TIMESTAMP` keys), checked against DuckDB with
   duplicate and NULL keys in both directions. Window keys may be timestamps
   of any unit.
+- **`MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED [BY SOURCE | BY
+  TARGET] [AND p] THEN UPDATE | DELETE | INSERT`**, over in-memory and
+  catalog tables (one snapshot), with the cardinality check for target rows
+  matched more than once.
+- **Savepoints**: `SAVEPOINT`, `ROLLBACK TO [SAVEPOINT]` (also ends an aborted
+  state), `RELEASE [SAVEPOINT]` (`Engine::savepoint` /
+  `rollback_to_savepoint` / `release_savepoint`).
+- **Concurrent transactions.** Through a `Database` every session may hold a
+  transaction; they run concurrently under snapshot isolation (each on a
+  private snapshot installed per statement, merged at `COMMIT`; a write
+  conflict at table granularity fails the later commit). `IsolationLevel`
+  and `Database::set_isolation` (`Serializable` restores waiting);
+  `Engine::open_transactions`.
 - **`DATE ± integer`** (`d + 7`, `30 + d`, `d - n`) → `DATE`, on the GPU and
   the host evaluator, and **computed `DATE` / `TIMESTAMP` outputs of fused
   projection kernels** (`CASE WHEN ... THEN d1 ELSE d2 END`, temporal
