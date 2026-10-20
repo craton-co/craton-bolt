@@ -476,7 +476,11 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::begin_transaction(&mut self) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::commit_transaction(&mut self) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::in_transaction(&self) -> bool
+pub fn craton_bolt::exec::engine::Engine::open_transactions(&self) -> usize
+pub fn craton_bolt::exec::engine::Engine::release_savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::rollback_to_savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::rollback_transaction(&mut self) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
@@ -849,12 +853,16 @@ pub fn craton_bolt::exec::partition_offsets::compute_partition_offsets(&craton_b
 pub fn craton_bolt::exec::partition_offsets::invalidate_pinned_scratch_on_context_teardown()
 pub fn craton_bolt::exec::partition_offsets::upload_offsets(&[u32]) -> craton_bolt::BoltResult<craton_bolt::cuda::smart_ptrs::GpuVec<u32>>
 pub mod craton_bolt::exec::session
+#[non_exhaustive] pub enum craton_bolt::exec::session::IsolationLevel
+pub craton_bolt::exec::session::IsolationLevel::Serializable
+pub craton_bolt::exec::session::IsolationLevel::Snapshot
 pub struct craton_bolt::exec::session::Database
 impl craton_bolt::exec::session::Database
 pub fn craton_bolt::exec::session::Database::close(&self)
 pub fn craton_bolt::exec::session::Database::open(craton_bolt::exec::engine::EngineBuilder) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
 pub fn craton_bolt::exec::session::Database::open_with_capacity(craton_bolt::exec::engine::EngineBuilder, usize) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
 pub fn craton_bolt::exec::session::Database::session(&self) -> craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Database::set_isolation(&self, craton_bolt::exec::session::IsolationLevel)
 pub fn craton_bolt::exec::session::Database::set_transaction_wait(&self, core::time::Duration)
 pub fn craton_bolt::exec::session::Database::stats(&self) -> craton_bolt::exec::session::DatabaseStats
 pub fn craton_bolt::exec::session::Database::with_engine<R, F>(&self, F) -> craton_bolt::BoltResult<R> where R: core::marker::Send + 'static, F: core::ops::function::FnOnce(&mut craton_bolt::exec::engine::Engine) -> R + core::marker::Send + 'static
@@ -1156,7 +1164,11 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::begin_transaction(&mut self) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::commit_transaction(&mut self) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::in_transaction(&self) -> bool
+pub fn craton_bolt::exec::engine::Engine::open_transactions(&self) -> usize
+pub fn craton_bolt::exec::engine::Engine::release_savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::rollback_to_savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::rollback_transaction(&mut self) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32
@@ -1937,10 +1949,13 @@ pub fn craton_bolt::plan::logical_plan::FormatToken::is_intraday(self) -> bool
 pub enum craton_bolt::plan::logical_plan::FrameBound
 pub craton_bolt::plan::logical_plan::FrameBound::CurrentRow
 pub craton_bolt::plan::logical_plan::FrameBound::Following(u64)
+pub craton_bolt::plan::logical_plan::FrameBound::FollowingValue(craton_bolt::plan::logical_plan::RangeOffset)
 pub craton_bolt::plan::logical_plan::FrameBound::Preceding(u64)
+pub craton_bolt::plan::logical_plan::FrameBound::PrecedingValue(craton_bolt::plan::logical_plan::RangeOffset)
 pub craton_bolt::plan::logical_plan::FrameBound::UnboundedFollowing
 pub craton_bolt::plan::logical_plan::FrameBound::UnboundedPreceding
 pub enum craton_bolt::plan::logical_plan::FrameUnits
+pub craton_bolt::plan::logical_plan::FrameUnits::Groups
 pub craton_bolt::plan::logical_plan::FrameUnits::Range
 pub craton_bolt::plan::logical_plan::FrameUnits::Rows
 pub enum craton_bolt::plan::logical_plan::JoinType
@@ -2026,6 +2041,10 @@ pub craton_bolt::plan::logical_plan::LogicalPlan::Window::partition_by: alloc::v
 pub craton_bolt::plan::logical_plan::LogicalPlan::Window::window_exprs: alloc::vec::Vec<craton_bolt::plan::logical_plan::WindowExpr>
 impl craton_bolt::plan::logical_plan::LogicalPlan
 pub fn craton_bolt::plan::logical_plan::LogicalPlan::schema(&self) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
+pub enum craton_bolt::plan::logical_plan::RangeOffset
+pub craton_bolt::plan::logical_plan::RangeOffset::Interval
+pub craton_bolt::plan::logical_plan::RangeOffset::Interval::micros: i64
+pub craton_bolt::plan::logical_plan::RangeOffset::Number(f64)
 pub enum craton_bolt::plan::logical_plan::ScalarFnKind
 pub craton_bolt::plan::logical_plan::ScalarFnKind::Concat
 pub craton_bolt::plan::logical_plan::ScalarFnKind::Initcap
@@ -3380,6 +3399,9 @@ pub fn craton_bolt::plan::logical_plan::Expr::shl(self, craton_bolt::plan::logic
 pub fn craton_bolt::plan::logical_plan::Expr::shr(self, craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::Expr
 pub fn craton_bolt::plan::logical_plan::Expr::sub(self, craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::Expr
 pub fn craton_bolt::plan::logical_plan::Expr::try_cast(self, craton_bolt::plan::logical_plan::DataType) -> craton_bolt::plan::logical_plan::Expr
+#[non_exhaustive] pub enum craton_bolt::IsolationLevel
+pub craton_bolt::IsolationLevel::Serializable
+pub craton_bolt::IsolationLevel::Snapshot
 pub enum craton_bolt::LogicalPlan
 pub craton_bolt::LogicalPlan::Aggregate
 pub craton_bolt::LogicalPlan::Aggregate::aggregates: alloc::vec::Vec<craton_bolt::plan::logical_plan::AggregateExpr>
@@ -3506,6 +3528,7 @@ pub fn craton_bolt::exec::session::Database::close(&self)
 pub fn craton_bolt::exec::session::Database::open(craton_bolt::exec::engine::EngineBuilder) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
 pub fn craton_bolt::exec::session::Database::open_with_capacity(craton_bolt::exec::engine::EngineBuilder, usize) -> craton_bolt::BoltResult<craton_bolt::exec::session::Database>
 pub fn craton_bolt::exec::session::Database::session(&self) -> craton_bolt::exec::session::Session
+pub fn craton_bolt::exec::session::Database::set_isolation(&self, craton_bolt::exec::session::IsolationLevel)
 pub fn craton_bolt::exec::session::Database::set_transaction_wait(&self, core::time::Duration)
 pub fn craton_bolt::exec::session::Database::stats(&self) -> craton_bolt::exec::session::DatabaseStats
 pub fn craton_bolt::exec::session::Database::with_engine<R, F>(&self, F) -> craton_bolt::BoltResult<R> where R: core::marker::Send + 'static, F: core::ops::function::FnOnce(&mut craton_bolt::exec::engine::Engine) -> R + core::marker::Send + 'static
@@ -3544,7 +3567,11 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::begin_transaction(&mut self) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::commit_transaction(&mut self) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::in_transaction(&self) -> bool
+pub fn craton_bolt::exec::engine::Engine::open_transactions(&self) -> usize
+pub fn craton_bolt::exec::engine::Engine::release_savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::rollback_to_savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::rollback_transaction(&mut self) -> craton_bolt::BoltResult<()>
+pub fn craton_bolt::exec::engine::Engine::savepoint(&mut self, &str) -> craton_bolt::BoltResult<()>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::builder() -> craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::Engine::device(&self) -> i32

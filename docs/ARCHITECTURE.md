@@ -252,6 +252,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/engine_dml.rs` | Row and schema changes: `DELETE`, `UPDATE` and `ALTER TABLE`. |
 | `src/exec/engine_host.rs` | The host execution tier chosen by the cost model (see [`crate::exec::cost`]): row-wise statements and scalar aggregates over one table, evaluated with the host expression evaluator. |
 | `src/exec/engine_join_impl.rs` | Reserved sibling module for the join execution / dispatch methods of [`crate::exec::engine::Engine`]. |
+| `src/exec/engine_merge.rs` | `MERGE`: update, delete and insert a table's rows from a source relation. |
 | `src/exec/engine_ooc.rs` | Out-of-core statement execution. |
 | `src/exec/engine_provider.rs` | Planner-facing adapters over the engine's registered tables, lifted out of `exec::engine` (pure reorganization; no behavior change). |
 | `src/exec/engine_query.rs` | The SQL / DataFrame query front door of [`Engine`]: `sql`, `explain_sql`, `run_logical_plan` and the internal `run_subplan`, plus the single [`QueryCompiler`] pipeline every one of them shares. |
@@ -259,7 +260,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/engine_streaming_impl.rs` | Streaming / morsel-driven execution methods for [`Engine`]. |
 | `src/exec/engine_string_impl.rs` | String-projection execution methods for [`Engine`]. |
 | `src/exec/engine_support.rs` | Standalone free helper functions lifted out of `exec::engine` (pure reorganization; no behavior change). |
-| `src/exec/engine_txn.rs` | Multi-statement transactions: `BEGIN` / `COMMIT` / `ROLLBACK`. |
+| `src/exec/engine_txn.rs` | Multi-statement transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`. |
 | `src/exec/engine_views.rs` | Materialized views. |
 | `src/exec/expr_agg.rs` | Host-side expression evaluator for aggregate inputs. |
 | `src/exec/extended_agg.rs` | Host-side aggregate execution for the dtypes the GPU reduction kernels don't cover: `Bool` (any aggregate) and `Utf8` (COUNT/MIN/MAX only). |

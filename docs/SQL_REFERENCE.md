@@ -727,23 +727,46 @@ changes tables returns one row, `rows_affected`.
 | `COMPACT TABLE t [ORDER BY (col, ...)]`, `VACUUM [KEEP n]` | Catalog tables only (`EngineBuilder::database`). `ORDER BY` rewrites the table sorted on a clustering key (recorded for later compactions), tightening its zone maps |
 | `DELETE FROM t [AS a] [WHERE ...]` | Rows whose predicate is TRUE are removed (NULL keeps the row). A catalog table rewrites only the files whose zone maps may match; subqueries see the table as it was |
 | `UPDATE t [AS a] SET c = expr, ... [WHERE ...]` | New values are cast to the column types; `NOT NULL` is enforced. No `FROM`, `RETURNING`, or `SET (a, b) = ...` |
+| `MERGE INTO t [AS a] USING s [AS b] ON cond WHEN ...` | See below |
 | `ALTER TABLE [IF EXISTS] t ADD [COLUMN] [IF NOT EXISTS] c type [NOT NULL] [DEFAULT expr]` | Existing rows get the default (or NULL; `NOT NULL` needs a default) |
 | `ALTER TABLE t DROP [COLUMN] [IF EXISTS] c`, `RENAME [COLUMN] a TO b`, `ALTER [COLUMN] c [SET DATA] TYPE type \| SET NOT NULL \| DROP NOT NULL` | Rewrites the table; refused while a materialized view reads it |
 | `ALTER TABLE t RENAME TO u` | Refused while a materialized view reads it |
 | `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` | See below |
+| `SAVEPOINT s`, `ROLLBACK TO [SAVEPOINT] s`, `RELEASE [SAVEPOINT] s` | Inside a transaction |
 
 With a catalog attached, tables (other than `TEMP`) and materialized views
 are durable and every change is a new catalog snapshot.
 
+**MERGE.** `MERGE INTO t USING s ON cond` followed by clauses, each
+`WHEN MATCHED [AND p] THEN UPDATE SET c = e, ... | DELETE`,
+`WHEN NOT MATCHED [BY TARGET] [AND p] THEN INSERT [(cols)] VALUES (...)`, or
+`WHEN NOT MATCHED BY SOURCE [AND p] THEN UPDATE SET ... | DELETE`. Each row
+takes the first clause of its group whose condition is TRUE; a target row
+matched by more than one source row is an error when a clause applies to it.
+The source may be a table or a derived table. Returns the rows inserted,
+updated and deleted; the target is rewritten in one step (one catalog
+snapshot).
+
 **Transactions.** Between `BEGIN` and `COMMIT` statements see their own
 changes; a catalog publishes them all as **one** snapshot at `COMMIT`, and
 `ROLLBACK` restores the catalog and in-memory tables, views and table
-registrations to their state at `BEGIN`. A failing statement aborts the
-transaction: later statements fail until `ROLLBACK` (a `COMMIT` then rolls
-back and reports it). `VACUUM` and dropping a lazy stream table are refused
-inside a transaction; savepoints, `SET TRANSACTION` and `AND CHAIN` are not
-supported. Through a `Database`, a transaction belongs to the session that
-began it and other sessions' statements wait for it to end.
+registrations to their state at `BEGIN`. `SAVEPOINT s` remembers the
+transaction's state; `ROLLBACK TO SAVEPOINT s` returns to it (keeping `s`,
+releasing later savepoints) and `RELEASE SAVEPOINT s` forgets it. A failing
+statement aborts the transaction: later statements fail until `ROLLBACK` or
+`ROLLBACK TO SAVEPOINT` (a `COMMIT` then rolls back and reports it).
+`VACUUM` is refused while any transaction is open, and dropping a lazy
+stream table inside one; `SET TRANSACTION` and `AND CHAIN` are not
+supported.
+
+Through a `Database`, each session may hold a transaction, and they run
+concurrently under **snapshot isolation**: a transaction sees the committed
+state as of its `BEGIN` plus its own changes, never another transaction's
+uncommitted changes or later commits. `COMMIT` merges its changes into what
+has been committed since; if a commit since its `BEGIN` changed a table or
+view it also changed, the commit fails ("could not serialize") and the
+transaction rolls back. `Database::set_isolation(IsolationLevel::Serializable)`
+makes other sessions' statements wait while a transaction is open instead.
 
 `EXPLAIN` output (`Engine::explain_sql`) ends with a `Storage scans:`
 section — per storage table, the chunks and columns the statement would read
@@ -808,7 +831,7 @@ These type-check but the physical layer rejects them at the GPU lowering boundar
 - `INTO`, table-valued functions **other than `generate_series`** (`unnest`, etc.), `CONNECT BY`, `CLUSTER / DISTRIBUTE / SORT BY`, `SETTINGS`, and the trailing `FORMAT` output clause (distinct from the supported `CAST(... FORMAT '<pattern>')` expression — see the CASE / CAST section). (`FETCH` and T-SQL `TOP` now fold into `LIMIT`, `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, `PREWHERE` is folded into `WHERE`, and `generate_series(...)` and `VALUES` are supported row sources — see the [generate_series](#generate_series) and [VALUES](#values-as-a-row-source) sections. Residuals: `FETCH` / `TOP` with `PERCENT` or `WITH TIES`, and a `TOP` combined with `LIMIT` / `FETCH`.)
 - (`GROUP BY ALL` / `ROLLUP` / `CUBE` / `GROUPING SETS` / `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` and the `GROUPING()` / `GROUPING_ID()` indicators are now **supported** — see [GROUP BY](#group-by). Residuals: more than 12 grouping columns, and `GROUPING()` without a grouping construct.)
 - `SELECT AS STRUCT/VALUE`.
-- `MERGE`, plain (non-materialized) `CREATE VIEW`, savepoints, and `DELETE ... USING` / `UPDATE ... FROM` / `RETURNING`. (`UPDATE`, `DELETE`, `ALTER TABLE` and `BEGIN` / `COMMIT` / `ROLLBACK` are **supported** — see [Statements](#statements).)
+- Plain (non-materialized) `CREATE VIEW`, `DELETE ... USING` / `UPDATE ... FROM` / `RETURNING`. (`UPDATE`, `DELETE`, `MERGE`, `ALTER TABLE`, `BEGIN` / `COMMIT` / `ROLLBACK` and savepoints are **supported** — see [Statements](#statements).)
 - `SELECT` without a `FROM` clause (`SELECT 1`); select from `(VALUES (1)) AS v(x)` instead.
 
 ### Validity propagation

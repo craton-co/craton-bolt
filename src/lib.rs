@@ -74,7 +74,9 @@ pub use exec::engine_views::{RefreshMode, ViewStatus};
 pub use exec::memory::{
     MemoryConsumer, MemoryGovernor, MemoryKind, MemoryReservation, MemoryStats,
 };
-pub use exec::session::{Database, DatabaseStats, PendingResult, Session, SessionSettings};
+pub use exec::session::{
+    Database, DatabaseStats, IsolationLevel, PendingResult, Session, SessionSettings,
+};
 pub use exec::streaming::{BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource};
 pub use exec::{Engine, EngineBuilder, QueryHandle};
 pub use plan::{DataFrame, ExecutionTier, Expr, LogicalPlan, MemoryBehavior, PhysicalPlan};

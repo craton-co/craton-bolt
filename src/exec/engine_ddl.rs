@@ -237,8 +237,9 @@ impl Engine {
     /// | `COMPACT TABLE t` / `VACUUM [KEEP n]` | catalog tables only |
     /// | `CREATE [OR REPLACE] MATERIALIZED VIEW v [WITH (refresh = 'on_commit')] AS SELECT ...`, `REFRESH MATERIALIZED VIEW v`, `DROP MATERIALIZED VIEW v` | see [`Engine::view_status`] |
     /// | `DELETE FROM t [WHERE ...]` / `UPDATE t SET c = expr, ... [WHERE ...]` | rewrites the affected files |
+    /// | `MERGE INTO t USING s ON c WHEN [NOT] MATCHED [BY SOURCE] [AND p] THEN UPDATE SET ... \| DELETE \| INSERT [(cols)] VALUES (...)` | see [`engine_merge`](crate::exec::engine_merge) |
     /// | `ALTER TABLE t ADD [COLUMN] c type [DEFAULT e]`, `DROP [COLUMN] c`, `RENAME [COLUMN] a TO b`, `ALTER [COLUMN] c TYPE t \| SET NOT NULL \| DROP NOT NULL`, `RENAME TO u` | |
-    /// | `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` | see [`Engine::begin_transaction`] |
+    /// | `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK`, `SAVEPOINT s`, `ROLLBACK TO [SAVEPOINT] s`, `RELEASE [SAVEPOINT] s` | see [`Engine::begin_transaction`] |
     ///
     /// Without a file-format option, `COPY` infers it from the file
     /// extension (`.csv` → CSV with a header, anything else → Parquet).
@@ -275,6 +276,8 @@ impl Engine {
                 Statement::StartTransaction { .. }
                     | Statement::Commit { .. }
                     | Statement::Rollback { .. }
+                    | Statement::Savepoint { .. }
+                    | Statement::ReleaseSavepoint { .. }
             );
             if control {
                 last = Some(self.count_statement(|e| e.transaction_statement(stmt))?);
@@ -306,7 +309,7 @@ impl Engine {
         Ok(last.expect("at least one statement"))
     }
 
-    /// `BEGIN` / `COMMIT` / `ROLLBACK`.
+    /// `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints.
     fn transaction_statement(&mut self, stmt: Statement) -> BoltResult<QueryHandle> {
         match stmt {
             Statement::StartTransaction { modifier: None, .. } => self.begin_transaction()?,
@@ -315,6 +318,12 @@ impl Engine {
                 chain: false,
                 savepoint: None,
             } => self.rollback_transaction()?,
+            Statement::Rollback {
+                chain: false,
+                savepoint: Some(name),
+            } => self.rollback_to_savepoint(&name.value)?,
+            Statement::Savepoint { name } => self.savepoint(&name.value)?,
+            Statement::ReleaseSavepoint { name } => self.release_savepoint(&name.value)?,
             other => {
                 return Err(BoltError::Sql(format!(
                     "transaction statement not supported: {other}"
@@ -545,6 +554,13 @@ impl Engine {
                 Ok(status(0))
             }
             Statement::Delete(d) => self.execute_delete(d).map(status),
+            Statement::Merge {
+                table,
+                source,
+                on,
+                clauses,
+                ..
+            } => self.execute_merge(table, source, *on, clauses).map(status),
             Statement::Update {
                 table,
                 assignments,
@@ -1036,6 +1052,13 @@ impl Engine {
     /// every data file no remaining snapshot references. Returns the number
     /// of files deleted.
     pub fn vacuum(&mut self, keep_snapshots: usize) -> BoltResult<usize> {
+        // An open transaction's files are not referenced by any published
+        // snapshot yet.
+        if self.open_transactions() > 0 {
+            return Err(BoltError::Plan(
+                "VACUUM cannot run while a transaction is open".into(),
+            ));
+        }
         #[cfg(feature = "storage")]
         if let Some(cat) = self.catalog.as_mut() {
             let r = cat.vacuum(keep_snapshots)?;

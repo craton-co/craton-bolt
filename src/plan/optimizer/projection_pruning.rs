@@ -277,16 +277,34 @@ fn prune(plan: LogicalPlan, required: &BTreeSet<String>) -> LogicalPlan {
                 }
             }
 
-            // Columns the join itself consumes are referenced in the *child*
-            // (bare-named) schemas via `on` / `filter`. Attribute each to
-            // whichever side actually owns it.
+            // The residual `filter` is evaluated over the joined row, so it
+            // names columns as the combined schema does (`right.s` for a right
+            // `s` that collides with a left one): attribute those like the
+            // parent's names. Bare names the combined schema lacks fall
+            // through to the child attribution below.
             let mut join_cols = BTreeSet::new();
+            if let Some(f) = &filter {
+                let mut filter_cols = BTreeSet::new();
+                add_expr_cols(f, &mut filter_cols);
+                for c in filter_cols {
+                    match combined.fields.iter().position(|f| f.name == c) {
+                        Some(idx) if idx < nleft => {
+                            left_req.insert(c);
+                        }
+                        Some(idx) => {
+                            right_req.insert(rschema.fields[idx - nleft].name.clone());
+                        }
+                        None => {
+                            join_cols.insert(c);
+                        }
+                    }
+                }
+            }
+            // The `on` pairs name columns of their own (bare-named) child
+            // schemas. Attribute each to whichever side actually owns it.
             for (l, r) in &on {
                 add_expr_cols(l, &mut join_cols);
                 add_expr_cols(r, &mut join_cols);
-            }
-            if let Some(f) = &filter {
-                add_expr_cols(f, &mut join_cols);
             }
             for c in &join_cols {
                 if lschema.fields.iter().any(|f| &f.name == c) {
@@ -595,6 +613,57 @@ mod tests {
         let bnames: Vec<_> = before.fields.iter().map(|f| f.name.clone()).collect();
         let anames: Vec<_> = after.fields.iter().map(|f| f.name.clone()).collect();
         assert_eq!(bnames, anames, "output schema must be preserved");
+    }
+
+    /// A residual join filter names a colliding right column as the joined
+    /// row does (`right.a`); pruning must keep `a` in the right scan even
+    /// when the parent does not read it (it used to be dropped, so storage
+    /// scans skipped the column and the filter compared placeholders).
+    #[test]
+    fn join_filter_keeps_renamed_right_column() {
+        use crate::plan::logical_plan::JoinType;
+        let scan = |t: &str| LogicalPlan::Scan {
+            table: t.into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("a", DataType::Int64, false),
+                Field::new("x", DataType::Int64, false),
+            ]),
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(scan("t1")),
+                right: Box::new(scan("t2")),
+                join_type: JoinType::Inner,
+                on: vec![(col("k"), col("k"))],
+                filter: Some(col("right.a").gt(crate::plan::lit(0_i64))),
+            }),
+            exprs: vec![col("x")],
+        };
+        let out = ProjectionPruning.rewrite(plan).expect("prune");
+        let LogicalPlan::Project { input, .. } = &out else {
+            panic!("expected Project, got {out:?}")
+        };
+        let LogicalPlan::Join { left, right, .. } = input.as_ref() else {
+            panic!("expected Join, got {input:?}")
+        };
+        let proj = |p: &LogicalPlan| match p {
+            LogicalPlan::Scan { projection, .. } => projection.clone(),
+            other => panic!("expected Scan, got {other:?}"),
+        };
+        let right_proj = proj(right);
+        assert!(
+            right_proj.as_ref().is_none_or(|p| p.contains(&"a".to_string())),
+            "right scan must read `a`; got {right_proj:?}"
+        );
+        // The left `a` anchors the `right.a` rename.
+        let left_proj = proj(left);
+        assert!(
+            left_proj.as_ref().is_none_or(|p| p.contains(&"a".to_string())),
+            "left scan must keep the rename anchor `a`; got {left_proj:?}"
+        );
+        out.schema().expect("pruned plan type-checks");
     }
 
     #[test]

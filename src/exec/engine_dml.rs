@@ -58,11 +58,11 @@ fn target_of(t: &TableWithJoins) -> BoltResult<(String, String)> {
     }
 }
 
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn concat(schema: &SchemaRef, batches: &[RecordBatch]) -> BoltResult<RecordBatch> {
+pub(crate) fn concat(schema: &SchemaRef, batches: &[RecordBatch]) -> BoltResult<RecordBatch> {
     let nonempty: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
     match nonempty.as_slice() {
         [] => Ok(RecordBatch::new_empty(Arc::clone(schema))),
@@ -169,7 +169,7 @@ impl Engine {
     }
 
     /// Schema of table `name` if statements may change its rows.
-    fn writable_schema(&self, name: &str) -> BoltResult<SchemaRef> {
+    pub(crate) fn writable_schema(&self, name: &str) -> BoltResult<SchemaRef> {
         if self.view_exists(name) {
             return Err(BoltError::Plan(format!(
                 "'{name}' is a materialized view; it changes only by REFRESH"
@@ -354,7 +354,7 @@ impl Engine {
     }
 
     /// Every row of a writable table, as one batch.
-    fn full_rows(&self, name: &str, schema: &SchemaRef) -> BoltResult<RecordBatch> {
+    pub(crate) fn full_rows(&self, name: &str, schema: &SchemaRef) -> BoltResult<RecordBatch> {
         #[cfg(feature = "storage")]
         if let Some(cat) = self.catalog.as_ref() {
             if cat.table(name).is_some() {
