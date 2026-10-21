@@ -734,8 +734,10 @@ fn range_offsets_over_dates_and_timestamps() {
     };
     let two_days = vec![1, 6, 6, 9, 5, 6, 7];
     assert_eq!(
-        run("SUM(v) OVER (ORDER BY d NULLS LAST RANGE BETWEEN INTERVAL '2 days' PRECEDING \
-             AND CURRENT ROW)"),
+        run(
+            "SUM(v) OVER (ORDER BY d NULLS LAST RANGE BETWEEN INTERVAL '2 days' PRECEDING \
+             AND CURRENT ROW)"
+        ),
         two_days
     );
     assert_eq!(
@@ -744,13 +746,17 @@ fn range_offsets_over_dates_and_timestamps() {
     );
     // Hours 0, 25, 26, 75, 148, 245, NULL.
     assert_eq!(
-        run("COUNT(v) OVER (ORDER BY ts NULLS LAST RANGE BETWEEN INTERVAL '50' HOUR PRECEDING \
-             AND CURRENT ROW)"),
+        run(
+            "COUNT(v) OVER (ORDER BY ts NULLS LAST RANGE BETWEEN INTERVAL '50' HOUR PRECEDING \
+             AND CURRENT ROW)"
+        ),
         vec![1, 2, 3, 3, 1, 1, 1]
     );
     assert_eq!(
-        run("SUM(v) OVER (ORDER BY ts DESC NULLS LAST RANGE BETWEEN INTERVAL '1 day' \
-             PRECEDING AND INTERVAL '2 hours' FOLLOWING)"),
+        run(
+            "SUM(v) OVER (ORDER BY ts DESC NULLS LAST RANGE BETWEEN INTERVAL '1 day' \
+             PRECEDING AND INTERVAL '2 hours' FOLLOWING)"
+        ),
         // DESC: preceding = later times. 0h: [−2h, 24h] -> {0}; 25h: [23h, 49h]
         // -> {25, 26}; 26h: [24h, 50h] -> {25, 26}; ...
         vec![1, 5, 5, 4, 5, 6, 7]

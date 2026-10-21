@@ -951,7 +951,9 @@ fn alias_asof_right_relation(dialect: &GenericDialect, sql: &str) -> Option<Stri
     let mut inserts = Vec::new();
     for (n, &i) in significant.iter().enumerate() {
         if !is_kw(&tokens[i], Keyword::ASOF)
-            || !significant.get(n + 1).is_some_and(|&j| is_kw(&tokens[j], Keyword::JOIN))
+            || !significant
+                .get(n + 1)
+                .is_some_and(|&j| is_kw(&tokens[j], Keyword::JOIN))
         {
             continue;
         }

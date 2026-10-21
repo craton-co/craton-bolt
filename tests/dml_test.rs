@@ -548,7 +548,8 @@ fn merge(e: &mut Engine) {
     );
     assert_eq!(n, 0);
     // A target row matched twice is an error; the table is unchanged.
-    e.execute_sql("INSERT INTO src VALUES (2, 'dup', 1)").unwrap();
+    e.execute_sql("INSERT INTO src VALUES (2, 'dup', 1)")
+        .unwrap();
     let err = e
         .execute_sql("MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN UPDATE SET v = 0")
         .unwrap_err()
@@ -569,7 +570,9 @@ fn merge(e: &mut Engine) {
     assert_eq!(all_rows(e)[1].2, Some(202));
     // Malformed clauses.
     assert!(e
-        .execute_sql("MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN INSERT VALUES (1, 'x', 1)")
+        .execute_sql(
+            "MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN INSERT VALUES (1, 'x', 1)"
+        )
         .is_err());
     assert!(e
         .execute_sql("MERGE INTO t USING src ON t.a = src.a WHEN MATCHED THEN UPDATE SET nope = 1")

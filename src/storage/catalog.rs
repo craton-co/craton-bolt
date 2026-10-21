@@ -755,7 +755,8 @@ impl Catalog {
             committed: &BTreeMap<String, V>,
             next: &mut BTreeMap<String, V>,
         ) -> BoltResult<()> {
-            let names: std::collections::BTreeSet<&String> = base.keys().chain(work.keys()).collect();
+            let names: std::collections::BTreeSet<&String> =
+                base.keys().chain(work.keys()).collect();
             for name in names {
                 let (b, w) = (base.get(name), work.get(name));
                 if b == w {
@@ -774,8 +775,20 @@ impl Catalog {
             }
             Ok(())
         }
-        merge("table", &base.tables, &work.tables, &committed.tables, &mut next.tables)?;
-        merge("materialized view", &base.views, &work.views, &committed.views, &mut next.views)?;
+        merge(
+            "table",
+            &base.tables,
+            &work.tables,
+            &committed.tables,
+            &mut next.tables,
+        )?;
+        merge(
+            "materialized view",
+            &base.views,
+            &work.views,
+            &committed.views,
+            &mut next.views,
+        )?;
         next.next_table_id = next.next_table_id.max(work.next_table_id);
         if next == committed {
             return Ok(());

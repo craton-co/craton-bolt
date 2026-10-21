@@ -601,12 +601,7 @@ impl RangeKey {
     /// Frame start / end positions of each position of the partition `rows`
     /// (only the value-offset bounds are meaningful). A NULL key's frame is
     /// its peer group.
-    fn positions(
-        &self,
-        rows: &[usize],
-        peer_lo: &[i64],
-        peer_hi: &[i64],
-    ) -> (Vec<i64>, Vec<i64>) {
+    fn positions(&self, rows: &[usize], peer_lo: &[i64], peer_hi: &[i64]) -> (Vec<i64>, Vec<i64>) {
         fn run<T: Copy + PartialOrd + std::ops::Add<Output = T>>(
             vals: Vec<Option<T>>,
             start: Option<T>,
@@ -616,8 +611,14 @@ impl RangeKey {
         ) -> (Vec<i64>, Vec<i64>) {
             // NULLs sort together at one end: the keyed rows are contiguous.
             let first = vals.iter().position(Option::is_some).unwrap_or(vals.len());
-            let last = vals.iter().rposition(Option::is_some).map_or(first, |i| i + 1);
-            let seg: Vec<T> = vals[first..last].iter().map(|v| v.expect("keyed")).collect();
+            let last = vals
+                .iter()
+                .rposition(Option::is_some)
+                .map_or(first, |i| i + 1);
+            let seg: Vec<T> = vals[first..last]
+                .iter()
+                .map(|v| v.expect("keyed"))
+                .collect();
             let mut lo = vec![0i64; vals.len()];
             let mut hi = vec![0i64; vals.len()];
             for (p, v) in vals.iter().enumerate() {

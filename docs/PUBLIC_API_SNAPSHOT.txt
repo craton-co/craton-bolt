@@ -1690,6 +1690,7 @@ pub fn craton_bolt::jit::ptx_cache_stats() -> (usize, usize, usize)
 pub fn craton_bolt::jit::set_disk_ptx_cache_dir(core::option::Option<std::path::PathBuf>)
 pub mod craton_bolt::metrics
 #[non_exhaustive] #[repr(usize)] pub enum craton_bolt::metrics::Counter
+pub craton_bolt::metrics::Counter::DevicePipelines = 12
 pub craton_bolt::metrics::Counter::GpuLaunchesTotal = 4
 pub craton_bolt::metrics::Counter::HostFallbacksTotal = 5
 pub craton_bolt::metrics::Counter::HostTierQueries = 10
@@ -1703,7 +1704,7 @@ pub craton_bolt::metrics::Counter::StorageChunksPruned = 7
 pub craton_bolt::metrics::Counter::StorageChunksRead = 6
 pub craton_bolt::metrics::Counter::ViewRewrites = 11
 impl craton_bolt::metrics::Counter
-pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 12]
+pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 13]
 pub const fn craton_bolt::metrics::Counter::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Counter::help(self) -> &'static str
 #[non_exhaustive] #[repr(usize)] pub enum craton_bolt::metrics::Phase
@@ -3309,6 +3310,7 @@ pub fn craton_bolt::BoltError::span(&self) -> core::option::Option<core::ops::ra
 impl core::convert::From<sqlparser::parser::ParserError> for craton_bolt::BoltError
 pub fn craton_bolt::BoltError::from(sqlparser::parser::ParserError) -> Self
 #[non_exhaustive] #[repr(usize)] pub enum craton_bolt::Counter
+pub craton_bolt::Counter::DevicePipelines = 12
 pub craton_bolt::Counter::GpuLaunchesTotal = 4
 pub craton_bolt::Counter::HostFallbacksTotal = 5
 pub craton_bolt::Counter::HostTierQueries = 10
@@ -3322,7 +3324,7 @@ pub craton_bolt::Counter::StorageChunksPruned = 7
 pub craton_bolt::Counter::StorageChunksRead = 6
 pub craton_bolt::Counter::ViewRewrites = 11
 impl craton_bolt::metrics::Counter
-pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 12]
+pub const craton_bolt::metrics::Counter::ALL: [craton_bolt::metrics::Counter; 13]
 pub const fn craton_bolt::metrics::Counter::as_str(self) -> &'static str
 pub const fn craton_bolt::metrics::Counter::help(self) -> &'static str
 pub enum craton_bolt::ExecutionTier
