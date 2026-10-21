@@ -134,6 +134,17 @@ All notable changes to this project will be documented here. The format follows 
   PRECEDING` over `DATE` / `TIMESTAMP` keys), checked against DuckDB with
   duplicate and NULL keys in both directions. Window keys may be timestamps
   of any unit.
+- **Device-resident operator pipelines** (`exec::device_pipeline`,
+  `Engine::execute_device`): an inner equi-join on one integer key over
+  fused projections or scans runs its hash build / probe on the device key
+  columns and gathers every output column on the device by the matched
+  indices, then hands the device table to the consumer — an aggregate over
+  the join reads it in place, `COUNT(*)` reads its row count, and a join
+  returned to the caller downloads only its output. Duplicate keys on
+  either side are supported. On an RTX 2060: join → `COUNT(*)` 10–22×,
+  joined rows 2×, join → aggregate 1.1–1.9× faster than the host-batch
+  path. `BOLT_DEVICE_PIPELINE=0` turns it off; `Counter::DevicePipelines`
+  counts it.
 - **`MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED [BY SOURCE | BY
   TARGET] [AND p] THEN UPDATE | DELETE | INSERT`**, over in-memory and
   catalog tables (one snapshot), with the cardinality check for target rows

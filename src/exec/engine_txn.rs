@@ -68,7 +68,13 @@ pub(crate) struct Transaction {
 }
 
 /// What identifies a view's content for conflict detection.
-fn view_key(v: &ViewDef) -> (&str, Option<std::time::SystemTime>, &std::collections::BTreeMap<String, u64>) {
+fn view_key(
+    v: &ViewDef,
+) -> (
+    &str,
+    Option<std::time::SystemTime>,
+    &std::collections::BTreeMap<String, u64>,
+) {
     (v.sql.as_str(), v.refreshed_at, &v.base_versions)
 }
 

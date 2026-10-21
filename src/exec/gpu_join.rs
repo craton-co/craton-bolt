@@ -1884,6 +1884,87 @@ pub fn hash_join_indices_on_gpu_with_shape(
     })
 }
 
+/// [`hash_join_indices_on_gpu_with_shape`] over keys that are already on the
+/// device (one `i64` per row, as `encode_keys_for_shape` would produce for a
+/// single integer key), leaving the matched pairs on the device: the join of
+/// a device-resident operator pipeline (`crate::exec::device_pipeline`).
+/// Duplicate keys on either side are fine (collision-list build). The keys
+/// must hold no NULLs and no `i64::MIN` (the empty-slot sentinel); fan-out
+/// beyond the output buffer returns [`BoltError::GpuCapacity`].
+pub(crate) fn hash_join_indices_on_gpu_resident_keys(
+    build_keys_dev: &GpuVec<i64>,
+    n_build: usize,
+    probe_keys_dev: &GpuVec<i64>,
+    n_probe: usize,
+) -> BoltResult<GpuJoinIndicesResident> {
+    if n_build == 0 || n_probe == 0 {
+        return Ok(GpuJoinIndicesResident {
+            build_idx: GpuVec::<u32>::zeros(0)?,
+            probe_idx: GpuVec::<u32>::zeros(0)?,
+            n_matches: 0,
+        });
+    }
+    let n_build_u32 = n_rows_to_u32(n_build)?;
+    let n_probe_u32 = n_rows_to_u32(n_probe)?;
+    let cap = compute_capacity(n_build)?;
+    let cap_u32 = u32::try_from(cap)
+        .map_err(|_| BoltError::Other(format!("gpu_join: cap {cap} doesn't fit in u32")))?;
+    let stream = CudaStream::null_or_default();
+    let keys_init = get_sentinel_i64_min_vec(cap);
+    let mut keys_table_dev = upload_primitive_values_async::<i64>(keys_init, &stream)?;
+    let mut row_idx_table_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut head_dev = alloc_u32_max_table_async(cap, &stream)?;
+    let mut next_idx_dev = alloc_u32_max_table_async(n_build, &stream)?;
+    let out_capacity_usize = n_build
+        .checked_add(n_probe)
+        .and_then(|x| x.checked_mul(2))
+        .ok_or_else(|| BoltError::Other("gpu_join: output buffer size overflow".into()))?;
+    let out_capacity_u32 = u32::try_from(out_capacity_usize).map_err(|_| {
+        BoltError::GpuCapacity(format!(
+            "gpu_join: out_capacity {out_capacity_usize} doesn't fit in u32"
+        ))
+    })?;
+    let mut out_probe_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_build_idx_dev = GpuVec::<u32>::zeros(out_capacity_usize)?;
+    let mut out_counter_dev = GpuVec::<u64>::zeros(1)?;
+    launch_build_collision_kernel(
+        build_keys_dev,
+        &mut keys_table_dev,
+        &mut row_idx_table_dev,
+        &mut head_dev,
+        &mut next_idx_dev,
+        n_build_u32,
+        cap_u32,
+        &stream,
+    )?;
+    let n_matches_raw = launch_probe_collision_kernel(
+        probe_keys_dev,
+        &keys_table_dev,
+        &head_dev,
+        &next_idx_dev,
+        &mut out_probe_idx_dev,
+        &mut out_build_idx_dev,
+        &mut out_counter_dev,
+        None,
+        n_probe_u32,
+        n_build_u32,
+        cap_u32,
+        out_capacity_u32,
+        &stream,
+    )?;
+    if n_matches_raw > out_capacity_u32 as u64 {
+        return Err(BoltError::GpuCapacity(format!(
+            "gpu_join: probe kernel claimed {n_matches_raw} matches but the output \
+             buffer holds {out_capacity_u32}"
+        )));
+    }
+    Ok(GpuJoinIndicesResident {
+        build_idx: out_build_idx_dev,
+        probe_idx: out_probe_idx_dev,
+        n_matches: n_matches_raw as usize,
+    })
+}
+
 /// Stage-2 OUTER orchestration. Returns `(build, probe)` index streams that
 /// may contain `None` slots where one side is NULL-padded. The caller passes
 /// `emit_unmatched_probe` for LEFT/FULL semantics and `emit_unmatched_build`

@@ -47,6 +47,7 @@ PTX-cache directory, are not configuration knobs and are omitted.)
 | `BOLT_POOL_WATCH_LOW_WATER_FRAC` | 0.10                 | `(0, 1)`    | Watcher proactive-evict threshold (free/total)  |
 | `BOLT_GPU_JOIN_TABLE_CAP_MB`     | driver-detected      | `64..=4096` | Override hash-table byte cap (MiB)              |
 | `BOLT_GPU_JOIN_STREAMING_INTERN` | off                  | `1`         | Streaming Utf8 intern for high-cardinality keys |
+| `BOLT_DEVICE_PIPELINE`           | on                   | `0`         | Turn off device-resident join pipelines         |
 | `BOLT_PTX_CACHE_DIR`             | unset (disabled)     | dir path    | Opt-in disk-backed PTX cache root               |
 | `BOLT_GPU_SORT`                  | planner heuristic    | `1` / `0`   | Force a GPU attempt / force host for `ORDER BY` |
 | `BOLT_GPU_DISTINCT`              | on                   | `0`/`false`/`no` | Force the single-primitive-key `DISTINCT` dedup to its host mirror |
@@ -173,6 +174,16 @@ PTX-cache directory, are not configuration knobs and are omitted.)
   layout; the AoS path divides by 16 instead.
 - **Source**: `src/exec/gpu_join.rs::parse_env_cap`
   (env var name constant: `CAP_ENV_VAR`, line 241).
+
+### `BOLT_DEVICE_PIPELINE`
+- **Default**: on
+- **Type**: `0` turns it off; anything else (or unset) leaves it on
+- **What**: Inner equi-joins on one integer key over projections / scans
+  run on the device and hand their columns to the aggregate, row count or
+  result download without a host round trip (`exec::device_pipeline`).
+  Read per statement.
+- **When**: Set `0` to compare against (or fall back to) the host-batch
+  operator path.
 
 ### `BOLT_GPU_JOIN_STREAMING_INTERN`
 - **Default**: off

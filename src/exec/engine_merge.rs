@@ -26,8 +26,7 @@ use arrow_array::types::Int64Type;
 use arrow_array::{new_null_array, Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use sqlparser::ast::{
-    AssignmentTarget, Expr, MergeAction, MergeClause, MergeClauseKind, MergeInsertKind,
-    TableFactor,
+    AssignmentTarget, Expr, MergeAction, MergeClause, MergeClauseKind, MergeInsertKind, TableFactor,
 };
 
 use crate::error::{BoltError, BoltResult};
@@ -87,7 +86,8 @@ impl Clauses {
                         let AssignmentTarget::ColumnName(name) = a.target else {
                             return Err(err("UPDATE SET (a, b) = ... is not supported"));
                         };
-                        let col = column(&name.0.last().map(|i| i.value.clone()).unwrap_or_default())?;
+                        let col =
+                            column(&name.0.last().map(|i| i.value.clone()).unwrap_or_default())?;
                         if set.iter().any(|(c, _)| *c == col) {
                             return Err(err(format!("column '{col}' is assigned more than once")));
                         }
@@ -117,7 +117,12 @@ impl Clauses {
                             row.len()
                         )));
                     }
-                    Action::Insert(names.into_iter().zip(row.iter().map(Expr::to_string)).collect())
+                    Action::Insert(
+                        names
+                            .into_iter()
+                            .zip(row.iter().map(Expr::to_string))
+                            .collect(),
+                    )
                 }
             };
             let clause = Clause {
@@ -215,7 +220,9 @@ impl Chosen {
             .ok_or_else(|| err("internal: row id column missing"))?;
         let r = arrow::compute::cast(r, &ArrowDataType::Int64).map_err(err)?;
         let r = r.as_primitive::<Int64Type>();
-        Ok((0..r.len()).map(|i| (!r.is_null(i)).then(|| r.value(i))).collect())
+        Ok((0..r.len())
+            .map(|i| (!r.is_null(i)).then(|| r.value(i)))
+            .collect())
     }
 }
 
@@ -240,24 +247,33 @@ impl Engine {
         let schema = self.writable_schema(&target)?;
         let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let clauses = Clauses::parse(clauses, &columns)?;
-        if clauses.matched.is_empty() && clauses.not_matched.is_empty() && clauses.by_source.is_empty()
+        if clauses.matched.is_empty()
+            && clauses.not_matched.is_empty()
+            && clauses.by_source.is_empty()
         {
             return Err(err("needs at least one WHEN clause"));
         }
         // Target rows with their row ids.
         let rows = self.full_rows(&target, &schema)?;
         let n = rows.num_rows();
-        let mut fields: Vec<ArrowField> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<ArrowField> =
+            schema.fields().iter().map(|f| f.as_ref().clone()).collect();
         fields.push(ArrowField::new(RID, ArrowDataType::Int64, false));
         let mut cols = rows.columns().to_vec();
         cols.push(Arc::new(Int64Array::from_iter_values(0..n as i64)));
-        let with_rid = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)
-            .map_err(err)?;
+        let with_rid =
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols).map_err(err)?;
         if self.has_table(MERGE_TARGET) {
             self.deregister_table(MERGE_TARGET)?;
         }
         self.register_table(MERGE_TARGET, with_rid)?;
-        let r = self.merged_rows(&rows, &qualifier, &source.to_string(), &on.to_string(), &clauses);
+        let r = self.merged_rows(
+            &rows,
+            &qualifier,
+            &source.to_string(),
+            &on.to_string(),
+            &clauses,
+        );
         self.deregister_table(MERGE_TARGET)?;
         let (new_rows, affected) = r?;
         if affected == 0 {
@@ -393,7 +409,11 @@ impl Engine {
             match actions.get(&rid) {
                 None => kept.push(rid as u32),
                 Some(&(row, k, src)) => {
-                    let group = if src { &clauses.by_source } else { &clauses.matched };
+                    let group = if src {
+                        &clauses.by_source
+                    } else {
+                        &clauses.matched
+                    };
                     affected += 1;
                     match group[k - 1].action {
                         Action::Delete => {}
@@ -417,8 +437,7 @@ impl Engine {
                 .zip(&cols)
                 .map(|(f, c)| ArrowField::new(f.name(), c.data_type().clone(), true))
                 .collect();
-            let b = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)
-                .map_err(err)?;
+            let b = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols).map_err(err)?;
             align_batch(&b, &schema, &[])
         };
         parts.push(batch_of(pick(&kept)?)?);
@@ -426,8 +445,12 @@ impl Engine {
             if list.is_empty() {
                 continue;
             }
-            let chosen = if src == 1 { by_source.as_ref() } else { matched.as_ref() }
-                .expect("rows came from it");
+            let chosen = if src == 1 {
+                by_source.as_ref()
+            } else {
+                matched.as_ref()
+            }
+            .expect("rows came from it");
             let rids: Vec<u32> = list.iter().map(|(r, _)| *r).collect();
             let result_rows = UInt32Array::from(list.iter().map(|(_, i)| *i).collect::<Vec<_>>());
             let original = pick(&rids)?;

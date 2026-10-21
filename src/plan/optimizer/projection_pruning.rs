@@ -654,13 +654,17 @@ mod tests {
         };
         let right_proj = proj(right);
         assert!(
-            right_proj.as_ref().is_none_or(|p| p.contains(&"a".to_string())),
+            right_proj
+                .as_ref()
+                .is_none_or(|p| p.contains(&"a".to_string())),
             "right scan must read `a`; got {right_proj:?}"
         );
         // The left `a` anchors the `right.a` rename.
         let left_proj = proj(left);
         assert!(
-            left_proj.as_ref().is_none_or(|p| p.contains(&"a".to_string())),
+            left_proj
+                .as_ref()
+                .is_none_or(|p| p.contains(&"a".to_string())),
             "left scan must keep the rename anchor `a`; got {left_proj:?}"
         );
         out.schema().expect("pruned plan type-checks");

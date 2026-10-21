@@ -1268,6 +1268,11 @@ pub struct Engine {
     /// whose GPU copy is cached, so a cache hit can prove the overlay data is
     /// unchanged (`Arc` identity; holding it also rules out address reuse).
     pub(crate) overlay_uploads: RefCell<HashMap<String, arrow_array::ArrayRef>>,
+    /// Overlay tables whose rows exist only on the device (a device-resident
+    /// pipeline's output, see `device_pipeline`), with their schema: their
+    /// `gpu_tables` entry is authoritative and a host copy is downloaded on
+    /// first host access.
+    pub(crate) device_overlays: RefCell<HashMap<String, Schema>>,
     /// Estimated device bytes and last-use tick of each resident GPU table,
     /// for budget-driven eviction between statements.
     pub(crate) gpu_residency: RefCell<HashMap<String, (usize, u64)>>,
@@ -1669,6 +1674,7 @@ impl EngineBuilder {
             spill_dir: self.spill_dir.clone(),
             auto_compact_files: self.auto_compact_files,
             overlay_uploads: RefCell::new(HashMap::new()),
+            device_overlays: RefCell::new(HashMap::new()),
             gpu_residency: RefCell::new(HashMap::new()),
             lru_tick: std::cell::Cell::new(0),
             #[cfg(feature = "storage")]
@@ -2257,6 +2263,28 @@ impl Engine {
     /// Without a memory budget the drain also registers the table's string
     /// dictionaries (see [`Engine::register_table_stream_lazy`]).
     pub(crate) fn materialize_streaming_source(&self, name: &str) -> BoltResult<()> {
+        // A device-only overlay: download it once, keeping the device copy
+        // fresh for the GPU paths.
+        let device_schema = self.device_overlays.borrow_mut().remove(name);
+        if let Some(schema) = device_schema {
+            let batch = {
+                let g = self.gpu_tables.borrow();
+                let gt = g.get(name).and_then(Option::as_ref).ok_or_else(|| {
+                    BoltError::Other(format!("device table '{name}' is not resident"))
+                })?;
+                crate::exec::device_pipeline::download_table(gt, &schema)?
+            };
+            if let Some(first) = batch.columns().first() {
+                self.overlay_uploads
+                    .borrow_mut()
+                    .insert(name.to_string(), Arc::clone(first));
+            }
+            self.streaming_sources.borrow_mut().insert(
+                name.to_string(),
+                crate::exec::streaming::TableSource::Materialized(vec![batch]),
+            );
+            return Ok(());
+        }
         let drained = {
             let overlay = self.streaming_sources.borrow();
             match overlay.get(name) {
@@ -2609,6 +2637,15 @@ impl Engine {
         // though they're separate fields, taking owned data sidesteps any
         // borrow-graph subtlety with the `&self` we pass to
         // `incremental_rebuild`.
+        // A device-resident pipeline output: the device copy is the data.
+        if self.device_overlays.borrow().contains_key(name) {
+            let g = self.gpu_tables.borrow();
+            if matches!(g.get(name), Some(Some(_))) {
+                return Ok(Ref::map(g, |m| {
+                    m.get(name).expect("checked").as_ref().expect("checked")
+                }));
+            }
+        }
         let host: Option<ClonedHostRevision> =
             self.host_revisions.get(name).cloned_revision_owned();
         self.touch_residency(name, None);
@@ -2876,6 +2913,15 @@ impl Engine {
         aggregate: &PhysicalPlan,
     ) -> BoltResult<QueryHandle> {
         use crate::exec::streaming::TableSource;
+        // A joined input that can stay on the device feeds the aggregate
+        // kernels in place.
+        if crate::exec::device_pipeline::device_eligible(input)
+            && crate::exec::device_pipeline::has_device_join(input)
+        {
+            if let Some(t) = self.execute_device(input)? {
+                return self.aggregate_over_device(t, table, input_schema, aggregate);
+            }
+        }
         let rows = self.execute(input)?.into_record_batch();
         if rows.num_columns() != input_schema.fields.len() {
             return Err(BoltError::Other(format!(
@@ -4228,8 +4274,19 @@ impl Engine {
                 // Distinct executor materialises the deduped rows as part of
                 // that), then emit a single-row Int64 batch holding the child's
                 // row count.
-                let h = self.execute(input)?;
-                let n_rows = h.batch.num_rows();
+                // A joined input that can stay on the device: only its row
+                // count is needed.
+                let device = if crate::exec::device_pipeline::device_eligible(input)
+                    && crate::exec::device_pipeline::has_device_join(input)
+                {
+                    self.execute_device(input)?
+                } else {
+                    None
+                };
+                let n_rows = match device {
+                    Some(t) => t.n_rows,
+                    None => self.execute(input)?.batch.num_rows(),
+                };
                 let batch = build_count_rows_batch(n_rows, output_schema)?;
                 Ok(QueryHandle::from_record_batch(batch))
             }
@@ -4310,15 +4367,26 @@ impl Engine {
                 on,
                 filter,
                 output_schema,
-            } => crate::exec::join::execute_join(
-                left,
-                right,
-                join_type,
-                on,
-                filter.as_ref(),
-                output_schema,
-                self,
-            ),
+            } => {
+                // Inputs and join on the device; only the joined columns
+                // come back.
+                if crate::exec::device_pipeline::device_eligible(phys) {
+                    if let Some(t) = self.execute_device(phys)? {
+                        let batch =
+                            crate::exec::device_pipeline::download_table(&t, output_schema)?;
+                        return Ok(QueryHandle::from_record_batch(batch));
+                    }
+                }
+                crate::exec::join::execute_join(
+                    left,
+                    right,
+                    join_type,
+                    on,
+                    filter.as_ref(),
+                    output_schema,
+                    self,
+                )
+            }
             PhysicalPlan::StringLikeFilter {
                 input,
                 table,
@@ -4463,6 +4531,45 @@ impl Engine {
         kernel: &KernelSpec,
         output_schema: &Schema,
     ) -> BoltResult<QueryHandle> {
+        match self.run_projection(table, kernel, output_schema, false)? {
+            ProjectionOutput::Host(h) => Ok(h),
+            ProjectionOutput::Device(_) => unreachable!("host output requested"),
+        }
+    }
+
+    /// [`Engine::execute_projection`] leaving the result on the device
+    /// (`crate::exec::device_pipeline`): `None` when an output column has a
+    /// layout device tables do not carry (Utf8, Decimal128).
+    pub(crate) fn execute_projection_device(
+        &self,
+        table: &str,
+        kernel: &KernelSpec,
+        output_schema: &Schema,
+    ) -> BoltResult<Option<crate::exec::gpu_table::GpuTable>> {
+        if kernel
+            .outputs
+            .iter()
+            .any(|io| matches!(io.dtype, DataType::Utf8 | DataType::Decimal128(_, _)))
+        {
+            return Ok(None);
+        }
+        match self.run_projection(table, kernel, output_schema, true) {
+            Ok(ProjectionOutput::Device(t)) => Ok(Some(t)),
+            Ok(ProjectionOutput::Host(_)) => unreachable!("device output requested"),
+            // The host path re-runs on a declined device (temporal / decimal
+            // uploads) — so does the caller.
+            Err(BoltError::GpuCapacity(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn run_projection(
+        &self,
+        table: &str,
+        kernel: &KernelSpec,
+        output_schema: &Schema,
+        device: bool,
+    ) -> BoltResult<ProjectionOutput> {
         // Lazy upload: if `register_batch` ran since the last query, this
         // rebuilds the GPU-resident copy from the host-concatenated batches.
         // The returned `Ref` is held across the kernel launch — no other
@@ -4836,6 +4943,59 @@ impl Engine {
         // at the bottom of this function (or inside `gpu_compact` for the
         // predicate path, which manages its own stream barriers).
 
+        // Device-resident output: compact on the device (when filtered) and
+        // hand the columns on without downloading them.
+        if device {
+            let mut out_rows = n_rows;
+            let columns: Vec<crate::exec::gpu_table::GpuColumnData> = if kernel.predicate.is_some()
+            {
+                let pred_module = self.get_or_build_module(kernel, PREDICATE_ENTRY, |k| {
+                    crate::jit::scan_kernel::compile_predicate_kernel(k, PREDICATE_ENTRY)
+                })?;
+                let pred_function = pred_module.function(PREDICATE_ENTRY)?;
+                let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
+                crate::exec::compact::launch_predicate_kernel(
+                    pred_function,
+                    &input_ptrs,
+                    mask.device_ptr(),
+                    &input_validity_ptrs,
+                    n_rows_to_u32(n_rows)?,
+                    &stream,
+                )?;
+                let cols: Vec<(CUdeviceptr, DataType)> = output_cols
+                    .iter()
+                    .zip(kernel.outputs.iter())
+                    .map(|(c, io)| (c.device_ptr(), io.dtype))
+                    .collect();
+                let (gathered, total) = crate::exec::gpu_compact::compact_columns_on_gpu(
+                    mask.device_ptr(),
+                    n_rows,
+                    &cols,
+                    &stream,
+                )?;
+                stream.synchronize()?;
+                drop(output_cols);
+                out_rows = total;
+                gathered
+                    .into_iter()
+                    .map(crate::exec::device_pipeline::gathered_to_column)
+                    .collect::<BoltResult<_>>()?
+            } else {
+                stream.synchronize()?;
+                output_cols
+                    .into_iter()
+                    .map(crate::exec::device_pipeline::device_col_to_column)
+                    .collect::<BoltResult<_>>()?
+            };
+            let table = crate::exec::device_pipeline::device_table_from_outputs(
+                columns,
+                &kernel.outputs,
+                output_schema,
+                out_rows,
+            )?;
+            return Ok(ProjectionOutput::Device(table));
+        }
+
         // 6. If the kernel has a predicate, run a separate predicate-only
         //    kernel to materialise a u8 mask. We default to GPU-side compaction
         //    (prefix scan + gather) when every output column is gather-friendly
@@ -4934,7 +5094,9 @@ impl Engine {
             crate::metrics::Phase::Materialize,
             materialize_start.elapsed(),
         );
-        Ok(QueryHandle::from_record_batch(batch_out))
+        Ok(ProjectionOutput::Host(QueryHandle::from_record_batch(
+            batch_out,
+        )))
     }
 
     /// Host re-run of a GPU projection the device *declined*
@@ -5025,6 +5187,12 @@ impl Engine {
         })?;
         Ok(QueryHandle::from_record_batch(batch_out))
     }
+}
+
+/// Where [`Engine::run_projection`] left its result.
+enum ProjectionOutput {
+    Host(QueryHandle),
+    Device(crate::exec::gpu_table::GpuTable),
 }
 
 /// Result of a query — wraps the output Arrow `RecordBatch`.

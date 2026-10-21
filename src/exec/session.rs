@@ -265,10 +265,9 @@ impl Database {
     /// [`IsolationLevel::Snapshot`]). Takes effect for statements submitted
     /// afterwards.
     pub fn set_isolation(&self, level: IsolationLevel) {
-        self.inner.serializable.store(
-            level == IsolationLevel::Serializable,
-            Ordering::Relaxed,
-        );
+        self.inner
+            .serializable
+            .store(level == IsolationLevel::Serializable, Ordering::Relaxed);
     }
 
     /// How long a statement waits for another session's open transaction

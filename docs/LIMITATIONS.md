@@ -172,10 +172,15 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   memory budget (morsel execution), where its string predicates are evaluated
   host-side (correct, but without the dictionary-index GPU fold).
 - **Aggregates over a non-fusable input are materialised.** `GROUP BY` /
-  aggregates over a join, union, distinct, or a filter the fused GPU kernel
+  aggregates over a union, distinct, or a filter the fused GPU kernel
   cannot evaluate (e.g. a raw `Utf8` comparison) run the input first, bind
   its rows as an ephemeral table, and aggregate that (GPU where the
-  aggregate shape allows). Correct, at the cost of materialising the input.
+  aggregate shape allows). An inner equi-join on one integer key over
+  projections / scans of numeric, boolean and temporal columns stays on the
+  device instead (as does a `COUNT(*)` of one, or one returned to the
+  caller); joins on several keys, string or nullable keys, outer joins,
+  string or decimal columns, and every other operator still pass host
+  batches between operators.
 
 ## Storage, catalog and statements
 

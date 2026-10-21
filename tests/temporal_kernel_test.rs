@@ -12,7 +12,9 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Date32Type, TimestampMicrosecondType};
 use arrow_array::{Array, Date32Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
+};
 
 use craton_bolt::{Engine, TierPolicy};
 
@@ -82,7 +84,11 @@ fn gpu(e: &mut Engine, q: &str) -> RecordBatch {
     e.set_tier_policy(TierPolicy::GpuFirst);
     assert_eq!(g.schema().fields().len(), h.schema().fields().len(), "{q}");
     for c in 0..g.num_columns() {
-        assert_eq!(g.column(c).data_type(), h.column(c).data_type(), "{q} column {c}");
+        assert_eq!(
+            g.column(c).data_type(),
+            h.column(c).data_type(),
+            "{q} column {c}"
+        );
         assert_eq!(g.column(c).as_ref(), h.column(c).as_ref(), "{q} column {c}");
     }
     g
@@ -90,12 +96,16 @@ fn gpu(e: &mut Engine, q: &str) -> RecordBatch {
 
 fn dates(b: &RecordBatch, c: usize) -> Vec<Option<i32>> {
     let a = b.column(c).as_primitive::<Date32Type>();
-    (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect()
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
 }
 
 fn times(b: &RecordBatch, c: usize) -> Vec<Option<i64>> {
     let a = b.column(c).as_primitive::<TimestampMicrosecondType>();
-    (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect()
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
 }
 
 #[test]
