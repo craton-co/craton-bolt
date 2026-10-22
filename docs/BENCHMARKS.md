@@ -282,6 +282,8 @@ everything else fixed.
 | `string_width` | 4 B / 64 B / 1 KiB values | dictionary filter latency | yes |
 | `morsel_size` | memory budget = table … table/64 (lazy stream) | morsel overhead | yes |
 | `recursive_cte` | depth 10 / 100 / 500 | cumulative materialisation | yes |
+| `memory_pressure` | host budget: unbounded, working set, 1/2, 1/8, 1/32 of it × `GROUP BY` / top-k / equi-join | latency; per-statement out-of-core runs, spill files, spilled bytes, repartitions, evictions (stderr) | yes |
+| `concurrent_queries` | 1 / 2 / 4 / 8 sessions on one `Database`, 8 statements each | throughput (statements/s); p50 / p95 latency and slowest/fastest session ratio (stderr) | yes |
 
 ```bash
 cargo bench --bench cost_model --no-default-features --features cuda-stub   # host groups
@@ -289,9 +291,18 @@ BOLT_BENCH_GPU=1 BOLT_COST_ROWS=4000000 cargo bench --bench cost_model      # al
 ```
 
 Device-memory pressure (a working set below and above free VRAM) is the
-`BOLT_VRAM_PRESSURE_ROWS` point of the scaling bench (below). Concurrent
-queries / sessions are not benchmarked: the engine runs one query at a time
-per process by design (see `LIMITATIONS.md`).
+`BOLT_VRAM_PRESSURE_ROWS` point of the scaling bench (below). Statements of
+concurrent sessions share one GPU runtime and run one at a time, so
+`concurrent_queries` measures queueing and fairness rather than parallel
+speed-up.
+
+A first run (RTX 2060, `BOLT_COST_ROWS=1000000`, other GPU work running at
+the same time, so indicative only): the 1 M-row `GROUP BY` takes 235 ms in
+memory and 260–380 ms through 225–1105 spill files as the budget falls to
+1/32 of the working set; top-k never spills (bounded top-k runs); four
+sessions reach about 1.5× the single-session throughput (98 vs 66
+statements/s) with p95 latency 88 ms vs 35 ms, and the slowest session's
+total stays within 1.26× of the fastest's.
 
 **What it surfaced.** Besides fragmentation (below), the first GPU run
 exposed two GROUP BY gaps that are now fixed: a single-key `SUM ... GROUP BY`

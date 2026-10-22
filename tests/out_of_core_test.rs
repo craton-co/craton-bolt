@@ -432,7 +432,10 @@ fn row_wise_scans_run_in_chunks_and_stream() {
     assert_eq!(i64s(&agg[0], 0), vec![N]);
     // Scalar aggregates over the over-budget scan merge per-chunk partials.
     let s = e
-        .sql("SELECT COUNT(*) AS n, SUM(v) AS sv, MIN(k) AS lo, MAX(k) AS hi, AVG(v) AS av               FROM pq WHERE g < 50")
+        .sql(
+            "SELECT COUNT(*) AS n, SUM(v) AS sv, MIN(k) AS lo, MAX(k) AS hi, AVG(v) AS av \
+             FROM pq WHERE g < 50",
+        )
         .unwrap()
         .into_record_batch();
     let rows: Vec<i64> = (0..N).filter(|k| k % 97 < 50).collect();
