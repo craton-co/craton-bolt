@@ -23,6 +23,8 @@
 //! | `string_width` | average Utf8 value width | yes |
 //! | `morsel_size` | memory budget → morsel rows (lazy stream) | yes |
 //! | `recursive_cte` | recursion depth | yes |
+//! | `memory_pressure` | host budget from above the working set to 1/32 of it (spill / repartition / eviction counts reported) | yes |
+//! | `concurrent_queries` | 1 / 2 / 4 / 8 sessions on one `Database` (throughput; p50 / p95 latency and per-session fairness reported) | yes |
 //!
 //! GPU groups run only with `BOLT_BENCH_GPU=1` (and a CUDA build); the host
 //! groups run everywhere, including `--no-default-features --features
@@ -551,6 +553,151 @@ mod gpu {
         g.finish();
     }
 
+    /// Out-of-core behaviour as the host budget shrinks below the working
+    /// set: the same `GROUP BY` / `ORDER BY ... LIMIT` / equi-join run in
+    /// memory, then through spill files, then with partitions split again.
+    /// Spill files, spilled bytes, repartitions and evictions per
+    /// configuration go to stderr (and the run manifest's axes).
+    pub fn memory_pressure(c: &mut Criterion) {
+        let rows = gpu_rows();
+        // Working set of the fact table: two Int64 columns.
+        let working_set = rows * 16;
+        let mut rng = Rng(0x5eed_cafe);
+        let fact = kv_batch(rows, |_| rng.below(rows as u64 / 4) as i64);
+        let dim = kv_batch(rows / 4, |i| i as i64);
+        let queries = [
+            ("groupby", "SELECT k, SUM(v) AS s FROM fact GROUP BY k"),
+            ("topk", "SELECT k, v FROM fact ORDER BY v DESC LIMIT 100"),
+            (
+                "join",
+                "SELECT COUNT(*) AS n FROM fact JOIN dim ON fact.k = dim.k WHERE dim.v > 10",
+            ),
+        ];
+        let mut g = group(c, "memory_pressure");
+        g.throughput(Throughput::Bytes(working_set as u64));
+        // `0` = no budget (in memory); otherwise working set / divisor.
+        for divisor in [0usize, 1, 2, 8, 32] {
+            let mut builder = Engine::builder();
+            if let Some(budget) = working_set.checked_div(divisor) {
+                builder = builder.host_memory_budget(budget.max(1 << 16));
+            }
+            let mut e = builder.build().unwrap();
+            e.register_table("fact", fact.clone()).unwrap();
+            e.register_table("dim", dim.clone()).unwrap();
+            let label = if divisor == 0 {
+                "unbounded".to_string()
+            } else {
+                format!("budget_1_over_{divisor}")
+            };
+            for (name, sql) in queries {
+                // One untimed statement, measured for its spill counters.
+                let before = e.memory_stats();
+                run(&e, sql);
+                let after = e.memory_stats();
+                g.bench_function(format!("{name}/{label}"), |b| {
+                    b.iter(|| black_box(run(&e, sql)))
+                });
+                eprintln!(
+                    "memory_pressure/{name}/{label} (per statement): out_of_core={} \
+                     spill_files={} spilled_bytes={} repartitions={} evictions={} host_peak={}",
+                    after.out_of_core_statements - before.out_of_core_statements,
+                    after.spill_files - before.spill_files,
+                    after.spilled_bytes - before.spilled_bytes,
+                    after.repartitions - before.repartitions,
+                    after.evictions - before.evictions,
+                    after.host_peak,
+                );
+            }
+        }
+        g.finish();
+    }
+
+    /// Many sessions sharing one `Database` runtime: each of `n` client
+    /// threads submits the same mix of statements. Criterion times the whole
+    /// batch (throughput = statements); p50 / p95 latency and fairness (the
+    /// slowest session's total over the fastest's) go to stderr.
+    pub fn concurrent_queries(c: &mut Criterion) {
+        use craton_bolt::Database;
+        let rows = gpu_rows() / 4;
+        let mut rng = Rng(0xc0ffee);
+        let t = kv_batch(rows, |_| rng.below(10_000) as i64);
+        let db = Database::open(Engine::builder()).unwrap();
+        db.with_engine(move |e| e.register_table("t", t).unwrap())
+            .unwrap();
+        let mix = [
+            "SELECT COUNT(*) FROM t WHERE v > 100",
+            "SELECT k, SUM(v) FROM t GROUP BY k",
+            "SELECT SUM(v * 2) FROM t WHERE k < 5000",
+            "SELECT v FROM t ORDER BY v DESC LIMIT 10",
+        ];
+        let per_session = 8usize;
+        // Warm the plans and kernels.
+        let s = db.session();
+        for q in mix {
+            s.sql(q).unwrap();
+        }
+        let mut g = group(c, "concurrent_queries");
+        for sessions in [1usize, 2, 4, 8] {
+            g.throughput(Throughput::Elements((sessions * per_session) as u64));
+            let mut latencies: Vec<Duration> = Vec::new();
+            let mut fairness: Vec<f64> = Vec::new();
+            g.bench_function(format!("{sessions}_sessions"), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = std::time::Instant::now();
+                        let handles: Vec<_> = (0..sessions)
+                            .map(|i| {
+                                let s = db.session();
+                                std::thread::spawn(move || {
+                                    let begun = std::time::Instant::now();
+                                    let mut lat = Vec::with_capacity(per_session);
+                                    for j in 0..per_session {
+                                        let t0 = std::time::Instant::now();
+                                        s.sql(mix[(i + j) % mix.len()]).unwrap();
+                                        lat.push(t0.elapsed());
+                                    }
+                                    (lat, begun.elapsed())
+                                })
+                            })
+                            .collect();
+                        let mut session_totals = Vec::with_capacity(sessions);
+                        for h in handles {
+                            let (lat, whole) = h.join().unwrap();
+                            latencies.extend(lat);
+                            session_totals.push(whole.as_secs_f64());
+                        }
+                        total += start.elapsed();
+                        let (lo, hi) = session_totals
+                            .iter()
+                            .fold((f64::MAX, 0.0f64), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+                        fairness.push(if lo > 0.0 { hi / lo } else { 1.0 });
+                    }
+                    total
+                })
+            });
+            latencies.sort();
+            let pct = |p: f64| {
+                latencies
+                    .get(
+                        ((latencies.len() as f64 * p) as usize)
+                            .min(latencies.len().saturating_sub(1)),
+                    )
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let worst_fairness = fairness.iter().cloned().fold(1.0f64, f64::max);
+            eprintln!(
+                "concurrent_queries/{sessions}_sessions: statements={} p50={:?} p95={:?} \
+                 worst_session_ratio={worst_fairness:.2}",
+                latencies.len(),
+                pct(0.50),
+                pct(0.95),
+            );
+        }
+        g.finish();
+    }
+
     pub fn recursive_cte(c: &mut Criterion) {
         let mut e = Engine::new().unwrap();
         e.register_table("seed", x_batch(1, 1)).unwrap();
@@ -587,6 +734,8 @@ fn bench_gpu(c: &mut Criterion) {
         gpu::string_width(c);
         gpu::morsel_size(c);
         gpu::recursive_cte(c);
+        gpu::memory_pressure(c);
+        gpu::concurrent_queries(c);
     }
     #[cfg(feature = "cuda-stub")]
     {

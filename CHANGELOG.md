@@ -134,6 +134,10 @@ All notable changes to this project will be documented here. The format follows 
   PRECEDING` over `DATE` / `TIMESTAMP` keys), checked against DuckDB with
   duplicate and NULL keys in both directions. Window keys may be timestamps
   of any unit.
+- **`memory_pressure` and `concurrent_queries` benchmark groups** in
+  `benches/cost_model.rs`: out-of-core latency and spill / repartition /
+  eviction counts as the host budget shrinks, and throughput, p50 / p95
+  latency and fairness with 1–8 sessions on one `Database`.
 - **Device-resident operator pipelines** (`exec::device_pipeline`,
   `Engine::execute_device`): an inner equi-join on one integer key over
   fused projections or scans runs its hash build / probe on the device key
