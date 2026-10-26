@@ -89,6 +89,7 @@ echo "========================================"
         -v "local-ci-target-tests:/target" \
         -v "$HOST_TMP_DIR:/ci_tmp" \
         -e CARGO_TARGET_DIR=/target \
+        -e CARGO_INCREMENTAL=0 \
         local-ci-tests bash -c "
   set -ex
   _step() { echo \"\$1\" > /ci_tmp/tests_failed_step; echo \">>> Running \$1\"; }
@@ -117,6 +118,7 @@ TESTS_PID=$!
         -v "local-ci-target-others:/target" \
         -v "$HOST_TMP_DIR:/ci_tmp" \
         -e CARGO_TARGET_DIR=/target \
+        -e CARGO_INCREMENTAL=0 \
         local-ci-others bash -c "
   set -ex
   _step() { echo \"\$1\" > /ci_tmp/others_failed_step; echo \">>> Running \$1\"; }
@@ -152,9 +154,9 @@ TESTS_PID=$!
   _step 'package (cargo publish --dry-run)'
   cargo publish --dry-run --allow-dirty --no-default-features --features cuda-stub
 
-  _step 'coverage (host, >=50% lines)'
-  cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
-  cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
+  _step 'coverage (host, >=60% lines)'
+  cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 60
+  cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 60
 
   _step 'cargo deny (licenses + bans)'
   cargo deny check licenses bans

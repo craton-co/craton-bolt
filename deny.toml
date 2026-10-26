@@ -94,9 +94,8 @@ yanked = "warn"
 ignore = [
     # POLICY: an id may be listed here only with (a) the exact advisory id,
     # (b) which feature graph reaches it, (c) why no upgrade is available, and
-    # (d) an entry in SECURITY.md's security-debt section. Nothing below is
-    # reachable from the DEFAULT feature graph — the shipped library — and
-    # therefore nothing below affects a downstream dependant of this crate.
+    # (d) an entry in SECURITY.md's security-debt section. Upstream-pinned
+    # transitive advisories must be proven non-impacting to Craton Bolt.
     # Each entry must be re-checked whenever the upstream crate is bumped.
     #
     # RUSTSEC-2024-0436 — `paste 1.0.15` is unmaintained (no vulnerability).
@@ -118,6 +117,25 @@ ignore = [
     # the library, integration tests, or published artifacts. Upstream has no patched
     # release; it leaves the graph when the Polars reference engine is bumped.
     "RUSTSEC-2026-0249",
+    # RUSTSEC-2024-0449 — `unsafe-libyaml 0.2.11` is unmaintained (repository archived).
+    # Reached only via `substrait 0.55` build dependency `serde_yaml` under the optional
+    # `substrait` feature. It is a build-time dependency, never linked into runtime artifacts.
+    # No upstream patch is available until `substrait` replaces `serde_yaml`.
+    "RUSTSEC-2024-0449",
+    # RUSTSEC-2026-0391 — `zstd 0.13.3` reused context stream leak.
+    # Reached via `parquet 53.4.1` under the `storage` feature. Parquet manages its own
+    # compression buffers without reusing abandoned `with_context` stream handles across
+    # tenant boundaries. Upstream `parquet 53.4.1` pins `zstd 0.13` (0.14+ is a breaking
+    # bump); it leaves the graph when the Arrow major is bumped.
+    "RUSTSEC-2026-0391",
+    # RUSTSEC-2026-0403 — `zstd-safe 7.2.1` legacy frame decompression uninit memory.
+    # Reached via `zstd 0.13.3` <- `parquet 53.4.1`. Parquet uses modern zstd frames, not
+    # corrupt v0.4-v0.7 legacy frames. Pinned by `parquet 53.4.1`; leaves on Arrow major bump.
+    "RUSTSEC-2026-0403",
+    # RUSTSEC-2026-0410 — `zstd-sys 2.0.13+zstd.1.5.6` wasm32 allocator shim.
+    # Affects wasm32 only; Craton Bolt is native CUDA (x86_64/aarch64) and never builds for
+    # wasm32. Pinned by `zstd 0.13.3` <- `parquet 53.4.1`; leaves on Arrow major bump.
+    "RUSTSEC-2026-0410",
 ]
 
 [sources]

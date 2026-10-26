@@ -28,7 +28,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-craton-bolt = "0.9"
+craton-bolt = "0.10"
 arrow-array  = "53"
 arrow-schema = "53"
 ```
@@ -601,7 +601,7 @@ lifetime; setting them mid-run has no effect.
 
 ```toml
 [dependencies]
-craton-bolt = { version = "0.9", features = ["pool-sharded"] }
+craton-bolt = { version = "0.10", features = ["pool-sharded"] }
 ```
 
 | Feature        | Default | What it does                                                            |

@@ -86,7 +86,7 @@ Generated from `.github/workflows/*.yml` by `tests/doc_consistency_test.rs`
 | `ci.yml` | push, pull_request, schedule, workflow_dispatch | `public-api` | public API snapshot | `ubuntu-latest` |
 | `ci.yml` | push, pull_request, schedule, workflow_dispatch | `doc` | doc (docs.rs parity) | `ubuntu-latest` |
 | `ci.yml` | push, pull_request, schedule, workflow_dispatch | `package` | package (cargo publish --dry-run) | `ubuntu-latest` |
-| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `coverage` | coverage (host, >=50% lines) | `ubuntu-latest` |
+| `ci.yml` | push, pull_request, schedule, workflow_dispatch | `coverage` | coverage (host, >=60% lines) | `ubuntu-latest` |
 | `ci.yml` | push, pull_request, schedule, workflow_dispatch | `cargo-deny` | cargo deny (advisories + licenses + bans) | `ubuntu-latest` |
 | `ci.yml` | push, pull_request, schedule, workflow_dispatch | `cargo-deny-all-features` | cargo deny (all-features, blocking) | `ubuntu-latest` |
 | `ci.yml` | push, pull_request, schedule, workflow_dispatch | `gpu-integration` | gpu integration (self-hosted NVIDIA GPU) | `[self-hosted, gpu]` |
@@ -101,7 +101,7 @@ Generated from `.github/workflows/*.yml` by `tests/doc_consistency_test.rs`
 | default `cudarc`, `flight`, `substrait` | compile plus executable feature smokes | same | yes |
 | rustdoc public API snapshot | pinned cargo-public-api + nightly | identical | yes |
 | DuckDB/reference and property tests | separate `reference-tests` shard | same | yes |
-| line coverage | `--lib --tests`, `src/cuda` excluded, minimum 50% | identical | yes |
+| line coverage | `--lib --tests`, `src/cuda` excluded, minimum 60% | identical | yes |
 | cargo-deny licenses/advisories/all-features | pinned setup | locked local tool install | yes |
 | package/publish dry-run | clean tree, no `--allow-dirty` | identical | yes |
 | live CUDA | self-hosted runner, serialized ignored suite | when `BOLT_LOCAL_GPU=1` | yes |

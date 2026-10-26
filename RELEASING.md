@@ -76,7 +76,7 @@ the publish step:
 | Secret | Purpose |
 |--------|---------|
 | `CRATES_IO_TOKEN` | `cargo publish` in CI |
-| `CODECOV_TOKEN` | Optional upload for the already-wired Codecov step; the local 50% line gate remains authoritative |
+| `CODECOV_TOKEN` | Optional upload for the already-wired Codecov step; the local 60% line gate remains authoritative |
 
 ## 7. Announcing the release
 

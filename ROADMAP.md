@@ -5,7 +5,7 @@ planned beyond it. For day-to-day progress, see `CHANGELOG.md`. For supported
 SQL today, see `docs/SQL_REFERENCE.md`. For the full 1.0 plan, see
 `docs/PATH_TO_1.0.md`. To install and build, see `docs/INSTALL.md`.
 
-## 0.9.0 (current — pre-production, API stabilising)
+## 0.10.0 (current — pre-production, API stabilising)
 
 0.9 makes SQL semantics the default and hardens the runtime contract (see
 `CHANGELOG.md` for the full list): SQL NULL semantics for integer / decimal
@@ -154,9 +154,9 @@ and is kept for reference:
 - `docs/MIGRATION_GUIDE.md` covers the 0.3 → 0.5 → 0.6 upgrade path.
 - `docs/USER_GUIDE.md` ships as a 10-minute tutorial.
 
-### Known limitations (not bugs) — as of 0.9.0
+### Known limitations (not bugs) — as of 0.10.0
 
-v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What remains:
+v0.10 closed most of the v0.9 carry-overs and security/correctness findings. What remains:
 
 - String and relational shapes span `Gpu`, `Host`, and `Hybrid`; callers can
   inspect `QueryHandle::planned_execution_tier()` instead of inferring a tier.
@@ -192,9 +192,9 @@ v0.9 closed most of the v0.8 carry-overs and security/correctness findings. What
   choice (`CostModel`, calibration, `EXPLAIN` estimates); SQL NULL semantics
   in the fused GPU kernels.
 
-## Beyond 0.9 — toward 1.0 (next)
+## Beyond 0.10 — toward 1.0 (next)
 
-With the v0.8 execution carry-overs largely landed in v0.9, the
+With the v0.9 execution carry-overs largely landed in v0.10, the
 remaining pre-1.0 work is the last GPU-lowering gaps, planner-driven
 dispatch, and the freeze checklist:
 

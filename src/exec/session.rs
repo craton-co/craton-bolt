@@ -700,3 +700,64 @@ impl Session {
         Ok((job, PendingResult { shared }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolation_level_defaults_and_contracts() {
+        assert_eq!(IsolationLevel::default(), IsolationLevel::Snapshot);
+        let s = IsolationLevel::Snapshot;
+        let ser = IsolationLevel::Serializable;
+        assert_ne!(s, ser);
+        // Test Copy and Debug
+        let copied = s;
+        assert_eq!(copied, s);
+        assert!(format!("{s:?}").contains("Snapshot"));
+        assert!(format!("{ser:?}").contains("Serializable"));
+    }
+
+    #[test]
+    fn session_settings_defaults_and_contracts() {
+        let def = SessionSettings::default();
+        assert!(!def.read_only);
+
+        let mut custom = def.clone();
+        custom.read_only = true;
+        assert!(custom.read_only);
+        assert_ne!(def, custom);
+        assert!(format!("{custom:?}").contains("read_only: true"));
+    }
+
+    #[test]
+    fn database_stats_defaults_and_contracts() {
+        let stats = DatabaseStats::default();
+        assert_eq!(stats.sessions, 0);
+        assert_eq!(stats.statements, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.cancelled, 0);
+        assert_eq!(stats.total_queue_wait, Duration::ZERO);
+        assert_eq!(stats.max_queue_wait, Duration::ZERO);
+
+        let cloned = stats;
+        assert_eq!(cloned, stats);
+        assert!(format!("{stats:?}").contains("DatabaseStats"));
+    }
+
+    #[test]
+    fn session_constants_and_panic_formatting() {
+        assert_eq!(DEFAULT_QUEUE_CAPACITY, 1024);
+        assert_eq!(DEFAULT_TRANSACTION_WAIT, Duration::from_secs(30));
+
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("literal error message");
+        assert_eq!(panic_message(&str_payload), "literal error message");
+
+        let string_payload: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("owned string error"));
+        assert_eq!(panic_message(&string_payload), "owned string error");
+
+        let int_payload: Box<dyn std::any::Any + Send> = Box::new(12345_i32);
+        assert_eq!(panic_message(&int_payload), "non-string panic payload");
+    }
+}
