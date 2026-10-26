@@ -18,7 +18,7 @@ version jumps in Craton Bolt's history so far:
   context-epoched caches); no Rust API moved — see `CHANGELOG.md`.
 - **0.8.0 -> 0.9.0** — SQL semantics become the default; one live `Engine`
   per process is enforced.
-- **0.9.0 -> next** — the unified query pipeline (behavioural deltas only).
+- **0.9.0 -> 0.10.0** — storage layer, persistent catalog, transactions, out-of-core execution, and SQL completeness.
 
 ## Public API diffs from the snapshot
 
@@ -655,7 +655,7 @@ was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
 | MSRV 1.85 | Breaking (build) | Upgrade the toolchain |
 | `ExecutionTier` / `planned_execution_tier()` | Additive | Inspect placement instead of inferring it |
 
-## 0.9.0 -> next (unreleased) migration
+## 0.9.0 -> 0.10.0 migration
 
 **What changed.** Every query path now runs one compile pipeline
 (`exec::engine_query`). No signature of `Engine::sql` / `explain_sql` /

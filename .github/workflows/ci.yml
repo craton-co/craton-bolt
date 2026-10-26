@@ -250,13 +250,13 @@ jobs:
   # because hosted runners cannot execute it; the remaining line floor is an
   # honest lower bound over code the host suite can exercise.
   # Measures HOST coverage under the same --no-default-features --features
-  # cuda-stub config the test job uses. The committed floor is 50% lines.
+  # cuda-stub config the test job uses. The committed floor is 60% lines.
   #
   # Real-device coverage is provided separately by the blocking
   # `gpu-integration` job below; it is intentionally excluded from this host
   # line-rate metric.
   coverage:
-    name: coverage (host, >=50% lines)
+    name: coverage (host, >=60% lines)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -293,8 +293,8 @@ jobs:
           # from the report: that code is dark on github-hosted runners (no
           # CUDA device, cuda-stub stubs the FFI), so including it would tank
           # the host coverage number for paths that physically cannot run here.
-          cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 50
-          cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 50
+          cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --lcov --output-path lcov.info --fail-under-lines 60
+          cargo llvm-cov --no-default-features --features cuda-stub,storage --lib --tests --ignore-filename-regex 'src/cuda/' --summary-only --fail-under-lines 60
 
       - name: Upload coverage report (lcov)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

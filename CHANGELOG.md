@@ -4,6 +4,8 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-26
+
 ### Fixed
 - **An inner join with equi keys and a residual predicate returned a filtered
   cross product** when the key columns shared a name (`... JOIN s ON t.k =
@@ -1213,7 +1215,8 @@ Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --
 - Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
 - Polars head-to-head numbers are not yet published.
 
-[Unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/craton-co/craton-bolt/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/craton-co/craton-bolt/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/craton-co/craton-bolt/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/craton-co/craton-bolt/compare/v0.6.0...v0.7.0

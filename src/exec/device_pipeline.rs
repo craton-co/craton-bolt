@@ -401,7 +401,7 @@ pub(crate) fn download_table(gt: &GpuTable, schema: &Schema) -> BoltResult<Recor
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(gt.columns.len());
     for (c, f) in gt.columns.iter().zip(&schema.fields) {
         let n = gt.n_rows;
-        let mut trim = |mut v: Vec<u8>| {
+        let trim = |mut v: Vec<u8>| {
             v.truncate(n);
             v
         };
@@ -409,28 +409,22 @@ pub(crate) fn download_table(gt: &GpuTable, schema: &Schema) -> BoltResult<Recor
             GpuColumnData::I32 { values, validity } => {
                 let mut v = values.to_vec()?;
                 v.truncate(n);
-                Arc::new(Int32Array::from(nulls(v, valid(validity)?.map(&mut trim))))
+                Arc::new(Int32Array::from(nulls(v, valid(validity)?.map(trim))))
             }
             GpuColumnData::I64 { values, validity } => {
                 let mut v = values.to_vec()?;
                 v.truncate(n);
-                Arc::new(Int64Array::from(nulls(v, valid(validity)?.map(&mut trim))))
+                Arc::new(Int64Array::from(nulls(v, valid(validity)?.map(trim))))
             }
             GpuColumnData::F32 { values, validity } => {
                 let mut v = values.to_vec()?;
                 v.truncate(n);
-                Arc::new(Float32Array::from(nulls(
-                    v,
-                    valid(validity)?.map(&mut trim),
-                )))
+                Arc::new(Float32Array::from(nulls(v, valid(validity)?.map(trim))))
             }
             GpuColumnData::F64 { values, validity } => {
                 let mut v = values.to_vec()?;
                 v.truncate(n);
-                Arc::new(Float64Array::from(nulls(
-                    v,
-                    valid(validity)?.map(&mut trim),
-                )))
+                Arc::new(Float64Array::from(nulls(v, valid(validity)?.map(trim))))
             }
             GpuColumnData::Bool(values) => {
                 let v = trim(values.to_vec()?);

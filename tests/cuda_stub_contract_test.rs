@@ -31,7 +31,7 @@
 #![cfg(feature = "cuda-stub")]
 
 use craton_bolt::cuda::cuda_sys;
-use craton_bolt::{BoltError, Engine};
+use craton_bolt::{BoltError, Database, Engine};
 
 /// Assert that `err` is the typed "no GPU in this build" error the stub is
 /// contracted to produce, and that its rendered message names the stub /
@@ -152,4 +152,34 @@ fn stub_gpu_entry_does_not_panic() {
              return a clean typed error, never to panic"
         ),
     }
+}
+
+/// Shared database runtime boundary: `Database::open(builder)`. Under the stub,
+/// the background runtime thread invokes `builder.build()`, which fails with
+/// the typed no-GPU error. The runtime thread must cleanly propagate the error,
+/// terminate without hanging, and release the active engine slot.
+#[test]
+fn database_open_returns_typed_no_gpu_error() {
+    let err =
+        Database::open(Engine::builder()).expect_err("Database::open() must fail under cuda-stub");
+    assert_is_stub_no_gpu_error(&err);
+}
+
+/// After a failed `Database::open`, the single-active-engine lock must be
+/// completely released, allowing subsequent builder attempts to fail with the
+/// same clean no-GPU error rather than an active-engine conflict error.
+#[test]
+fn database_open_cleans_up_on_failure_and_releases_permit() {
+    let err1 = Database::open(Engine::builder()).expect_err("first Database::open() must fail");
+    assert_is_stub_no_gpu_error(&err1);
+
+    // Second attempt right after: must NOT fail with "only one active Engine..."
+    let err2 = Database::open(Engine::builder()).expect_err("second Database::open() must fail");
+    assert_is_stub_no_gpu_error(&err2);
+
+    // Direct Engine::new() immediately after: also must fail cleanly
+    let err3 = Engine::new()
+        .err()
+        .expect("Engine::new() after failed database open must fail");
+    assert_is_stub_no_gpu_error(&err3);
 }

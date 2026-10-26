@@ -244,17 +244,20 @@ disabled (the default).
 #### Accepted advisory debt
 
 The advisory gate is blocking on **both** the default and the `--all-features`
-graph. Two advisories are nonetheless tolerated, listed explicitly in
-`deny.toml` rather than suppressed by loosening the policy. Neither is
-reachable from the **default feature graph**, so neither affects a downstream
-dependant of this crate. Both are re-checked whenever the owning dependency is
-bumped, and both leave the graph on that bump.
+graph. Seven advisories are nonetheless tolerated, listed explicitly in
+`deny.toml` rather than suppressed by loosening the policy. All are
+re-checked whenever the owning dependency is bumped, and all leave the
+graph on that bump.
 
 | Advisory | Crate | Reached via | Why it stands |
 |---|---|---|---|
 | `RUSTSEC-2024-0436` | `paste 1.0.15` | `arrow-flight 53`, optional `flight` feature | Unmaintained, not a vulnerability. A compile-time proc-macro, not linked into any artifact. arrow-flight 53 pins it; no maintained drop-in at this arrow major. |
 | `RUSTSEC-2025-0003` | `fast-float 0.2.0` | `polars 0.42`, `reference-benches` only | Unchecked read on empty input. Present only in the benchmark harness's reference engine, parsing benchmark-local fixture data; never in the library, integration tests, or a published artifact. Upstream has no patched release — the fix lives in the `fast-float2` fork adopted by later Polars. |
 | `RUSTSEC-2026-0249` | `smartstring 1.0.1` | `polars 0.42`, `reference-benches` only | Unmaintained, repository archived by owner. Present only in the benchmark harness's reference engine; never in the library, integration tests, or a published artifact. No patched release available. |
+| `RUSTSEC-2024-0449` | `unsafe-libyaml 0.2.11` | `substrait 0.55` (build dep via `serde_yaml`), optional `substrait` feature | Unmaintained, repository archived by owner. Machine-translated C libyaml used at build-time in `substrait`; not linked into the runtime library or published artifacts. Upstream `substrait` has no release dropping `serde_yaml` yet. |
+| `RUSTSEC-2026-0391` | `zstd 0.13.3` | `parquet 53.4.1`, `storage` feature | Reused context stream leak on abandoned streams. Parquet manages isolated stream sessions and does not reuse abandoned context handles across tenant boundaries. Pinned by `parquet 53.4.1` (requiring `zstd 0.13`); leaves on Arrow/Parquet major bump. |
+| `RUSTSEC-2026-0403` | `zstd-safe 7.2.1` | `parquet 53.4.1`, `storage` feature | Uninitialized memory exposed when streaming decompression of a legacy frame fails. Parquet writes and reads standard modern zstd frames, not corrupt v0.4–v0.7 legacy frames. Pinned by `parquet 53.4.1`; leaves on Arrow/Parquet major bump. |
+| `RUSTSEC-2026-0410` | `zstd-sys 2.0.13+zstd.1.5.6` | `parquet 53.4.1`, `storage` feature | Memory corruption in WebAssembly allocator shim on allocation failure. Craton Bolt targets native x86_64/aarch64 with CUDA, never wasm32. Pinned by `zstd 0.13.3` via `parquet 53.4.1`; leaves on Arrow/Parquet major bump. |
 
 There is no longer a non-blocking advisory lane: the former `rust-cuda`
 build-toolchain tree, which was the reason one existed, has been removed.

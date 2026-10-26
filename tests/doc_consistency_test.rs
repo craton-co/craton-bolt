@@ -432,7 +432,7 @@ fn local_and_hosted_ci_commands_stay_in_sync() {
         "cargo run --example quickstart --features cuda-stub --no-default-features",
         "cargo test --lib --tests --no-default-features --features cuda-stub,substrait",
         "--ignore-filename-regex 'src/cuda/'",
-        "--fail-under-lines 50",
+        "--fail-under-lines 60",
         "cargo deny --all-features check advisories licenses bans",
         "bash scripts/check_public_api.sh",
         "--features cudarc,storage -- --ignored --test-threads=1",

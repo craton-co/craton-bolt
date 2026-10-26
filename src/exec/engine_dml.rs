@@ -637,3 +637,104 @@ impl Engine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_from(sql: &str) -> TableWithJoins {
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        match stmts.pop().unwrap() {
+            sqlparser::ast::Statement::Query(q) => match *q.body {
+                sqlparser::ast::SetExpr::Select(s) => s.from.into_iter().next().unwrap(),
+                _ => panic!("expected select"),
+            },
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn quote_escapes_double_quotes_properly() {
+        assert_eq!(quote("col"), "\"col\"");
+        assert_eq!(quote("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote(""), "\"\"");
+        assert_eq!(quote("\"\""), "\"\"\"\"\"\"");
+    }
+
+    #[test]
+    fn concat_batches_handles_empty_single_and_multiple() {
+        let schema: SchemaRef = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            ArrowDataType::Int32,
+            false,
+        )]));
+
+        // 1. Empty slice
+        let empty_result = concat(&schema, &[]).unwrap();
+        assert_eq!(empty_result.num_rows(), 0);
+
+        // 2. Single batch
+        let b1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let single_result = concat(&schema, std::slice::from_ref(&b1)).unwrap();
+        assert_eq!(single_result.num_rows(), 3);
+
+        // 3. Multiple batches
+        let b2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef],
+        )
+        .unwrap();
+        let multi_result = concat(&schema, &[b1, b2]).unwrap();
+        assert_eq!(multi_result.num_rows(), 5);
+    }
+
+    #[test]
+    fn cast_column_identity_and_conversions() {
+        let col: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+
+        // Identity
+        let id = cast_column(&col, &ArrowDataType::Int32, "x").unwrap();
+        assert!(Arc::ptr_eq(&col, &id));
+
+        // Valid conversion Int32 -> Int64
+        let converted = cast_column(&col, &ArrowDataType::Int64, "x").unwrap();
+        assert_eq!(converted.data_type(), &ArrowDataType::Int64);
+        assert_eq!(converted.len(), 3);
+
+        // Invalid conversion Int32 -> Date64 or unsupported string format
+        let bad_str: ArrayRef = Arc::new(StringArray::from(vec!["not_a_number"]));
+        let bad = cast_column(&bad_str, &ArrowDataType::Int32, "str_col");
+        assert!(bad.is_err());
+        assert!(bad
+            .unwrap_err()
+            .to_string()
+            .contains("cannot convert column 'str_col'"));
+    }
+
+    #[test]
+    fn target_of_extracts_table_and_alias() {
+        // Simple table without alias
+        let t1 = parse_from("SELECT * FROM users");
+        let (tbl, qual) = target_of(&t1).unwrap();
+        assert_eq!(tbl, "users");
+        assert_eq!(qual, "users");
+
+        // Table with alias
+        let t2 = parse_from("SELECT * FROM users AS u");
+        let (tbl2, qual2) = target_of(&t2).unwrap();
+        assert_eq!(tbl2, "users");
+        assert_eq!(qual2, "u");
+
+        // Table with join -> rejected
+        let t3 = parse_from("SELECT * FROM users AS u JOIN orders ON true");
+        assert!(target_of(&t3).is_err());
+    }
+}
