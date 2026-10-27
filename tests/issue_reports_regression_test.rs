@@ -429,7 +429,10 @@ fn report_008_register_batch_is_proportional_to_the_batch() {
     let out = engine
         .sql("SELECT COUNT(*) FROM t WHERE s = 's7'")
         .unwrap();
-    assert_eq!(first_as_f64(out.record_batch()), Some(301.0));
+    // ids 7, 1007, ..., 301007 (the table holds ids 0..301056).
+    let want = (0..147 * rows).filter(|i| i % 1000 == 7).count();
+    assert_eq!(want, 302);
+    assert_eq!(first_as_f64(out.record_batch()), Some(want as f64));
 }
 
 /// 100 rows whose NULL slots hold non-zero garbage, as DuckDB-exported
