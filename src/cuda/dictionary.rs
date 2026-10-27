@@ -132,6 +132,110 @@ where
     }
 }
 
+/// How appended rows extend a lex-sorted dictionary (craton-bolt-008), computed
+/// without mutating it by [`plan_sorted_extension`].
+///
+/// Extending the dictionary this way yields exactly the dictionary and codes a
+/// full rebuild over the prefix rows plus the appended rows would produce,
+/// because both are "sorted distinct non-null values, code = rank + 1".
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SortedDictExtension {
+    /// Values absent from the dictionary, sorted and deduplicated.
+    pub(crate) new_values: Vec<String>,
+    /// Codes of the appended rows in the extended dictionary (`0` = NULL).
+    pub(crate) tail: Vec<i32>,
+    /// `remap[old_code]` is that code's value in the extended dictionary
+    /// (`remap[0] == 0`), or `None` when no existing code moves because every
+    /// new value sorts after every existing one.
+    pub(crate) remap: Option<Vec<i32>>,
+}
+
+/// Plan the extension of the sorted `dictionary` by appended `rows` (`None` =
+/// NULL) plus `extra_values` that join the dictionary without a row of their
+/// own (an Arrow dictionary's unreferenced values). Cost is
+/// `O((rows + extra) log dictionary)` plus `O(dictionary)` only when an
+/// existing code moves.
+pub(crate) fn plan_sorted_extension(
+    dictionary: &[String],
+    extra_values: &[&str],
+    rows: &[Option<&str>],
+) -> BoltResult<SortedDictExtension> {
+    let known = |s: &str| dictionary.binary_search_by(|d| d.as_str().cmp(s)).is_ok();
+    let mut missing: Vec<&str> = rows
+        .iter()
+        .flatten()
+        .chain(extra_values)
+        .copied()
+        .filter(|s| !known(s))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if dictionary.len() + missing.len() > i32::MAX as usize {
+        return Err(BoltError::Other(format!(
+            "dictionary overflow: more than {} unique strings (i32 index space)",
+            i32::MAX
+        )));
+    }
+    // Every value lives in exactly one of the two disjoint sorted sets, so its
+    // rank in their union is the count of smaller values in both.
+    let code = |s: &str| {
+        let rank =
+            dictionary.partition_point(|d| d.as_str() < s) + missing.partition_point(|m| *m < s);
+        (rank + 1) as i32
+    };
+    let tail = rows.iter().map(|r| r.map_or(0, code)).collect();
+    let moves = match (dictionary.last(), missing.first()) {
+        (Some(last), Some(first)) => *first < last.as_str(),
+        _ => false,
+    };
+    let remap = moves.then(|| {
+        let mut remap = Vec::with_capacity(dictionary.len() + 1);
+        remap.push(0);
+        let mut smaller_new = 0;
+        for (p, d) in dictionary.iter().enumerate() {
+            while smaller_new < missing.len() && missing[smaller_new] < d.as_str() {
+                smaller_new += 1;
+            }
+            remap.push((p + smaller_new + 1) as i32);
+        }
+        remap
+    });
+    Ok(SortedDictExtension {
+        new_values: missing.into_iter().map(str::to_string).collect(),
+        tail,
+        remap,
+    })
+}
+
+/// Merge the planned `new_values` into the sorted `dictionary` (moves, no
+/// clones of the existing strings).
+pub(crate) fn apply_sorted_extension(dictionary: &mut Vec<String>, new_values: Vec<String>) {
+    if new_values.is_empty() {
+        return;
+    }
+    if dictionary
+        .last()
+        .is_none_or(|last| new_values[0].as_str() > last.as_str())
+    {
+        dictionary.extend(new_values);
+        return;
+    }
+    let old = std::mem::take(dictionary);
+    dictionary.reserve(old.len() + new_values.len());
+    let mut old = old.into_iter().peekable();
+    let mut new = new_values.into_iter().peekable();
+    loop {
+        let take_old = match (old.peek(), new.peek()) {
+            (Some(o), Some(n)) => o < n,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let next = if take_old { old.next() } else { new.next() };
+        dictionary.extend(next);
+    }
+}
+
 /// Compute the byte-lexicographic collation rank permutation of a dictionary
 /// slice (finding F10).
 ///
@@ -390,6 +494,39 @@ impl DictionaryColumn {
             indices: device_indices,
             n_rows,
         })
+    }
+
+    /// Append `rows` (`None` = NULL) to the column, adding `extra_values` and
+    /// every new row value to the dictionary (craton-bolt-008).
+    ///
+    /// The result equals [`Self::from_string_array`] over all rows, but only
+    /// the appended rows are encoded and uploaded: the device prefix is kept
+    /// by a DtoD copy unless a new value sorts before an existing one, in
+    /// which case the prefix codes are remapped (an `O(rows)` integer pass).
+    /// On error the column is unusable and must be rebuilt.
+    pub(crate) fn append_rows(
+        &mut self,
+        extra_values: &[&str],
+        rows: &[Option<&str>],
+    ) -> BoltResult<()> {
+        let plan = plan_sorted_extension(&self.dictionary, extra_values, rows)?;
+        let prefix = std::mem::replace(&mut self.indices, GpuVec::<i32>::empty());
+        let total = self.n_rows + rows.len();
+        self.indices = match &plan.remap {
+            None => prefix.extended_with_prefix(total, self.n_rows, &plan.tail)?,
+            Some(remap) => {
+                let mut host = prefix.to_vec()?;
+                host.truncate(self.n_rows);
+                for code in host.iter_mut() {
+                    *code = remap[*code as usize];
+                }
+                host.extend_from_slice(&plan.tail);
+                GpuVec::<i32>::from_slice(&host)?
+            }
+        };
+        apply_sorted_extension(&mut self.dictionary, plan.new_values);
+        self.n_rows = total;
+        Ok(())
     }
 
     /// Lookup the index of a literal string in the dictionary.
@@ -1056,6 +1193,81 @@ mod tests {
         lex_sort_dictionary(&mut dict, &mut indices);
         assert!(dict.is_empty());
         assert_eq!(indices, vec![0, 0]);
+    }
+
+    /// Extend `(dictionary, indices)` built from `prefix` with `tail` the way
+    /// `DictionaryColumn::append_rows` does on the device.
+    fn extend_like_append<'a>(
+        prefix: &[Option<&'a str>],
+        extra: &[&'a str],
+        tail: &[Option<&'a str>],
+    ) -> (Vec<String>, Vec<i32>, SortedDictExtension) {
+        let (mut dictionary, mut indices) =
+            DictionaryColumn::dedupe_for_test(prefix.iter().copied()).unwrap();
+        let plan = plan_sorted_extension(&dictionary, extra, tail).unwrap();
+        if let Some(remap) = &plan.remap {
+            for code in indices.iter_mut() {
+                *code = remap[*code as usize];
+            }
+        }
+        indices.extend_from_slice(&plan.tail);
+        let ext = SortedDictExtension {
+            new_values: plan.new_values.clone(),
+            tail: plan.tail.clone(),
+            remap: plan.remap.clone(),
+        };
+        apply_sorted_extension(&mut dictionary, plan.new_values);
+        (dictionary, indices, ext)
+    }
+
+    /// craton-bolt-008: extending a dictionary with appended rows gives
+    /// exactly the dictionary and codes of a full rebuild over all rows —
+    /// NULLs stay 0, known values keep their codes when nothing sorts before
+    /// them, and new values that sort first/between/last shift the prefix
+    /// codes through the remap.
+    #[test]
+    fn sorted_extension_equals_full_rebuild() {
+        let prefix = [Some("m"), None, Some("d"), Some("m"), Some("x")];
+        let cases: Vec<(Vec<&str>, Vec<Option<&str>>)> = vec![
+            // Only known values and NULLs: no new value, nothing moves.
+            (vec![], vec![Some("x"), None, Some("d"), Some("m")]),
+            // New values after the last one: appended, nothing moves.
+            (
+                vec![],
+                vec![Some("z"), Some("y"), None, Some("z"), Some("d")],
+            ),
+            // New values before and between existing ones, duplicated.
+            (
+                vec![],
+                vec![Some("a"), Some("e"), Some("a"), None, Some("x")],
+            ),
+            // Unreferenced Arrow dictionary values join the dictionary.
+            (vec!["b", "m"], vec![None, Some("n")]),
+            // Empty append.
+            (vec![], vec![]),
+        ];
+        for (extra, tail) in cases {
+            let (dictionary, indices, ext) = extend_like_append(&prefix, &extra, &tail);
+            let all: Vec<Option<&str>> = prefix
+                .iter()
+                .chain(&tail)
+                .copied()
+                .chain(extra.iter().map(|s| Some(*s)))
+                .collect();
+            let (want_dict, want_idx) = DictionaryColumn::dedupe_for_test(all).unwrap();
+            assert_eq!(dictionary, want_dict, "tail {tail:?} extra {extra:?}");
+            assert_eq!(
+                indices,
+                want_idx[..prefix.len() + tail.len()],
+                "tail {tail:?} extra {extra:?}"
+            );
+            let moves = ext.new_values.first().is_some_and(|n| n.as_str() < "x");
+            assert_eq!(ext.remap.is_some(), moves, "remap only when a code moves");
+        }
+        // Appending to an empty column (all-NULL prefix) builds from scratch.
+        let (dictionary, indices, _) = extend_like_append(&[None], &[], &[Some("q"), Some("p")]);
+        assert_eq!(dictionary, vec!["p".to_string(), "q".to_string()]);
+        assert_eq!(indices, vec![0, 2, 1]);
     }
 
     /// R1 (distinct → lex codes): after dedupe the dictionary is strictly

@@ -195,6 +195,84 @@ impl DictRegistry {
         Ok(())
     }
 
+    /// Extend `table`'s dictionaries with the rows of the appended `batch`
+    /// only (craton-bolt-008), instead of rebuilding them from the whole
+    /// table. The result equals [`Self::register_table`] over the
+    /// concatenation of every batch so far. On error the table's entry may
+    /// be partially extended; the caller must rebuild it.
+    pub fn append_batch(&mut self, table: &str, batch: &RecordBatch) -> BoltResult<()> {
+        let schema = batch.schema();
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let arr = batch.column(idx);
+            let (extra, rows): (Vec<&str>, Vec<Option<&str>>) = match field.data_type() {
+                ArrowDataType::Utf8 => {
+                    let sa = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                        BoltError::Type(format!(
+                            "column '{}' in table '{table}' declared Utf8 but did not \
+                                 downcast to StringArray",
+                            field.name()
+                        ))
+                    })?;
+                    (Vec::new(), sa.iter().collect())
+                }
+                ArrowDataType::Dictionary(key_t, val_t)
+                    if key_t.as_ref() == &ArrowDataType::Int32
+                        && val_t.as_ref() == &ArrowDataType::Utf8 =>
+                {
+                    let da = arr
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<ArrowInt32Type>>()
+                        .ok_or_else(|| {
+                            BoltError::Type(format!(
+                                "column '{}' in table '{table}' declared Dictionary<Int32, \
+                                 Utf8> but did not downcast to DictionaryArray<Int32Type>",
+                                field.name()
+                            ))
+                        })?;
+                    let values = da
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            BoltError::Type(format!(
+                                "DictionaryArray has non-Utf8 value type {:?}",
+                                da.values().data_type()
+                            ))
+                        })?;
+                    let mut rows = Vec::with_capacity(da.len());
+                    for key in da.keys().iter() {
+                        rows.push(match key {
+                            None => None,
+                            Some(k) if k >= 0 && (k as usize) < values.len() => values
+                                .is_valid(k as usize)
+                                .then(|| values.value(k as usize)),
+                            Some(k) => {
+                                return Err(BoltError::Other(format!(
+                                    "dictionary key {k} out of range (dictionary has {} slots)",
+                                    values.len()
+                                )))
+                            }
+                        });
+                    }
+                    (values.iter().flatten().collect(), rows)
+                }
+                _ => continue,
+            };
+            let dict = self
+                .by_table
+                .get_mut(table)
+                .and_then(|cols| cols.get_mut(field.name()))
+                .ok_or_else(|| {
+                    BoltError::Plan(format!(
+                        "append to '{table}': column '{}' has no dictionary",
+                        field.name()
+                    ))
+                })?;
+            dict.append_rows(&extra, &rows)?;
+        }
+        Ok(())
+    }
+
     /// Drop all dictionaries for `table`. No-op if `table` was never
     /// registered.
     pub fn unregister_table(&mut self, table: &str) {
@@ -295,9 +373,9 @@ impl DictRegistry {
             // Both i32- and i64-indexed variants go through the same path; the
             // rewriter inspects the variant when it resolves a literal.
             rewriter.register(col_name.to_string(), dict);
-            // Every registry dictionary is built from the table's FULL data in
-            // one pass — `register_table` sees the whole batch, `register_batch`
-            // rebuilds from the coalesced union of every batch, and
+            // Every registry dictionary covers the table's FULL data —
+            // `register_table` sees the whole batch, `register_batch` extends
+            // it with every appended row (`append_batch`), and
             // `from_dictionary_array` keeps every non-null Arrow value (deduped)
             // — so it observed every distinct value the column holds. That is
             // exactly the completeness invariant (finding PL-M6) under which an

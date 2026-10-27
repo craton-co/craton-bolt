@@ -869,6 +869,7 @@ impl Engine {
         }
         self.bump_data_epoch();
         self.tables.remove(name);
+        self.coalesced_reads.get_mut().remove(name);
         self.streaming_sources.borrow_mut().remove(name);
         self.storage_tables.borrow_mut().remove(name);
         self.gpu_tables.borrow_mut().remove(name);

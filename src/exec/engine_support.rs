@@ -673,29 +673,32 @@ pub(crate) fn propagate_column_nullability(
     table: &str,
     batch: &RecordBatch,
 ) {
+    let schema = batch.schema();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let has_nulls = column_has_nulls(field, batch.column(idx));
+        provider.set_column_nullability(table.to_string(), field.name().clone(), has_nulls);
+    }
+}
+
+/// Whether column `arr` (declared as `field`) holds a NULL row. For
+/// `DictionaryArray<Int32, _>` the per-row validity lives on the keys.
+pub(crate) fn column_has_nulls(field: &arrow_schema::Field, arr: &ArrayRef) -> bool {
     // `Array::null_count` is an inherent-trait method; pull the trait into
     // scope locally so we can ask any `&dyn Array` for its null count.
     use arrow_array::Array;
-    let schema = batch.schema();
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let arr = batch.column(idx);
-        let has_nulls = match field.data_type() {
-            ArrowDataType::Dictionary(key_t, _) if key_t.as_ref() == &ArrowDataType::Int32 => {
-                // Dict keys carry the per-row validity. Downcast and ask the
-                // keys array directly; fall back to the array's own
-                // `null_count()` if the downcast fails (shouldn't happen for
-                // Int32 keys but defensive).
-                match arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>()
-                {
-                    Some(da) => da.keys().null_count() > 0,
-                    None => arr.null_count() > 0,
-                }
+    match field.data_type() {
+        ArrowDataType::Dictionary(key_t, _) if key_t.as_ref() == &ArrowDataType::Int32 => {
+            // Fall back to the array's own `null_count()` if the downcast
+            // fails (shouldn't happen for Int32 keys but defensive).
+            match arr
+                .as_any()
+                .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>()
+            {
+                Some(da) => da.keys().null_count() > 0,
+                None => arr.null_count() > 0,
             }
-            _ => arr.null_count() > 0,
-        };
-        provider.set_column_nullability(table.to_string(), field.name().clone(), has_nulls);
+        }
+        _ => arr.null_count() > 0,
     }
 }
 

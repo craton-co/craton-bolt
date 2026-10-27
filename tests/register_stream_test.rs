@@ -130,3 +130,130 @@ fn e2e_register_table_stream_producer_error_aborts() {
         .value(0);
     assert_eq!(sum, 150, "post-rollback table must have only the new rows");
 }
+
+/// craton-bolt-008: `register_batch` extends the Utf8 dictionary with each
+/// appended batch's values only and keeps the table as chunks. Queries
+/// interleaved with appends must still see every row under both tier
+/// policies: equality on a literal that only a later batch holds, values
+/// that sort before every earlier one (the existing codes shift), LIKE,
+/// GROUP BY over the Utf8 column, NULLs and COUNT.
+#[test]
+#[ignore = "gpu:tier1"]
+fn e2e_register_batch_appends_keep_utf8_queries_correct() {
+    use std::collections::HashMap;
+
+    use arrow_array::{Int64Array, StringArray};
+    use craton_bolt::{Engine, TierPolicy};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("s", ArrowDataType::Utf8, true),
+    ]));
+    let value = |b: i64, i: i64| -> Option<String> {
+        match i % 13 {
+            0 => None,
+            1 => Some(format!("a{b:02}")),
+            2 => Some(format!("new{b:02}")),
+            _ => Some(format!("v{:02}", i % 9)),
+        }
+    };
+    let rows_per = 64i64;
+    let make = |b: i64| {
+        let ids: Vec<i64> = (b * rows_per..(b + 1) * rows_per).collect();
+        let s: Vec<Option<String>> = ids.iter().map(|&i| value(b, i)).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(s)),
+            ],
+        )
+        .unwrap()
+    };
+    let scalar = |e: &Engine, q: &str| -> i64 {
+        let out = e.sql(q).unwrap_or_else(|err| panic!("{q}: {err}"));
+        let b = out.record_batch();
+        let c = arrow::compute::cast(b.column(0), &ArrowDataType::Int64).unwrap();
+        let c = c.as_any().downcast_ref::<Int64Array>().unwrap();
+        if c.is_null(0) {
+            0
+        } else {
+            c.value(0)
+        }
+    };
+
+    for policy in [TierPolicy::GpuFirst, TierPolicy::CostBased] {
+        let mut engine = Engine::new().expect("ctx");
+        engine.set_tier_policy(policy);
+        let mut all: Vec<(i64, Option<String>)> = Vec::new();
+        for b in 0..12i64 {
+            let batch = make(b);
+            for i in b * rows_per..(b + 1) * rows_per {
+                all.push((i, value(b, i)));
+            }
+            if b == 0 {
+                engine.register_table("t", batch).unwrap();
+            } else {
+                engine.register_batch("t", batch).unwrap();
+            }
+            if b % 3 != 1 && b != 0 {
+                continue;
+            }
+            let ctx = format!("{policy:?} after batch {b}");
+            let count_eq = |lit: &str| all.iter().filter(|r| r.1.as_deref() == Some(lit)).count();
+            assert_eq!(
+                scalar(&engine, "SELECT COUNT(*) FROM t"),
+                all.len() as i64,
+                "{ctx}"
+            );
+            let lit = format!("a{b:02}");
+            assert_eq!(
+                scalar(
+                    &engine,
+                    &format!("SELECT COUNT(*) FROM t WHERE s = '{lit}'")
+                ),
+                count_eq(&lit) as i64,
+                "{ctx}: literal only in the newest batch"
+            );
+            assert_eq!(
+                scalar(&engine, "SELECT SUM(id) FROM t WHERE s = 'v04'"),
+                all.iter()
+                    .filter(|r| r.1.as_deref() == Some("v04"))
+                    .map(|r| r.0)
+                    .sum::<i64>(),
+                "{ctx}: equality on a value every batch holds"
+            );
+            assert_eq!(
+                scalar(&engine, "SELECT COUNT(*) FROM t WHERE s LIKE 'new%'"),
+                all.iter()
+                    .filter(|r| r.1.as_deref().is_some_and(|s| s.starts_with("new")))
+                    .count() as i64,
+                "{ctx}: LIKE"
+            );
+            assert_eq!(
+                scalar(&engine, "SELECT COUNT(s) FROM t"),
+                all.iter().filter(|r| r.1.is_some()).count() as i64,
+                "{ctx}: NULLs"
+            );
+            let out = engine
+                .sql("SELECT s, COUNT(*) AS n FROM t GROUP BY s")
+                .unwrap_or_else(|e| panic!("{ctx}: GROUP BY: {e}"));
+            let rb = out.record_batch();
+            let keys = arrow::compute::cast(rb.column(0), &ArrowDataType::Utf8).unwrap();
+            let keys = keys.as_any().downcast_ref::<StringArray>().unwrap();
+            let ns = arrow::compute::cast(rb.column(1), &ArrowDataType::Int64).unwrap();
+            let ns = ns.as_any().downcast_ref::<Int64Array>().unwrap();
+            let got: HashMap<Option<String>, i64> = (0..rb.num_rows())
+                .map(|r| {
+                    let k = (!keys.is_null(r)).then(|| keys.value(r).to_string());
+                    (k, ns.value(r))
+                })
+                .collect();
+            let mut want: HashMap<Option<String>, i64> = HashMap::new();
+            for r in &all {
+                *want.entry(r.1.clone()).or_default() += 1;
+            }
+            assert_eq!(got, want, "{ctx}: GROUP BY s");
+        }
+    }
+}

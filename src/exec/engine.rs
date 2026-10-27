@@ -47,10 +47,10 @@ use crate::exec::engine_cache_key::{
 use crate::exec::engine_device_col::DeviceCol;
 use crate::exec::engine_provider::EngineProvider;
 use crate::exec::engine_support::{
-    arrow_schema_to_plan_schema, build_count_rows_batch, column_storage_rows, concat_table_batches,
-    debug_sync_check, host_column_to_arrow_array, install_persistent_cache_override,
-    passthrough_output_sources, plan_schema_to_arrow_schema, propagate_column_nullability,
-    should_emit_pool_stats, try_extend_column,
+    arrow_schema_to_plan_schema, build_count_rows_batch, column_has_nulls, column_storage_rows,
+    concat_table_batches, debug_sync_check, host_column_to_arrow_array,
+    install_persistent_cache_override, passthrough_output_sources, plan_schema_to_arrow_schema,
+    propagate_column_nullability, should_emit_pool_stats, try_extend_column,
 };
 // Re-exported (not just `use`d) so `crate::exec::engine::pool_stats_interval_from_env`
 // — the path `lib.rs`'s `__test_only_env_vars` module re-exports — keeps resolving
@@ -1041,6 +1041,31 @@ impl Drop for ActiveEnginePermit {
     }
 }
 
+/// A cached concatenation of a multi-chunk table (see
+/// `Engine::coalesced_reads`).
+pub(crate) struct CoalescedRead {
+    /// The chunks it was built from. Holding them keeps their column
+    /// allocations alive, so pointer identity cannot be reused by a later
+    /// chunk and the identity check in [`Self::matches`] is exact.
+    chunks: Vec<RecordBatch>,
+    batch: RecordBatch,
+}
+
+impl CoalescedRead {
+    /// True when `chunks` are exactly the chunks this was built from.
+    fn matches(&self, chunks: &[RecordBatch]) -> bool {
+        self.chunks.len() == chunks.len()
+            && self.chunks.iter().zip(chunks).all(|(a, b)| {
+                a.num_rows() == b.num_rows()
+                    && a.num_columns() == b.num_columns()
+                    && a.columns()
+                        .iter()
+                        .zip(b.columns())
+                        .all(|(x, y)| Arc::ptr_eq(x, y))
+            })
+    }
+}
+
 /// Top-level query engine.
 ///
 /// Field-drop order matters: `dict_registry` owns `DictionaryColumn`s which own
@@ -1076,18 +1101,24 @@ impl Drop for ActiveEnginePermit {
 pub struct Engine {
     /// Registered tables, keyed by name.
     ///
-    /// **Invariant: every entry holds exactly one batch.** Multi-batch
-    /// ingestion (`register_batch` appends, `register_table_stream`) is
-    /// coalesced at ingest time, so query-time reads are Arc clones and no
-    /// query pays an O(table-bytes) host concatenation. The `Vec` shape is
-    /// kept so the validity probes and morsel planner can take a batch slice
-    /// uniformly with the streaming overlay.
+    /// An entry is a list of chunks. `register_table_stream` coalesces at
+    /// ingest; `register_batch` appends a chunk and coalesces only once the
+    /// appended chunks outgrow the head chunk (craton-bolt-008: coalescing
+    /// on every append made N appends O(N^2)), so each row is copied an
+    /// amortised constant number of times. Query-time reads of a
+    /// multi-chunk entry concatenate once and are then served from
+    /// `coalesced_reads`, so repeated queries stay Arc clones.
     ///
     /// `pub(crate)` (was module-private): read by the engine-method clusters
     /// that were split out of this file into sibling modules
     /// (`engine_streaming_impl`, `engine_agg_impl`). Pure visibility widening —
     /// no behaviour change.
     pub(crate) tables: HashMap<String, Vec<RecordBatch>>,
+    /// The concatenation of a multi-chunk `tables` entry, made by the first
+    /// query-time read (`materialize_table` runs from `&self`) and valid
+    /// while the entry still holds exactly the pinned chunks. The next
+    /// `register_batch` adopts it as the table's head chunk.
+    pub(crate) coalesced_reads: RefCell<HashMap<String, CoalescedRead>>,
     /// Lazily-registered streaming table sources, keyed by name.
     ///
     /// Tables registered through [`Engine::register_table_stream_lazy`] are
@@ -1640,6 +1671,7 @@ impl EngineBuilder {
 
         let engine = Engine {
             tables: HashMap::new(),
+            coalesced_reads: RefCell::new(HashMap::new()),
             streaming_sources: RefCell::new(HashMap::new()),
             provider: MemTableProvider::new(),
             dict_registry: RefCell::new(crate::exec::dict_registry::DictRegistry::new()),
@@ -2471,136 +2503,103 @@ impl Engine {
         self.gpu_tables
             .borrow_mut()
             .insert(name.clone(), Some(new_gpu_table));
+        self.coalesced_reads.get_mut().remove(&name);
         self.tables.insert(name, vec![batch]);
         Ok(())
     }
 
     /// Append `batch` to the table named `name`, creating it if absent.
     ///
-    /// The append is coalesced into the table's single stored batch here, at
-    /// ingest (see the field doc on `tables`), so no query ever pays a
-    /// full-table host concatenation. The coalesced batch is the one the
-    /// dictionary union below needs anyway, so storing it costs nothing
-    /// extra.
+    /// Costs O(rows in `batch`), not O(rows in the table) (craton-bolt-008):
+    ///   - the batch is stored as a new chunk; the chunks are coalesced only
+    ///     once the appended ones outgrow the head chunk (see the field doc on
+    ///     `tables`), so a row is copied an amortised constant number of times;
+    ///   - the Utf8 dictionaries are extended with this batch's values only
+    ///     ([`DictRegistry::append_batch`](crate::exec::dict_registry::DictRegistry::append_batch)),
+    ///     giving exactly the dictionary a rebuild over every batch would give,
+    ///     so a literal that only an appended batch holds still folds (review
+    ///     C10);
+    ///   - per-column nullability is OR-ed with this batch's.
     ///
     /// Subsequent batches MUST share the schema of the first batch; mismatched
-    /// schemas surface a `Plan` error here rather than at query time.
+    /// schemas surface a `Plan` error here rather than at query time. On error
+    /// the table is unchanged.
     ///
-    /// Dictionaries are **unioned across all registered batches** (review C10):
-    /// after each append, the dict registry is rebuilt against the
-    /// concatenated host batches so the string-literal rewriter sees every
-    /// dictionary value that exists in any batch. Without this union, a query
-    /// like `WHERE s = 'literal_only_in_batch_2'` would constant-fold to
-    /// `Bool(false)` against batch 0's dictionary and silently return zero
-    /// rows even though batch 2 contains matching rows. The GPU index column
-    /// is rebuilt lazily on the next query via `ensure_gpu_table` (which
-    /// scans the same concatenated batch through `GpuTable::from_record_batch`),
-    /// so the registry's dictionary and the GPU's per-row indices stay aligned
-    /// — both are built from the same concat-batch input, in the same
-    /// first-occurrence order.
-    ///
-    /// Performance: this method does NOT re-upload anything to the GPU. It
-    /// only pushes the host-side `RecordBatch`, rebuilds the host-side
-    /// dictionary against the materialised concat, and bumps per-column
-    /// host revisions for the table. The GPU-resident `GpuTable` stays
-    /// intact in the cache — the next query touches each column through
-    /// `ensure_gpu_table`, which compares per-column host revisions
-    /// against `GpuColumn::host_revision` and:
-    ///   - reuses any column whose revision still matches (no re-upload);
-    ///   - for each dirty column, allocates a new GpuVec sized for the
-    ///     full new row count, DtoD-copies the previously-uploaded
-    ///     prefix from the cached column, and HtoD-uploads only the
-    ///     tail of new rows. The unchanged prefix never re-crosses
-    ///     PCIe.
-    ///
-    /// Before this incremental cache (batch 5), `register_batch` set the
-    /// `gpu_tables` slot to `None` and the next query re-uploaded EVERY
-    /// column in full from the concatenated host batches. A
-    /// streaming-append workload that issued one query between each of N
-    /// appends paid `1+2+…+N = N(N+1)/2` batches' worth of HtoD traffic.
-    /// With the incremental cache, the same workload pays N batches'
-    /// worth — one HtoD copy of the new tail per append.
+    /// Nothing is uploaded here for the base columns: `ensure_gpu_table`
+    /// compares per-column host revisions on the next query and uploads only
+    /// the new tail of each fixed-width column, DtoD-preserving the prefix.
     pub fn register_batch(&mut self, name: &str, batch: RecordBatch) -> BoltResult<()> {
         self.bump_data_epoch();
         self.touch_table(name);
-        // Stage 6: dict-encoded columns are ingested natively now, so no
-        // flatten-to-StringArray is needed for the schema check below to
-        // line up — batch 0 and any appended batch both carry the Arrow
-        // `Dictionary<Int32, Utf8>` type verbatim.
-        if let Some(existing) = self.tables.get_mut(name) {
-            // Schema-check against batch 0 — concat_batches would fail at query
-            // time anyway, but surface it eagerly at registration time.
-            if let Some(first) = existing.first() {
-                if first.schema() != batch.schema() {
-                    return Err(BoltError::Plan(format!(
-                        "register_batch: schema mismatch for table '{name}' — \
-                         expected {:?}, got {:?}",
-                        first.schema(),
-                        batch.schema()
-                    )));
-                }
-            }
-            existing.push(batch);
-            // Coalesce: the table becomes ONE batch again. Every later read
-            // (`materialize_table`, GPU upload, validity probes) is then an
-            // Arc clone instead of an O(table-bytes) concat per query.
-            let coalesced = concat_table_batches(name, existing)?;
-            *existing = vec![coalesced];
-            // Review C10: rebuild the dict registry against the *concatenated*
-            // batches so the string-literal rewriter sees every dict value
-            // from every batch — not just batch 0. Without this, a literal
-            // that lives only in an appended batch resolves to `None` in the
-            // rewriter and the predicate folds to `Bool(false)`, silently
-            // dropping every otherwise-matching row in the appended batch.
-            //
-            // We also re-extend the provider schema in case rebuilding flipped
-            // any `__idx_<col>` between i32 and i64 (the union may push a
-            // column over the i64 cardinality threshold). And we re-evaluate
-            // per-column nullability against the same concatenated view — a
-            // previously null-free column may have just gained a null.
-            let concatenated = self.materialize_table(name)?;
-            let registry = self.dict_registry.get_mut();
-            registry.unregister_table(name);
-            registry.register_table(name.to_string(), &concatenated)?;
-            let base_schema = arrow_schema_to_plan_schema(concatenated.schema().as_ref())?;
-            let extended = registry.extended_schema(name, &base_schema);
-            self.provider.register(name.to_string(), extended);
-            propagate_column_nullability(&mut self.provider, name, &concatenated);
-            // Batch 5: bump per-column host revisions for an append. Every
-            // column gains rows, so every column's revision bumps; the
-            // table revision bumps too. The GpuTable in `gpu_tables` is
-            // INTENTIONALLY left in place — `ensure_gpu_table` will
-            // compare revisions on the next query and incrementally
-            // upload only the new tail per column (DtoD-preserving the
-            // unchanged prefix). Note: the dict registry just rebuilt
-            // its index columns from the concatenated batch in
-            // first-occurrence order; since the append preserves the
-            // historical row order, the prefix of the rebuilt indices
-            // is bit-identical to the prefix the GpuTable already
-            // holds — so the prefix-preserving copy is correct for
-            // Utf8 columns too.
-            let n_rows_total = concatenated.num_rows();
-            let entry = self.host_revisions.entry(name.to_string()).or_default();
-            entry.table_revision += 1;
-            entry.n_rows = n_rows_total;
-            let new_rev = entry.table_revision;
-            for field in concatenated.schema().fields() {
-                entry.column_revisions.insert(field.name().clone(), new_rev);
-                entry
-                    .column_n_rows
-                    .insert(field.name().clone(), n_rows_total);
-            }
-            // Leave `gpu_tables[name]` untouched — incremental upload
-            // happens in `ensure_gpu_table`. If the slot is somehow
-            // absent (initial install raced or was cleared by an
-            // out-of-band path), `ensure_gpu_table` falls through to
-            // a full upload, which is still correct just not optimal.
-            Ok(())
-        } else {
+        // Stage 6: dict-encoded columns are ingested natively, so batch 0 and
+        // any appended batch both carry the Arrow `Dictionary<Int32, Utf8>`
+        // type verbatim and the schema check below lines up.
+        let Some(existing) = self.tables.get(name) else {
             // First batch for a brand-new table: defer to register_table so the
             // dictionary + provider wiring happens exactly once.
-            self.register_table(name.to_string(), batch)
+            return self.register_table(name.to_string(), batch);
+        };
+        if let Some(first) = existing.first() {
+            if first.schema() != batch.schema() {
+                return Err(BoltError::Plan(format!(
+                    "register_batch: schema mismatch for table '{name}' —                      expected {:?}, got {:?}",
+                    first.schema(),
+                    batch.schema()
+                )));
+            }
         }
+        // A query since the last append may have coalesced the chunks already.
+        let mut chunks = match self.coalesced_reads.get_mut().remove(name) {
+            Some(c) if c.matches(existing) => vec![c.batch],
+            _ => existing.clone(),
+        };
+        chunks.push(batch.clone());
+        let appended: usize = chunks[1..].iter().map(RecordBatch::num_rows).sum();
+        if appended >= chunks[0].num_rows() {
+            chunks = vec![concat_table_batches(name, &chunks)?];
+        }
+        if let Err(e) = self.dict_registry.get_mut().append_batch(name, &batch) {
+            // Restore the dictionaries of the unchanged table.
+            let full = self.materialize_table(name)?;
+            let registry = self.dict_registry.get_mut();
+            registry.unregister_table(name);
+            registry.register_table(name.to_string(), &full)?;
+            return Err(e);
+        }
+        let schema = batch.schema();
+        let had_nulls: Vec<bool> = schema
+            .fields()
+            .iter()
+            .map(|f| self.provider.has_nulls(name, f.name()))
+            .collect();
+        let base_schema = arrow_schema_to_plan_schema(schema.as_ref())?;
+        let extended = self
+            .dict_registry
+            .get_mut()
+            .extended_schema(name, &base_schema);
+        self.provider.register(name.to_string(), extended);
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let has_nulls = had_nulls[idx] || column_has_nulls(field, batch.column(idx));
+            self.provider
+                .set_column_nullability(name.to_string(), field.name().clone(), has_nulls);
+        }
+        let n_rows_total = chunks.iter().map(RecordBatch::num_rows).sum();
+        self.tables.insert(name.to_string(), chunks);
+        // Batch 5: every column gained rows, so every column's revision and
+        // the table revision bump. `gpu_tables[name]` is INTENTIONALLY left in
+        // place: `ensure_gpu_table` extends it on the next query (or falls
+        // back to a full upload when the slot is absent).
+        let entry = self.host_revisions.entry(name.to_string()).or_default();
+        entry.table_revision += 1;
+        entry.n_rows = n_rows_total;
+        let new_rev = entry.table_revision;
+        for field in schema.fields() {
+            entry.column_revisions.insert(field.name().clone(), new_rev);
+            entry
+                .column_n_rows
+                .insert(field.name().clone(), n_rows_total);
+        }
+        Ok(())
     }
 
     /// Make sure the GPU-resident copy of `name` is fresh.
@@ -2883,17 +2882,34 @@ impl Engine {
 
     /// The single `RecordBatch` holding a registered table's rows.
     ///
-    /// Both the eager store and the materialised lazy overlay keep each
-    /// table coalesced into exactly one batch (see the field docs on
-    /// `tables` / `streaming_sources`), so this is an Arc clone — no column
-    /// is copied. `concat_table_batches` is retained only as a defensive
-    /// fallback for an out-of-band multi-batch entry.
+    /// A single-chunk table is an Arc clone. A table with appended chunks
+    /// (see the field doc on `tables`) is concatenated by the first read and
+    /// served from `coalesced_reads` until it changes again.
     // `pub(crate)` (was module-private): called from the string method
     // cluster split out into `engine_string_impl`. Pure visibility widening.
     pub(crate) fn materialize_table(&self, name: &str) -> BoltResult<RecordBatch> {
         // Eager tables first; fall back to the lazy streaming overlay.
-        if let Some(batches) = self.tables.get(name) {
-            return concat_table_batches(name, batches);
+        if let Some(chunks) = self.tables.get(name) {
+            if chunks.len() < 2 {
+                return concat_table_batches(name, chunks);
+            }
+            if let Some(c) = self.coalesced_reads.borrow().get(name) {
+                if c.matches(chunks) {
+                    return Ok(c.batch.clone());
+                }
+            }
+            let batch = concat_table_batches(name, chunks)?;
+            let mut cache = self.coalesced_reads.borrow_mut();
+            // Drop entries for tables that changed since they were cached.
+            cache.retain(|t, c| self.tables.get(t).is_some_and(|ch| c.matches(ch)));
+            cache.insert(
+                name.to_string(),
+                CoalescedRead {
+                    chunks: chunks.clone(),
+                    batch: batch.clone(),
+                },
+            );
+            return Ok(batch);
         }
         // Streaming overlay: collapse the source to materialised on first
         // read, then concat its batches.
@@ -5944,10 +5960,11 @@ mod tests {
         assert_eq!(sum, expected_sum, "sum of x column across all 10 batches");
     }
 
-    /// Multi-batch ingestion is coalesced at ingest: after any number of
-    /// appends (or an eager multi-batch stream, or a lazy drain) the table
-    /// holds exactly one batch, so no query concatenates. Values and order
-    /// are preserved.
+    /// Multi-batch ingestion is coalesced: appends are coalesced
+    /// geometrically (craton-bolt-008) and a multi-chunk table is
+    /// concatenated once by its first read, so repeated reads are Arc
+    /// clones; an eager multi-batch stream holds exactly one batch. Values
+    /// and order are preserved.
     #[test]
     #[ignore = "gpu:projection"]
     fn multi_batch_ingest_is_coalesced_to_one_batch() {
@@ -5956,7 +5973,25 @@ mod tests {
             engine
                 .register_batch("appended", int64_batch(i * 10, 10))
                 .unwrap();
-            assert_eq!(engine.tables["appended"].len(), 1, "after append {i}");
+        }
+        // Chunk sizes 10,10 -> 20; +10 -> 20,10; +10 -> 40; +10 -> 40,10.
+        assert_eq!(engine.tables["appended"].len(), 2);
+        let first = engine.materialize_table("appended").unwrap();
+        let again = engine.materialize_table("appended").unwrap();
+        assert!(Arc::ptr_eq(first.column(0), again.column(0)));
+        // The next append adopts the coalesced read as its head chunk.
+        engine
+            .register_batch("appended", int64_batch(50, 10))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            engine.tables["appended"][0].column(0),
+            first.column(0)
+        ));
+        engine.deregister_table("appended").unwrap();
+        for i in 0..5i64 {
+            engine
+                .register_batch("appended", int64_batch(i * 10, 10))
+                .unwrap();
         }
         engine
             .register_table_stream(

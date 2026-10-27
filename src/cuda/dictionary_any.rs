@@ -336,6 +336,34 @@ impl DictionaryColumnAny {
         Ok(Self::I32(inner))
     }
 
+    /// Append rows to the column without re-encoding the existing ones (see
+    /// [`DictionaryColumn::append_rows`]). Growing past
+    /// [`I32_INDEX_THRESHOLD`] distinct values fails exactly like
+    /// [`Self::from_string_array`] does, since the wide path is not wired.
+    pub(crate) fn append_rows(
+        &mut self,
+        extra_values: &[&str],
+        rows: &[Option<&str>],
+    ) -> BoltResult<()> {
+        match self {
+            Self::I32(d) => {
+                d.append_rows(extra_values, rows)?;
+                if d.dictionary.len() >= I32_INDEX_THRESHOLD {
+                    return Err(crate::error::BoltError::Other(format!(
+                        "i64-indexed dictionary not yet wired through codegen; \
+                         use i32 path (column has {} distinct strings, threshold is {})",
+                        d.dictionary.len(),
+                        I32_INDEX_THRESHOLD
+                    )));
+                }
+                Ok(())
+            }
+            Self::I64(_) => Err(crate::error::BoltError::Other(
+                "i64-indexed dictionary not yet wired through codegen".into(),
+            )),
+        }
+    }
+
     /// Plan dtype of the index column. Drives the engine's `__idx_<col>`
     /// schema injection and any per-column kernel-arg dispatch.
     pub fn index_dtype(&self) -> DataType {
