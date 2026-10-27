@@ -1511,18 +1511,19 @@ fn welford_state_from_batch(
 /// Pack a finalized stddev (`Some(σ)` or `None`) into a one-row Arrow
 /// `Float64Array`.
 ///
-/// * `STDDEV_POP` returns `0.0` on an empty input — mirrors the existing
-///   AVG convention so the output schema field can stay non-nullable in
-///   downstream consumers that don't yet handle the SQL NULL case.
+/// * `STDDEV_POP` returns SQL NULL on an empty / all-NULL input.
 /// * `STDDEV_SAMP` returns SQL NULL when `count <= 1` (the divisor is zero
 ///   or negative — undefined per the SQL standard); the output field is
 ///   nullable per `LogicalPlan::Aggregate` schema-construction.
+///
+/// Shared by the plain scalar path and the pre-stage path
+/// (`agg_with_pre`), so both decide the empty-input result the same way.
 ///
 /// `out_field.dtype` must be `Float64` (validated against the planner's
 /// declared output schema); we surface a Type error otherwise so a
 /// future plan that picks the wrong dtype fails loudly rather than
 /// silently truncating.
-fn stddev_to_array(
+pub(crate) fn stddev_to_array(
     value: Option<f64>,
     agg: &AggregateExpr,
     out_field: &Field,
@@ -1533,25 +1534,13 @@ fn stddev_to_array(
             out_field.dtype
         )));
     }
-    match (agg, value) {
-        (AggregateExpr::StddevPop(_), Some(v)) => {
-            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
-        }
-        (AggregateExpr::StddevPop(_), None) => {
-            // Empty input: match the AVG-on-empty convention (return 0.0
-            // rather than NULL) so the output column stays packed when the
-            // SELECT-list re-projection consumes it. Documented in the
-            // public stddev semantics on `welford::WelfordState`.
-            Ok(Arc::new(Float64Array::from(vec![0.0_f64])) as ArrayRef)
-        }
-        (AggregateExpr::StddevSamp(_), Some(v)) => {
-            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
-        }
-        (AggregateExpr::StddevSamp(_), None) => {
-            // count <= 1 → SQL NULL. The output field is nullable in the
-            // logical plan's Aggregate schema (every aggregate output is),
-            // so a single-element nullable Float64Array packs cleanly here.
-            Ok(Arc::new(Float64Array::from(vec![None::<f64>])) as ArrayRef)
+    match agg {
+        // `None` (empty input, or count <= 1 for STDDEV_SAMP) is SQL NULL.
+        // The output field is nullable in the logical plan's Aggregate
+        // schema (every aggregate output is), so a single-element nullable
+        // Float64Array packs cleanly here.
+        AggregateExpr::StddevPop(_) | AggregateExpr::StddevSamp(_) => {
+            Ok(Arc::new(Float64Array::from(vec![value])) as ArrayRef)
         }
         _ => Err(BoltError::Other(
             "stddev_to_array called with non-STDDEV aggregate".into(),
@@ -2390,7 +2379,7 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
 /// non-nullable column would be rejected by `RecordBatch::try_new`. Mirrors
 /// the `None`-seeded packing in `minmax_decimal128_from_batch` and the
 /// nullable branch of `avg_result_array`.
-fn null_scalar_array(out_dtype: DataType) -> BoltResult<ArrayRef> {
+pub(crate) fn null_scalar_array(out_dtype: DataType) -> BoltResult<ArrayRef> {
     match out_dtype {
         DataType::Int32 => Ok(Arc::new(Int32Array::from(vec![Option::<i32>::None])) as ArrayRef),
         DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![Option::<i64>::None])) as ArrayRef),

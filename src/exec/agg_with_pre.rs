@@ -49,6 +49,7 @@ use crate::cuda::buffer::primitive_to_gpu;
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
+use crate::exec::aggregate::{null_scalar_array, stddev_to_array};
 use crate::exec::expr_agg;
 use crate::exec::gpu_compact::{gather_one, prefix_scan_mask, GatheredCol, ScanResult};
 use crate::exec::gpu_table::{GpuColumnData, GpuTable};
@@ -180,7 +181,7 @@ pub fn try_execute_resident(
     }
     let n_rows = resident.n_rows;
     if n_rows == 0 {
-        // Degenerate: let the host path return the typed identity.
+        // Degenerate: let the host path return the typed NULL.
         return Ok(None);
     }
 
@@ -352,8 +353,15 @@ pub fn try_execute_resident(
     //        one we reduce the dense pre-output buffer in place.
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plans.len());
     for (i, fa) in plans.iter().enumerate() {
-        let out_dtype = aggregate.output_schema.fields[i].dtype;
+        let out_field = &aggregate.output_schema.fields[i];
+        let out_dtype = out_field.dtype;
+        // Inputs carry no NULLs here (gated above), so the survivor count is
+        // the non-NULL count: zero survivors means SUM/MIN/MAX are NULL.
+        let survivors = scan.as_ref().map_or(n_rows, |(_, sr)| sr.total_count);
         let array = match fa {
+            FastAgg::Reduce(..) if out_field.nullable && survivors == 0 => {
+                null_scalar_array(out_dtype)?
+            }
             FastAgg::Reduce(idx, op) => {
                 let scalar = match &scan {
                     Some((_mask, sr)) => {
@@ -370,13 +378,7 @@ pub fn try_execute_resident(
                 };
                 scalar_to_array(scalar, out_dtype)?
             }
-            FastAgg::Count => {
-                let n = match &scan {
-                    Some((_mask, sr)) => sr.total_count,
-                    None => n_rows,
-                };
-                scalar_to_array(Scalar::I64(n as i64), out_dtype)?
-            }
+            FastAgg::Count => scalar_to_array(Scalar::I64(survivors as i64), out_dtype)?,
         };
         arrays.push(array);
     }
@@ -391,8 +393,8 @@ pub fn try_execute_resident(
 
 /// Reduce a device-resident [`GatheredCol`] (compacted survivors) in place,
 /// reading it as its own element type. Used by [`try_execute_resident`]'s
-/// predicate branch. An empty gather (`len == 0`) flows through
-/// `reduce_gpu_vec`, which short-circuits to the op's identity.
+/// predicate branch. The caller emits NULL for an empty gather, so the
+/// identity `reduce_gpu_vec` returns for `len == 0` never reaches a result.
 fn reduce_gathered(op: ReduceOp, gathered: &GatheredCol) -> BoltResult<Scalar> {
     let n = gathered.len();
     match gathered {
@@ -674,6 +676,12 @@ fn build_one_aggregate(
         AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
             let op = ReduceOp::from_agg(agg)?;
             let resolved = resolve_agg_input_col(expr, pre_spec, compacted, out_field.dtype)?;
+            // SQL: SUM/MIN/MAX over zero non-NULL (post-filter) values is
+            // NULL, not the reduction identity. Same rule as the plain
+            // scalar path in `aggregate::build_one_aggregate`.
+            if out_field.nullable && resolved.non_null_count() == 0 {
+                return null_scalar_array(out_field.dtype);
+            }
             let scalar = reduce_host_col(op, resolved.as_ref())?;
             scalar_to_array(scalar, out_field.dtype)
         }
@@ -720,7 +728,7 @@ fn build_one_aggregate(
                 AggregateExpr::StddevSamp(_) => crate::exec::welford::StddevKind::Samp,
                 _ => unreachable!("matched in outer arm"),
             };
-            stddev_to_array_with_pre(crate::exec::welford::finalize(&state, kind), agg, out_field)
+            stddev_to_array(crate::exec::welford::finalize(&state, kind), agg, out_field)
         }
         AggregateExpr::Avg(expr) => {
             // AVG via the **fused** kernel: one launch produces both the
@@ -1070,46 +1078,6 @@ fn reduce_host_col(op: ReduceOp, col: &HostCol) -> BoltResult<Scalar> {
         HostColValues::I64(v) => reduce_host_slice::<i64>(op, DataType::Int64, v),
         HostColValues::F32(v) => reduce_host_slice::<f32>(op, DataType::Float32, v),
         HostColValues::F64(v) => reduce_host_slice::<f64>(op, DataType::Float64, v),
-    }
-}
-
-/// Pack a finalized stddev (`Some(σ)` or `None`) into a one-row Arrow
-/// `Float64Array`. Mirrors [`aggregate::stddev_to_array`] (see that
-/// module's doc); duplicated here so the pre-aggregated path doesn't
-/// have to reach across module boundaries for a single
-/// dtype-checked-pack helper.
-fn stddev_to_array_with_pre(
-    value: Option<f64>,
-    agg: &AggregateExpr,
-    out_field: &Field,
-) -> BoltResult<ArrayRef> {
-    if out_field.dtype != DataType::Float64 {
-        return Err(BoltError::Type(format!(
-            "STDDEV output dtype must be Float64, got {:?}",
-            out_field.dtype
-        )));
-    }
-    match (agg, value) {
-        (AggregateExpr::StddevPop(_), Some(v)) => {
-            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
-        }
-        (AggregateExpr::StddevPop(_), None) => {
-            // Empty / all-NULL input → 0.0 (mirrors the AVG convention so
-            // a non-nullable downstream consumer never sees a NULL here).
-            Ok(Arc::new(Float64Array::from(vec![0.0_f64])) as ArrayRef)
-        }
-        (AggregateExpr::StddevSamp(_), Some(v)) => {
-            Ok(Arc::new(Float64Array::from(vec![v])) as ArrayRef)
-        }
-        (AggregateExpr::StddevSamp(_), None) => {
-            // count <= 1 → SQL NULL. The aggregate output field is
-            // nullable by `LogicalPlan::Aggregate` construction, so this
-            // single-element nullable Float64Array packs cleanly.
-            Ok(Arc::new(Float64Array::from(vec![None::<f64>])) as ArrayRef)
-        }
-        _ => Err(BoltError::Other(
-            "stddev_to_array_with_pre called with non-STDDEV aggregate".into(),
-        )),
     }
 }
 
@@ -2066,5 +2034,110 @@ mod null_propagation_tests {
             neumaier_sum_f64(mixed_inf.iter().copied()).is_nan(),
             "+Inf and -Inf together must produce NaN"
         );
+    }
+
+    // ---- empty / all-NULL post-filter input is SQL NULL (craton-bolt-003) ----
+
+    /// One pre output `x` of `dtype`, compacted to `col`.
+    fn one_col(dtype: DataType, col: HostCol) -> (KernelSpec, CompactedPreOutputs) {
+        let io = crate::plan::physical_plan::ColumnIO {
+            name: "x".into(),
+            dtype,
+        };
+        let spec = KernelSpec {
+            inputs: vec![io.clone()],
+            outputs: vec![io],
+            ops: Vec::new(),
+            predicate: None,
+            register_count: 0,
+            input_has_validity: Vec::new(),
+            output_has_validity: Vec::new(),
+        };
+        (spec, CompactedPreOutputs { cols: vec![col] })
+    }
+
+    fn agg_cell(agg: AggregateExpr, dtype: DataType, col: HostCol) -> ArrayRef {
+        let (spec, compacted) = one_col(dtype, col);
+        let out = Field {
+            name: "a".into(),
+            dtype: if matches!(agg, AggregateExpr::Count(_)) {
+                DataType::Int64
+            } else if matches!(
+                agg,
+                AggregateExpr::StddevPop(_)
+                    | AggregateExpr::StddevSamp(_)
+                    | AggregateExpr::VarPop(_)
+                    | AggregateExpr::VarSamp(_)
+                    | AggregateExpr::Avg(_)
+            ) {
+                DataType::Float64
+            } else {
+                dtype
+            },
+            nullable: true,
+        };
+        build_one_aggregate(&agg, &out, &spec, &compacted).expect("aggregate")
+    }
+
+    #[test]
+    fn aggregates_over_empty_or_all_null_input_are_null() {
+        let x = || Expr::Column("x".into());
+        let empty = || HostCol {
+            values: HostColValues::F64(Vec::new()),
+            validity: None,
+        };
+        let all_null = || HostCol {
+            values: HostColValues::I64(vec![1_000, 1_000]),
+            validity: Some(vec![0, 0]),
+        };
+        let one = || HostCol {
+            values: HostColValues::F64(vec![3.0]),
+            validity: None,
+        };
+        for (agg, dtype, col) in [
+            (AggregateExpr::Sum(x()), DataType::Float64, empty()),
+            (AggregateExpr::Min(x()), DataType::Float64, empty()),
+            (AggregateExpr::Max(x()), DataType::Float64, empty()),
+            (AggregateExpr::Sum(x()), DataType::Int64, all_null()),
+            (AggregateExpr::Min(x()), DataType::Int64, all_null()),
+            (AggregateExpr::Max(x()), DataType::Int64, all_null()),
+            (AggregateExpr::Avg(x()), DataType::Float64, empty()),
+            (
+                AggregateExpr::StddevPop(Box::new(x())),
+                DataType::Float64,
+                empty(),
+            ),
+            (
+                AggregateExpr::StddevSamp(Box::new(x())),
+                DataType::Float64,
+                one(),
+            ),
+            (
+                AggregateExpr::VarPop(Box::new(x())),
+                DataType::Float64,
+                empty(),
+            ),
+            (
+                AggregateExpr::VarSamp(Box::new(x())),
+                DataType::Float64,
+                one(),
+            ),
+        ] {
+            let label = format!("{agg:?} over {dtype:?}");
+            let cell = agg_cell(agg, dtype, col);
+            assert_eq!(cell.len(), 1, "{label}");
+            assert!(cell.is_null(0), "{label} must be NULL");
+        }
+        // STDDEV_POP over one value is 0, not NULL.
+        let cell = agg_cell(
+            AggregateExpr::StddevPop(Box::new(x())),
+            DataType::Float64,
+            one(),
+        );
+        assert!(!cell.is_null(0));
+        // COUNT over an all-NULL input stays 0.
+        let cell = agg_cell(AggregateExpr::Count(x()), DataType::Int64, all_null());
+        let cell = cell.as_any().downcast_ref::<Int64Array>().expect("i64");
+        assert_eq!(cell.value(0), 0);
     }
 }
