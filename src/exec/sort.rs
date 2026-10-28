@@ -141,6 +141,39 @@ pub fn should_use_gpu_sort(
     key_dtypes.iter().copied().all(dtype_is_gpu_sort_default)
 }
 
+/// The values a host sort orders `values` by: a float column with every NaN
+/// (either sign, any payload) replaced by the positive quiet NaN, which
+/// Arrow's total order places above `+inf`. This makes the host sort agree
+/// with the GPU radix path (which canonicalizes the same way) and with
+/// MIN / MAX: all NaNs are one value, greater than every other. Other types,
+/// and float columns without NaN, are returned as is. Only the sort key is
+/// replaced; the sorted output keeps the original values.
+pub(crate) fn sort_key_values(values: &arrow_array::ArrayRef) -> arrow_array::ArrayRef {
+    use arrow_array::types::{Float32Type, Float64Type};
+    use arrow_array::{cast::AsArray, PrimitiveArray};
+    match values.data_type() {
+        arrow_schema::DataType::Float64 => {
+            let a = values.as_primitive::<Float64Type>();
+            if !a.iter().any(|v| v.is_some_and(f64::is_nan)) {
+                return Arc::clone(values);
+            }
+            let out: PrimitiveArray<Float64Type> =
+                a.unary(|v| if v.is_nan() { f64::NAN } else { v });
+            Arc::new(out)
+        }
+        arrow_schema::DataType::Float32 => {
+            let a = values.as_primitive::<Float32Type>();
+            if !a.iter().any(|v| v.is_some_and(f32::is_nan)) {
+                return Arc::clone(values);
+            }
+            let out: PrimitiveArray<Float32Type> =
+                a.unary(|v| if v.is_nan() { f32::NAN } else { v });
+            Arc::new(out)
+        }
+        _ => Arc::clone(values),
+    }
+}
+
 /// Apply ORDER BY to the input handle.
 pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<QueryHandle> {
     let batch = input.into_record_batch();
@@ -199,7 +232,7 @@ pub fn execute_sort(input: QueryHandle, sort_exprs: &[SortExpr]) -> BoltResult<Q
         let col_name = expr_to_column_name(&se.expr)?;
         let idx = batch.schema().index_of(&col_name).map_err(arrow_err)?;
         sort_cols.push(SortColumn {
-            values: batch.column(idx).clone(),
+            values: sort_key_values(batch.column(idx)),
             options: Some(SortOptions {
                 descending: se.descending,
                 nulls_first: se.nulls_first,
@@ -602,6 +635,52 @@ mod tests {
         let out = execute_sort(handle, &[col("x", true, false)]).unwrap();
         let result = out.into_record_batch();
         assert_eq!(as_f64(&result, 0), vec![Some(3.5), Some(2.5), Some(1.5)]);
+    }
+
+    /// Every NaN (either sign, any payload) is one value, greater than
+    /// `+inf` — the order the GPU radix path and MIN / MAX already use.
+    #[test]
+    fn host_sort_puts_every_nan_last_ascending_and_first_descending() {
+        let neg_nan = -f64::NAN;
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        let vals = vec![
+            Some(neg_nan),
+            Some(1.0),
+            None,
+            Some(f64::INFINITY),
+            Some(payload_nan),
+            Some(-2.0),
+            Some(f64::NAN),
+        ];
+        let sorted = |desc: bool| {
+            let h = QueryHandle::from_record_batch(float_batch("x", vals.clone()));
+            as_f64(
+                &execute_sort(h, &[col("x", desc, false)])
+                    .unwrap()
+                    .into_record_batch(),
+                0,
+            )
+        };
+        let asc = sorted(false);
+        assert_eq!(
+            &asc[..3],
+            &[Some(-2.0), Some(1.0), Some(f64::INFINITY)],
+            "{asc:?}"
+        );
+        assert!(asc[3..6].iter().all(|v| v.unwrap().is_nan()), "{asc:?}");
+        assert_eq!(asc[6], None);
+        let desc = sorted(true);
+        assert!(desc[..3].iter().all(|v| v.unwrap().is_nan()), "{desc:?}");
+        assert_eq!(
+            &desc[3..6],
+            &[Some(f64::INFINITY), Some(1.0), Some(-2.0)],
+            "{desc:?}"
+        );
+        // The output keeps the input values bit for bit.
+        assert!(asc
+            .iter()
+            .flatten()
+            .any(|v| v.to_bits() == neg_nan.to_bits()));
     }
 
     // -- Planner-driven dispatch decision tests (pure host, no CUDA). --

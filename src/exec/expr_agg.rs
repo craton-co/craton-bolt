@@ -1810,7 +1810,13 @@ where
 {
     match op {
         BinaryOp::Eq => x == y,
-        BinaryOp::NotEq => x != y,
+        // Ordered not-equal, as the GPU kernels compute it (`setp.ne`): FALSE
+        // when either float operand is NaN. Identical to `!=` for every
+        // totally ordered type.
+        BinaryOp::NotEq => matches!(
+            x.partial_cmp(&y),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+        ),
         BinaryOp::Lt => x < y,
         BinaryOp::LtEq => x <= y,
         BinaryOp::Gt => x > y,

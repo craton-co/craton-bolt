@@ -430,7 +430,12 @@ fn fold_float(op: BinaryOp, a: f64, b: f64) -> Option<Literal> {
         Mul => Literal::Float64(a * b),
         Div => Literal::Float64(a / b),
         Eq => Literal::Bool(a == b),
-        NotEq => Literal::Bool(a != b),
+        // Ordered not-equal, as the GPU kernels compute it (`setp.ne`):
+        // FALSE when either side is NaN.
+        NotEq => Literal::Bool(matches!(
+            a.partial_cmp(&b),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+        )),
         Lt => Literal::Bool(a < b),
         LtEq => Literal::Bool(a <= b),
         Gt => Literal::Bool(a > b),

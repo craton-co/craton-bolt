@@ -208,7 +208,7 @@ fn build_permutation(
     for e in partition_by {
         let idx = column_index(batch, e)?;
         sort_cols.push(SortColumn {
-            values: batch.column(idx).clone(),
+            values: crate::exec::sort::sort_key_values(batch.column(idx)),
             options: Some(SortOptions {
                 descending: false,
                 nulls_first: true,
@@ -218,7 +218,7 @@ fn build_permutation(
     for se in order_by {
         let idx = column_index(batch, &se.expr)?;
         sort_cols.push(SortColumn {
-            values: batch.column(idx).clone(),
+            values: crate::exec::sort::sort_key_values(batch.column(idx)),
             options: Some(SortOptions {
                 descending: se.descending,
                 nulls_first: se.nulls_first,

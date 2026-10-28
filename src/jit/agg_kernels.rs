@@ -576,13 +576,12 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
             rc = acc_reg_class
         )
         .map_err(write_err)?;
-        writeln!(
-            ptx,
-            "\t{combine} %{rc}3, %{rc}2, %{rc}1;",
-            combine = combine,
-            rc = acc_reg_class
-        )
-        .map_err(write_err)?;
+        let (d, a, b) = (
+            format!("%{acc_reg_class}3"),
+            format!("%{acc_reg_class}2"),
+            format!("%{acc_reg_class}1"),
+        );
+        ptx.push_str(&combine_lines(op, acc_dtype, &combine, &d, &a, &b));
         writeln!(
             ptx,
             "\tst.shared.{st} [%rd5], %{rc}3;",
@@ -626,13 +625,8 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
                     stride = stride
                 )
                 .map_err(write_err)?;
-                writeln!(
-                    ptx,
-                    "\t{combine} %{rc}5, %{rc}5, %{rc}6;",
-                    combine = combine,
-                    rc = acc_reg_class
-                )
-                .map_err(write_err)?;
+                let (d, b) = (format!("%{acc_reg_class}5"), format!("%{acc_reg_class}6"));
+                ptx.push_str(&combine_lines(op, acc_dtype, &combine, &d, &d, &b));
             }
             DataType::Float32 => {
                 // Working value lives in %f5; bridge through %r6/%r7 for shfl.
@@ -644,8 +638,7 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
                 )
                 .map_err(write_err)?;
                 writeln!(ptx, "\tmov.b32 %f6, %r7;").map_err(write_err)?;
-                writeln!(ptx, "\t{combine} %f5, %f5, %f6;", combine = combine)
-                    .map_err(write_err)?;
+                ptx.push_str(&combine_lines(op, acc_dtype, &combine, "%f5", "%f5", "%f6"));
             }
             DataType::Int64 => {
                 // Split %rl5 into two b32 halves, shuffle each, recombine.
@@ -663,8 +656,9 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
                 )
                 .map_err(write_err)?;
                 writeln!(ptx, "\tmov.b64 %rl6, {{%r10, %r11}};").map_err(write_err)?;
-                writeln!(ptx, "\t{combine} %rl5, %rl5, %rl6;", combine = combine)
-                    .map_err(write_err)?;
+                ptx.push_str(&combine_lines(
+                    op, acc_dtype, &combine, "%rl5", "%rl5", "%rl6",
+                ));
             }
             DataType::Float64 => {
                 // Split %fd5 into two b32 halves, shuffle each, recombine.
@@ -682,8 +676,9 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
                 )
                 .map_err(write_err)?;
                 writeln!(ptx, "\tmov.b64 %fd6, {{%r10, %r11}};").map_err(write_err)?;
-                writeln!(ptx, "\t{combine} %fd5, %fd5, %fd6;", combine = combine)
-                    .map_err(write_err)?;
+                ptx.push_str(&combine_lines(
+                    op, acc_dtype, &combine, "%fd5", "%fd5", "%fd6",
+                ));
             }
             DataType::Bool
             | DataType::Utf8
@@ -735,6 +730,36 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
 /// We use the same suffix for `ld`/`st` (e.g. `s32` for Int32) — separate
 /// returns keep the call sites symmetric and forward-compatible if we ever
 /// need to differ.
+/// The PTX lines combining `a` and `b` into `d` (`d` may alias `a`).
+///
+/// Float `MAX` follows the engine's NaN-as-largest order (see
+/// `exec::aggregate::float_total_cmp`): PTX `max.fXX` returns the non-NaN
+/// operand, which would drop a NaN from its block's partial, so a NaN on
+/// either side is forced through. Float `MIN` needs nothing extra: `min.fXX`
+/// already skips a NaN, which is the smallest-wins rule when NaN is largest.
+fn combine_lines(
+    op: ReduceOp,
+    acc_dtype: DataType,
+    combine: &str,
+    d: &str,
+    a: &str,
+    b: &str,
+) -> String {
+    let nan = match (op, acc_dtype) {
+        (ReduceOp::Max, DataType::Float32) => Some(("f32", "0f7FC00000")),
+        (ReduceOp::Max, DataType::Float64) => Some(("f64", "0d7FF8000000000000")),
+        _ => None,
+    };
+    match nan {
+        // %p4 is free in this kernel; the NaN test reads `a` before `d`
+        // (which may alias it) is written.
+        Some((ty, imm)) => format!(
+            "\tsetp.nan.{ty} %p4, {a}, {b};\n\t{combine} {d}, {a}, {b};\n\t@%p4 mov.{ty} {d}, {imm};\n"
+        ),
+        None => format!("\t{combine} {d}, {a}, {b};\n"),
+    }
+}
+
 fn ptx_type_info(
     dtype: DataType,
 ) -> BoltResult<(
@@ -1203,6 +1228,31 @@ mod validity_reduction_tests {
             ptx.contains("@%p7 bra LOAD_IDENTITY;"),
             "MIN(Float32) validity kernel must guard NULL rows:\n{ptx}"
         );
+    }
+
+    /// Float MAX keeps a NaN in its block partial (NaN is the largest
+    /// value) at every combine site; float MIN and integer MAX use the plain
+    /// combine.
+    #[test]
+    fn float_max_combine_propagates_nan() {
+        for dt in [DataType::Float32, DataType::Float64] {
+            for ptx in [
+                compile_reduction_kernel(ReduceOp::Max, dt).unwrap(),
+                compile_reduction_kernel_with_validity(ReduceOp::Max, dt).unwrap(),
+            ] {
+                let combines = ptx.matches("\tmax.f").count();
+                assert!(combines > 0, "{dt:?}:\n{ptx}");
+                assert_eq!(
+                    ptx.matches("setp.nan.f").count(),
+                    combines,
+                    "{dt:?}:\n{ptx}"
+                );
+            }
+            let ptx = compile_reduction_kernel(ReduceOp::Min, dt).unwrap();
+            assert!(!ptx.contains("setp.nan."), "{dt:?}:\n{ptx}");
+        }
+        let ptx = compile_reduction_kernel(ReduceOp::Max, DataType::Int64).unwrap();
+        assert!(!ptx.contains("setp.nan."));
     }
 }
 
