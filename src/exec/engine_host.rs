@@ -375,6 +375,11 @@ impl Engine {
         let tables = vec![table.clone()];
         self.scan_storage_tables(plan, &tables, &[], true)?;
         self.materialize_streaming_source(&table)?;
+        if self.sql_semantics == crate::SqlSemantics::Standard {
+            // The GPU path rewrites in `QueryCompiler::compile`; the host
+            // tier evaluates the uncompiled plan, so it rewrites here.
+            return self.host_eval(&crate::plan::sql_semantics::total_order_comparisons(plan)?);
+        }
         self.host_eval(plan)
     }
 
@@ -453,7 +458,7 @@ impl Engine {
                         };
                         let i = b.schema().index_of(c).map_err(|_| decline("sort key"))?;
                         Ok(SortColumn {
-                            values: Arc::clone(b.column(i)),
+                            values: crate::exec::sort::sort_key_values(b.column(i)),
                             options: Some(SortOptions {
                                 descending: s.descending,
                                 nulls_first: s.nulls_first,
@@ -611,6 +616,12 @@ impl Engine {
     /// The current [`TierPolicy`].
     pub fn tier_policy(&self) -> TierPolicy {
         self.tier_policy
+    }
+
+    /// The [`SqlSemantics`](crate::SqlSemantics) chosen with
+    /// [`EngineBuilder::sql_semantics`](crate::EngineBuilder::sql_semantics).
+    pub fn sql_semantics(&self) -> crate::SqlSemantics {
+        self.sql_semantics
     }
 
     /// Render the tier decision of `plan` for `EXPLAIN` (`None` when the

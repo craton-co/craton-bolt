@@ -50,7 +50,7 @@ use crate::exec::dict_registry::DictRegistry;
 use crate::exec::engine::{Engine, QueryHandle};
 use crate::exec::engine_provider::{EngineProvider, EngineTableStats};
 use crate::plan::sql_frontend::{classify_query, QueryShape, RecursiveQueryPlan};
-use crate::plan::{LogicalPlan, PhysicalPlan, PlanRewrite, RowEstimator};
+use crate::plan::{LogicalPlan, PhysicalPlan, PlanRewrite, RowEstimator, SqlSemantics};
 
 /// How [`QueryCompiler::compile`] treats uncorrelated subqueries.
 pub(crate) enum Subqueries<'e> {
@@ -79,6 +79,9 @@ pub(crate) struct QueryCompiler<'a> {
     pub(crate) rewrites: &'a [Box<dyn PlanRewrite>],
     pub(crate) optimize: bool,
     pub(crate) estimator: Arc<dyn RowEstimator>,
+    /// [`SqlSemantics::Standard`] rewrites float comparisons to the total
+    /// order before anything else sees the plan.
+    pub(crate) semantics: SqlSemantics,
 }
 
 impl QueryCompiler<'_> {
@@ -96,6 +99,15 @@ impl QueryCompiler<'_> {
         user_rewrites: bool,
         subqueries: Subqueries<'_>,
     ) -> BoltResult<CompiledLogical> {
+        // Total-order float comparisons (exactly once per compiled plan; an
+        // extracted subquery is compiled — and rewritten — on its own).
+        let standard;
+        let plan = if self.semantics == SqlSemantics::Standard {
+            standard = crate::plan::sql_semantics::total_order_comparisons(plan)?;
+            &standard
+        } else {
+            plan
+        };
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding `__idx_<col>` column.
         let plan = tracing::info_span!("plan").in_scope(|| self.dict.rewrite_plan(plan))?;
@@ -219,6 +231,7 @@ impl Engine {
             rewrites: &self.rewrites,
             optimize: self.optimize,
             estimator: self.row_estimator(),
+            semantics: self.sql_semantics,
         }
     }
 
@@ -297,6 +310,7 @@ impl Engine {
         user_rewrites: bool,
         top_level: bool,
     ) -> BoltResult<QueryHandle> {
+        self.check_integer_overflow(plan)?;
         if top_level {
             if let Some(h) = self.timed_ooc(plan)? {
                 return Ok(h);
@@ -311,6 +325,36 @@ impl Engine {
         } else {
             self.execute(&phys)
         }
+    }
+
+    /// [`SqlSemantics::Standard`]: run the statement's overflow checks (see
+    /// [`crate::plan::sql_semantics::overflow_checks`]) and fail it with an
+    /// "out of range" error when an evaluated row overflows. Runs before any
+    /// tier is chosen, so the GPU and the host tier are both checked. The
+    /// check plans themselves are not checked again.
+    pub(crate) fn check_integer_overflow(&self, plan: &LogicalPlan) -> BoltResult<()> {
+        if self.sql_semantics != SqlSemantics::Standard || self.overflow_checking.get() {
+            return Ok(());
+        }
+        let checks = crate::plan::sql_semantics::overflow_checks(plan)?;
+        if checks.is_empty() {
+            return Ok(());
+        }
+        self.overflow_checking.set(true);
+        let result = (|| {
+            for check in &checks {
+                let rows = self
+                    .execute_logical(&check.plan, false, false)?
+                    .into_record_batch()
+                    .num_rows();
+                if rows > 0 {
+                    return Err(check.error());
+                }
+            }
+            Ok(())
+        })();
+        self.overflow_checking.set(false);
+        result
     }
 
     /// Out-of-core execution of a top-level plan, if it needs it (see
@@ -472,6 +516,7 @@ impl Engine {
                 if let Some(h) = self.answer_from_view(&plan)? {
                     return Ok(h);
                 }
+                self.check_integer_overflow(&plan)?;
                 // Out-of-core results depend on the budget path taken and
                 // are not cached.
                 if let Some(h) = self.timed_ooc(&plan)? {
@@ -822,6 +867,7 @@ mod tests {
             rewrites,
             optimize,
             estimator: Arc::new(crate::plan::StatsEstimator::new(EngineTableStats::default())),
+            semantics: SqlSemantics::Ieee,
         }
     }
 

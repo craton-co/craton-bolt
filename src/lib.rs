@@ -79,7 +79,9 @@ pub use exec::session::{
 };
 pub use exec::streaming::{BatchProducer, BatchStream, MorselPlan, PinnedBudget, TableSource};
 pub use exec::{Engine, EngineBuilder, QueryHandle};
-pub use plan::{DataFrame, ExecutionTier, Expr, LogicalPlan, MemoryBehavior, PhysicalPlan};
+pub use plan::{
+    DataFrame, ExecutionTier, Expr, LogicalPlan, MemoryBehavior, PhysicalPlan, SqlSemantics,
+};
 
 /// Stage 4 (pool telemetry): public re-exports for downstream
 /// observability. [`pool_stats`] returns a [`PoolStats`] snapshot of

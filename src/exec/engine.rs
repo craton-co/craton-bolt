@@ -1314,6 +1314,11 @@ pub struct Engine {
     pub(crate) catalog: Option<crate::storage::Catalog>,
     /// When statements may run on the host tier (see `crate::exec::cost`).
     pub(crate) tier_policy: crate::exec::cost::TierPolicy,
+    /// Float-comparison / overflow / NULL-order semantics (builder-only).
+    pub(crate) sql_semantics: crate::plan::SqlSemantics,
+    /// Set while a [`SqlSemantics::Standard`](crate::SqlSemantics::Standard)
+    /// overflow check runs, so its own plan is not checked again.
+    pub(crate) overflow_checking: std::cell::Cell<bool>,
     /// Answer queries from fresh materialized views with the same plan.
     pub(crate) view_rewrite: bool,
     /// Tier cost estimates (replaced by `calibrate_cost_model`).
@@ -1383,6 +1388,7 @@ pub struct EngineBuilder {
     /// Compaction policy (see [`EngineBuilder::auto_compact`]).
     auto_compact_files: Option<usize>,
     tier_policy: crate::exec::cost::TierPolicy,
+    sql_semantics: crate::plan::SqlSemantics,
     cost_model: Option<Arc<dyn crate::exec::cost::CostModel>>,
     view_rewrite: bool,
     /// Persistent catalog directory to open (see [`EngineBuilder::database`]).
@@ -1415,6 +1421,7 @@ impl EngineBuilder {
             spill_dir: None,
             auto_compact_files: None,
             tier_policy: crate::exec::cost::TierPolicy::GpuFirst,
+            sql_semantics: crate::plan::SqlSemantics::Ieee,
             cost_model: None,
             view_rewrite: true,
             #[cfg(feature = "storage")]
@@ -1479,6 +1486,16 @@ impl EngineBuilder {
     /// See [`crate::exec::cost`].
     pub fn tier_policy(mut self, policy: crate::exec::cost::TierPolicy) -> Self {
         self.tier_policy = policy;
+        self
+    }
+
+    /// SQL semantics of float comparisons, integer overflow and the default
+    /// `ORDER BY` NULL placement (default
+    /// [`SqlSemantics::Ieee`](crate::SqlSemantics::Ieee), the historical
+    /// behaviour). [`SqlSemantics::Standard`](crate::SqlSemantics::Standard)
+    /// matches DuckDB / PostgreSQL on every tier; see `docs/SQL_REFERENCE.md`.
+    pub fn sql_semantics(mut self, semantics: crate::plan::SqlSemantics) -> Self {
+        self.sql_semantics = semantics;
         self
     }
 
@@ -1673,7 +1690,11 @@ impl EngineBuilder {
             tables: HashMap::new(),
             coalesced_reads: RefCell::new(HashMap::new()),
             streaming_sources: RefCell::new(HashMap::new()),
-            provider: MemTableProvider::new(),
+            provider: {
+                let mut p = MemTableProvider::new();
+                p.set_sql_semantics(self.sql_semantics);
+                p
+            },
             dict_registry: RefCell::new(crate::exec::dict_registry::DictRegistry::new()),
             gpu_tables: RefCell::new(HashMap::new()),
             host_revisions: HashMap::new(),
@@ -1712,6 +1733,8 @@ impl EngineBuilder {
             #[cfg(feature = "storage")]
             catalog: None,
             tier_policy: self.tier_policy,
+            sql_semantics: self.sql_semantics,
+            overflow_checking: std::cell::Cell::new(false),
             view_rewrite: self.view_rewrite,
             cost_model: RefCell::new(
                 self.cost_model

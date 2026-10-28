@@ -285,6 +285,33 @@ pub trait TableProvider {
         // the cache is functionally disabled for default-impl providers.
         next_provider_version()
     }
+
+    /// The engine's [`SqlSemantics`](crate::plan::SqlSemantics): under
+    /// [`Standard`](crate::plan::SqlSemantics::Standard) an `ORDER BY` key
+    /// without `NULLS FIRST` / `NULLS LAST` sorts NULLs last in both
+    /// directions (DuckDB); under the default
+    /// [`Ieee`](crate::plan::SqlSemantics::Ieee), NULLs first for `ASC` and
+    /// last for `DESC`. Wrapping providers should delegate.
+    fn sql_semantics(&self) -> crate::plan::SqlSemantics {
+        crate::plan::SqlSemantics::Ieee
+    }
+}
+
+/// Default `NULLS FIRST` of an `ORDER BY` key written without one.
+fn default_nulls_first(semantics: crate::plan::SqlSemantics, descending: bool) -> bool {
+    match semantics {
+        crate::plan::SqlSemantics::Standard => false,
+        _ => !descending,
+    }
+}
+
+/// The semantics of the provider a resolver lowers subqueries against (the
+/// default when it has none).
+fn resolver_semantics(resolver: &NameResolver<'_>) -> crate::plan::SqlSemantics {
+    resolver
+        .ctx
+        .map(|c| c.provider.sql_semantics())
+        .unwrap_or_default()
 }
 
 /// In-FROM-scope name resolver: maps `table.col` (and bare `col`) references in
@@ -616,6 +643,8 @@ pub struct MemTableProvider {
     /// `MemTableProvider` instances coexist (e.g. in parallel test
     /// threads sharing the process-wide `PLAN_CACHE`).
     version: AtomicU64,
+    /// See [`TableProvider::sql_semantics`].
+    semantics: crate::plan::SqlSemantics,
 }
 
 /// Global monotonic counter feeding every [`MemTableProvider`] version bump.
@@ -635,6 +664,7 @@ impl Default for MemTableProvider {
             tables: HashMap::new(),
             nulls_by_column: HashMap::new(),
             version: AtomicU64::new(next_provider_version()),
+            semantics: crate::plan::SqlSemantics::Ieee,
         }
     }
 }
@@ -650,6 +680,7 @@ impl Clone for MemTableProvider {
             tables: self.tables.clone(),
             nulls_by_column: self.nulls_by_column.clone(),
             version: AtomicU64::new(next_provider_version()),
+            semantics: self.semantics,
         }
     }
 }
@@ -658,6 +689,13 @@ impl MemTableProvider {
     /// Empty provider.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the semantics [`TableProvider::sql_semantics`] reports. Bumps the
+    /// schema version: cached plans carry the previous default NULL order.
+    pub(crate) fn set_sql_semantics(&mut self, semantics: crate::plan::SqlSemantics) {
+        self.semantics = semantics;
+        self.bump_version();
     }
 
     /// Builder-style: register a table and return `self`.
@@ -785,6 +823,10 @@ impl TableProvider for MemTableProvider {
         // `Relaxed` matches the writer (`bump_version` uses `Relaxed`); we
         // do not need a happens-before edge against any other state.
         self.version.load(Ordering::Relaxed)
+    }
+
+    fn sql_semantics(&self) -> crate::plan::SqlSemantics {
+        self.semantics
     }
 }
 
@@ -2386,6 +2428,10 @@ impl<'a> TableProvider for SchemaOverlayProvider<'a> {
                 .unwrap_or(false);
         }
         self.base.has_nulls(table_name, col_idx)
+    }
+
+    fn sql_semantics(&self) -> crate::plan::SqlSemantics {
+        self.base.sql_semantics()
     }
 }
 
@@ -5230,6 +5276,7 @@ fn build_corr_where_post(
 
     let result_provider = CorrWhereResultProvider {
         schema: left_schema,
+        semantics: resolver_semantics(left_resolver),
     };
     let ctes = CteScope::new();
     let mut plan = plan_select(&out_select, &result_provider, &ctes, 1)?;
@@ -5280,6 +5327,7 @@ fn build_corr_where_post(
 /// [`CORR_WHERE_RESULT_TABLE`]. Mirrors [`LateralResultProvider`].
 struct CorrWhereResultProvider<'a> {
     schema: &'a Schema,
+    semantics: crate::plan::SqlSemantics,
 }
 impl TableProvider for CorrWhereResultProvider<'_> {
     fn schema(&self, name: &str) -> BoltResult<Schema> {
@@ -5290,6 +5338,9 @@ impl TableProvider for CorrWhereResultProvider<'_> {
             "correlated-WHERE OUTER template referenced unknown table '{name}' \
              (only the surviving outer relation is in scope)"
         )))
+    }
+    fn sql_semantics(&self) -> crate::plan::SqlSemantics {
+        self.semantics
     }
 }
 
@@ -5312,6 +5363,9 @@ impl TableProvider for LateralProvider<'_> {
     }
     fn schema_version(&self) -> u64 {
         self.base.schema_version()
+    }
+    fn sql_semantics(&self) -> crate::plan::SqlSemantics {
+        self.base.sql_semantics()
     }
 }
 
@@ -5490,6 +5544,7 @@ fn build_lateral_post(
     // Lower the rewritten SELECT against a provider exposing the result table.
     let result_provider = LateralResultProvider {
         schema: combined_schema,
+        semantics: resolver_semantics(left_resolver),
     };
     let ctes = CteScope::new();
     let mut plan = plan_select(&out_select, &result_provider, &ctes, 1)?;
@@ -5542,6 +5597,7 @@ fn build_lateral_post(
 /// [`LATERAL_APPLY_RESULT_TABLE`].
 struct LateralResultProvider<'a> {
     schema: &'a Schema,
+    semantics: crate::plan::SqlSemantics,
 }
 impl TableProvider for LateralResultProvider<'_> {
     fn schema(&self, name: &str) -> BoltResult<Schema> {
@@ -5554,6 +5610,9 @@ impl TableProvider for LateralResultProvider<'_> {
             "LATERAL apply OUTER template referenced unknown table '{name}' \
              (only the applied relation is in scope)"
         )))
+    }
+    fn sql_semantics(&self) -> crate::plan::SqlSemantics {
+        self.semantics
     }
 }
 
@@ -7081,10 +7140,10 @@ fn lower_order_by(exprs: &[OrderByExpr], ctx: SubqueryCtx<'_>) -> BoltResult<Vec
             Some(true) | None => false,
             Some(false) => true,
         };
-        // Default NULL placement: NULLS FIRST for ASC, NULLS LAST for DESC.
+        // Default NULL placement: see `TableProvider::sql_semantics`.
         let nulls_first = match nulls_first {
             Some(b) => *b,
-            None => !descending,
+            None => default_nulls_first(ctx.provider.sql_semantics(), descending),
         };
         out.push(SortExpr {
             expr: lower_expr(expr, &resolver, 0)?,
@@ -10421,7 +10480,7 @@ fn lower_window_order_by(
         let descending = matches!(asc, Some(false));
         let nulls_first = match nulls_first {
             Some(b) => *b,
-            None => !descending,
+            None => default_nulls_first(resolver_semantics(resolver), descending),
         };
         out.push(SortExpr {
             expr: lower_expr(expr, resolver, depth + 1)?,
@@ -13681,6 +13740,26 @@ mod wave7_tests {
             }
             other => panic!("expected Sort, got {other:?}"),
         }
+    }
+
+    /// `SqlSemantics::Standard` (DuckDB): NULLS LAST in both directions
+    /// unless written; the setting is part of the parse-cache key.
+    #[test]
+    fn standard_semantics_default_to_nulls_last() {
+        let mut p = provider();
+        let ieee = parse("SELECT a FROM t1 ORDER BY a", &p).unwrap();
+        p.set_sql_semantics(crate::plan::SqlSemantics::Standard);
+        let keys = |sql: &str| match parse(sql, &p).unwrap() {
+            LogicalPlan::Sort { sort_exprs, .. } => sort_exprs,
+            other => panic!("expected Sort, got {other:?}"),
+        };
+        let LogicalPlan::Sort { sort_exprs, .. } = ieee else {
+            panic!()
+        };
+        assert!(sort_exprs[0].nulls_first, "Ieee: ASC NULLS FIRST");
+        assert!(!keys("SELECT a FROM t1 ORDER BY a")[0].nulls_first);
+        assert!(!keys("SELECT a FROM t1 ORDER BY a DESC")[0].nulls_first);
+        assert!(keys("SELECT a FROM t1 ORDER BY a NULLS FIRST")[0].nulls_first);
     }
 
     #[test]
