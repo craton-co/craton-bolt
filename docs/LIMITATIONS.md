@@ -254,6 +254,25 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 
 These are real, code-level behaviors to be aware of:
 
+- **IEEE floats and wrapping integers by default.** Unless the engine is
+  built with `EngineBuilder::sql_semantics(SqlSemantics::Standard)`, every
+  float comparison with NaN is FALSE (`<>` included, so `NaN <> 3` is FALSE
+  and `x > 3` / `NOT (x > 3)` do not partition the non-NULL rows), integer
+  `+ - *` and `CAST(<BIGINT> AS INT)` wrap on overflow, and `ORDER BY ... ASC`
+  puts NULLs first. DuckDB and PostgreSQL order NaN above every value, raise
+  an out-of-range error on overflow and put NULLs last for `ASC`; `Standard`
+  does the same. See
+  [`SQL_REFERENCE.md#semantics-modes`](SQL_REFERENCE.md#semantics-modes).
+- **`SqlSemantics::Standard` costs and gaps.** Integer arithmetic that type
+  and literal interval analysis cannot prove in range (for example a
+  `BIGINT` column plus another column or a non-zero literal) adds one check
+  pass per plan node
+  before the statement runs. Every operand of `AND` / `OR` and every function
+  argument is treated as evaluated, so `x < 10 AND x * y > 0` raises when
+  `x * y` overflows on a row with `x >= 10`. Float equi-join keys and
+  `IN (SELECT ...)` membership keep their hash equality; float-to-integer
+  `CAST` and date / timestamp arithmetic are not overflow-checked.
+
 - **NULLs in GPU kernels.** Predicates and outputs over nullable columns are
   compiled with explicit validity checks (`plan::null_semantics`), which
   cost one validity load per nullable column read.

@@ -504,6 +504,7 @@ pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<d
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::calibrate_cost_model(&mut self) -> craton_bolt::BoltResult<craton_bolt::exec::cost::DefaultCostModel>
 pub fn craton_bolt::exec::engine::Engine::set_tier_policy(&mut self, craton_bolt::exec::cost::TierPolicy)
+pub fn craton_bolt::exec::engine::Engine::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub fn craton_bolt::exec::engine::Engine::tier_policy(&self) -> craton_bolt::exec::cost::TierPolicy
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::catalog(&self) -> core::option::Option<&craton_bolt::storage::catalog::Catalog>
@@ -541,6 +542,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> S
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::sql_semantics(self, craton_bolt::plan::sql_semantics::SqlSemantics) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::view_rewrite(self, bool) -> Self
 pub struct craton_bolt::exec::engine::QueryHandle
@@ -1192,6 +1194,7 @@ pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<d
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::calibrate_cost_model(&mut self) -> craton_bolt::BoltResult<craton_bolt::exec::cost::DefaultCostModel>
 pub fn craton_bolt::exec::engine::Engine::set_tier_policy(&mut self, craton_bolt::exec::cost::TierPolicy)
+pub fn craton_bolt::exec::engine::Engine::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub fn craton_bolt::exec::engine::Engine::tier_policy(&self) -> craton_bolt::exec::cost::TierPolicy
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::catalog(&self) -> core::option::Option<&craton_bolt::storage::catalog::Catalog>
@@ -1229,6 +1232,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> S
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::sql_semantics(self, craton_bolt::plan::sql_semantics::SqlSemantics) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::view_rewrite(self, bool) -> Self
 pub struct craton_bolt::exec::PinnedBudget
@@ -2404,6 +2408,7 @@ pub fn craton_bolt::plan::sql_frontend::MemTableProvider::has_nulls(&self, &str,
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::null_count(&self, &str, usize) -> core::option::Option<usize>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema(&self, &str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema_version(&self) -> u64
+pub fn craton_bolt::plan::sql_frontend::MemTableProvider::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub struct craton_bolt::plan::sql_frontend::MultiAggGroupByPlan
 pub craton_bolt::plan::sql_frontend::MultiAggGroupByPlan::aggs: alloc::vec::Vec<craton_bolt::plan::sql_frontend::CdAgg>
 pub craton_bolt::plan::sql_frontend::MultiAggGroupByPlan::base: craton_bolt::plan::logical_plan::LogicalPlan
@@ -2465,11 +2470,13 @@ pub fn craton_bolt::plan::sql_frontend::TableProvider::has_nulls(&self, &str, us
 pub fn craton_bolt::plan::sql_frontend::TableProvider::null_count(&self, &str, usize) -> core::option::Option<usize>
 pub fn craton_bolt::plan::sql_frontend::TableProvider::schema(&self, &str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::sql_frontend::TableProvider::schema_version(&self) -> u64
+pub fn craton_bolt::plan::sql_frontend::TableProvider::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 impl craton_bolt::plan::sql_frontend::TableProvider for craton_bolt::plan::sql_frontend::MemTableProvider
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::has_nulls(&self, &str, usize) -> bool
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::null_count(&self, &str, usize) -> core::option::Option<usize>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema(&self, &str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema_version(&self) -> u64
+pub fn craton_bolt::plan::sql_frontend::MemTableProvider::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub fn craton_bolt::plan::sql_frontend::parse(&str, &dyn craton_bolt::plan::sql_frontend::TableProvider) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::LogicalPlan>
 pub fn craton_bolt::plan::sql_frontend::plan_cache_stats() -> (usize, usize, usize)
 pub fn craton_bolt::plan::sql_frontend::plan_correlated_where(&str, &dyn craton_bolt::plan::sql_frontend::TableProvider) -> craton_bolt::BoltResult<core::option::Option<craton_bolt::plan::sql_frontend::CorrelatedWherePlan>>
@@ -2480,6 +2487,10 @@ pub fn craton_bolt::plan::sql_frontend::plan_lateral_apply(&str, &dyn craton_bol
 pub fn craton_bolt::plan::sql_frontend::plan_multi_agg_groupby(&str, &dyn craton_bolt::plan::sql_frontend::TableProvider) -> craton_bolt::BoltResult<core::option::Option<craton_bolt::plan::sql_frontend::MultiAggGroupByPlan>>
 pub fn craton_bolt::plan::sql_frontend::plan_recursive_cte(&str, &dyn craton_bolt::plan::sql_frontend::TableProvider) -> craton_bolt::BoltResult<core::option::Option<craton_bolt::plan::sql_frontend::RecursiveQueryPlan>>
 pub fn craton_bolt::plan::sql_frontend::plan_values_query(&str, &dyn craton_bolt::plan::sql_frontend::TableProvider) -> craton_bolt::BoltResult<core::option::Option<craton_bolt::plan::sql_frontend::ValuesQueryPlan>>
+pub mod craton_bolt::plan::sql_semantics
+#[non_exhaustive] pub enum craton_bolt::plan::sql_semantics::SqlSemantics
+pub craton_bolt::plan::sql_semantics::SqlSemantics::Ieee
+pub craton_bolt::plan::sql_semantics::SqlSemantics::Standard
 pub mod craton_bolt::plan::statistics
 pub enum craton_bolt::plan::statistics::ScalarValue
 pub craton_bolt::plan::statistics::ScalarValue::Bool(bool)
@@ -2809,6 +2820,9 @@ pub craton_bolt::plan::SetOpKind::Except
 pub craton_bolt::plan::SetOpKind::Intersect
 impl craton_bolt::plan::logical_plan::SetOpKind
 pub fn craton_bolt::plan::logical_plan::SetOpKind::keyword(self) -> &'static str
+#[non_exhaustive] pub enum craton_bolt::plan::SqlSemantics
+pub craton_bolt::plan::SqlSemantics::Ieee
+pub craton_bolt::plan::SqlSemantics::Standard
 pub enum craton_bolt::plan::StringLengthOutput
 pub craton_bolt::plan::StringLengthOutput::Length
 pub craton_bolt::plan::StringLengthOutput::Length::source: alloc::string::String
@@ -2872,6 +2886,7 @@ pub fn craton_bolt::plan::sql_frontend::MemTableProvider::has_nulls(&self, &str,
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::null_count(&self, &str, usize) -> core::option::Option<usize>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema(&self, &str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema_version(&self) -> u64
+pub fn craton_bolt::plan::sql_frontend::MemTableProvider::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub struct craton_bolt::plan::Schema
 pub craton_bolt::plan::Schema::fields: alloc::vec::Vec<craton_bolt::plan::logical_plan::Field>
 impl craton_bolt::plan::logical_plan::Schema
@@ -2912,11 +2927,13 @@ pub fn craton_bolt::plan::TableProvider::has_nulls(&self, &str, usize) -> bool
 pub fn craton_bolt::plan::TableProvider::null_count(&self, &str, usize) -> core::option::Option<usize>
 pub fn craton_bolt::plan::TableProvider::schema(&self, &str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::TableProvider::schema_version(&self) -> u64
+pub fn craton_bolt::plan::TableProvider::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 impl craton_bolt::plan::sql_frontend::TableProvider for craton_bolt::plan::sql_frontend::MemTableProvider
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::has_nulls(&self, &str, usize) -> bool
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::null_count(&self, &str, usize) -> core::option::Option<usize>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema(&self, &str) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::Schema>
 pub fn craton_bolt::plan::sql_frontend::MemTableProvider::schema_version(&self) -> u64
+pub fn craton_bolt::plan::sql_frontend::MemTableProvider::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub fn craton_bolt::plan::avg(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
 pub fn craton_bolt::plan::col(impl core::convert::Into<alloc::string::String>) -> craton_bolt::plan::logical_plan::Expr
 pub fn craton_bolt::plan::count(craton_bolt::plan::logical_plan::Expr) -> craton_bolt::plan::logical_plan::AggregateExpr
@@ -3486,6 +3503,9 @@ pub const fn craton_bolt::metrics::Phase::help(self) -> &'static str
 pub craton_bolt::RefreshMode::Manual
 pub craton_bolt::RefreshMode::OnCommit
 pub craton_bolt::RefreshMode::Scheduled(core::time::Duration)
+#[non_exhaustive] pub enum craton_bolt::SqlSemantics
+pub craton_bolt::SqlSemantics::Ieee
+pub craton_bolt::SqlSemantics::Standard
 pub enum craton_bolt::TableSource
 pub craton_bolt::TableSource::Materialized(alloc::vec::Vec<arrow_array::record_batch::RecordBatch>)
 pub craton_bolt::TableSource::Streaming(craton_bolt::exec::streaming::BatchProducer)
@@ -3597,6 +3617,7 @@ pub fn craton_bolt::exec::engine::Engine::with_rewrite(self, alloc::boxed::Box<d
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::calibrate_cost_model(&mut self) -> craton_bolt::BoltResult<craton_bolt::exec::cost::DefaultCostModel>
 pub fn craton_bolt::exec::engine::Engine::set_tier_policy(&mut self, craton_bolt::exec::cost::TierPolicy)
+pub fn craton_bolt::exec::engine::Engine::sql_semantics(&self) -> craton_bolt::plan::sql_semantics::SqlSemantics
 pub fn craton_bolt::exec::engine::Engine::tier_policy(&self) -> craton_bolt::exec::cost::TierPolicy
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::catalog(&self) -> core::option::Option<&craton_bolt::storage::catalog::Catalog>
@@ -3634,6 +3655,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> S
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::sql_semantics(self, craton_bolt::plan::sql_semantics::SqlSemantics) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::view_rewrite(self, bool) -> Self
 pub struct craton_bolt::GpuBuffer<T: bytemuck::pod::Pod>

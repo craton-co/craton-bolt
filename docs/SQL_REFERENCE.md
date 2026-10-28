@@ -112,6 +112,75 @@ still not modelled.
 
 Unary minus on a numeric literal is folded into a signed literal (`-5` becomes `Literal::Int64(-5)`, and `-9223372036854775808` is preserved as `i64::MIN`). On any other expression it's rewritten as `0 - expr`. Unary plus is a no-op. Any other unary op (including SQL `NOT`) is an error.
 
+## Semantics modes
+
+`EngineBuilder::sql_semantics(SqlSemantics)` chooses, once per engine, how
+float comparisons, integer overflow and the default `ORDER BY` NULL placement
+behave. It applies to every statement on every tier (`TierPolicy::GpuFirst`
+and `CostBased` give the same results), and `Engine::sql_semantics()` reports
+it. The default, `SqlSemantics::Ieee`, is the historical behaviour;
+`SqlSemantics::Standard` matches DuckDB / PostgreSQL.
+
+```rust
+use craton_bolt::{Engine, SqlSemantics};
+let engine = Engine::builder().sql_semantics(SqlSemantics::Standard).build()?;
+```
+
+| Behaviour | `Ieee` (default) | `Standard` |
+| :--- | :--- | :--- |
+| Float `=`, `<`, `<=`, `>`, `>=` with a NaN operand | FALSE (IEEE-754 ordered comparison) | Total order: every NaN equals every NaN and is greater than every other value, `+inf` included |
+| Float `<>` / `!=` with a NaN operand | FALSE (an *ordered* not-equal: `NaN <> 3` and `NaN <> NaN` are FALSE) | The negation of `=`: `NaN <> 3` is TRUE, `NaN <> NaN` is FALSE |
+| `x > 3` vs `NOT (x > 3)` | Do not partition the non-NULL rows: a NaN row satisfies neither | Partition the non-NULL rows |
+| Comparison with a NULL operand | NULL (UNKNOWN) | NULL (UNKNOWN) |
+| Integer `+`, `-`, `*` overflow (`INTEGER` / `BIGINT` result) | Wraps (two's complement) | Error: `Out of Range Error: integer overflow (value out of range) in <expr>` |
+| `CAST(<BIGINT> AS INT)` out of range | Keeps the low 32 bits (wraps) | Error, as above |
+| `ORDER BY k` / `ORDER BY k DESC` without `NULLS FIRST` / `NULLS LAST` | `ASC NULLS FIRST`, `DESC NULLS LAST` | `NULLS LAST` in both directions (DuckDB; PostgreSQL puts NULLs first for `DESC`) |
+
+The Ieee row for `<>` is the GPU kernels' `setp.ne` (ordered); the host
+evaluator and the constant folder compute the same, so the result does not
+depend on the tier. The NULL-placement default also applies to window
+`ORDER BY`; an explicit `NULLS FIRST` / `NULLS LAST` always wins.
+
+Identical in both modes:
+
+- `ORDER BY` treats every NaN (either sign, any payload) as one value greater
+  than `+inf`: last for `ASC`, first for `DESC`.
+- `MIN` / `MAX` order NaN as the largest value: `MAX` is NaN when the input has
+  a NaN, `MIN` skips NaN unless every value is NaN.
+- `SELECT DISTINCT` treats all NaNs as one value.
+- Integer literals are `BIGINT`, so `int_col + 1` is a `BIGINT` that cannot
+  overflow for an `INTEGER` column. `INTEGER op INTEGER` stays `INTEGER` (see
+  [Arithmetic](#arithmetic)).
+- Integer `SUM` overflow, `Decimal128` overflow, and the NULL results of
+  integer `/` and `%` (zero divisor, `MIN / -1`) are as documented in their
+  sections; float arithmetic follows IEEE-754.
+
+How `Standard` is implemented, and what that means:
+
+- **Float comparisons** are rewritten in the plan into IEEE comparisons before
+  optimization: `isnan(x)` is `NOT (x = x)`, which is UNKNOWN for a NULL `x`,
+  so `x < y` becomes `(x < y) OR ((x = x) AND NOT (y = y))`, `x = y` becomes
+  `(x = y) OR (NOT (x = x) AND NOT (y = y))`, and `>`, `<=`, `>=`, `<>` are
+  derived from those two by swapping operands and `NOT`. A literal operand
+  folds its NaN test, so `d > 3` is `(3 < d) OR NOT (d = d)` and `d = 3.4` is
+  unchanged. Three-valued logic is preserved. `IN` lists and `BETWEEN` are
+  covered because they desugar to comparisons. Not rewritten: equi-join keys
+  (hash-join equality, see [JOIN](#join)) and the membership test of
+  `IN (SELECT ...)`.
+- **Integer overflow** is checked before the statement runs. Interval
+  analysis over operand types and literals proves most arithmetic in range
+  (an `INTEGER` column times a `BIGINT` literal, for example), and that
+  arithmetic costs nothing. For every plan node with an operation it cannot
+  prove, the engine runs a check query, `LIMIT 1` over the node's input rows
+  for which the operation would overflow (written so that the check itself
+  evaluates correctly under wrapping arithmetic), and fails the statement if
+  it returns a row. So only rows that reach the expression count: rows removed
+  by `WHERE`, NULL operands and untaken `CASE` branches never raise. Each
+  checked node costs one more pass over its input. Both operands of `AND` /
+  `OR` and every argument of a function such as `COALESCE` count as evaluated.
+- Not checked in either mode: float-to-integer `CAST`, date / timestamp
+  arithmetic.
+
 ## Operators
 
 ### Arithmetic
@@ -131,6 +200,9 @@ SQL `NULL` per row. Integer division/remainder used as aggregate inputs are
 rejected rather than silently changing tier. `BOLT_LEGACY_ARITHMETIC=1`
 explicitly restores the old device path and its non-SQL behavior. Float
 division follows IEEE-754: `1.0 / 0.0 = +inf`, `0.0 / 0.0 = NaN`.
+
+Integer `+`, `-`, `*` wrap on overflow by default and raise an "out of range"
+error under `SqlSemantics::Standard`; see [Semantics modes](#semantics-modes).
 
 #### Decimal128 arithmetic
 
@@ -157,6 +229,10 @@ SELECT CAST(price AS DECIMAL(10, 2)) FROM line_items;      -- Decimal rescale (G
 ### Comparison
 
 `=`, `<>` (also `!=`), `<`, `<=`, `>`, `>=`. Result dtype is `Bool`. Both operands must unify under the rules above. Numeric comparisons run on the **GPU**. `Decimal128` comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) lower to the **GPU** (`Op::Cmp128`) and are **scale-aligned**: two decimals with *differing* scales are rescaled to the common scale `max(s_l, s_r)` (the smaller-scale side is multiplied by `10^Δ`) before the i128 compare, and an **integer peer** is auto-coerced (`WHERE dec_col > 5` works). Precision need not match. Float/Bool/temporal peers are rejected — CAST explicitly.
+
+Float comparisons with NaN follow the engine's [semantics mode](#semantics-modes):
+IEEE by default (every comparison with NaN is FALSE, `<>` included), total
+order under `SqlSemantics::Standard`.
 
 For `Utf8` columns, equality (`=`, `<>`, `!=`) against string *literals* is supported — the literal rewriter folds `WHERE col = 'X'` into integer equality on the column's dictionary index at plan time (**GPU**). **Ordering comparisons** (`<`, `>`, `<=`, `>=`) of a `Utf8` column against a string *literal* (`WHERE name < 'M'`, either operand order) are **also** supported (**GPU**): because dictionary indices reflect insertion order rather than lex order, the rewriter partitions the dictionary entries by the literal under **binary (UTF-8 byte) collation** at plan time and emits an OR-of-equalities over the matching dictionary indices (the same index-membership form `LIKE` uses). This is byte/binary collation, **not** locale-aware / ICU collation, and a `NULL` row never satisfies an ordering predicate (correct SQL 3VL). **Column-vs-column** Utf8 ordering (`WHERE a < b`, two string columns) **also** folds to the **GPU** (finding F12): since each column has its own dictionary, the rewriter ranks both columns against the de-duplicated **union** of their dictionaries under binary collation (`unified_rank_maps_of`), materialises a per-row rank column for each side, and emits the NULL-safe integer predicate `(rank_a >= 0) AND (rank_b >= 0) AND (rank_a OP rank_b)`. The `>= 0` guards drop NULL rows (correct SQL 3VL — in a projection context this is the "NULL → no row passes" / NULL→false behaviour). Shapes the rank path can't cover (a non-dict or protected column) fall back to a host string comparison. `MIN(utf8_col)` and `MAX(utf8_col)` use lex order on the host.
 
@@ -248,7 +324,7 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `MIN(utf8)`    | `Utf8`                        | Lexicographic; NULL if all-null group.                     |
 | `MIN(date32 \| timestamp)` | Same dtype as input | GPU reduction on the i32/i64 storage; result rebuilt preserving the date / (unit + tz). NULL if all-null group. Scalar + GROUP BY. |
 | `MIN(decimal)` | `Decimal128(p, s)`            | **GPU** i128 reduce — scalar via block-reduce (host-fold fallback inside), **grouped** via the per-slot-locked 128-bit accumulator (`bolt_groupby_agg_decimal`). Preserves input `(p, s)`. NULL if all-null group. |
-| `MAX(int|float)` | Same dtype as input         | Same caveats as MIN.                                       |
+| `MAX(int|float)` | Same dtype as input         | Same caveats as MIN. Float MIN / MAX order NaN as the largest value (`MAX` returns NaN when one is present). |
 | `MAX(bool)`    | `Bool`                        | NULL if all-null group.                                    |
 | `MAX(utf8)`    | `Utf8`                        | NULL if all-null group.                                    |
 | `MAX(date32 \| timestamp)` | Same dtype as input | Same as `MIN` (temporal): GPU reduction, type/unit/tz preserved. Scalar + GROUP BY. |
@@ -343,7 +419,8 @@ Rejected residuals: a grouping construct with **more than 12 distinct grouping c
 `ORDER BY <expr> [ASC|DESC] [NULLS FIRST|NULLS LAST] [, ...]` is supported and sits *above* the projection / aggregate / HAVING in the plan tree, so it sees the final output schema. A sort key may also read a column of the `FROM` tables that the SELECT list does not output (`SELECT v FROM t ORDER BY k`); it is carried as a hidden column and dropped after sorting. Output aliases take precedence over same-named input columns. Defaults:
 
 - Direction defaults to `ASC`.
-- NULL placement defaults to `NULLS FIRST` for `ASC` and `NULLS LAST` for `DESC` (SQL convention).
+- NULL placement defaults to `NULLS FIRST` for `ASC` and `NULLS LAST` for `DESC` under the default `SqlSemantics::Ieee`, and to `NULLS LAST` for both under `SqlSemantics::Standard` (see [Semantics modes](#semantics-modes)).
+- Every NaN sorts as one value greater than `+inf` (last for `ASC`, first for `DESC`), on the host and the GPU sort path alike.
 
 `ORDER BY ... WITH FILL` is rejected. A **GPU** radix sort backs single-key `Int32` / `Int64` orderings (ASC, plus multi-key and `DESC`); other key shapes and dtypes fall back to the **host-side** sort executor (`src/exec/sort.rs`).
 

@@ -397,6 +397,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/plan/physical_plan.rs` | Physical plan: column-ordinal-resolved, register-machine IR for GPU codegen. |
 | `src/plan/rewrite.rs` | Public optimizer extension surface: the [`PlanRewrite`] trait. |
 | `src/plan/sql_frontend.rs` | SQL frontend: parses a SQL string into a `LogicalPlan` against a `TableProvider`. |
+| `src/plan/sql_semantics.rs` | Engine-wide SQL semantics mode and the plan transforms behind its `Standard` mode. |
 | `src/plan/statistics.rs` | Cardinality / statistics estimation for the cost-based optimizer. |
 | `src/plan/string_literal_rewrite.rs` | String-literal predicate rewriting. |
 | `src/plan/subquery.rs` | Uncorrelated-subquery support for the SQL frontend. |
