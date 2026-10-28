@@ -81,6 +81,27 @@ fn and_opt(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     }
 }
 
+/// `Some(k)` when `e` is `__idx_<c> = k` / `__idx_<c> <> k` with an integer
+/// literal `k`, the dictionary rewrite's form of a Utf8 comparison (`k > 0`)
+/// or of `IS [NOT] NULL` (`k == 0`, the NULL slot).
+fn dict_index_compare(e: &Expr) -> Option<i64> {
+    let Expr::Binary {
+        op: BinaryOp::Eq | BinaryOp::NotEq,
+        left,
+        right,
+    } = e
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(c), Expr::Literal(Literal::Int32(k))) if c.starts_with("__idx_") => {
+            Some(i64::from(*k))
+        }
+        (Expr::Column(c), Expr::Literal(Literal::Int64(k))) if c.starts_with("__idx_") => Some(*k),
+        _ => None,
+    }
+}
+
 /// Rewrites against one scan schema.
 pub(crate) struct NullSemantics<'a> {
     schema: &'a Schema,
@@ -92,11 +113,26 @@ impl<'a> NullSemantics<'a> {
     }
 
     fn nullable(&self, column: &str) -> bool {
-        // Rewriter-synthesised dictionary columns encode NULL rows
-        // themselves (index sentinel / rank guard).
-        !column.starts_with("__idx_")
-            && !column.starts_with("__rank_")
-            && self.schema.field(column).is_ok_and(|f| f.nullable)
+        // A dictionary index column `__idx_<c>` is NULL exactly where `<c>`
+        // is: its NULL rows hold the NULL slot 0 (see `known`). Rank columns
+        // carry their own guard (`>= 0`) in the rewritten predicate.
+        if let Some(original) = column.strip_prefix("__idx_") {
+            return self.schema.field(original).is_ok_and(|f| f.nullable);
+        }
+        !column.starts_with("__rank_") && self.schema.field(column).is_ok_and(|f| f.nullable)
+    }
+
+    /// `__idx_<c> <> 0`: the validity of a dictionary index column.
+    fn dict_index_known(&self, column: &str) -> Expr {
+        let zero = match self.schema.field(column).map(|f| f.dtype) {
+            Ok(DataType::Int64) => Literal::Int64(0),
+            _ => Literal::Int32(0),
+        };
+        Expr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(Expr::Column(column.to_string())),
+            right: Box::new(Expr::Literal(zero)),
+        }
     }
 
     /// `true` when `e` reads a nullable column or a NULL literal.
@@ -111,6 +147,8 @@ impl<'a> NullSemantics<'a> {
             return;
         }
         match e {
+            // The dictionary rewrite's `IS [NOT] NULL` is never UNKNOWN.
+            _ if dict_index_compare(e) == Some(0) => {}
             Expr::Column(c) => *found = self.nullable(c),
             Expr::Literal(Literal::Null) => *found = true,
             Expr::Literal(_) => {}
@@ -147,6 +185,10 @@ impl<'a> NullSemantics<'a> {
             return Ok(e.clone());
         }
         Ok(match e {
+            // A NULL row's index (slot 0) never equals a real slot.
+            Expr::Binary {
+                op: BinaryOp::Eq, ..
+            } if dict_index_compare(e).is_some() => e.clone(),
             Expr::Alias(x, _) => self.is_true(x)?,
             Expr::Literal(Literal::Bool(b)) => lit(*b),
             Expr::Literal(Literal::Null) => lit(false),
@@ -256,6 +298,7 @@ impl<'a> NullSemantics<'a> {
             return Ok(None);
         }
         Ok(match e {
+            Expr::Column(c) if c.starts_with("__idx_") => Some(self.dict_index_known(c)),
             Expr::Column(c) => Some(Expr::Unary {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(Expr::Column(c.clone())),
@@ -453,5 +496,55 @@ mod tests {
         assert!(format!("{k:?}").contains("Column(\"a\")"));
         assert!(!ns.is_strict(&e));
         assert!(ns.is_strict(&lt(col("n"), 5)));
+    }
+
+    fn dict_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("k", DataType::Utf8, false),
+            Field::new("__idx_s", DataType::Int32, false),
+            Field::new("__idx_k", DataType::Int32, false),
+        ])
+    }
+
+    fn idx_cmp(op: BinaryOp, c: &str, k: i32) -> Expr {
+        Expr::Binary {
+            op,
+            left: Box::new(col(c)),
+            right: Box::new(Expr::Literal(Literal::Int32(k))),
+        }
+    }
+
+    /// craton-bolt-006: a dictionary-folded comparison over a nullable Utf8
+    /// column is UNKNOWN on NULL rows (index 0), so `<>` and `NOT` exclude
+    /// them; `=` against a real slot and the `IS [NOT] NULL` slot test stay
+    /// as they are.
+    #[test]
+    fn dictionary_index_columns_follow_kleene_logic() {
+        let s = dict_schema();
+        let ns = NullSemantics::new(&s);
+        let guard = format!("{:?}", idx_cmp(BinaryOp::NotEq, "__idx_s", 0));
+
+        let ne = ns.is_true(&idx_cmp(BinaryOp::NotEq, "__idx_s", 1)).unwrap();
+        assert!(format!("{ne:?}").contains(&guard), "{ne:?}");
+        let not_eq = ns
+            .is_true(&not(idx_cmp(BinaryOp::Eq, "__idx_s", 1)))
+            .unwrap();
+        assert!(format!("{not_eq:?}").contains(&guard), "{not_eq:?}");
+
+        let eq = idx_cmp(BinaryOp::Eq, "__idx_s", 1);
+        assert_eq!(format!("{:?}", ns.is_true(&eq).unwrap()), format!("{eq:?}"));
+        for null_test in [
+            idx_cmp(BinaryOp::Eq, "__idx_s", 0),
+            idx_cmp(BinaryOp::NotEq, "__idx_s", 0),
+        ] {
+            assert!(!ns.touches_nulls(&null_test));
+            let negated = ns.is_true(&not(null_test.clone())).unwrap();
+            assert_eq!(format!("{negated:?}"), format!("{:?}", not(null_test)));
+        }
+
+        // A non-nullable Utf8 column's index needs no guard.
+        let ne_k = idx_cmp(BinaryOp::NotEq, "__idx_k", 1);
+        assert!(!ns.touches_nulls(&ne_k));
     }
 }

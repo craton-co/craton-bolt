@@ -14,6 +14,10 @@
 //!   * `col = 'lit'`  → `__idx_col = <dict index of lit>` (Int32 or Int64,
 //!     matching the dictionary variant's index width)
 //!   * `col <> 'lit'` → `__idx_col <> <dict index of lit>`
+//!   * `col IS NULL` → `__idx_col = 0`, `col IS NOT NULL` → `__idx_col <> 0`
+//!     (slot 0 is the NULL slot). `plan::null_semantics` reads `__idx_col`
+//!     as NULL exactly when it is 0, so `<>` and `NOT` over a folded
+//!     predicate exclude NULL rows (Kleene logic).
 //!   * `col LIKE 'pattern'` (constant pattern, no `ESCAPE`, not negated) over
 //!     a dict-encoded Utf8 column → an OR-of-equalities on `__idx_col` against
 //!     the dictionary indices whose entries match the pattern. The pattern is
@@ -109,8 +113,10 @@
 //!     executor can always back the comparison; shapes the rank path declines
 //!     fall back to the host string comparison.
 //!
+//!   * `col IN ('a','b')` arrives desugared to an OR of equalities (a NOT IN
+//!     to an AND of inequalities), each folded as above.
+//!
 //! Deferred:
-//!   * `IN ('a','b','c')` — would lower to OR-of-equalities; not in scope.
 //!   * Aggregate / group-by expressions over Utf8 columns — would need a
 //!     separate dictionary-aware GROUP BY path.
 //!
@@ -125,7 +131,9 @@ use std::collections::HashMap;
 
 use crate::cuda::dictionary_any::DictionaryColumnAny;
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema};
+use crate::plan::logical_plan::{
+    BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema, UnaryOp,
+};
 
 /// Convention: the index column for a Utf8 column named `c` is `__idx_<c>`.
 /// The engine uploads the dictionary indices under this name. The integer
@@ -916,8 +924,10 @@ pub fn plan_col_vs_col_rank<R: LiteralResolver>(
 /// Build a Bool predicate that is true iff `column` (an integer index
 /// column, e.g. `__idx_<col>`) equals one of `indices`.
 ///
-/// Emitted as a left-deep OR of equalities: `(col = i0) OR (col = i1) OR …`.
-/// Every operand is a GPU-lowerable integer compare (`Op::Eq`) combined with
+/// Emitted as an OR of equalities: `(col = i0) OR (col = i1) OR …`, balanced
+/// (see [`crate::plan::logical_plan::fold_balanced`]) because the set grows
+/// with the number of matching dictionary entries, which no SQL-size limit
+/// bounds (craton-bolt-007). Every operand is a GPU-lowerable integer compare (`Op::Eq`) combined with
 /// `Op::Or`, so the whole tree lowers to the fused predicate kernel — this is
 /// the "integer-index → Bool match table" lookup expressed in the existing
 /// IR, with no new op or kernel. (Mirrors the deferred `IN ('a','b',…)`
@@ -928,25 +938,36 @@ pub fn plan_col_vs_col_rank<R: LiteralResolver>(
 /// rows, whose index is slot 0, are likewise excluded by construction):
 /// fold straight to `Bool(false)`.
 fn build_index_membership(column: &str, indices: &[LiteralIndex]) -> Expr {
-    let mut iter = indices.iter().copied();
-    let first = match iter.next() {
-        Some(idx) => idx,
-        None => return Expr::Literal(Literal::Bool(false)),
+    let eqs = indices
+        .iter()
+        .map(|idx| Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column(column.to_string())),
+            right: Box::new(Expr::Literal(idx.into_literal())),
+        })
+        .collect();
+    crate::plan::logical_plan::fold_balanced(BinaryOp::Or, eqs)
+        .unwrap_or(Expr::Literal(Literal::Bool(false)))
+}
+
+/// `index_column = 0` (`want_null`) or `index_column <> 0`: the dictionary
+/// form of `col IS NULL` / `col IS NOT NULL` (slot 0 is the NULL slot). The
+/// literal has the index column's width. `plan::null_semantics` treats this
+/// shape as a NULL test (never UNKNOWN).
+fn dict_null_slot_test(index_column: &str, index_dtype: DataType, want_null: bool) -> Expr {
+    let zero = match index_dtype {
+        DataType::Int64 => Literal::Int64(0),
+        _ => Literal::Int32(0),
     };
-    let eq = |idx: LiteralIndex| Expr::Binary {
-        op: BinaryOp::Eq,
-        left: Box::new(Expr::Column(column.to_string())),
-        right: Box::new(Expr::Literal(idx.into_literal())),
-    };
-    let mut acc = eq(first);
-    for idx in iter {
-        acc = Expr::Binary {
-            op: BinaryOp::Or,
-            left: Box::new(acc),
-            right: Box::new(eq(idx)),
-        };
+    Expr::Binary {
+        op: if want_null {
+            BinaryOp::Eq
+        } else {
+            BinaryOp::NotEq
+        },
+        left: Box::new(Expr::Column(index_column.to_string())),
+        right: Box::new(Expr::Literal(zero)),
     }
-    acc
 }
 
 /// Lower a column-vs-column Utf8 ordering `col_a OP col_b` (finding F12) into a
@@ -1054,11 +1075,23 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             })
         }
         Expr::Unary { op, operand } => {
-            // The `IS NULL` / `IS NOT NULL` surface has no string-literal
-            // operand to dictionary-rewrite — the operand is the value whose
-            // nullness we're testing, not a constant. Recurse so any nested
-            // string-literal comparisons inside a typed operand still get
-            // normalised.
+            // `col IS [NOT] NULL` over a dict-encoded Utf8 column is a test
+            // of the NULL slot: a NULL row's index is 0 (craton-bolt-006; the
+            // GPU has no Utf8 register class, so the Utf8 operand itself
+            // cannot reach the kernel). Gated like the Eq/Neq fold.
+            if let (UnaryOp::IsNull | UnaryOp::IsNotNull, Expr::Column(col_name)) =
+                (op, strip_alias(operand))
+            {
+                if r.knows(col_name) && r.predicate_rewrite_allowed(col_name) {
+                    return Ok(dict_null_slot_test(
+                        &r.index_column_name(col_name),
+                        r.index_dtype(col_name),
+                        matches!(op, UnaryOp::IsNull),
+                    ));
+                }
+            }
+            // Otherwise recurse so any nested string-literal comparisons
+            // inside a typed operand still get normalised.
             let new_operand = rewrite_expr_with(operand, r, depth + 1)?;
             Ok(Expr::Unary {
                 op: *op,
@@ -3535,5 +3568,79 @@ mod tests {
                 "sentinel must be below every real rank"
             );
         }
+    }
+
+    fn expr_depth(e: &Expr) -> usize {
+        match e {
+            Expr::Binary { left, right, .. } => 1 + expr_depth(left).max(expr_depth(right)),
+            Expr::Unary { operand, .. } => 1 + expr_depth(operand),
+            _ => 0,
+        }
+    }
+
+    /// craton-bolt-007: the membership set of a predicate matching every one
+    /// of 5,000 dictionary entries is a tree of logarithmic depth (it used
+    /// to be a left-deep OR as deep as the set), with every index kept.
+    #[test]
+    fn large_membership_sets_are_balanced() {
+        let names: Vec<String> = (0..5_000).map(|i| format!("name_{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let r = MockResolver::new().with_dict("s", &refs);
+        let like = Expr::Like {
+            expr: Box::new(col("s")),
+            pattern: "%".into(),
+            escape: None,
+            negated: false,
+            case_insensitive: false,
+        };
+        let gt = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(col("s")),
+            right: Box::new(lit("")),
+        };
+        for e in [like, gt] {
+            let out = rewrite_expr_with(&e, &r, 0).unwrap();
+            assert!(expr_depth(&out) <= 24, "depth {}", expr_depth(&out));
+            assert_eq!(
+                collect_membership_i32(&out, "__idx_s"),
+                (1..=5_000).collect::<Vec<i32>>()
+            );
+        }
+    }
+
+    /// craton-bolt-006: `IS [NOT] NULL` on a dict column tests the NULL slot
+    /// (index 0) with the index column's width; on a protected (projected)
+    /// column it is left for the host.
+    #[test]
+    fn is_null_on_dict_column_tests_the_null_slot() {
+        let is = |op: UnaryOp, c: &str| Expr::Unary {
+            op,
+            operand: Box::new(col(c)),
+        };
+        let r = MockResolver::new().known_i32("s").known_i64("w");
+        for (op, want) in [
+            (UnaryOp::IsNull, BinaryOp::Eq),
+            (UnaryOp::IsNotNull, BinaryOp::NotEq),
+        ] {
+            match rewrite_expr_with(&is(op, "s"), &r, 0).unwrap() {
+                Expr::Binary { op, left, right } => {
+                    assert_eq!(op, want);
+                    assert_column(&left, "__idx_s");
+                    assert_int32_lit(&right, 0);
+                }
+                other => panic!("expected a NULL-slot test, got {other:?}"),
+            }
+            match rewrite_expr_with(&is(op, "w"), &r, 0).unwrap() {
+                Expr::Binary { right, .. } => assert_int64_lit(&right, 0),
+                other => panic!("expected a NULL-slot test, got {other:?}"),
+            }
+            // Not a dict column: unchanged.
+            let out = rewrite_expr_with(&is(op, "id"), &r, 0).unwrap();
+            assert!(matches!(out, Expr::Unary { .. }), "{out:?}");
+        }
+        let mut protected = MockResolver::new().known_i32("s");
+        protected.protected.insert("s".into());
+        let out = rewrite_expr_with(&is(UnaryOp::IsNull, "s"), &protected, 0).unwrap();
+        assert!(matches!(out, Expr::Unary { .. }), "{out:?}");
     }
 }
