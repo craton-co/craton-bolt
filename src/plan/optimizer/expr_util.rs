@@ -88,15 +88,11 @@ pub fn split_conjuncts(expr: Expr, out: &mut Vec<Expr>) {
 }
 
 /// Rebuild a single boolean predicate from a list of conjuncts by folding
-/// them with `AND`. Returns `None` for an empty list (no predicate).
+/// them with `AND` (balanced for long lists, see
+/// [`crate::plan::logical_plan::fold_balanced`]). Returns `None` for an
+/// empty list (no predicate).
 pub fn combine_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
-    let mut iter = conjuncts.into_iter();
-    let first = iter.next()?;
-    Some(iter.fold(first, |acc, c| Expr::Binary {
-        op: BinaryOp::And,
-        left: Box::new(acc),
-        right: Box::new(c),
-    }))
+    crate::plan::logical_plan::fold_balanced(BinaryOp::And, conjuncts)
 }
 
 /// True when `expr` is a literal boolean equal to `value`. Used by the

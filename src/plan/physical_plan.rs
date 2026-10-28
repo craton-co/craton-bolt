@@ -3692,20 +3692,10 @@ fn substitute_one_depth(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) 
     }
 }
 
-/// AND-fold a list of predicates into a single optional expression.
-fn and_all(mut preds: Vec<Expr>) -> Option<Expr> {
-    if preds.is_empty() {
-        return None;
-    }
-    let mut acc = preds.remove(0);
-    for p in preds {
-        acc = Expr::Binary {
-            op: BinaryOp::And,
-            left: Box::new(acc),
-            right: Box::new(p),
-        };
-    }
-    Some(acc)
+/// AND-fold a list of predicates into a single optional expression
+/// (balanced for long lists, see [`crate::plan::logical_plan::fold_balanced`]).
+fn and_all(preds: Vec<Expr>) -> Option<Expr> {
+    crate::plan::logical_plan::fold_balanced(BinaryOp::And, preds)
 }
 
 /// Short tag describing a plan node's variant for error messages.

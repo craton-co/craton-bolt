@@ -985,4 +985,69 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("rewrite refused"), "{err}");
     }
+
+    /// craton-bolt-007: long `OR` / `AND` chains and large `IN` lists plan,
+    /// explain and lower on an ordinary 2 MiB thread stack (they used to
+    /// overflow it and abort the process).
+    #[test]
+    fn deep_predicates_compile_on_a_2mib_stack() {
+        let chain = |k: usize, op: &str, f: &dyn Fn(usize) -> String| {
+            (0..k).map(f).collect::<Vec<_>>().join(op)
+        };
+        let queries = vec![
+            format!(
+                "SELECT x FROM t WHERE {}",
+                chain(300, " OR ", &|i| format!("x = {i}"))
+            ),
+            format!(
+                "SELECT x FROM t WHERE {}",
+                chain(3_000, " OR ", &|i| format!("x = {i}"))
+            ),
+            format!(
+                "SELECT x FROM t WHERE {}",
+                chain(2_000, " AND ", &|i| format!("x <> {}", i + 10_000))
+            ),
+            format!(
+                "SELECT x FROM t WHERE x IN ({})",
+                chain(5_000, ", ", &|i| i.to_string())
+            ),
+            format!(
+                "SELECT x FROM t WHERE x NOT IN ({})",
+                chain(5_000, ", ", &|i| i.to_string())
+            ),
+        ];
+        let failures = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let dict = DictRegistry::new();
+                let c = compiler(&dict, &[], true);
+                let mut failures = Vec::new();
+                for q in &queries {
+                    let head = &q[..q.len().min(48)];
+                    let p = match crate::plan::parse_sql(q, &provider()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            failures.push(format!("parse {head}: {e}"));
+                            continue;
+                        }
+                    };
+                    let compiled = match c.compile(&p, true, Subqueries::Defer) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            failures.push(format!("compile {head}: {e}"));
+                            continue;
+                        }
+                    };
+                    let _ = render_explain(&compiled);
+                    if let Err(e) = crate::plan::lower_physical(&compiled.plan) {
+                        failures.push(format!("lower {head}: {e}"));
+                    }
+                }
+                failures
+            })
+            .unwrap()
+            .join()
+            .expect("compile thread overflowed or panicked");
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
 }

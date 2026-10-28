@@ -4,15 +4,16 @@
 //!
 //! The SQL frontend desugars `<probe> [NOT] IN (v1, v2, ..., vN)` into a
 //! chain of element-wise comparisons reusing existing binary operators,
-//! wrapped in an explicit three-valued CASE:
+//! combined with a balanced `OR` / `AND`:
 //!
 //!   * `IN`     → `(probe = v1) OR  (probe = v2) OR  ...`
 //!   * `NOT IN` → `(probe <> v1) AND (probe <> v2) AND ...`
 //!
-//! The CASE preserves SQL UNKNOWN for NULL probes/list elements instead of
+//! When the probe or a list element is a NULL constant the chain is wrapped
+//! in an explicit three-valued CASE, which preserves SQL UNKNOWN instead of
 //! allowing the fused boolean path to materialise a stored false/true value.
 //! These tests pin the lowered plan shape (no GPU needed) and the
-//! cap / empty-list behaviour. They live alongside the other plan-
+//! large / empty-list behaviour. They live alongside the other plan-
 //! shape tests (`having_test.rs`, `is_null_test.rs`).
 
 use craton_bolt::plan::{
@@ -117,7 +118,7 @@ fn contains_op(e: &Expr, target: BinaryOp) -> bool {
 fn in_list_three_values_lowers_to_or_chain_of_eq() {
     let sql = "SELECT v FROM t WHERE k IN (1, 2, 3)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = strict_chain(filter_predicate(&plan));
+    let pred = filter_predicate(&plan);
 
     assert_eq!(
         count_op(pred, BinaryOp::Eq),
@@ -147,7 +148,7 @@ fn in_list_three_values_lowers_to_or_chain_of_eq() {
 fn in_list_five_values_produces_five_eq_leaves() {
     let sql = "SELECT v FROM t WHERE k IN (10, 20, 30, 40, 50)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = strict_chain(filter_predicate(&plan));
+    let pred = filter_predicate(&plan);
 
     assert_eq!(
         count_op(pred, BinaryOp::Eq),
@@ -195,7 +196,7 @@ fn in_list_five_values_produces_five_eq_leaves() {
 fn not_in_list_lowers_to_and_chain_of_neq() {
     let sql = "SELECT v FROM t WHERE k NOT IN (1, 2, 3)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = strict_chain(filter_predicate(&plan));
+    let pred = filter_predicate(&plan);
 
     assert_eq!(
         count_op(pred, BinaryOp::NotEq),
@@ -225,7 +226,7 @@ fn not_in_list_lowers_to_and_chain_of_neq() {
 fn in_list_single_value_collapses_to_single_eq() {
     let sql = "SELECT v FROM t WHERE k IN (42)";
     let plan = parse_sql(sql, &t_provider()).expect("parse");
-    let pred = strict_chain(filter_predicate(&plan));
+    let pred = filter_predicate(&plan);
 
     assert_eq!(count_op(pred, BinaryOp::Eq), 1);
     assert!(
@@ -264,40 +265,30 @@ fn empty_in_list_rejected_at_parse_time() {
     );
 }
 
-// ---- Cap rejection ---------------------------------------------------------
+// ---- Large lists -----------------------------------------------------------
 
-/// Lists longer than the 64-value cap must produce a clear error message
-/// pointing the user at a JOIN. The exact cap is implementation detail,
-/// but the "use a JOIN" guidance is load-bearing.
+/// Long lists lower (craton-bolt-007: there used to be a 64-value cap) to a
+/// chain of logarithmic depth, so the planner's recursive walkers need no
+/// stack proportional to the list.
 #[test]
-fn in_list_over_cap_rejected_with_join_hint() {
-    // 65 values: one past the documented MAX_IN_LIST_VALUES = 64.
-    let values: Vec<String> = (0..65).map(|i| i.to_string()).collect();
-    let sql = format!("SELECT v FROM t WHERE k IN ({})", values.join(", "));
-
-    let err = match parse_sql(&sql, &t_provider()) {
-        Ok(plan) => panic!("expected over-cap IN list to error, got plan: {plan:?}"),
-        Err(e) => format!("{e}"),
-    };
-    let msg = err.to_ascii_lowercase();
-    assert!(
-        msg.contains("in with") || msg.contains("> 64") || msg.contains("64 values"),
-        "error should reference the cap, got: {err}",
-    );
-    assert!(
-        msg.contains("join"),
-        "error should suggest a JOIN, got: {err}",
-    );
-}
-
-/// Exactly at the 64-value cap must still succeed.
-#[test]
-fn in_list_at_cap_succeeds() {
-    let values: Vec<String> = (0..64).map(|i| i.to_string()).collect();
-    let sql = format!("SELECT v FROM t WHERE k IN ({})", values.join(", "));
-    let plan = parse_sql(&sql, &t_provider()).expect("at-cap IN list should lower");
-    let pred = strict_chain(filter_predicate(&plan));
-    assert_eq!(count_op(pred, BinaryOp::Eq), 64);
+fn large_in_list_lowers_to_a_balanced_chain() {
+    fn depth(e: &Expr) -> usize {
+        match e {
+            Expr::Binary { left, right, .. } => 1 + depth(left).max(depth(right)),
+            _ => 0,
+        }
+    }
+    let values: Vec<String> = (0..5_000).map(|i| i.to_string()).collect();
+    for (negated, cmp) in [("", BinaryOp::Eq), ("NOT ", BinaryOp::NotEq)] {
+        let sql = format!(
+            "SELECT v FROM t WHERE k {negated}IN ({})",
+            values.join(", ")
+        );
+        let plan = parse_sql(&sql, &t_provider()).expect("large IN list should lower");
+        let pred = filter_predicate(&plan);
+        assert_eq!(count_op(pred, cmp), 5_000);
+        assert!(depth(pred) <= 24, "depth {}", depth(pred));
+    }
 }
 
 // ---- Interaction with other expressions ------------------------------------
@@ -322,15 +313,16 @@ fn in_list_composes_with_outer_and() {
     else {
         panic!("expected top-level AND, got {pred:?}");
     };
-    // The IN-chain side has two Eqs and at least one OR.
-    let wrapped_in_side = if matches!(left.as_ref(), Expr::Case { .. }) {
-        left
-    } else {
-        right
-    };
-    let in_side = strict_chain(wrapped_in_side);
-    assert_eq!(count_op(in_side, BinaryOp::Eq), 2);
-    assert!(contains_op(in_side, BinaryOp::Or));
+    // The IN-chain side has two Eqs and one OR; the other side is `v > 0`.
+    assert_eq!(count_op(left, BinaryOp::Eq), 2);
+    assert!(contains_op(left, BinaryOp::Or));
+    assert!(matches!(
+        right.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Gt,
+            ..
+        }
+    ));
 }
 
 #[test]

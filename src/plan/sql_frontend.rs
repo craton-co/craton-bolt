@@ -918,6 +918,7 @@ fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<State
     let aliased = alias_asof_right_relation(dialect, sql);
     let mut stmts = Parser::parse_sql(dialect, aliased.as_deref().unwrap_or(sql))
         .map_err(|e| parse_error_to_bolt_error(e, sql))?;
+    balance_logical_chains(&mut stmts);
     let _ = sqlparser::ast::visit_expressions_mut(&mut stmts, |e| {
         if let SqlExpr::Function(f) = e {
             let name = f.name.to_string().to_ascii_uppercase();
@@ -931,6 +932,91 @@ fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<State
         std::ops::ControlFlow::<()>::Continue(())
     });
     Ok(stmts)
+}
+
+/// Rebalance every long `AND` / `OR` chain of the parsed statements.
+///
+/// The parser builds `a OR b OR c ...` left-deep, so the tree is as deep as
+/// the chain is long, and every recursive walker of the frontend, the
+/// optimizer, the NULL rewrite and the codegen (and `Drop`) would need a
+/// stack proportional to it: a 300-term `OR` overflowed a 2 MiB thread stack
+/// (craton-bolt-007). Each chain longer than
+/// [`crate::plan::logical_plan::LEFT_DEEP_FOLD_MAX`] is flattened without
+/// recursion and rebuilt with the same leaf order and depth `O(log n)`
+/// (Kleene `AND` / `OR` are associative, and left-to-right short-circuit
+/// order is kept). Shorter chains keep the parser's shape. The visitor
+/// rebalances a chain before it descends into it.
+fn balance_logical_chains(stmts: &mut [Statement]) {
+    use sqlparser::ast::{VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+
+    fn is_chain_op(op: &BinaryOperator) -> bool {
+        matches!(op, BinaryOperator::And | BinaryOperator::Or)
+    }
+
+    /// The leaves of the `op` chain rooted at `e`, left to right; `None`
+    /// when there are no more than `max` of them (nothing is moved then).
+    fn take_long_chain(e: &mut SqlExpr, op: &BinaryOperator, max: usize) -> Option<Vec<SqlExpr>> {
+        let mut count = 0usize;
+        let mut stack = vec![&*e];
+        while let Some(x) = stack.pop() {
+            match x {
+                SqlExpr::BinaryOp { left, op: o, right } if o == op => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+                _ => count += 1,
+            }
+        }
+        if count <= max {
+            return None;
+        }
+        let mut leaves = Vec::with_capacity(count);
+        let mut stack = vec![std::mem::replace(e, SqlExpr::Value(Value::Null))];
+        while let Some(x) = stack.pop() {
+            match x {
+                SqlExpr::BinaryOp { left, op: o, right } if o == *op => {
+                    stack.push(*right);
+                    stack.push(*left);
+                }
+                leaf => leaves.push(leaf),
+            }
+        }
+        Some(leaves)
+    }
+
+    fn build(op: &BinaryOperator, mut leaves: Vec<SqlExpr>) -> SqlExpr {
+        if leaves.len() == 1 {
+            return leaves.pop().expect("one leaf");
+        }
+        let right = leaves.split_off(leaves.len() / 2);
+        SqlExpr::BinaryOp {
+            left: Box::new(build(op, leaves)),
+            op: op.clone(),
+            right: Box::new(build(op, right)),
+        }
+    }
+
+    struct Balance;
+    impl VisitorMut for Balance {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &mut SqlExpr) -> ControlFlow<()> {
+            if let SqlExpr::BinaryOp { op, .. } = &*e {
+                if is_chain_op(op) {
+                    let op = op.clone();
+                    if let Some(leaves) =
+                        take_long_chain(e, &op, crate::plan::logical_plan::LEFT_DEEP_FOLD_MAX)
+                    {
+                        *e = build(&op, leaves);
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    for stmt in stmts {
+        let _ = stmt.visit(&mut Balance);
+    }
 }
 
 /// `<table> ASOF JOIN <table> MATCH_CONDITION (...)` without aliases:
@@ -10883,42 +10969,15 @@ fn lower_expr_in_having(
             list,
             negated,
         } => {
-            if list.len() > MAX_IN_LIST_VALUES {
-                return Err(BoltError::Sql(format!(
-                    "IN with > {MAX_IN_LIST_VALUES} values not yet supported; use a JOIN \
-                     against a derived table (got {} values)",
-                    list.len()
-                )));
-            }
             if list.is_empty() {
                 return Ok(Expr::Literal(Literal::Bool(*negated)));
             }
             let lowered_expr = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
-            let (cmp_op, combine_op) = if *negated {
-                (BinaryOp::NotEq, BinaryOp::And)
-            } else {
-                (BinaryOp::Eq, BinaryOp::Or)
-            };
-            let mut acc: Option<Expr> = None;
-            for item in list {
-                let item_lowered = lower_expr_in_having(item, resolver, agg_aliases, depth + 1)?;
-                let cmp = Expr::Binary {
-                    op: cmp_op,
-                    left: Box::new(lowered_expr.clone()),
-                    right: Box::new(item_lowered),
-                };
-                acc = Some(match acc {
-                    None => cmp,
-                    Some(prev) => Expr::Binary {
-                        op: combine_op,
-                        left: Box::new(prev),
-                        right: Box::new(cmp),
-                    },
-                });
-            }
-            Ok(strict_three_valued_bool(acc.expect(
-                "non-empty IN list guarantees at least one chain element",
-            )))
+            let items = list
+                .iter()
+                .map(|item| lower_expr_in_having(item, resolver, agg_aliases, depth + 1))
+                .collect::<BoltResult<Vec<_>>>()?;
+            Ok(in_list_chain(lowered_expr, items, *negated))
         }
         // HAVING ... BETWEEN ...: desugar the same way as the scalar lowerer
         // but route each operand through `lower_expr_in_having` so aggregate
@@ -11970,13 +12029,8 @@ fn lower_nullif(args: &[&SqlExpr], resolver: &NameResolver<'_>, depth: usize) ->
     })
 }
 
-/// Maximum number of values accepted on the right-hand side of a SQL
-/// `IN (...)` list operator. Lists at or under this bound are desugared
-/// to a balanced OR/AND chain of element-wise comparisons.
-const MAX_IN_LIST_VALUES: usize = 64;
-
-/// Desugar SQL `<expr> [NOT] IN (v1, v2, ..., vN)` into a strict
-/// three-valued chain of element-wise comparisons:
+/// Desugar SQL `<expr> [NOT] IN (v1, v2, ..., vN)` into a chain of
+/// element-wise comparisons (see [`in_list_chain`]):
 ///
 ///   * `IN`     → `(expr = v1) OR  (expr = v2) OR  ... OR  (expr = vN)`
 ///   * `NOT IN` → `(expr <> v1) AND (expr <> v2) AND ... AND (expr <> vN)`
@@ -11992,42 +12046,58 @@ fn lower_in_list(
             "expression nesting exceeds depth limit ({MAX_RECURSION_DEPTH})"
         )));
     }
-    if list.len() > MAX_IN_LIST_VALUES {
-        return Err(BoltError::Sql(format!(
-            "IN with > {MAX_IN_LIST_VALUES} values not yet supported; use a JOIN \
-             against a derived table (got {} values)",
-            list.len()
-        )));
-    }
     if list.is_empty() {
         return Ok(Expr::Literal(Literal::Bool(negated)));
     }
     let lowered_expr = lower_expr(expr, resolver, depth + 1)?;
+    let items = list
+        .iter()
+        .map(|item| lower_expr(item, resolver, depth + 1))
+        .collect::<BoltResult<Vec<_>>>()?;
+    Ok(in_list_chain(lowered_expr, items, negated))
+}
+
+/// The element-wise comparison chain of `probe [NOT] IN (items)` (non-empty
+/// `items`), combined with a balanced `OR` / `AND`
+/// ([`crate::plan::logical_plan::fold_balanced`]) so a long list does not
+/// build a tree as deep as the list (craton-bolt-007).
+///
+/// When the probe or an item is a NULL constant the chain is wrapped by
+/// [`strict_three_valued_bool`], which keeps its UNKNOWN explicit and routes
+/// it to the host evaluator. Without one the chain is an ordinary predicate:
+/// a NULL *column* value is handled by the kernels' NULL rewrite
+/// (`plan::null_semantics`), and the chain stays visible to the dictionary
+/// rewrite, so a Utf8 `IN` folds to an index membership test
+/// (craton-bolt-006).
+fn in_list_chain(probe: Expr, items: Vec<Expr>, negated: bool) -> Expr {
+    fn is_null_constant(e: &Expr) -> bool {
+        match e {
+            Expr::Literal(Literal::Null) => true,
+            Expr::Alias(inner, _) | Expr::Cast { expr: inner, .. } => is_null_constant(inner),
+            _ => false,
+        }
+    }
     let (cmp_op, combine_op) = if negated {
         (BinaryOp::NotEq, BinaryOp::And)
     } else {
         (BinaryOp::Eq, BinaryOp::Or)
     };
-    let mut acc: Option<Expr> = None;
-    for item in list {
-        let item_lowered = lower_expr(item, resolver, depth + 1)?;
-        let cmp = Expr::Binary {
+    let strict = is_null_constant(&probe) || items.iter().any(is_null_constant);
+    let cmps = items
+        .into_iter()
+        .map(|item| Expr::Binary {
             op: cmp_op,
-            left: Box::new(lowered_expr.clone()),
-            right: Box::new(item_lowered),
-        };
-        acc = Some(match acc {
-            None => cmp,
-            Some(prev) => Expr::Binary {
-                op: combine_op,
-                left: Box::new(prev),
-                right: Box::new(cmp),
-            },
-        });
+            left: Box::new(probe.clone()),
+            right: Box::new(item),
+        })
+        .collect();
+    let chain = crate::plan::logical_plan::fold_balanced(combine_op, cmps)
+        .expect("non-empty IN list guarantees at least one chain element");
+    if strict {
+        strict_three_valued_bool(chain)
+    } else {
+        chain
     }
-    Ok(strict_three_valued_bool(acc.expect(
-        "non-empty IN list guarantees at least one chain element",
-    )))
 }
 
 /// Preserve a boolean expression's SQL three-valued result explicitly.

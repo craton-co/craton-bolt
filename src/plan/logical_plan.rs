@@ -903,6 +903,35 @@ fn binary(op: BinaryOp, l: Expr, r: Expr) -> Expr {
     }
 }
 
+/// Operand count up to which [`fold_balanced`] folds left-deep (the shape the
+/// SQL parser produces for `a AND b AND c`).
+pub(crate) const LEFT_DEEP_FOLD_MAX: usize = 8;
+
+/// Combine `operands` with the associative operator `op` (in practice `AND`
+/// or `OR`), keeping their left-to-right order, into a tree whose depth is
+/// `O(log n)`: up to [`LEFT_DEEP_FOLD_MAX`] operands fold left-deep, longer
+/// lists split in halves. `None` for an empty list.
+///
+/// Every planner pass, the NULL rewrite and the codegen walk expressions
+/// recursively, so a left-deep chain over user-sized input (a long `OR`
+/// list, an `IN` list, a dictionary membership set) would grow the stack
+/// with the input and overflow it (craton-bolt-007). Kleene `AND` / `OR`
+/// are associative and the leaf order is kept, so left-to-right
+/// short-circuit evaluation is unchanged.
+pub(crate) fn fold_balanced(op: BinaryOp, mut operands: Vec<Expr>) -> Option<Expr> {
+    if operands.len() <= LEFT_DEEP_FOLD_MAX {
+        let mut iter = operands.into_iter();
+        let first = iter.next()?;
+        return Some(iter.fold(first, |acc, e| binary(op, acc, e)));
+    }
+    let right = operands.split_off(operands.len() / 2);
+    Some(binary(
+        op,
+        fold_balanced(op, operands)?,
+        fold_balanced(op, right)?,
+    ))
+}
+
 #[allow(clippy::should_implement_trait)]
 impl Expr {
     /// Wrap `self` in an `Alias`.
@@ -3952,5 +3981,67 @@ mod subquery_node_tests {
         };
         assert!(!format!("{scalar:?}").is_empty());
         assert!(!format!("{in_sq:?}").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fold_balanced_tests {
+    use super::*;
+
+    fn depth(e: &Expr) -> usize {
+        match e {
+            Expr::Binary { left, right, .. } => 1 + depth(left).max(depth(right)),
+            _ => 0,
+        }
+    }
+
+    fn leaves(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                leaves(left, out);
+                leaves(right, out);
+            }
+            Expr::Column(c) => out.push(c.clone()),
+            other => panic!("unexpected leaf {other:?}"),
+        }
+    }
+
+    fn cols(n: usize) -> Vec<Expr> {
+        (0..n).map(|i| col(format!("c{i}"))).collect()
+    }
+
+    #[test]
+    fn empty_is_none_and_one_is_itself() {
+        assert!(fold_balanced(BinaryOp::Or, Vec::new()).is_none());
+        let one = fold_balanced(BinaryOp::Or, cols(1)).unwrap();
+        assert!(matches!(one, Expr::Column(ref c) if c == "c0"));
+    }
+
+    #[test]
+    fn short_lists_fold_left_deep() {
+        let e = fold_balanced(BinaryOp::Or, cols(3)).unwrap();
+        let want = binary(
+            BinaryOp::Or,
+            binary(BinaryOp::Or, col("c0"), col("c1")),
+            col("c2"),
+        );
+        assert_eq!(format!("{e:?}"), format!("{want:?}"));
+    }
+
+    #[test]
+    fn long_lists_are_logarithmic_and_keep_order() {
+        for n in [9, 100, 5_000, 100_000] {
+            let e = fold_balanced(BinaryOp::Or, cols(n)).unwrap();
+            let bound = LEFT_DEEP_FOLD_MAX + (usize::BITS - n.leading_zeros()) as usize;
+            assert!(depth(&e) <= bound, "n = {n}: depth {} > {bound}", depth(&e));
+            let mut got = Vec::new();
+            leaves(&e, &mut got);
+            let want: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+            assert_eq!(got, want, "n = {n}");
+        }
     }
 }
