@@ -363,13 +363,12 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
 
     // -------- Lower compute ops (skip Store — projection's responsibility).
     //
-    // The predicate's compute lineage is fully contained in the spec's
-    // non-Store ops because `lower_projection` emits the predicate first and
-    // every transitive operand precedes it. We simply emit every compute op
-    // in order, which both produces the predicate register and naturally
-    // dead-code-eliminates none of them — fine for correctness; the JIT
-    // assembler can prune unused values when it lowers PTX -> SASS.
-    for op in &spec.ops {
+    // Only the predicate's compute lineage is emitted: the ops that only
+    // feed projected outputs (e.g. `SELECT CAST(dec AS DOUBLE) ... WHERE
+    // id = 1`) belong to the projection kernel, and some of them have no
+    // predicate-kernel lowering.
+    let lineage = predicate_lineage(&spec.ops, predicate_reg);
+    for (op, _) in spec.ops.iter().zip(&lineage).filter(|(_, live)| **live) {
         match op {
             // The predicate kernel ignores value Stores — projection's
             // responsibility. `Store128` is similarly skipped (it never
@@ -432,6 +431,118 @@ pub fn compile_predicate_kernel(spec: &KernelSpec, kernel_name: &str) -> BoltRes
     writeln!(out, "}}").map_err(write_err)?;
 
     Ok(out)
+}
+
+/// Which of `ops` (SSA, in definition order) the value of `predicate`
+/// transitively depends on.
+fn predicate_lineage(ops: &[Op], predicate: Reg) -> Vec<bool> {
+    let mut live: std::collections::HashSet<Reg> = std::collections::HashSet::from([predicate]);
+    let mut keep = vec![false; ops.len()];
+    for (i, op) in ops.iter().enumerate().rev() {
+        let (defs, uses) = op_defs_uses(op);
+        if defs.iter().any(|d| live.contains(d)) {
+            keep[i] = true;
+            live.extend(uses);
+        }
+    }
+    keep
+}
+
+/// `(registers written, registers read)` by `op`.
+fn op_defs_uses(op: &Op) -> (Vec<Reg>, Vec<Reg>) {
+    match op {
+        Op::LoadColumn { dst, .. } | Op::Const { dst, .. } | Op::IsNullCheck { dst, .. } => {
+            (vec![*dst], vec![])
+        }
+        Op::Cast { dst, src, .. } | Op::Not { dst, src } => (vec![*dst], vec![*src]),
+        Op::Binary { dst, lhs, rhs, .. } => (vec![*dst], vec![*lhs, *rhs]),
+        Op::Select {
+            dst,
+            cond,
+            then_val,
+            else_val,
+            ..
+        } => (vec![*dst], vec![*cond, *then_val, *else_val]),
+        Op::Store { src, .. } => (vec![], vec![*src]),
+        Op::Store128 { src_lo, src_hi, .. } => (vec![], vec![*src_lo, *src_hi]),
+        Op::LoadColumn128 { dst_lo, dst_hi, .. } | Op::Const128 { dst_lo, dst_hi, .. } => {
+            (vec![*dst_lo, *dst_hi], vec![])
+        }
+        Op::Add128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        }
+        | Op::Sub128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        }
+        | Op::Mul128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        }
+        | Op::Div128 {
+            dst_lo,
+            dst_hi,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+        } => (vec![*dst_lo, *dst_hi], vec![*a_lo, *a_hi, *b_lo, *b_hi]),
+        Op::Cmp128 {
+            dst,
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        } => (vec![*dst], vec![*a_lo, *a_hi, *b_lo, *b_hi]),
+        Op::WidenToI128 {
+            dst_lo,
+            dst_hi,
+            src,
+            ..
+        }
+        | Op::F64ToI128 {
+            dst_lo,
+            dst_hi,
+            src,
+        } => (vec![*dst_lo, *dst_hi], vec![*src]),
+        Op::NarrowI128ToInt {
+            dst,
+            src_lo,
+            src_hi,
+            ..
+        }
+        | Op::I128ToF64 {
+            dst,
+            src_lo,
+            src_hi,
+        } => (vec![*dst], vec![*src_lo, *src_hi]),
+        Op::Select128 {
+            dst_lo,
+            dst_hi,
+            cond,
+            then_lo,
+            then_hi,
+            else_lo,
+            else_hi,
+        } => (
+            vec![*dst_lo, *dst_hi],
+            vec![*cond, *then_lo, *then_hi, *else_lo, *else_hi],
+        ),
+    }
 }
 
 /// Lower a single non-Store op into PTX. Mirrors `ptx_gen::emit_op` for the
@@ -569,12 +680,35 @@ fn emit_op(
         // narrow / CASE-decimal select) are not expected in a predicate kernel.
         // Decline cleanly so the planner routes such predicates to the
         // projection path or host fallback rather than emitting wrong PTX.
+        // `CAST(dec AS DOUBLE)` inside a predicate.
+        Op::I128ToF64 {
+            dst,
+            src_lo,
+            src_hi,
+        } => {
+            let lo = b.alloc.get(*src_lo)?.to_string();
+            let hi = b.alloc.get(*src_hi)?.to_string();
+            let rd = [(); 4].map(|_| b.alloc.alloc("rd"));
+            let fd = [(); 4].map(|_| b.alloc.alloc("fd"));
+            let p = b.alloc.alloc("p");
+            let dst = b.alloc.assign(*dst, DataType::Float64)?;
+            for line in crate::jit::ptx_gen::i128_to_f64_ptx(
+                &dst,
+                &lo,
+                &hi,
+                rd.each_ref().map(String::as_str),
+                fd.each_ref().map(String::as_str),
+                &p,
+            ) {
+                b.emit(&line)?;
+            }
+            Ok(())
+        }
         Op::WidenToI128 { .. }
         | Op::NarrowI128ToInt { .. }
         | Op::Div128 { .. }
         | Op::Select128 { .. }
-        | Op::F64ToI128 { .. }
-        | Op::I128ToF64 { .. } => Err(BoltError::Other(
+        | Op::F64ToI128 { .. } => Err(BoltError::Other(
             "scan_kernel: Decimal128 Div / CAST / CASE-select ops are not \
              lowered into a predicate kernel (use the projection path or host \
              fallback); planner bug if this fires in a WHERE predicate"

@@ -1361,34 +1361,91 @@ fn emit_div_128(
     Ok(())
 }
 
-/// Emit `Op::I128ToF64` — convert a signed i128 `(lo, hi)` pair to `f64`,
-/// computing `hi * 2^64 + lo` in floating point.
+/// PTX for `Op::I128ToF64`: convert the signed i128 `(lo, hi)` to the f64
+/// `dst` through its magnitude.
 ///
 /// ```text
-///   cvt.rn.f64.s64 %hf, %hi        // signed high half -> f64
-///   cvt.rn.f64.u64 %lf, %lo        // UNSIGNED low half -> f64
-///   mov.f64        %two64, 0d43F0000000000000   // 2^64
-///   fma.rn.f64     %dst, %hf, %two64, %lf        // hi*2^64 + lo
+///   setp.lt.s64  %neg, %hi, 0               // sign
+///   sub.cc.u64   %nlo, 0, %lo               // -(hi:lo), two's complement
+///   subc.u64     %nhi, 0, %hi
+///   selp.b64     %mlo, %nlo, %lo, %neg      // |v| = (mhi:mlo), unsigned
+///   selp.b64     %mhi, %nhi, %hi, %neg
+///   cvt.rn.f64.u64 %hf, %mhi
+///   cvt.rn.f64.u64 %lf, %mlo
+///   mov.f64      %two64, 0d43F0000000000000 // 2^64
+///   fma.rn.f64   %mag, %hf, %two64, %lf     // |v| = mhi*2^64 + mlo
+///   neg.f64      %hf, %mag                  // (%hf reused for -|v|)
+///   selp.f64     %dst, %hf, %mag, %neg
 /// ```
 ///
-/// The low half is converted as UNSIGNED (`cvt.rn.f64.u64`) because in a
-/// two's-complement i128 the value is exactly `hi*2^64 + lo_unsigned` — the
-/// sign already lives entirely in `hi` (converted signed). `fma.rn`
-/// round-to-nearest keeps the single unavoidable rounding step. Precision
-/// loss beyond f64's 53 significant bits is expected for a decimal->float
-/// conversion (documented on `Op::I128ToF64`).
+/// Converting the signed `hi * 2^64 + lo` directly loses a small negative
+/// value: for `-25`, `lo = 2^64 - 25` rounds to `2^64` and the sum is `0`
+/// (decimal `-0.25` came out as a wrong value). On the magnitude every
+/// `|v| < 2^64` has `mhi = 0` and converts with one correctly rounded step;
+/// larger magnitudes may round twice, within f64 precision. `i128::MIN`
+/// negates to itself, whose unsigned magnitude `2^127` is exact.
+///
+/// `rd` holds four b64 temporaries, `fd` four f64 temporaries, `p` one
+/// predicate; [`crate::jit::scan_kernel`] emits the same lines.
+pub(crate) fn i128_to_f64_ptx(
+    dst: &str,
+    lo: &str,
+    hi: &str,
+    rd: [&str; 4],
+    fd: [&str; 4],
+    p: &str,
+) -> [String; 11] {
+    let [nlo, nhi, mlo, mhi] = rd;
+    let [hf, lf, two64, mag] = fd;
+    [
+        format!("setp.lt.s64 {p}, {hi}, 0;"),
+        format!("sub.cc.u64 {nlo}, 0, {lo};"),
+        format!("subc.u64 {nhi}, 0, {hi};"),
+        format!("selp.b64 {mlo}, {nlo}, {lo}, {p};"),
+        format!("selp.b64 {mhi}, {nhi}, {hi}, {p};"),
+        format!("cvt.rn.f64.u64 {hf}, {mhi};"),
+        format!("cvt.rn.f64.u64 {lf}, {mlo};"),
+        format!("mov.f64 {two64}, 0d43F0000000000000;"),
+        format!("fma.rn.f64 {mag}, {hf}, {two64}, {lf};"),
+        format!("neg.f64 {hf}, {mag};"),
+        format!("selp.f64 {dst}, {hf}, {mag}, {p};"),
+    ]
+}
+
+/// Host model of [`i128_to_f64_ptx`], step for step (each `as f64` from a
+/// `u64` is the `cvt.rn`, `mul_add` the `fma.rn`).
+#[cfg(test)]
+pub(crate) fn i128_to_f64_model(v: i128) -> f64 {
+    let bits = v as u128;
+    let negative = ((bits >> 64) as i64) < 0;
+    let m = if negative { bits.wrapping_neg() } else { bits };
+    let (mlo, mhi) = (m as u64, (m >> 64) as u64);
+    let mag = (mhi as f64).mul_add(18_446_744_073_709_551_616.0, mlo as f64);
+    if negative {
+        -mag
+    } else {
+        mag
+    }
+}
+
+/// Emit `Op::I128ToF64` (see [`i128_to_f64_ptx`]).
 fn emit_i128_to_f64(b: &mut PtxBuilder, dst: Reg, src_lo: Reg, src_hi: Reg) -> BoltResult<()> {
     let lo_n = b.alloc.get(src_lo)?.to_string();
     let hi_n = b.alloc.get(src_hi)?.to_string();
-    let hf = b.alloc.alloc("fd");
-    let lf = b.alloc.alloc("fd");
-    let two64 = b.alloc.alloc("fd");
+    let rd = [(); 4].map(|_| b.alloc.alloc("rd"));
+    let fd = [(); 4].map(|_| b.alloc.alloc("fd"));
+    let p = b.alloc.alloc("p");
     let dst_name = b.alloc.assign(dst, DataType::Float64)?;
-    // 0x43F0000000000000 is 2^64 as an IEEE-754 double.
-    emit_fmt!(b, "cvt.rn.f64.s64 {}, {};", hf, hi_n)?;
-    emit_fmt!(b, "cvt.rn.f64.u64 {}, {};", lf, lo_n)?;
-    emit_fmt!(b, "mov.f64 {}, 0d43F0000000000000;", two64)?;
-    emit_fmt!(b, "fma.rn.f64 {}, {}, {}, {};", dst_name, hf, two64, lf)?;
+    for line in i128_to_f64_ptx(
+        &dst_name,
+        &lo_n,
+        &hi_n,
+        rd.each_ref().map(String::as_str),
+        fd.each_ref().map(String::as_str),
+        &p,
+    ) {
+        b.emit(&line)?;
+    }
     Ok(())
 }
 
@@ -4781,9 +4838,32 @@ mod decimal128_ir_tests {
         assert_eq!(f2i(f64::NAN), 0);
     }
 
+    /// `Op::I128ToF64` converts the magnitude and reapplies the sign; the
+    /// host model of those steps is exact for negative decimals (`-25` was
+    /// `0` with the signed `hi*2^64 + lo` form).
+    #[test]
+    fn i128_to_f64_model_is_exact_for_small_negatives() {
+        for v in [
+            -25i128,
+            -1,
+            0,
+            1,
+            125,
+            -50,
+            -(1 << 53),
+            i64::MIN as i128 - 1,
+        ] {
+            assert_eq!(i128_to_f64_model(v), v as f64, "{v}");
+        }
+        assert_eq!(i128_to_f64_model(i128::MIN), -(2f64.powi(127)));
+        assert_eq!(i128_to_f64_model(i128::MAX), 2f64.powi(127));
+        let big = 3i128 << 100;
+        assert_eq!(i128_to_f64_model(-big), -(big as f64));
+    }
+
     /// F5: `Op::I128ToF64` (Decimal128 -> Float conversion) computes
-    /// `hi*2^64 + lo` via `cvt.rn.f64.s64` (signed hi), `cvt.rn.f64.u64`
-    /// (UNSIGNED lo), and an `fma.rn.f64` against the 2^64 constant.
+    /// `|v| = mhi*2^64 + mlo` with UNSIGNED `cvt.rn.f64.u64` halves and an
+    /// `fma.rn.f64` against the 2^64 constant, then reapplies the sign.
     #[test]
     fn i128_to_f64_emits_hi_times_2pow64_plus_lo() {
         let spec = KernelSpec {
@@ -4819,8 +4899,8 @@ mod decimal128_ir_tests {
         };
         let ptx = compile(&spec, "bolt_i128_to_f64").expect("compile");
         assert!(
-            ptx.contains("cvt.rn.f64.s64"),
-            "expected signed hi conversion\n{ptx}"
+            !ptx.contains("cvt.rn.f64.s64") && ptx.contains("subc.u64"),
+            "expected the magnitude (negated pair), not a signed hi conversion\n{ptx}"
         );
         assert!(
             ptx.contains("cvt.rn.f64.u64"),
