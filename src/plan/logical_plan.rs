@@ -124,7 +124,9 @@ impl DataType {
     /// arithmetic / comparison between decimals and the existing primitive
     /// numerics is intentionally NOT defined, so leaving
     /// `is_numeric()` unchanged means a decimal column will surface a clear
-    /// type error if anyone tries to add it to (e.g.) an Int64.
+    /// type error if anyone tries to add it to (e.g.) an Int64. (A numeric
+    /// *constant* compared with a decimal is rewritten into the decimal's type
+    /// by [`crate::plan::literal_coercion`].)
     pub fn is_decimal(self) -> bool {
         matches!(self, DataType::Decimal128(_, _))
     }
@@ -1151,6 +1153,13 @@ impl Expr {
                         // Allow numeric cross-comparisons; result is still Bool.
                         let _ = unify_numeric(l, r)?;
                         Ok(DataType::Bool)
+                    } else if comparison_literal_coerces(left, right, r)
+                        || comparison_literal_coerces(right, left, l)
+                    {
+                        // A constant the literal-coercion pass rewrites into
+                        // the other operand's type (`dec >= 2.5`,
+                        // `ts_us >= TIMESTAMP '...'`).
+                        Ok(DataType::Bool)
                     } else {
                         Err(BoltError::Type(format!("cannot compare {l:?} with {r:?}")))
                     }
@@ -1788,6 +1797,15 @@ fn peer_typed_dtype(e: &Expr, peer: &Expr, schema: &Schema, _op: BinaryOp) -> Bo
         }
     }
     e.dtype(schema)
+}
+
+/// True when `side` is a constant that [`crate::plan::literal_coercion`]
+/// rewrites into the type `other_dtype` of the opposite, non-constant
+/// comparison operand `other`.
+fn comparison_literal_coerces(side: &Expr, other: &Expr, other_dtype: DataType) -> bool {
+    !matches!(other, Expr::Literal(_))
+        && matches!(side, Expr::Literal(lit)
+            if crate::plan::literal_coercion::coercible(lit, other_dtype))
 }
 
 /// True if the engine's logical plane accepts `CAST(<src> AS <target>)`.

@@ -382,6 +382,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/observability.rs` | Observability surface — pool-stats observer + tracing span catalogue. |
 | `src/plan/dataframe.rs` | Lazy DataFrame builder over [`LogicalPlan`]. |
 | `src/plan/explain.rs` | Plan introspection / `EXPLAIN`. |
+| `src/plan/literal_coercion.rs` | Exact coercion of a constant compared with an operand of another type. |
 | `src/plan/logical_plan.rs` | Logical plan AST: schemas, expressions, and relational nodes. |
 | `src/plan/mod.rs` | Logical plan IR, DataFrame builder, SQL frontend, and physical plan. |
 | `src/plan/null_semantics.rs` | SQL NULL semantics for the fused GPU kernels. |

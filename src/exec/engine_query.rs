@@ -99,18 +99,20 @@ impl QueryCompiler<'_> {
         user_rewrites: bool,
         subqueries: Subqueries<'_>,
     ) -> BoltResult<CompiledLogical> {
+        // Constants compared with a Decimal128 / Timestamp / Date32 operand
+        // take that operand's type first, so every later stage sees a
+        // same-typed comparison.
+        let plan = crate::plan::literal_coercion::coerce_plan(plan.clone());
         // Total-order float comparisons (exactly once per compiled plan; an
         // extracted subquery is compiled — and rewritten — on its own).
-        let standard;
         let plan = if self.semantics == SqlSemantics::Standard {
-            standard = crate::plan::sql_semantics::total_order_comparisons(plan)?;
-            &standard
+            crate::plan::sql_semantics::total_order_comparisons(&plan)?
         } else {
             plan
         };
         // String-literal predicates against Utf8 columns are folded into
         // integer equality against the corresponding `__idx_<col>` column.
-        let plan = tracing::info_span!("plan").in_scope(|| self.dict.rewrite_plan(plan))?;
+        let plan = tracing::info_span!("plan").in_scope(|| self.dict.rewrite_plan(&plan))?;
         // Built-in optimizer (constant folding, predicate pushdown,
         // filter-into-join, statistics-driven join reorder, projection
         // pruning), re-run until the plan stabilises or the iteration cap is

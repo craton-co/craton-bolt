@@ -314,11 +314,13 @@ impl Engine {
         tables: &[String],
         nested_tables: &[String],
     ) -> HashMap<String, ScanRequest> {
+        // Pruning reads the same coerced comparisons the query compiles.
+        let plan = crate::plan::literal_coercion::coerce_plan(plan.clone());
         let optimized = if self.optimize {
             let passes = crate::plan::default_passes_with_estimator(self.row_estimator());
-            crate::plan::optimizer::run_to_fixpoint(&passes, plan.clone()).ok()
+            crate::plan::optimizer::run_to_fixpoint(&passes, plan).ok()
         } else {
-            Some(plan.clone())
+            Some(plan)
         };
         let Some(optimized) = optimized else {
             return HashMap::new();
