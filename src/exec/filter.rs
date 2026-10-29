@@ -73,11 +73,21 @@ pub fn execute_filter(input: QueryHandle, predicate: &Expr) -> BoltResult<QueryH
         return Ok(QueryHandle::from_record_batch(batch));
     }
 
-    // Lift each batch column into a HostColumn. We keep both the owned
-    // HostColumns and the &-references the evaluator's ColumnEnv expects.
+    // Lift each column the predicate reads into a HostColumn. We keep both
+    // the owned HostColumns and the &-references the evaluator's ColumnEnv
+    // expects. Columns the predicate does not read (of any type, Decimal128
+    // included) only pass through `arrow::compute::filter` below.
+    let mut referenced = Vec::new();
+    crate::plan::optimizer::expr_util::collect_columns(predicate, &mut referenced);
     let schema = batch.schema();
     let mut owned: Vec<(String, HostColumn)> = Vec::with_capacity(batch.num_columns());
     for (i, field) in schema.fields().iter().enumerate() {
+        if !referenced
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(field.name()))
+        {
+            continue;
+        }
         let arr = batch.column(i);
         let hc = arrow_array_to_host_column(arr.as_ref(), n_rows)?;
         owned.push((field.name().clone(), hc));
