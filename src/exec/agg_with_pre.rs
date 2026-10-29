@@ -1322,6 +1322,8 @@ enum PreColValues {
     I64(GpuVec<i64>),
     F32(GpuVec<f32>),
     F64(GpuVec<f64>),
+    /// Decimal128 input rows, two u64 halves each (never an output).
+    Dec128(GpuVec<u64>),
 }
 
 impl PreCol {
@@ -1383,11 +1385,25 @@ impl PreCol {
                     .ok_or_else(|| downcast_err("input", "Float64"))?;
                 PreColValues::F64(GpuVec::from_buffer(primitive_to_gpu(pa)?))
             }
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            // An input only (`WHERE dec IS NULL`, `WHERE dec > 2.5`): the
+            // interleaved `[lo, hi]` u64 rows `Op::LoadColumn128` reads, as
+            // in `GpuColumnData::Decimal128`.
+            DataType::Decimal128(_, _) => {
+                let da = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::Decimal128Array>()
+                    .ok_or_else(|| downcast_err("input", "Decimal128"))?;
+                let rows: Vec<u64> = da
+                    .values()
+                    .iter()
+                    .flat_map(|v| {
+                        let bits = *v as u128;
+                        [bits as u64, (bits >> 64) as u64]
+                    })
+                    .collect();
+                PreColValues::Dec128(GpuVec::from_slice(&rows)?)
+            }
+            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -1440,6 +1456,7 @@ impl PreCol {
             PreColValues::I64(v) => v.device_ptr(),
             PreColValues::F32(v) => v.device_ptr(),
             PreColValues::F64(v) => v.device_ptr(),
+            PreColValues::Dec128(v) => v.device_ptr(),
         }
     }
 
@@ -1474,6 +1491,7 @@ impl PreCol {
             PreColValues::I64(v) => reduce_gpu_vec::<i64>(op, DataType::Int64, v, n_rows),
             PreColValues::F32(v) => reduce_gpu_vec::<f32>(op, DataType::Float32, v, n_rows),
             PreColValues::F64(v) => reduce_gpu_vec::<f64>(op, DataType::Float64, v, n_rows),
+            PreColValues::Dec128(_) => Err(decimal_output_err()),
         }
     }
 
@@ -1492,12 +1510,19 @@ impl PreCol {
             PreColValues::I64(v) => HostColValues::I64(copy_back::<i64>(&v, n_rows)?),
             PreColValues::F32(v) => HostColValues::F32(copy_back::<f32>(&v, n_rows)?),
             PreColValues::F64(v) => HostColValues::F64(copy_back::<f64>(&v, n_rows)?),
+            PreColValues::Dec128(_) => return Err(decimal_output_err()),
         };
         Ok(HostCol {
             values: host_values,
             validity,
         })
     }
+}
+
+/// A Decimal128 `PreCol` is a kernel input; `alloc_zeros` never makes one
+/// an output, so reducing or downloading one is a planner bug.
+fn decimal_output_err() -> BoltError {
+    BoltError::Other("agg_with_pre: a Decimal128 pre-kernel column is input-only".into())
 }
 
 /// Host-side typed column produced by downloading a `PreCol`. Carries a
