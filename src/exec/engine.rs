@@ -4874,9 +4874,32 @@ impl Engine {
                     io.name, table
                 ))
             })?;
-            let vptr = match column.data.validity_ptr() {
-                Some(vptr) => vptr,
-                None => {
+            let vptr = match (&column.data, column.data.validity_ptr()) {
+                // Decimal128 keeps its validity as an Arrow-packed bitmap
+                // (`DeviceValidityFormat::Packed`); `Op::IsNullCheck` reads one
+                // byte per row, so the kernel gets an unpacked copy.
+                (
+                    crate::exec::gpu_table::GpuColumnData::Decimal128 {
+                        valid_mask: Some(mask),
+                        ..
+                    },
+                    _,
+                ) => {
+                    use crate::exec::validity_audit::{
+                        normalize_device_validity_to_unpacked, DeviceValidityFormat,
+                    };
+                    let unpacked = normalize_device_validity_to_unpacked(
+                        &mask.to_vec()?,
+                        DeviceValidityFormat::Packed,
+                        n_rows,
+                    );
+                    let buf = GpuVec::<u8>::from_slice(&unpacked)?;
+                    let ptr = buf.device_ptr();
+                    synth_validity_bufs.push(buf);
+                    ptr
+                }
+                (_, Some(vptr)) => vptr,
+                (_, None) => {
                     // The column is nullable in the schema (so the planner did
                     // NOT constant-fold this IsNullCheck) but carries NO actual
                     // nulls on device, so `validity_ptr()` is `None`. Every row

@@ -156,6 +156,25 @@ pub fn normalize_device_validity_to_packed(
     }
 }
 
+/// Normalise a device-validity buffer of either [`DeviceValidityFormat`] into
+/// the **unpacked** one-`u8`-per-row layout (`1` = present, `0` = NULL) that
+/// the projection / predicate kernels' `Op::IsNullCheck` reads. Rows past the
+/// end of a short packed buffer are NULL.
+pub fn normalize_device_validity_to_unpacked(
+    buf: &[u8],
+    format: DeviceValidityFormat,
+    n_rows: usize,
+) -> Vec<u8> {
+    match format {
+        DeviceValidityFormat::Unpacked => (0..n_rows)
+            .map(|i| u8::from(buf.get(i).is_some_and(|b| *b != 0)))
+            .collect(),
+        DeviceValidityFormat::Packed => (0..n_rows)
+            .map(|i| buf.get(i / 8).map_or(0, |b| (b >> (i % 8)) & 1))
+            .collect(),
+    }
+}
+
 /// Does an Arrow array carry validity that the GPU side must honour?
 ///
 /// `true` iff the array has at least one NULL (`null_count() > 0`). This is
@@ -281,6 +300,26 @@ mod tests {
         // zero-extends, a long input truncates.
         let got = normalize_device_validity_to_packed(&[0xFFu8], DeviceValidityFormat::Packed, 17);
         assert_eq!(got, vec![0xFF, 0x00, 0x00]);
+    }
+
+    /// Unpacking inverts packing, row for row, for both source formats.
+    #[test]
+    fn normalize_to_unpacked_round_trips() {
+        let arr = Int32Array::from(
+            (0..19)
+                .map(|i| (i % 3 != 0).then_some(i))
+                .collect::<Vec<_>>(),
+        );
+        let want: Vec<u8> = (0..arr.len()).map(|i| u8::from(!arr.is_null(i))).collect();
+        let packed = packed_validity_for(&arr);
+        assert_eq!(
+            normalize_device_validity_to_unpacked(&packed, DeviceValidityFormat::Packed, 19),
+            want
+        );
+        assert_eq!(
+            normalize_device_validity_to_unpacked(&want, DeviceValidityFormat::Unpacked, 19),
+            want
+        );
     }
 
     /// `buffer_len` reflects the two formats' byte footprints.
