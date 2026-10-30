@@ -123,7 +123,10 @@ fn report_003_aggregates_over_empty_filtered_input_are_null() {
             ("SELECT SUM(d) FROM t WHERE id < 0 AND d > 0", Want::Null),
             ("SELECT SUM(d + 1) FROM t WHERE id < 0", Want::Null),
             ("SELECT COUNT(d) FROM t WHERE id < 0", Want::Value(0.0)),
-            ("SELECT SUM(v) FROM t WHERE d IS NOT NULL", Want::Value(4215.0)),
+            (
+                "SELECT SUM(v) FROM t WHERE d IS NOT NULL",
+                Want::Value(4215.0),
+            ),
             ("SELECT MIN(v) FROM t WHERE id > 90", Want::Value(92.0)),
         ],
     );
@@ -176,15 +179,24 @@ fn report_004_decimal128_predicates() {
                 "SELECT id FROM t WHERE dec >= CAST(2.50 AS DECIMAL(10,2))",
                 Want::Rows(84),
             ),
-            ("SELECT id FROM t WHERE CAST(dec AS DOUBLE) >= 2.5", Want::Rows(84)),
+            (
+                "SELECT id FROM t WHERE CAST(dec AS DOUBLE) >= 2.5",
+                Want::Rows(84),
+            ),
             ("SELECT s FROM t WHERE id > 50", Want::Rows(49)),
             ("SELECT id FROM t WHERE s IN ('v1', 'v2')", Want::Rows(34)),
-            ("SELECT CAST(dec AS DOUBLE) FROM t WHERE id = 1", Want::Value(1.25)),
+            (
+                "SELECT CAST(dec AS DOUBLE) FROM t WHERE id = 1",
+                Want::Value(1.25),
+            ),
             (
                 "SELECT CAST(dec - 3 AS DOUBLE) FROM t WHERE id = 2",
                 Want::Value(-0.5),
             ),
-            ("SELECT COUNT(*) FROM t WHERE dec IS NULL", Want::Value(15.0)),
+            (
+                "SELECT COUNT(*) FROM t WHERE dec IS NULL",
+                Want::Value(15.0),
+            ),
         ],
     );
 }
@@ -198,9 +210,21 @@ fn timestamp_table() -> RecordBatch {
     let us: Vec<i64> = (0..n).map(|i| base_us + i * day_us).collect();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new("ts_ns", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
-        Field::new("ts_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-        Field::new("ts_ms", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new(
+            "ts_ns",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new(
+            "ts_us",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new(
+            "ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new(
             "ts_tz",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -251,9 +275,7 @@ fn report_005_timestamp_literals_meet_every_unit() {
             Want::Rows(6),
         ));
         cases.push((
-            format!(
-                "SELECT id FROM t WHERE {col} >= CAST('2024-01-05 00:00:00' AS TIMESTAMP)"
-            ),
+            format!("SELECT id FROM t WHERE {col} >= CAST('2024-01-05 00:00:00' AS TIMESTAMP)"),
             Want::Rows(6),
         ));
     }
@@ -263,6 +285,142 @@ fn report_005_timestamp_literals_meet_every_unit() {
     ));
     let cases: Vec<(&str, Want)> = cases.iter().map(|(q, w)| (q.as_str(), *w)).collect();
     check(timestamp_table(), &cases);
+}
+
+/// 10 rows, i = 0..9: dt = 2024-01-01 + i days (Date32), neg = (i - 5) * 0.25
+/// as DECIMAL(5,2) (NULL when i == 3), tsec = dt at 12:00 in seconds.
+fn coercion_edge_table() -> RecordBatch {
+    use arrow_array::{Date32Array, TimestampSecondArray};
+    let day0 = 19_723; // 2024-01-01
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("dt", DataType::Date32, false),
+        Field::new("neg", DataType::Decimal128(5, 2), true),
+        Field::new("tsec", DataType::Timestamp(TimeUnit::Second, None), false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef,
+            Arc::new(Date32Array::from(
+                (0..10).map(|i| day0 + i).collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                Decimal128Array::from(
+                    (0..10)
+                        .map(|i| (i != 3).then_some((i as i128 - 5) * 25))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(5, 2)
+                .unwrap(),
+            ),
+            Arc::new(TimestampSecondArray::from(
+                (0..10i64)
+                    .map(|i| (day0 as i64 + i) * 86_400 + 43_200)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "gpu:e2e"]
+fn report_004_005_coercion_edges() {
+    check(
+        coercion_edge_table(),
+        &[
+            // Date32 against timestamp constants: day boundaries are exact,
+            // a time of day falls between two dates.
+            (
+                "SELECT id FROM t WHERE dt >= TIMESTAMP '2024-01-05'",
+                Want::Rows(6),
+            ),
+            (
+                "SELECT id FROM t WHERE dt >= TIMESTAMP '2024-01-05 12:00:00'",
+                Want::Rows(5),
+            ),
+            (
+                "SELECT id FROM t WHERE dt <= TIMESTAMP '2024-01-05 12:00:00'",
+                Want::Rows(5),
+            ),
+            (
+                "SELECT id FROM t WHERE dt = TIMESTAMP '2024-01-05 12:00:00'",
+                Want::Rows(0),
+            ),
+            (
+                "SELECT id FROM t WHERE dt <> TIMESTAMP '2024-01-05 12:00:00'",
+                Want::Rows(10),
+            ),
+            (
+                "SELECT id FROM t WHERE TIMESTAMP '2024-01-05' <= dt",
+                Want::Rows(6),
+            ),
+            (
+                "SELECT id FROM t WHERE dt >= CAST('2024-01-05' AS DATE)",
+                Want::Rows(6),
+            ),
+            // A timestamp column against a DATE constant, and a range.
+            (
+                "SELECT id FROM t WHERE tsec >= DATE '2024-01-05'",
+                Want::Rows(6),
+            ),
+            (
+                "SELECT id FROM t WHERE tsec BETWEEN TIMESTAMP '2024-01-03 12:00:00' \
+                 AND TIMESTAMPTZ '2024-01-05 13:00:00+01'",
+                Want::Rows(3),
+            ),
+            (
+                "SELECT id FROM t WHERE tsec = TIMESTAMP '2024-01-05 12:00:00.5'",
+                Want::Rows(0),
+            ),
+            (
+                "SELECT id FROM t WHERE tsec < TIMESTAMP '2024-01-01 12:00:00.5'",
+                Want::Rows(1),
+            ),
+            (
+                "SELECT COUNT(*) FROM t WHERE tsec >= TIMESTAMP '2024-01-05'",
+                Want::Value(6.0),
+            ),
+            // A naive TIMESTAMP constant has no offset; TIMESTAMPTZ does.
+            (
+                "SELECT id FROM t WHERE tsec >= TIMESTAMP '2024-01-05 02:00:00+02'",
+                Want::Error("TIMESTAMPTZ"),
+            ),
+            // Negative decimals: comparisons, NULL semantics, exact CAST.
+            ("SELECT id FROM t WHERE neg < 0", Want::Rows(4)),
+            ("SELECT id FROM t WHERE neg <= -0.5", Want::Rows(3)),
+            ("SELECT id FROM t WHERE neg > -0.501", Want::Rows(6)),
+            (
+                "SELECT id FROM t WHERE neg = -1.25 OR neg = 0.75 OR neg = 2",
+                Want::Rows(2),
+            ),
+            ("SELECT id FROM t WHERE neg <> -0.501", Want::Rows(9)),
+            ("SELECT id FROM t WHERE neg < 1000", Want::Rows(9)),
+            ("SELECT id FROM t WHERE neg IS NULL", Want::Rows(1)),
+            (
+                "SELECT id FROM t WHERE neg = CAST(-0.25 AS DECIMAL(5,2))",
+                Want::Rows(1),
+            ),
+            (
+                "SELECT CAST(neg AS DOUBLE) FROM t WHERE id = 4",
+                Want::Value(-0.25),
+            ),
+            (
+                "SELECT CAST(neg AS DOUBLE) FROM t WHERE id = 0",
+                Want::Value(-1.25),
+            ),
+            (
+                "SELECT id FROM t WHERE CAST(neg AS DOUBLE) < -0.3",
+                Want::Rows(3),
+            ),
+            ("SELECT COUNT(*) FROM t WHERE neg < 0", Want::Value(4.0)),
+            (
+                "SELECT COUNT(*) FROM t WHERE neg IS NOT NULL",
+                Want::Value(9.0),
+            ),
+        ],
+    );
 }
 
 /// 100 rows: id = i, s = 'v' || i % 6, NULL when i % 7 == 0 (craton-bolt-006).
@@ -294,7 +452,10 @@ fn report_006_utf8_null_in_and_not_equal() {
         ("SELECT id FROM t WHERE s IS NOT NULL", Want::Rows(85)),
         ("SELECT id FROM t WHERE s IS NULL", Want::Rows(15)),
         ("SELECT id FROM t WHERE s IN ('v1', 'v2')", Want::Rows(28)),
-        ("SELECT id FROM t WHERE s NOT IN ('v1', 'v2')", Want::Rows(57)),
+        (
+            "SELECT id FROM t WHERE s NOT IN ('v1', 'v2')",
+            Want::Rows(57),
+        ),
         ("SELECT id, s FROM t WHERE id > 3", Want::Rows(96)),
         ("SELECT id FROM t WHERE s != 'v1'", Want::Rows(71)),
         ("SELECT id FROM t WHERE NOT (s = 'v1')", Want::Rows(71)),
@@ -351,11 +512,17 @@ fn report_007_deep_predicates_do_not_overflow_a_2mib_stack() {
     let queries: Vec<(String, usize)> = vec![
         ("SELECT id FROM t WHERE s LIKE 'name_1%'".into(), 1_111),
         ("SELECT id FROM t WHERE s LIKE '%'".into(), n as usize),
-        ("SELECT id FROM t WHERE s > 'name_4'".into(), n as usize - below),
+        (
+            "SELECT id FROM t WHERE s > 'name_4'".into(),
+            n as usize - below,
+        ),
         (format!("SELECT id FROM t WHERE {}", or_chain(300)), 300),
         (format!("SELECT id FROM t WHERE {}", or_chain(3_000)), 3_000),
         (format!("SELECT id FROM t WHERE {and_chain}"), n as usize),
-        (format!("SELECT id FROM t WHERE id IN ({in_list})"), n as usize),
+        (
+            format!("SELECT id FROM t WHERE id IN ({in_list})"),
+            n as usize,
+        ),
     ];
     let handle = std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
@@ -445,7 +612,11 @@ fn garbage_null_table() -> RecordBatch {
     let valid: Vec<bool> = (0..n).map(|i| i % 7 != 0 && i % 5 != 4).collect();
     let nulls = NullBuffer::from(valid.clone());
     let v = Int32Array::new(
-        ScalarBuffer::from((0..n).map(|i| if valid[i] { i as i32 } else { 1_000 }).collect::<Vec<_>>()),
+        ScalarBuffer::from(
+            (0..n)
+                .map(|i| if valid[i] { i as i32 } else { 1_000 })
+                .collect::<Vec<_>>(),
+        ),
         Some(nulls.clone()),
     );
     let d = Float64Array::new(
@@ -466,7 +637,9 @@ fn garbage_null_table() -> RecordBatch {
         schema,
         vec![
             Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Int32Array::from((0..n as i32).map(|i| i % 5).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(
+                (0..n as i32).map(|i| i % 5).collect::<Vec<_>>(),
+            )),
             Arc::new(v),
             Arc::new(d),
         ],
@@ -485,12 +658,18 @@ fn residual_validity_is_honoured_everywhere() {
     let id_gt_20_nulls = id_gt_20_nulls as f64;
     let cases: Vec<(String, Want)> = vec![
         ("SELECT d FROM t WHERE d > 0".into(), Want::Rows(pos)),
-        ("SELECT COUNT(*) FROM t WHERE d > 0".into(), Want::Value(pos as f64)),
+        (
+            "SELECT COUNT(*) FROM t WHERE d > 0".into(),
+            Want::Value(pos as f64),
+        ),
         (
             "SELECT COUNT(*) - COUNT(d) FROM t WHERE id > 20".into(),
             Want::Value(id_gt_20_nulls),
         ),
-        ("SELECT d FROM t WHERE d IS NULL".into(), Want::Rows(100 - nn)),
+        (
+            "SELECT d FROM t WHERE d IS NULL".into(),
+            Want::Rows(100 - nn),
+        ),
         ("SELECT COUNT(d + 1) FROM t".into(), Want::Value(nn as f64)),
         (
             "SELECT SUM(CASE WHEN d > 0 THEN 1 ELSE 0 END) FROM t".into(),
@@ -498,22 +677,46 @@ fn residual_validity_is_honoured_everywhere() {
         ),
         // The all-NULL group g = 4 aggregates to NULL.
         ("SELECT SUM(v) FROM t WHERE g = 4".into(), Want::Null),
-        ("SELECT s FROM (SELECT g, SUM(v) AS s FROM t GROUP BY g) q WHERE g = 4".into(), Want::Null),
-        ("SELECT m FROM (SELECT g, MIN(v) AS m FROM t GROUP BY g) q WHERE g = 4".into(), Want::Null),
-        ("SELECT m FROM (SELECT g, MAX(d) AS m FROM t GROUP BY g) q WHERE g = 4".into(), Want::Null),
+        (
+            "SELECT s FROM (SELECT g, SUM(v) AS s FROM t GROUP BY g) q WHERE g = 4".into(),
+            Want::Null,
+        ),
+        (
+            "SELECT m FROM (SELECT g, MIN(v) AS m FROM t GROUP BY g) q WHERE g = 4".into(),
+            Want::Null,
+        ),
+        (
+            "SELECT m FROM (SELECT g, MAX(d) AS m FROM t GROUP BY g) q WHERE g = 4".into(),
+            Want::Null,
+        ),
         // An aggregate below a sort / limit / distinct keeps its validity (W9-A-003).
-        ("SELECT COUNT(v) AS c FROM t ORDER BY c".into(), Want::Value(nn as f64)),
-        ("SELECT COUNT(v) FROM t LIMIT 1".into(), Want::Value(nn as f64)),
-        ("SELECT DISTINCT COUNT(v) FROM t".into(), Want::Value(nn as f64)),
+        (
+            "SELECT COUNT(v) AS c FROM t ORDER BY c".into(),
+            Want::Value(nn as f64),
+        ),
+        (
+            "SELECT COUNT(v) FROM t LIMIT 1".into(),
+            Want::Value(nn as f64),
+        ),
+        (
+            "SELECT DISTINCT COUNT(v) FROM t".into(),
+            Want::Value(nn as f64),
+        ),
         // count(*) next to an INTEGER SUM (W5-A-001).
         (
             "SELECT COUNT(*) FROM (SELECT COUNT(*) AS c, SUM(v) AS s FROM t) q".into(),
             Want::Value(1.0),
         ),
-        ("SELECT c FROM (SELECT COUNT(*) AS c, SUM(v) AS s FROM t) q".into(), Want::Value(100.0)),
+        (
+            "SELECT c FROM (SELECT COUNT(*) AS c, SUM(v) AS s FROM t) q".into(),
+            Want::Value(100.0),
+        ),
         // An ascending sort puts NULL first (documented default) and keeps it NULL.
         ("SELECT v FROM t ORDER BY v LIMIT 1".into(), Want::Null),
-        ("SELECT v FROM t ORDER BY v NULLS LAST LIMIT 1".into(), Want::Value(1.0)),
+        (
+            "SELECT v FROM t ORDER BY v NULLS LAST LIMIT 1".into(),
+            Want::Value(1.0),
+        ),
     ];
     let cases: Vec<(&str, Want)> = cases.iter().map(|(q, w)| (q.as_str(), *w)).collect();
     check(b, &cases);

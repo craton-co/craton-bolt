@@ -335,12 +335,23 @@ These are real, code-level behaviors to be aware of:
   (`F64ToI128` / `I128ToF64`). **Grouped** `Decimal128` `SUM` / `MIN` / `MAX`
   now also run on the **GPU** (`bolt_groupby_agg_decimal`, a per-slot spin-locked
   128-bit accumulator; `SUM` raises the same overflow error as the scalar path,
-  `MIN` / `MAX` preserve the input `(p, s)`). **Residual gaps:** `SUM` over a
+  `MIN` / `MAX` preserve the input `(p, s)`). Numeric constants compared with a
+  `Decimal128` operand, and timestamp / date constants compared with a
+  `Timestamp` (any unit or zone) or `Date32` operand, take the operand's type
+  exactly (`plan::literal_coercion`); `TIMESTAMPTZ '…'` literals and constant
+  `CAST(… AS DECIMAL(p, s) | DATE | TIMESTAMP[TZ])` fold at parse time.
+  **Residual gaps:** `SUM` over a
   temporal column is rejected by design (undefined SQL);
   `TRY_CAST` / `SAFE_CAST` of Float⇄`Decimal128`
-  is rejected at type-check (the host evaluator has no `Decimal128` column); and
-  `CAST` to/from `Timestamp` / `String` is still rejected at the GPU lowering
-  boundary. See the type tiers in
+  is rejected at type-check (the host evaluator has no `Decimal128` column); a
+  predicate the planner routes to the host evaluator (for example the
+  NULL-aware `CASE` an `IN (…)` list lowers to) cannot read a `Decimal128`
+  column, so `dec IN (…)` errors where `dec = a OR dec = b` runs; a float
+  constant with more than 15 significant digits is compared through its
+  nearest double; comparisons between two non-constant operands of differing
+  decimal / temporal types are type errors; and
+  `CAST` of a non-constant to/from `Timestamp` / `String` is still rejected at
+  type-check. See the type tiers in
   [`docs/SQL_REFERENCE.md`](SQL_REFERENCE.md).
 - **Env-gated experimental paths.** Several kernels (e.g. GPU radix sort,
   CUDA-graph sort, alternate hash/scan algorithms) are gated behind

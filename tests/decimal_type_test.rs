@@ -27,9 +27,9 @@
 //!    round-trip plumbing.
 //! 2. `SELECT decimal_col FROM t` lowers successfully through the v0.7
 //!    physical-plan codegen.
-//! 3. `CAST(int_col AS DECIMAL(18, 2))` still parses (sqlparser accepts
-//!    the syntax) and is rejected at lowering with the documented
-//!    "CAST to/from Decimal128 not yet lowered" message.
+//! 3. `CAST(int_col AS DECIMAL(18, 2))` parses and is rejected by the type
+//!    check (an integer column is not a supported DECIMAL CAST source); a
+//!    constant CAST to DECIMAL folds to an exact literal.
 
 use std::sync::Arc;
 
@@ -133,6 +133,38 @@ fn select_non_decimal_column_still_lowers() {
     let _ = lower_physical(&plan).expect("physical lowering of a non-Decimal SELECT must succeed");
 }
 
+/// `CAST(<constant> AS DECIMAL(p, s))` folds to an exact decimal literal,
+/// and a numeric constant compared with a decimal column type-checks (the
+/// engine rewrites it into the column's type before lowering).
+#[test]
+fn cast_constant_to_decimal_folds() {
+    use craton_bolt::plan::{Expr, Literal, LogicalPlan};
+    let provider = provider_with_decimal();
+    let plan = parse_sql("SELECT CAST(-2.505 AS DECIMAL(10, 2)) FROM t", &provider)
+        .expect("constant CAST to DECIMAL parses");
+    let LogicalPlan::Project { exprs, .. } = &plan else {
+        panic!("expected a projection, got {plan:?}");
+    };
+    assert!(
+        matches!(exprs[0], Expr::Literal(Literal::Decimal128(-251, 10, 2))),
+        "{exprs:?}"
+    );
+    for q in [
+        "SELECT id FROM t WHERE amount >= 2.50",
+        "SELECT id FROM t WHERE 3 > amount",
+    ] {
+        let plan = parse_sql(q, &provider).expect("decimal vs numeric constant parses");
+        plan.schema()
+            .expect("decimal vs numeric constant type-checks");
+    }
+    assert!(
+        parse_sql("SELECT id FROM t WHERE amount >= id", &provider)
+            .and_then(|plan| plan.schema())
+            .is_err(),
+        "a decimal column against an integer column is still a type error"
+    );
+}
+
 // ---- 3. CAST(int AS DECIMAL(18, 2)) ----------------------------------------
 
 /// `CAST(id AS DECIMAL(18, 2))` parses through sqlparser without an error
@@ -143,8 +175,15 @@ fn select_non_decimal_column_still_lowers() {
 #[test]
 fn cast_int_to_decimal_parses_then_rejects_at_lower() {
     let provider = provider_with_decimal();
-    let result = parse_sql("SELECT CAST(id AS DECIMAL(18, 2)) FROM t", &provider);
-    let err = result.expect_err("CAST to DECIMAL must be rejected at lowering");
+    // `DECIMAL(p, s)` is a CAST target (a constant folds exactly, see
+    // `cast_constant_to_decimal_folds`); an integer column is not a
+    // supported source, which the type check reports.
+    let plan = parse_sql("SELECT CAST(id AS DECIMAL(18, 2)) FROM t", &provider)
+        .expect("DECIMAL(18, 2) is a CAST target");
+    let result = plan
+        .schema()
+        .and_then(|_| lower_physical(&plan).map(|_| ()));
+    let err = result.expect_err("CAST of an Int32 column to DECIMAL must be rejected");
     match err {
         BoltError::Plan(msg) => {
             assert!(
