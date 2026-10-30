@@ -593,9 +593,7 @@ fn report_008_register_batch_is_proportional_to_the_batch() {
     );
     let out = engine.sql("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(first_as_f64(out.record_batch()), Some((147 * rows) as f64));
-    let out = engine
-        .sql("SELECT COUNT(*) FROM t WHERE s = 's7'")
-        .unwrap();
+    let out = engine.sql("SELECT COUNT(*) FROM t WHERE s = 's7'").unwrap();
     // ids 7, 1007, ..., 301007 (the table holds ids 0..301056).
     let want = (0..147 * rows).filter(|i| i % 1000 == 7).count();
     assert_eq!(want, 302);
@@ -733,15 +731,33 @@ fn report_006_007_null_in_lists_and_deep_dml_predicates() {
     let cases = [
         // x IN (a, NULL) is TRUE where x = a, otherwise NULL.
         ("SELECT id FROM t WHERE s IN ('v1', NULL)", Want::Rows(14)),
-        ("SELECT count(*) FROM t WHERE s IN ('v1', NULL)", Want::Value(14.0)),
-        ("SELECT id FROM t WHERE s IN ('v1', NULL) OR id = 0", Want::Rows(15)),
+        (
+            "SELECT count(*) FROM t WHERE s IN ('v1', NULL)",
+            Want::Value(14.0),
+        ),
+        (
+            "SELECT id FROM t WHERE s IN ('v1', NULL) OR id = 0",
+            Want::Rows(15),
+        ),
         // ... and NOT IN (a, NULL) is never TRUE: FALSE where x = a.
-        ("SELECT id FROM t WHERE s NOT IN ('v1', NULL)", Want::Rows(0)),
-        ("SELECT id FROM t WHERE NOT (s IN ('v1', NULL))", Want::Rows(0)),
-        ("SELECT id FROM t WHERE NOT (s NOT IN ('v1', NULL))", Want::Rows(14)),
+        (
+            "SELECT id FROM t WHERE s NOT IN ('v1', NULL)",
+            Want::Rows(0),
+        ),
+        (
+            "SELECT id FROM t WHERE NOT (s IN ('v1', NULL))",
+            Want::Rows(0),
+        ),
+        (
+            "SELECT id FROM t WHERE NOT (s NOT IN ('v1', NULL))",
+            Want::Rows(14),
+        ),
         ("SELECT id FROM t WHERE id IN (1, NULL)", Want::Rows(1)),
         ("SELECT id FROM t WHERE id NOT IN (1, NULL)", Want::Rows(0)),
-        ("SELECT id FROM t WHERE NOT (id NOT IN (1, NULL))", Want::Rows(1)),
+        (
+            "SELECT id FROM t WHERE NOT (id NOT IN (1, NULL))",
+            Want::Rows(1),
+        ),
     ];
     check(batch.clone(), &cases);
     let mut engine = Engine::new().expect("CUDA context");
