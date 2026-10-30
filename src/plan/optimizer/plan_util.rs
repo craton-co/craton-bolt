@@ -19,6 +19,24 @@ where
     E: Fn(Expr) -> Expr,
     A: Fn(AggregateExpr) -> AggregateExpr,
 {
+    map_plan_exprs_and_predicates(plan, map_expr, map_expr, map_agg)
+}
+
+/// [`map_plan_exprs`], except that a `Filter` predicate is mapped by
+/// `map_predicate` instead of `map_expr` (a filter keeps only the rows where
+/// it is TRUE, so a pass may treat UNKNOWN there as FALSE).
+pub fn map_plan_exprs_and_predicates<E, P, A>(
+    plan: LogicalPlan,
+    map_expr: &E,
+    map_predicate: &P,
+    map_agg: &A,
+) -> LogicalPlan
+where
+    E: Fn(Expr) -> Expr,
+    P: Fn(Expr) -> Expr,
+    A: Fn(AggregateExpr) -> AggregateExpr,
+{
+    let rec = |p: LogicalPlan| map_plan_exprs_and_predicates(p, map_expr, map_predicate, map_agg);
     match plan {
         LogicalPlan::Window {
             input,
@@ -26,18 +44,18 @@ where
             partition_by,
             order_by,
         } => LogicalPlan::Window {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            input: Box::new(rec(*input)),
             window_exprs,
             partition_by: partition_by.into_iter().map(map_expr).collect(),
             order_by,
         },
         LogicalPlan::Scan { .. } => plan,
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
-            predicate: map_expr(predicate),
+            input: Box::new(rec(*input)),
+            predicate: map_predicate(predicate),
         },
         LogicalPlan::Project { input, exprs } => LogicalPlan::Project {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            input: Box::new(rec(*input)),
             exprs: exprs.into_iter().map(map_expr).collect(),
         },
         LogicalPlan::Aggregate {
@@ -45,24 +63,24 @@ where
             group_by,
             aggregates,
         } => LogicalPlan::Aggregate {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            input: Box::new(rec(*input)),
             group_by: group_by.into_iter().map(map_expr).collect(),
             aggregates: aggregates.into_iter().map(map_agg).collect(),
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            input: Box::new(rec(*input)),
         },
         LogicalPlan::Limit {
             input,
             limit,
             offset,
         } => LogicalPlan::Limit {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            input: Box::new(rec(*input)),
             limit,
             offset,
         },
         LogicalPlan::Sort { input, sort_exprs } => LogicalPlan::Sort {
-            input: Box::new(map_plan_exprs(*input, map_expr, map_agg)),
+            input: Box::new(rec(*input)),
             sort_exprs: sort_exprs
                 .into_iter()
                 .map(|mut se| {
@@ -72,10 +90,7 @@ where
                 .collect(),
         },
         LogicalPlan::Union { inputs } => LogicalPlan::Union {
-            inputs: inputs
-                .into_iter()
-                .map(|i| map_plan_exprs(i, map_expr, map_agg))
-                .collect(),
+            inputs: inputs.into_iter().map(rec).collect(),
         },
         LogicalPlan::Join {
             left,
@@ -84,8 +99,8 @@ where
             on,
             filter,
         } => LogicalPlan::Join {
-            left: Box::new(map_plan_exprs(*left, map_expr, map_agg)),
-            right: Box::new(map_plan_exprs(*right, map_expr, map_agg)),
+            left: Box::new(rec(*left)),
+            right: Box::new(rec(*right)),
             join_type,
             on: on
                 .into_iter()
@@ -101,8 +116,8 @@ where
             op,
             all,
         } => LogicalPlan::SetOp {
-            left: Box::new(map_plan_exprs(*left, map_expr, map_agg)),
-            right: Box::new(map_plan_exprs(*right, map_expr, map_agg)),
+            left: Box::new(rec(*left)),
+            right: Box::new(rec(*right)),
             op,
             all,
         },

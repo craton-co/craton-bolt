@@ -9,8 +9,9 @@
 //!   * `IN`     → `(probe = v1) OR  (probe = v2) OR  ...`
 //!   * `NOT IN` → `(probe <> v1) AND (probe <> v2) AND ...`
 //!
-//! When the probe or a list element is a NULL constant the chain is wrapped
-//! in an explicit three-valued CASE, which preserves SQL UNKNOWN instead of
+//! A NULL-constant list element is folded out (`k IN (1, NULL)` is
+//! `(k = 1) OR NULL`); a NULL probe or an all-NULL list is wrapped in an
+//! explicit three-valued CASE, which preserves SQL UNKNOWN instead of
 //! allowing the fused boolean path to materialise a stored false/true value.
 //! These tests pin the lowered plan shape (no GPU needed) and the
 //! large / empty-list behaviour. They live alongside the other plan-
@@ -325,27 +326,46 @@ fn in_list_composes_with_outer_and() {
     ));
 }
 
+/// A NULL item compares as UNKNOWN whatever the probe, so it is folded out
+/// of the chain: `k IN (1, NULL, 3)` is `((k = 1) OR (k = 3)) OR NULL`.
 #[test]
-fn in_list_with_null_has_explicit_unknown_else() {
+fn in_list_with_null_folds_the_null_item_out() {
     let plan = parse_sql("SELECT v FROM t WHERE k IN (1, NULL, 3)", &t_provider()).expect("parse");
-    let wrapped = filter_predicate(&plan);
-    let chain = strict_chain(wrapped);
-    assert_eq!(count_op(chain, BinaryOp::Eq), 3);
-    assert!(
-        format!("{chain:?}").contains("Null"),
-        "NULL list element must remain in the strict comparison chain: {chain:?}"
-    );
+    let Expr::Binary {
+        op: BinaryOp::Or,
+        left,
+        right,
+    } = filter_predicate(&plan)
+    else {
+        panic!("expected `<chain> OR NULL`");
+    };
+    assert_eq!(count_op(left, BinaryOp::Eq), 2);
+    assert!(!format!("{left:?}").contains("Null"), "{left:?}");
+    assert!(matches!(right.as_ref(), Expr::Literal(Literal::Null)));
 }
 
+/// `k NOT IN (1, NULL, 3)` is `((k <> 1) AND (k <> 3)) AND NULL`: never TRUE.
 #[test]
-fn not_in_list_with_null_has_explicit_unknown_else() {
+fn not_in_list_with_null_folds_the_null_item_out() {
     let plan =
         parse_sql("SELECT v FROM t WHERE k NOT IN (1, NULL, 3)", &t_provider()).expect("parse");
-    let wrapped = filter_predicate(&plan);
-    let chain = strict_chain(wrapped);
-    assert_eq!(count_op(chain, BinaryOp::NotEq), 3);
-    assert!(
-        format!("{chain:?}").contains("Null"),
-        "NULL list element must remain in the strict comparison chain: {chain:?}"
-    );
+    let Expr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = filter_predicate(&plan)
+    else {
+        panic!("expected `<chain> AND NULL`");
+    };
+    assert_eq!(count_op(left, BinaryOp::NotEq), 2);
+    assert!(!format!("{left:?}").contains("Null"), "{left:?}");
+    assert!(matches!(right.as_ref(), Expr::Literal(Literal::Null)));
+}
+
+/// A list of only NULLs keeps the explicit three-valued CASE.
+#[test]
+fn in_list_of_only_nulls_keeps_the_strict_wrapper() {
+    let plan = parse_sql("SELECT v FROM t WHERE k IN (NULL)", &t_provider()).expect("parse");
+    let chain = strict_chain(filter_predicate(&plan));
+    assert_eq!(count_op(chain, BinaryOp::Eq), 1);
 }

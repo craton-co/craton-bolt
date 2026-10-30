@@ -721,3 +721,118 @@ fn residual_validity_is_honoured_everywhere() {
     let cases: Vec<(&str, Want)> = cases.iter().map(|(q, w)| (q.as_str(), *w)).collect();
     check(b, &cases);
 }
+
+/// Residuals of craton-bolt-006 / 007: `IN` / `NOT IN` lists holding a NULL
+/// over a dictionary-encoded Utf8 column follow SQL three-valued logic, and
+/// DML / DDL statements carrying a long `OR` / `AND` chain run on a 2 MiB
+/// thread stack.
+#[test]
+#[ignore = "gpu:e2e"]
+fn report_006_007_null_in_lists_and_deep_dml_predicates() {
+    let batch = utf8_table();
+    let cases = [
+        // x IN (a, NULL) is TRUE where x = a, otherwise NULL.
+        ("SELECT id FROM t WHERE s IN ('v1', NULL)", Want::Rows(14)),
+        ("SELECT count(*) FROM t WHERE s IN ('v1', NULL)", Want::Value(14.0)),
+        ("SELECT id FROM t WHERE s IN ('v1', NULL) OR id = 0", Want::Rows(15)),
+        // ... and NOT IN (a, NULL) is never TRUE: FALSE where x = a.
+        ("SELECT id FROM t WHERE s NOT IN ('v1', NULL)", Want::Rows(0)),
+        ("SELECT id FROM t WHERE NOT (s IN ('v1', NULL))", Want::Rows(0)),
+        ("SELECT id FROM t WHERE NOT (s NOT IN ('v1', NULL))", Want::Rows(14)),
+        ("SELECT id FROM t WHERE id IN (1, NULL)", Want::Rows(1)),
+        ("SELECT id FROM t WHERE id NOT IN (1, NULL)", Want::Rows(0)),
+        ("SELECT id FROM t WHERE NOT (id NOT IN (1, NULL))", Want::Rows(1)),
+    ];
+    check(batch.clone(), &cases);
+    let mut engine = Engine::new().expect("CUDA context");
+    engine.register_table("t", batch).unwrap();
+    for (q, _) in cases {
+        let explain = engine.explain_sql(q).is_ok();
+        let run = engine.sql(q).is_ok();
+        assert_eq!(explain, run, "{q}: explain ok = {explain}, sql ok = {run}");
+    }
+    drop(engine);
+
+    let chain = |k: std::ops::Range<i64>, op: &str, f: &dyn Fn(i64) -> String| {
+        k.map(f).collect::<Vec<_>>().join(op)
+    };
+    let values = chain(0..5_000, ", ", &|i| format!("({i})"));
+    let statements: Vec<(String, Option<i64>)> = vec![
+        ("CREATE TABLE d (id BIGINT)".into(), None),
+        (format!("INSERT INTO d VALUES {values}"), Some(5_000)),
+        (
+            format!(
+                "CREATE MATERIALIZED VIEW mv AS SELECT id FROM d WHERE {}",
+                chain(0..3_000, " OR ", &|i| format!("id = {i}"))
+            ),
+            None,
+        ),
+        (
+            format!(
+                "DELETE FROM d WHERE {}",
+                chain(0..3_000, " OR ", &|i| format!("id = {i}"))
+            ),
+            Some(3_000),
+        ),
+        (
+            format!(
+                "UPDATE d SET id = id + 10000 WHERE {}",
+                chain(3_000..4_000, " OR ", &|i| format!("id = {i}"))
+            ),
+            Some(1_000),
+        ),
+        (
+            format!(
+                "DELETE FROM d WHERE {}",
+                chain(0..2_000, " AND ", &|i| format!("id <> {}", i + 13_000))
+            ),
+            Some(1_000),
+        ),
+        (
+            format!(
+                "MERGE INTO d USING (SELECT id FROM d) AS q ON d.id = q.id \
+                 WHEN MATCHED AND ({}) THEN DELETE",
+                chain(13_000..14_000, " OR ", &|i| format!("q.id = {i}"))
+            ),
+            Some(1_000),
+        ),
+    ];
+    let failures = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let mut failures = Vec::new();
+            let mut engine = Engine::new().expect("CUDA context");
+            for (q, want) in &statements {
+                let head = &q[..q.len().min(60)];
+                match engine.execute_sql(q) {
+                    Ok(out) => {
+                        if let Some(n) = want {
+                            let got = first_as_f64(out.record_batch());
+                            if got != Some(*n as f64) {
+                                failures.push(format!("{head}: affected {got:?}, want {n}"));
+                            }
+                        }
+                    }
+                    Err(e) => failures.push(format!("{head}: {e}")),
+                }
+            }
+            for (q, want) in [
+                ("SELECT COUNT(*) FROM d", 0.0),
+                ("SELECT COUNT(*) FROM mv", 3_000.0),
+            ] {
+                match engine.sql(q) {
+                    Ok(out) if first_as_f64(out.record_batch()) == Some(want) => {}
+                    Ok(out) => failures.push(format!(
+                        "{q}: {:?}, want {want}",
+                        first_as_f64(out.record_batch())
+                    )),
+                    Err(e) => failures.push(format!("{q}: {e}")),
+                }
+            }
+            failures
+        })
+        .unwrap()
+        .join()
+        .expect("worker thread overflowed or panicked");
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

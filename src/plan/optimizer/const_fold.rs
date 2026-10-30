@@ -15,7 +15,14 @@
 //!   could suppress a runtime error this pass must not change (mirroring
 //!   `fold_int`'s div-by-zero / overflow guards);
 //! * collapses double negation `NOT (NOT x)` -> `x`;
-//! * folds `NOT true` / `NOT false`.
+//! * folds `NOT true` / `NOT false`;
+//! * in a `Filter` predicate, folds a NULL literal reached through `AND` /
+//!   `OR` / `NOT` only: the filter keeps the rows where the predicate is
+//!   TRUE, so at a position where only "is TRUE" matters UNKNOWN is FALSE
+//!   (`x OR NULL` -> `x`, `x AND NULL` -> `x AND false`), and under an odd
+//!   number of `NOT`s, where only "is FALSE" matters, UNKNOWN is TRUE. This
+//!   is the shape `IN` / `NOT IN` with a NULL item lowers to
+//!   (`sql_frontend::in_list_chain`).
 //!
 //! Folding is intentionally conservative: it only fires on like-typed integer
 //! / float / bool literal pairs. Mixed-width numeric folding is skipped (the
@@ -30,7 +37,7 @@ use crate::plan::logical_plan::{
 };
 use crate::plan::rewrite::PlanRewrite;
 
-use super::plan_util::map_plan_exprs;
+use super::plan_util::map_plan_exprs_and_predicates;
 
 /// Constant-folding / boolean-simplification pass. See module docs.
 #[derive(Debug, Default)]
@@ -48,7 +55,34 @@ impl PlanRewrite for ConstantFold {
 
 /// Recursively fold every expression in `plan`, preserving structure.
 fn fold_plan(plan: LogicalPlan) -> LogicalPlan {
-    map_plan_exprs(plan, &fold_expr, &fold_agg)
+    map_plan_exprs_and_predicates(plan, &fold_expr, &|p| fold_truth(fold_expr(p)), &fold_agg)
+}
+
+/// Simplify an already-folded `Filter` predicate, where only TRUE counts.
+fn fold_truth(pred: Expr) -> Expr {
+    fold_polar(pred, true)
+}
+
+/// Replace each NULL literal reached from the root through `AND` / `OR` /
+/// `NOT` (not through `CASE`, a comparison or a function) by the boolean
+/// that leaves the answer to "is `e` equal to `want`?" unchanged: `AND` and
+/// `OR` are monotone, so a NULL operand of an `e` asked "is TRUE" acts as
+/// FALSE and one asked "is FALSE" acts as TRUE; `NOT` flips the question.
+fn fold_polar(e: Expr, want: bool) -> Expr {
+    match e {
+        Expr::Literal(Literal::Null) => Expr::Literal(Literal::Bool(!want)),
+        Expr::Binary {
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            left,
+            right,
+        } => fold_binary(op, fold_polar(*left, want), fold_polar(*right, want)),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } => fold_unary(UnaryOp::Not, fold_polar(*operand, !want)),
+        Expr::Alias(inner, name) => Expr::Alias(Box::new(fold_polar(*inner, want)), name),
+        other => other,
+    }
 }
 
 /// Fold an aggregate's inner expression(s).
@@ -792,5 +826,74 @@ mod tests {
         // CAST(col(a) AS Int64): nothing constant to fold — left intact.
         let e = cast(col("a"), DataType::Int64);
         assert!(matches!(fold_expr(e), Expr::Cast { .. }));
+    }
+
+    fn null() -> Expr {
+        Expr::Literal(Literal::Null)
+    }
+
+    fn filter(pred: Expr) -> Expr {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(vec![Field::new("a", DataType::Int64, true)])),
+            predicate: pred,
+        };
+        match fold_plan(plan) {
+            LogicalPlan::Filter { predicate, .. } => predicate,
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    /// A NULL operand of AND / OR in a filter predicate is FALSE there:
+    /// `a = 1 OR NULL` keeps the rows `a = 1` keeps, `a <> 1 AND NULL` none.
+    #[test]
+    fn filter_null_under_and_or_folds_to_false() {
+        let eq = b(BinaryOp::Eq, col("a"), lit(1i64));
+        assert_eq!(
+            format!("{:?}", filter(b(BinaryOp::Or, eq.clone(), null()))),
+            format!("{eq:?}")
+        );
+        let ne = b(BinaryOp::NotEq, col("a"), lit(1i64));
+        assert_eq!(
+            format!("{:?}", filter(b(BinaryOp::And, ne.clone(), null()))),
+            format!("{:?}", b(BinaryOp::And, ne, lit(false)))
+        );
+        assert!(matches!(
+            filter(null()),
+            Expr::Literal(Literal::Bool(false))
+        ));
+    }
+
+    /// Under NOT only "is FALSE" matters, where NULL acts as TRUE:
+    /// `NOT (a = 1 OR NULL)` is never TRUE and `NOT (a <> 1 AND NULL)` is
+    /// TRUE exactly where `a = 1`.
+    #[test]
+    fn filter_null_under_not_folds_to_true() {
+        let not = |e: Expr| Expr::Unary {
+            op: UnaryOp::Not,
+            operand: Box::new(e),
+        };
+        let eq = b(BinaryOp::Eq, col("a"), lit(1i64));
+        assert_eq!(
+            format!("{:?}", filter(not(b(BinaryOp::Or, eq.clone(), null())))),
+            format!("{:?}", not(b(BinaryOp::Or, eq, lit(true))))
+        );
+        let ne = b(BinaryOp::NotEq, col("a"), lit(1i64));
+        assert_eq!(
+            format!("{:?}", filter(not(b(BinaryOp::And, ne.clone(), null())))),
+            format!("{:?}", not(ne))
+        );
+    }
+
+    /// Outside a filter, and below a comparison in one, NULL keeps its
+    /// meaning.
+    #[test]
+    fn null_is_kept_outside_filter_truth_positions() {
+        let or_null = b(BinaryOp::Or, b(BinaryOp::Eq, col("a"), lit(1i64)), null());
+        assert_eq!(
+            format!("{:?}", fold_expr(or_null.clone())),
+            format!("{or_null:?}")
+        );
+        let cmp = b(BinaryOp::Eq, col("a"), null());
+        assert_eq!(format!("{:?}", filter(cmp.clone())), format!("{cmp:?}"));
     }
 }

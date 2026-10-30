@@ -958,9 +958,8 @@ fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<State
         DuplicateTreatment, Expr as SqlExpr, FunctionArguments, Ident, ObjectName,
     };
     let aliased = alias_asof_right_relation(dialect, sql);
-    let mut stmts = Parser::parse_sql(dialect, aliased.as_deref().unwrap_or(sql))
+    let mut stmts = parse_sql_statements(dialect, aliased.as_deref().unwrap_or(sql))
         .map_err(|e| parse_error_to_bolt_error(e, sql))?;
-    balance_logical_chains(&mut stmts);
     let _ = sqlparser::ast::visit_expressions_mut(&mut stmts, |e| {
         if let SqlExpr::Function(f) = e {
             let name = f.name.to_string().to_ascii_uppercase();
@@ -973,6 +972,19 @@ fn parse_statements(dialect: &GenericDialect, sql: &str) -> BoltResult<Vec<State
         }
         std::ops::ControlFlow::<()>::Continue(())
     });
+    Ok(stmts)
+}
+
+/// The single entry point from SQL text to `sqlparser` statements (queries
+/// here, every statement kind in `Engine::execute_sql`): parse, then
+/// [`balance_logical_chains`], so no consumer of the AST sees a chain as deep
+/// as it is long.
+pub(crate) fn parse_sql_statements(
+    dialect: &GenericDialect,
+    sql: &str,
+) -> Result<Vec<Statement>, ParserError> {
+    let mut stmts = Parser::parse_sql(dialect, sql)?;
+    balance_logical_chains(&mut stmts);
     Ok(stmts)
 }
 
@@ -12129,13 +12141,16 @@ fn lower_in_list(
 /// ([`crate::plan::logical_plan::fold_balanced`]) so a long list does not
 /// build a tree as deep as the list (craton-bolt-007).
 ///
-/// When the probe or an item is a NULL constant the chain is wrapped by
-/// [`strict_three_valued_bool`], which keeps its UNKNOWN explicit and routes
-/// it to the host evaluator. Without one the chain is an ordinary predicate:
-/// a NULL *column* value is handled by the kernels' NULL rewrite
+/// A NULL *column* value is handled by the kernels' NULL rewrite
 /// (`plan::null_semantics`), and the chain stays visible to the dictionary
 /// rewrite, so a Utf8 `IN` folds to an index membership test
-/// (craton-bolt-006).
+/// (craton-bolt-006). A NULL-constant item compares as UNKNOWN whatever the
+/// probe, so it is folded out of the chain: `x IN (a, NULL)` is
+/// `(x = a) OR NULL` and `x NOT IN (a, NULL)` is `(x <> a) AND NULL` (never
+/// TRUE). In a filter the optimizer then folds that NULL to FALSE
+/// (`optimizer::const_fold`), so no comparison against NULL is left for the
+/// host evaluator. A NULL-constant probe, or a list of only NULLs, keeps the
+/// [`strict_three_valued_bool`] wrapper.
 fn in_list_chain(probe: Expr, items: Vec<Expr>, negated: bool) -> Expr {
     fn is_null_constant(e: &Expr) -> bool {
         match e {
@@ -12149,7 +12164,13 @@ fn in_list_chain(probe: Expr, items: Vec<Expr>, negated: bool) -> Expr {
     } else {
         (BinaryOp::Eq, BinaryOp::Or)
     };
-    let strict = is_null_constant(&probe) || items.iter().any(is_null_constant);
+    let has_null_item = items.iter().any(is_null_constant);
+    let strict = is_null_constant(&probe) || items.iter().all(is_null_constant);
+    let items: Vec<Expr> = if strict {
+        items
+    } else {
+        items.into_iter().filter(|e| !is_null_constant(e)).collect()
+    };
     let cmps = items
         .into_iter()
         .map(|item| Expr::Binary {
@@ -12162,6 +12183,12 @@ fn in_list_chain(probe: Expr, items: Vec<Expr>, negated: bool) -> Expr {
         .expect("non-empty IN list guarantees at least one chain element");
     if strict {
         strict_three_valued_bool(chain)
+    } else if has_null_item {
+        Expr::Binary {
+            op: combine_op,
+            left: Box::new(chain),
+            right: Box::new(Expr::Literal(Literal::Null)),
+        }
     } else {
         chain
     }
@@ -18259,5 +18286,83 @@ mod asof_parse_tests {
             "SELECT 'ASOF JOIN x MATCH_CONDITION' FROM trades"
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod balance_chain_tests {
+    use super::*;
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    /// Deepest `BinaryOp` nesting over every expression of `stmts`.
+    fn max_binary_depth(stmts: &[Statement]) -> usize {
+        fn depth(e: &SqlExpr) -> usize {
+            match e {
+                SqlExpr::BinaryOp { left, right, .. } => 1 + depth(left).max(depth(right)),
+                SqlExpr::Nested(x) => depth(x),
+                _ => 0,
+            }
+        }
+        struct Deepest(usize);
+        impl Visitor for Deepest {
+            type Break = ();
+            fn pre_visit_expr(&mut self, e: &SqlExpr) -> ControlFlow<()> {
+                self.0 = self.0.max(depth(e));
+                ControlFlow::Continue(())
+            }
+        }
+        let mut v = Deepest(0);
+        for stmt in stmts {
+            let _ = stmt.visit(&mut v);
+        }
+        v.0
+    }
+
+    /// craton-bolt-007: every statement kind leaves the shared parse entry
+    /// point with its long `AND` / `OR` chains balanced, on a 2 MiB stack.
+    #[test]
+    fn statements_of_every_kind_have_balanced_chains() {
+        let ors = (0..3_000)
+            .map(|i| format!("id = {i}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let ands = (0..3_000)
+            .map(|i| format!("id <> {i}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sqls = [
+            format!("SELECT id FROM t WHERE {ors}"),
+            format!("DELETE FROM t WHERE {ors}"),
+            format!("UPDATE t SET id = 0 WHERE {ands}"),
+            format!("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE {ors}"),
+            format!("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED AND ({ors}) THEN DELETE"),
+            format!("CREATE TABLE c (id BIGINT CHECK ({ors}))"),
+        ];
+        let depths = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                sqls.iter()
+                    .map(|q| {
+                        let stmts = parse_sql_statements(&GenericDialect {}, q).expect("parse");
+                        (q[..20].to_string(), max_binary_depth(&stmts))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+            .join()
+            .expect("parse thread overflowed or panicked");
+        for (q, d) in depths {
+            assert!(d <= 16, "{q}...: depth {d}");
+        }
+    }
+
+    /// Short chains keep the parser's left-deep shape.
+    #[test]
+    fn short_chains_are_untouched() {
+        let q = "SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 3";
+        let balanced = parse_sql_statements(&GenericDialect {}, q).unwrap();
+        let raw = Parser::parse_sql(&GenericDialect {}, q).unwrap();
+        assert_eq!(format!("{balanced:?}"), format!("{raw:?}"));
     }
 }

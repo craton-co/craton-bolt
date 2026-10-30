@@ -21,7 +21,6 @@ use arrow_schema::{
 };
 use sqlparser::ast::{ColumnOption, CopySource, CopyTarget, ObjectName, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::error::{BoltError, BoltResult};
 use crate::exec::engine::{Engine, QueryHandle};
@@ -264,7 +263,7 @@ impl Engine {
             return r;
         }
         crate::plan::sql_frontend::guard_sql_size(sql)?;
-        let stmts = Parser::parse_sql(&GenericDialect {}, sql)
+        let stmts = crate::plan::sql_frontend::parse_sql_statements(&GenericDialect {}, sql)
             .map_err(|e| crate::plan::sql_frontend::parse_error_to_bolt_error(e, sql))?;
         if stmts.is_empty() {
             return Err(BoltError::Sql("no SQL statement to execute".into()));
