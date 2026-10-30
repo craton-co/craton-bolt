@@ -852,3 +852,29 @@ fn report_006_007_null_in_lists_and_deep_dml_predicates() {
         .expect("worker thread overflowed or panicked");
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+#[test]
+#[ignore = "gpu:e2e"]
+fn residual_in_lists_over_decimal_and_projected_utf8() {
+    check(
+        decimal_table(),
+        &[
+            ("SELECT id FROM t WHERE dec IN (2.5, 3.75)", Want::Rows(2)),
+            ("SELECT id FROM t WHERE dec NOT IN (2.5, 3.75)", Want::Rows(83)),
+            ("SELECT id FROM t WHERE dec IN (2.5, NULL)", Want::Rows(1)),
+            ("SELECT COUNT(*) FROM t WHERE dec BETWEEN 2.5 AND 5", Want::Value(3.0)),
+        ],
+    );
+    check(
+        utf8_table(),
+        &[
+            ("SELECT s IN ('v1', NULL) FROM t", Want::Rows(100)),
+            ("SELECT s IN ('v1', 'v2') FROM t", Want::Rows(100)),
+            ("SELECT s IS NULL FROM t", Want::Rows(100)),
+            (
+                "SELECT COUNT(*) FROM t WHERE (s IN ('v1', NULL)) IS NULL",
+                Want::Value(86.0),
+            ),
+        ],
+    );
+}
