@@ -11165,6 +11165,9 @@ fn lower_expr_in_having(
                 CastKind::TryCast | CastKind::SafeCast => true,
             };
             let target = lower_cast_data_type(data_type)?;
+            if let Some(lit) = fold_constant_cast(expr, target, safe)? {
+                return Ok(lit);
+            }
             let inner = lower_expr_in_having(expr, resolver, agg_aliases, depth + 1)?;
             Ok(Expr::Cast {
                 expr: Box::new(inner),
@@ -11801,6 +11804,9 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 CastKind::TryCast | CastKind::SafeCast => true,
             };
             let target = lower_cast_data_type(data_type)?;
+            if let Some(lit) = fold_constant_cast(expr, target, safe)? {
+                return Ok(lit);
+            }
             let inner = lower_expr(expr, resolver, depth + 1)?;
             Ok(Expr::Cast {
                 expr: Box::new(inner),
@@ -11907,7 +11913,9 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             use sqlparser::ast::DataType as SqlDataType;
             match data_type {
                 SqlDataType::Date => parse_date_literal(value),
-                SqlDataType::Timestamp(_precision, _tz) => parse_timestamp_literal(value),
+                SqlDataType::Timestamp(_precision, tz) => {
+                    parse_timestamp_text(value, timestamp_zone(tz).is_some()).map(Expr::Literal)
+                }
                 other => Err(BoltError::Sql(format!(
                     "unsupported typed-string literal: {other} '{value}'"
                 ))),
@@ -12258,11 +12266,12 @@ fn lower_value(v: &Value) -> BoltResult<Expr> {
 /// Map a parsed `sqlparser::ast::DataType` into the engine's internal
 /// [`DataType`] for `CAST`.
 ///
-/// Only the primitive types the executor will plausibly lower are
-/// accepted — anything else (CHAR(n), DECIMAL, DATE/TIME, structured types,
-/// etc.) surfaces a clear `BoltError::Sql` so the user knows the parser
-/// understood the type name but the engine doesn't support converting to it
-/// yet.
+/// Only the types the executor will plausibly lower are accepted —
+/// anything else (CHAR(n), TIME, structured types, etc.) surfaces a clear
+/// `BoltError::Sql` so the user knows the parser understood the type name
+/// but the engine doesn't support converting to it yet. `DECIMAL(p, s)`,
+/// `DATE` and `TIMESTAMP[(p)] [WITH TIME ZONE]` / `TIMESTAMPTZ` are targets
+/// too; a constant cast to them folds to a literal (`fold_constant_cast`).
 ///
 /// Recognised aliases follow common SQL spellings:
 ///   * `INT`, `INTEGER`, `INT4`, `INT32`   -> [`DataType::Int32`]
@@ -12458,11 +12467,163 @@ fn lower_cast_data_type(t: &SqlDataType) -> BoltResult<DataType> {
         | SqlDataType::Float8
         | SqlDataType::Float64 => DataType::Float64,
         SqlDataType::Bool | SqlDataType::Boolean => DataType::Bool,
+        // Same defaults as a `CREATE TABLE` column (`engine_ddl`):
+        // DECIMAL = (38, 10), DECIMAL(p) = (p, 0).
+        SqlDataType::Decimal(info) | SqlDataType::Numeric(info) | SqlDataType::Dec(info) => {
+            use sqlparser::ast::ExactNumberInfo;
+            let (p, s) = match info {
+                ExactNumberInfo::None => (38, 10),
+                ExactNumberInfo::Precision(p) => (*p, 0),
+                ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
+            };
+            if !(1..=38).contains(&p) || s > p {
+                return Err(BoltError::Sql(format!(
+                    "CAST target {t}: precision must be 1..=38 and scale at most the precision"
+                )));
+            }
+            DataType::Decimal128(p as u8, s as i8)
+        }
+        SqlDataType::Date => DataType::Date32,
+        SqlDataType::Timestamp(precision, tz) => {
+            let unit = match precision {
+                Some(0) => TimeUnit::Second,
+                Some(1..=3) => TimeUnit::Millisecond,
+                Some(4..=6) => TimeUnit::Microsecond,
+                _ => TimeUnit::Nanosecond,
+            };
+            DataType::Timestamp(unit, timestamp_zone(tz))
+        }
         other => {
             return Err(BoltError::Sql(format!(
                 "CAST target type not supported: {other}"
             )));
         }
+    })
+}
+
+/// The zone of a `TIMESTAMP` type spelling: `TIMESTAMPTZ` and `TIMESTAMP
+/// WITH TIME ZONE` hold UTC instants, plain `TIMESTAMP` is naive.
+fn timestamp_zone(tz: &sqlparser::ast::TimezoneInfo) -> Option<&'static str> {
+    use sqlparser::ast::TimezoneInfo;
+    match tz {
+        TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => {
+            Some(crate::plan::logical_plan::intern_timezone("UTC"))
+        }
+        TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => None,
+    }
+}
+
+/// `CAST(<constant> AS DECIMAL | DATE | TIMESTAMP[TZ])` folded to a literal
+/// from the constant's SQL text, so the value is exact: a numeric or string
+/// constant to `DECIMAL(p, s)` (rounded half away from zero to `s` digits),
+/// a string constant to `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`. `None` when
+/// `e` is not such a constant, `target` is another type, or the cast is a
+/// `TRY_CAST` (`safe`, whose failures are NULL rather than an error).
+fn fold_constant_cast(e: &SqlExpr, target: DataType, safe: bool) -> BoltResult<Option<Expr>> {
+    let Some((negated, text, is_string)) = constant_text(e).filter(|_| !safe) else {
+        return Ok(None);
+    };
+    let lit = match target {
+        DataType::Decimal128(p, s) => {
+            let value = parse_decimal_text(text.trim())
+                .and_then(|(m, scale)| round_decimal(if negated { -m } else { m }, scale, s));
+            let fits = |v: &i128| {
+                10i128
+                    .checked_pow(p as u32)
+                    .is_some_and(|max| v.abs() < max)
+            };
+            match value.filter(fits) {
+                Some(v) => Literal::Decimal128(v, p, s),
+                None => {
+                    let sign = if negated { "-" } else { "" };
+                    return Err(BoltError::Sql(format!(
+                        "CAST({sign}{text} AS DECIMAL({p},{s})): not a number that fits the type"
+                    )));
+                }
+            }
+        }
+        DataType::Date32 if is_string && !negated => match parse_date_literal(text)? {
+            Expr::Literal(l) => l,
+            _ => return Ok(None),
+        },
+        DataType::Timestamp(unit, tz) if is_string && !negated => {
+            let Literal::Timestamp(ns, _, _) = parse_timestamp_text(text, tz.is_some())? else {
+                return Ok(None);
+            };
+            let per_tick: i64 = match unit {
+                TimeUnit::Second => 1_000_000_000,
+                TimeUnit::Millisecond => 1_000_000,
+                TimeUnit::Microsecond => 1_000,
+                TimeUnit::Nanosecond => 1,
+            };
+            Literal::Timestamp(ns.div_euclid(per_tick), unit, tz)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(Expr::Literal(lit)))
+}
+
+/// `(negated, text, is_string)` of a number or string constant, through
+/// parentheses and unary signs.
+fn constant_text(e: &SqlExpr) -> Option<(bool, &str, bool)> {
+    match e {
+        SqlExpr::Value(Value::Number(n, _)) => Some((false, n.as_str(), false)),
+        SqlExpr::Value(Value::SingleQuotedString(s)) => Some((false, s.as_str(), true)),
+        SqlExpr::Nested(inner) => constant_text(inner),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => constant_text(expr),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => constant_text(expr).map(|(neg, t, s)| (!neg, t, s)),
+        _ => None,
+    }
+}
+
+/// Parse `[+-]digits[.digits][e[+-]digits]` exactly into `(mantissa, scale)`
+/// with `value = mantissa * 10^-scale`.
+fn parse_decimal_text(s: &str) -> Option<(i128, i32)> {
+    let (body, exp) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], s[i + 1..].parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (negative, body) = match body.as_bytes().first()? {
+        b'-' => (true, &body[1..]),
+        b'+' => (false, &body[1..]),
+        _ => (false, body),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut mantissa: i128 = 0;
+    for c in int_part.chars().chain(frac_part.chars()) {
+        mantissa = mantissa
+            .checked_mul(10)?
+            .checked_add(c.to_digit(10)? as i128)?;
+    }
+    let scale = i32::try_from(frac_part.len()).ok()?.checked_sub(exp)?;
+    Some((if negative { -mantissa } else { mantissa }, scale))
+}
+
+/// `mantissa * 10^-scale` rounded half away from zero to `to` fractional
+/// digits, as a count of `10^-to` units.
+fn round_decimal(mantissa: i128, scale: i32, to: i8) -> Option<i128> {
+    let shift = to as i32 - scale;
+    if shift >= 0 {
+        return mantissa.checked_mul(10i128.checked_pow(shift as u32)?);
+    }
+    let Some(d) = 10i128.checked_pow(shift.unsigned_abs()) else {
+        // Below half a unit of the target scale.
+        return Some(0);
+    };
+    let (q, r) = (mantissa / d, mantissa % d);
+    Some(if r.abs() >= d - r.abs() {
+        q + r.signum()
+    } else {
+        q
     })
 }
 
@@ -12485,52 +12646,88 @@ fn parse_date_literal(s: &str) -> BoltResult<Expr> {
     Ok(Expr::Literal(Literal::Date32(days)))
 }
 
-/// Parse a SQL `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.fff]'` literal into a
+/// Parse `YYYY-MM-DD[( |T)HH:MM:SS[.fff]][offset]` into a
 /// [`Literal::Timestamp`] of `TimeUnit::Nanosecond` resolution (matches
-/// Arrow's default `TimestampNanosecondArray`). No timezone is currently
-/// recognised here — the literal is interpreted as naive (TZ = `None`).
+/// Arrow's default `TimestampNanosecondArray`). A date alone is midnight.
+///
+/// `zoned` is the `TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE` spelling: the
+/// value is a UTC instant (zone `"UTC"`), and the text may end in a UTC
+/// offset (`Z`, `+hh`, `+hh:mm`, `+hhmm`, or with `-`) that is subtracted;
+/// without one the text is read as UTC. A plain `TIMESTAMP` is naive (zone
+/// `None`) and rejects an offset. Comparisons with a column of another unit
+/// or zone are rescaled by [`crate::plan::literal_coercion`].
 ///
 /// As with [`parse_date_literal`] this is intentionally minimal: the
 /// optional fractional-seconds tail accepts 1..=9 digits (anything past 9
-/// is truncated to nanoseconds), the date-time separator may be `' '` or
-/// `'T'`. Anything else surfaces a `BoltError::Sql`.
-fn parse_timestamp_literal(s: &str) -> BoltResult<Expr> {
+/// is truncated to nanoseconds). Anything else surfaces a `BoltError::Sql`.
+fn parse_timestamp_text(s: &str, zoned: bool) -> BoltResult<Literal> {
+    let kind = if zoned { "TIMESTAMPTZ" } else { "TIMESTAMP" };
     let s = s.trim();
-    let (date_part, time_part) = split_date_time(s).ok_or_else(|| {
-        BoltError::Sql(format!(
-            "TIMESTAMP literal must be 'YYYY-MM-DD HH:MM:SS[.fff]', got '{s}'"
-        ))
-    })?;
+    let (date_part, time_part) = split_date_time(s).unwrap_or((s, ""));
     let (y, m, d) = parse_ymd(date_part).ok_or_else(|| {
         BoltError::Sql(format!(
-            "TIMESTAMP literal '{s}' has malformed date component"
+            "{kind} literal must be 'YYYY-MM-DD[ HH:MM:SS[.fff]]', got '{s}'"
         ))
     })?;
-    let (hh, mm, ss, nanos) = parse_hms_fraction(time_part).ok_or_else(|| {
-        BoltError::Sql(format!(
-            "TIMESTAMP literal '{s}' has malformed time component"
-        ))
+    let (time_part, offset_seconds) = split_utc_offset(time_part.trim()).ok_or_else(|| {
+        BoltError::Sql(format!("{kind} literal '{s}' has a malformed UTC offset"))
     })?;
+    if offset_seconds.is_some() && !zoned {
+        return Err(BoltError::Sql(format!(
+            "TIMESTAMP literal '{s}' carries a UTC offset; write TIMESTAMPTZ '{s}' for an instant"
+        )));
+    }
+    let (hh, mm, ss, nanos) = if time_part.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        parse_hms_fraction(time_part).ok_or_else(|| {
+            BoltError::Sql(format!("{kind} literal '{s}' has malformed time component"))
+        })?
+    };
     let days = days_since_epoch(y, m, d)
-        .ok_or_else(|| BoltError::Sql(format!("TIMESTAMP literal '{s}' is out of range")))?;
+        .ok_or_else(|| BoltError::Sql(format!("{kind} literal '{s}' is out of range")))?;
     let seconds_in_day = (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
     let total_seconds = (days as i64)
         .checked_mul(86_400)
         .and_then(|d| d.checked_add(seconds_in_day))
-        .ok_or_else(|| BoltError::Sql(format!("TIMESTAMP literal '{s}' overflows i64 seconds")))?;
+        .and_then(|t| t.checked_sub(offset_seconds.unwrap_or(0)))
+        .ok_or_else(|| BoltError::Sql(format!("{kind} literal '{s}' overflows i64 seconds")))?;
     let ticks = total_seconds
         .checked_mul(1_000_000_000)
         .and_then(|t| t.checked_add(nanos as i64))
         .ok_or_else(|| {
             BoltError::Sql(format!(
-                "TIMESTAMP literal '{s}' overflows i64 nanoseconds since epoch"
+                "{kind} literal '{s}' overflows i64 nanoseconds since epoch"
             ))
         })?;
-    Ok(Expr::Literal(Literal::Timestamp(
-        ticks,
-        TimeUnit::Nanosecond,
-        None,
-    )))
+    let zone = zoned.then(|| crate::plan::logical_plan::intern_timezone("UTC"));
+    Ok(Literal::Timestamp(ticks, TimeUnit::Nanosecond, zone))
+}
+
+/// Split a trailing UTC offset off a time of day: `(time, Some(seconds east
+/// of UTC))`, or `(time, None)` without one. `None` for a malformed offset.
+fn split_utc_offset(t: &str) -> Option<(&str, Option<i64>)> {
+    if let Some(rest) = t.strip_suffix(['Z', 'z']) {
+        return Some((rest.trim_end(), Some(0)));
+    }
+    let Some(i) = t.rfind(['+', '-']) else {
+        return Some((t, None));
+    };
+    let sign = if t.as_bytes()[i] == b'-' { -1 } else { 1 };
+    let digits: String = t[i + 1..].chars().filter(|c| *c != ':').collect();
+    if !digits.chars().all(|c| c.is_ascii_digit()) || ![2, 4].contains(&digits.len()) {
+        return None;
+    }
+    let hh: i64 = digits[..2].parse().ok()?;
+    let mm: i64 = if digits.len() == 4 {
+        digits[2..].parse().ok()?
+    } else {
+        0
+    };
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    Some((t[..i].trim_end(), Some(sign * (hh * 3600 + mm * 60))))
 }
 
 /// Parse a strict `YYYY-MM-DD` string into `(year, month, day)`. Returns
@@ -12747,13 +12944,103 @@ mod date_validation_tests {
         assert!(parse_date_literal("2024-04-30").is_ok());
     }
 
+    fn ts(s: &str, zoned: bool) -> Option<(i64, Option<&'static str>)> {
+        match parse_timestamp_text(s, zoned).ok()? {
+            Literal::Timestamp(t, TimeUnit::Nanosecond, tz) => Some((t, tz)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn timestamp_literals_accept_dates_and_offsets() {
+        let day5 = 1_704_412_800_000_000_000i64; // 2024-01-05 00:00:00 UTC
+        let utc = Some(crate::plan::logical_plan::intern_timezone("UTC"));
+        assert_eq!(ts("2024-01-05", false), Some((day5, None)));
+        assert_eq!(ts("2024-01-05 00:00:00", false), Some((day5, None)));
+        assert_eq!(
+            ts("2024-01-05T00:00:00.5", false),
+            Some((day5 + 500_000_000, None))
+        );
+        for zoned in [
+            "2024-01-05 02:00:00+02",
+            "2024-01-05 02:00:00+02:00",
+            "2024-01-05 02:00:00 +0200",
+            "2024-01-04 22:00:00-02",
+            "2024-01-05 00:00:00Z",
+            "2024-01-05",
+        ] {
+            assert_eq!(ts(zoned, true), Some((day5, utc)), "{zoned}");
+        }
+        assert_eq!(
+            ts("2024-01-05 05:30:00+05:30", true),
+            Some((day5, utc)),
+            "minutes of an offset"
+        );
+        // A naive TIMESTAMP rejects an offset; malformed offsets are errors.
+        assert!(parse_timestamp_text("2024-01-05 02:00:00+02", false).is_err());
+        assert!(parse_timestamp_text("2024-01-05 02:00:00+2", true).is_err());
+        assert!(parse_timestamp_text("2024-01-05 02:00:00+24", true).is_err());
+        assert!(parse_timestamp_text("2024/01/05", false).is_err());
+    }
+
+    #[test]
+    fn decimal_text_parses_and_rounds_exactly() {
+        assert_eq!(parse_decimal_text("2.50"), Some((250, 2)));
+        assert_eq!(parse_decimal_text("-0.25"), Some((-25, 2)));
+        assert_eq!(parse_decimal_text("1.5e2"), Some((15, -1)));
+        assert_eq!(parse_decimal_text(".5"), Some((5, 1)));
+        assert_eq!(parse_decimal_text("x"), None);
+        assert_eq!(parse_decimal_text("."), None);
+        assert_eq!(round_decimal(250, 2, 2), Some(250));
+        assert_eq!(round_decimal(25, 1, 2), Some(250));
+        assert_eq!(round_decimal(2505, 3, 2), Some(251));
+        assert_eq!(round_decimal(-2505, 3, 2), Some(-251));
+        assert_eq!(round_decimal(2504, 3, 2), Some(250));
+        assert_eq!(round_decimal(15, -1, 0), Some(150));
+        assert_eq!(round_decimal(1, 60, 2), Some(0));
+    }
+
+    #[test]
+    fn constant_casts_fold_to_literals() {
+        use sqlparser::ast::Value;
+        let num = |n: &str| SqlExpr::Value(Value::Number(n.into(), false));
+        let neg = |e: SqlExpr| SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(e),
+        };
+        let fold = |e: &SqlExpr, t| match fold_constant_cast(e, t, false) {
+            Ok(Some(Expr::Literal(l))) => Some(l),
+            _ => None,
+        };
+        let d = DataType::Decimal128(10, 2);
+        assert_eq!(fold(&num("2.50"), d), Some(Literal::Decimal128(250, 10, 2)));
+        assert_eq!(
+            fold(&neg(num("0.255")), d),
+            Some(Literal::Decimal128(-26, 10, 2))
+        );
+        assert!(fold_constant_cast(&num("1e10"), d, false).is_err());
+        assert_eq!(
+            fold(
+                &SqlExpr::Value(Value::SingleQuotedString("2024-01-05 00:00:01.5".into())),
+                DataType::Timestamp(TimeUnit::Second, None)
+            ),
+            Some(Literal::Timestamp(1_704_412_801, TimeUnit::Second, None))
+        );
+        // A column or a TRY_CAST is not folded.
+        assert!(matches!(
+            fold_constant_cast(&SqlExpr::Identifier("c".into()), d, false),
+            Ok(None)
+        ));
+        assert!(matches!(fold_constant_cast(&num("2.5"), d, true), Ok(None)));
+    }
+
     #[test]
     fn rejects_second_value_sixty() {
         // Leap second `:60` is rejected for strictness.
         assert!(parse_hms_fraction("00:00:60").is_none());
         assert!(parse_hms_fraction("23:59:59").is_some());
         assert!(
-            parse_timestamp_literal("2024-01-01 00:00:60").is_err(),
+            parse_timestamp_text("2024-01-01 00:00:60", false).is_err(),
             ":60 seconds must be rejected"
         );
     }
