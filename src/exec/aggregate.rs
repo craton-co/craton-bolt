@@ -2165,7 +2165,7 @@ impl ReduceScalar for i64 {
 /// non-NaN case (which already orders `-0 < +0`) and fold every NaN — including
 /// `total_cmp`'s negative-NaN half — up to the top.
 #[inline]
-fn float_total_cmp<T: FloatTotalCmp>(a: T, b: T) -> std::cmp::Ordering {
+pub(crate) fn float_total_cmp<T: FloatTotalCmp>(a: T, b: T) -> std::cmp::Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => std::cmp::Ordering::Equal,
         (true, false) => std::cmp::Ordering::Greater, // NaN is the largest
@@ -2174,9 +2174,23 @@ fn float_total_cmp<T: FloatTotalCmp>(a: T, b: T) -> std::cmp::Ordering {
     }
 }
 
+/// MIN / MAX of float block partials under [`float_total_cmp`] (NaN is the
+/// largest value). `None` for no partials.
+pub(crate) fn float_total_extreme<T: FloatTotalCmp>(partials: &[T], max: bool) -> Option<T> {
+    let want = if max {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Less
+    };
+    partials
+        .iter()
+        .copied()
+        .reduce(|a, b| if float_total_cmp(b, a) == want { b } else { a })
+}
+
 /// Bridge so `float_total_cmp` works over both `f32` and `f64` without
 /// duplicating the NaN-folding logic (each delegates to its own `total_cmp`).
-trait FloatTotalCmp: Copy {
+pub(crate) trait FloatTotalCmp: Copy {
     fn is_nan(self) -> bool;
     fn total_cmp_native(&self, other: &Self) -> std::cmp::Ordering;
 }

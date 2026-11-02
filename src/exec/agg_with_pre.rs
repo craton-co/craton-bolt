@@ -1794,8 +1794,14 @@ impl ReduceScalar for f32 {
             ReduceOp::Sum | ReduceOp::Count => {
                 neumaier_sum_f64(host.iter().copied().map(f64::from)) as f32
             }
-            ReduceOp::Min => host.iter().copied().fold(f32::INFINITY, f32::min),
-            ReduceOp::Max => host.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            // NaN is the largest value (see `aggregate::float_total_cmp`):
+            // MAX keeps a NaN partial, MIN is NaN only when every partial is.
+            ReduceOp::Min => {
+                crate::exec::aggregate::float_total_extreme(host, false).unwrap_or(f32::NAN)
+            }
+            ReduceOp::Max => {
+                crate::exec::aggregate::float_total_extreme(host, true).unwrap_or(f32::NEG_INFINITY)
+            }
         };
         Ok(Scalar::F32(acc))
     }
@@ -1816,8 +1822,14 @@ impl ReduceScalar for f64 {
             // compensated summation; a naive left-fold drifts. NaN/Inf
             // propagate through Neumaier unchanged.
             ReduceOp::Sum | ReduceOp::Count => neumaier_sum_f64(host.iter().copied()),
-            ReduceOp::Min => host.iter().copied().fold(f64::INFINITY, f64::min),
-            ReduceOp::Max => host.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            // NaN is the largest value (see `aggregate::float_total_cmp`):
+            // MAX keeps a NaN partial, MIN is NaN only when every partial is.
+            ReduceOp::Min => {
+                crate::exec::aggregate::float_total_extreme(host, false).unwrap_or(f64::NAN)
+            }
+            ReduceOp::Max => {
+                crate::exec::aggregate::float_total_extreme(host, true).unwrap_or(f64::NEG_INFINITY)
+            }
         };
         Ok(Scalar::F64(acc))
     }

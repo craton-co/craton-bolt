@@ -174,8 +174,12 @@ impl ReduceOp {
             // MIN identities — the largest representable value of dtype.
             (Min, Int32) => Ok(i32::MAX.to_string()),
             (Min, Int64) => Ok(i64::MAX.to_string()),
-            (Min, Float32) => Ok(format!("0f{:08X}", f32::INFINITY.to_bits())),
-            (Min, Float64) => Ok(format!("0d{:016X}", f64::INFINITY.to_bits())),
+            // Floats: NaN, the largest value under the engine's
+            // NaN-as-largest order. `min.fXX` returns the non-NaN operand, so
+            // NaN loses to every real value, and an all-NaN (or all-padding)
+            // block yields NaN rather than leaking a +inf identity.
+            (Min, Float32) => Ok(format!("0f{:08X}", f32::NAN.to_bits())),
+            (Min, Float64) => Ok(format!("0d{:016X}", f64::NAN.to_bits())),
 
             // MAX identities — the smallest representable value of dtype.
             (Max, Int32) => Ok(i32::MIN.to_string()),
@@ -1216,13 +1220,20 @@ mod validity_reduction_tests {
     /// (so they never win the MIN) — assert both the identity literal and the
     /// gate are present.
     #[test]
-    fn validity_variant_min_f32_uses_inf_identity() {
+    fn validity_variant_min_f32_uses_nan_identity() {
+        // NaN is the largest value: it never wins MIN against a real value,
+        // and an all-NaN block stays NaN instead of leaking +inf.
         let ptx = compile_reduction_kernel_with_validity(ReduceOp::Min, DataType::Float32)
             .expect("kernel should compile");
-        let inf = format!("0f{:08X}", f32::INFINITY.to_bits());
+        let nan = format!("0f{:08X}", f32::NAN.to_bits());
         assert!(
-            ptx.contains(&inf),
-            "MIN(Float32) identity must be +inf ({inf}):\n{ptx}"
+            ptx.contains(&nan),
+            "MIN(Float32) identity must be NaN ({nan}):\n{ptx}"
+        );
+        let ptx64 = compile_reduction_kernel(ReduceOp::Min, DataType::Float64).unwrap();
+        assert!(
+            ptx64.contains(&format!("0d{:016X}", f64::NAN.to_bits())),
+            "MIN(Float64) identity must be NaN:\n{ptx64}"
         );
         assert!(
             ptx.contains("@%p7 bra LOAD_IDENTITY;"),
