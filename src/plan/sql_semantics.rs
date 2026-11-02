@@ -883,7 +883,28 @@ fn own_overflow(e: &Expr, schema: &Schema) -> BoltResult<Option<Expr>> {
             let Some(range) = type_range(*target) else {
                 return Ok(None);
             };
-            if expr.dtype(schema).ok() != Some(DataType::Int64) {
+            let from = expr.dtype(schema).ok();
+            if matches!(from, Some(DataType::Float32 | DataType::Float64)) {
+                // Every tier truncates toward zero. The check plan is
+                // compiled under the total order, where NaN is greater than
+                // every bound, so NaN and +inf trip the upper test and -inf
+                // the lower one; NULL stays UNKNOWN.
+                let x = (**expr).clone();
+                let flit = |v: f64| Expr::Literal(Literal::Float64(v));
+                return Ok(Some(if *target == DataType::Int32 {
+                    or(
+                        bin(BinaryOp::LtEq, x.clone(), flit(i32::MIN as f64 - 1.0)),
+                        bin(BinaryOp::GtEq, x, flit(i32::MAX as f64 + 1.0)),
+                    )
+                } else {
+                    // -2^63 is exact in f64 and no f64 lies in (-2^63 - 1, -2^63).
+                    or(
+                        bin(BinaryOp::Lt, x.clone(), flit(i64::MIN as f64)),
+                        bin(BinaryOp::GtEq, x, flit(9_223_372_036_854_775_808.0)),
+                    )
+                }));
+            }
+            if from != Some(DataType::Int64) {
                 return Ok(None);
             }
             match interval(expr, schema) {
@@ -1139,6 +1160,65 @@ mod tests {
             safe: false,
         };
         assert_eq!(checks(narrow).len(), 1);
+    }
+
+    /// A float-to-integer CAST is checked: NaN (greatest under the total
+    /// order the check plan is compiled with), +-inf and values whose
+    /// truncation leaves the target range overflow.
+    #[test]
+    fn float_to_int_cast_gets_a_range_check() {
+        let cast = |t| Expr::Cast {
+            expr: Box::new(col("d")),
+            target: t,
+            safe: false,
+        };
+        let pred = |e| {
+            let c = checks(e);
+            assert_eq!(c.len(), 1);
+            let LogicalPlan::Limit { input, .. } = &c[0].plan else {
+                panic!()
+            };
+            let LogicalPlan::Filter { predicate, .. } = &**input else {
+                panic!()
+            };
+            predicate.clone()
+        };
+        let s = schema();
+        for (t, lo, hi) in [
+            (DataType::Int32, -2_147_483_648.0, 2_147_483_647.0),
+            (
+                DataType::Int64,
+                -9_223_372_036_854_775_808.0,
+                9_223_372_036_854_774_784.0,
+            ),
+        ] {
+            let p = total_order_expr(&pred(cast(t)), &s).unwrap();
+            let flags = |v: Option<f64>| eval(&p, &|_| v).map(|b| b.b()).unwrap_or(false);
+            for ok in [0.0, 2.9, -2.9, lo, hi, lo - 0.5, hi + 0.5] {
+                if (DataType::Int64 == t) && (ok == lo - 0.5 || ok == hi + 0.5) {
+                    continue; // not representable apart from the bound
+                }
+                assert!(!flags(Some(ok)), "{t:?} {ok}");
+            }
+            for bad in [
+                f64::NAN,
+                -f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                hi * 2.0,
+                lo * 2.0,
+            ] {
+                assert!(flags(Some(bad)), "{t:?} {bad}");
+            }
+            assert!(!flags(None), "NULL never overflows");
+        }
+        // TRY_CAST never raises.
+        assert!(checks(Expr::Cast {
+            expr: Box::new(col("d")),
+            target: DataType::Int32,
+            safe: true,
+        })
+        .is_empty());
     }
 
     /// The Int64 overflow conditions, evaluated with wrapping arithmetic (as

@@ -419,3 +419,231 @@ fn standard_integer_overflow_is_an_error() {
         );
     }
 }
+
+/// `g` group key, `v` float: group 0 all NaN (both signs), group 1 {1, NaN},
+/// group 2 {NULL, NaN}, group 3 {NULL}; `n` rows repeating the pattern so
+/// large inputs reach the GPU grouped paths.
+fn nan_groups(n: usize) -> RecordBatch {
+    let pat: [(i32, Option<f64>); 7] = [
+        (0, Some(f64::NAN)),
+        (0, Some(-f64::NAN)),
+        (1, Some(1.0)),
+        (1, Some(f64::NAN)),
+        (2, None),
+        (2, Some(f64::NAN)),
+        (3, None),
+    ];
+    let rows: Vec<_> = (0..n).map(|i| pat[i % pat.len()]).collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("g", ArrowDataType::Int32, false),
+        ArrowField::new("v", ArrowDataType::Float64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// MIN is NaN only when every non-NULL value is NaN (NaN is the largest
+/// value), never the +inf identity: scalar and grouped, both modes.
+#[test]
+#[ignore = "gpu:e2e — MIN over all-NaN input is NaN"]
+fn min_over_all_nan_input_is_nan() {
+    for n in [7usize, 70_000] {
+        for policy in POLICIES {
+            for sem in [None, Some(SqlSemantics::Standard)] {
+                let mut e = engine(sem, policy);
+                e.register_table("g", nan_groups(n)).unwrap();
+                let tag = format!("{n} {policy:?} {sem:?}");
+                for q in [
+                    "SELECT MIN(v) FROM g WHERE g = 0",
+                    "SELECT MIN(v) FROM g WHERE g = 2",
+                    "SELECT MAX(v) FROM g WHERE g = 0",
+                ] {
+                    let got = f64s(&e, q);
+                    assert!(got[0].is_some_and(f64::is_nan), "{tag}: {q}: {got:?}");
+                }
+                assert_eq!(
+                    f64s(&e, "SELECT MIN(v) FROM g WHERE g = 1"),
+                    vec![Some(1.0)],
+                    "{tag}"
+                );
+                let b = e
+                    .sql("SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM g GROUP BY g ORDER BY g")
+                    .unwrap_or_else(|err| panic!("{tag}: {err}"))
+                    .into_record_batch();
+                let lo = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                let hi = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+                let lo: Vec<Option<f64>> = lo.iter().collect();
+                let hi: Vec<Option<f64>> = hi.iter().collect();
+                assert!(lo[0].is_some_and(f64::is_nan), "{tag}: grouped MIN {lo:?}");
+                assert_eq!(lo[1], Some(1.0), "{tag}: grouped MIN {lo:?}");
+                assert!(lo[2].is_some_and(f64::is_nan), "{tag}: grouped MIN {lo:?}");
+                assert_eq!(lo[3], None, "{tag}: grouped MIN {lo:?}");
+                assert!(
+                    hi[..3].iter().all(|v| v.is_some_and(f64::is_nan)),
+                    "{tag}: {hi:?}"
+                );
+                assert_eq!(hi[3], None, "{tag}");
+            }
+        }
+    }
+}
+
+fn float_keys(name: &str, vals: Vec<Option<f64>>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(format!("{name}id"), ArrowDataType::Int32, false),
+        ArrowField::new(format!("{name}k"), ArrowDataType::Float64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from((0..vals.len() as i32).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(Float64Array::from(vals)),
+        ],
+    )
+    .unwrap()
+}
+
+fn join_engine(semantics: Option<SqlSemantics>, policy: TierPolicy) -> Engine {
+    let mut e = engine(semantics, policy);
+    // l: 0 NaN, 1 1.0, 2 NULL, 3 -NaN ; r: 0 -NaN, 1 1.0, 2 NULL, 3 2.0
+    e.register_table(
+        "l",
+        float_keys("l", vec![Some(f64::NAN), Some(1.0), None, Some(-f64::NAN)]),
+    )
+    .unwrap();
+    e.register_table(
+        "r",
+        float_keys("r", vec![Some(-f64::NAN), Some(1.0), None, Some(2.0)]),
+    )
+    .unwrap();
+    e
+}
+
+fn id_pairs(e: &Engine, q: &str) -> Vec<(i32, i32)> {
+    let b = e
+        .sql(q)
+        .unwrap_or_else(|err| panic!("{q}: {err}"))
+        .into_record_batch();
+    let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let c = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    let mut v: Vec<_> = a
+        .iter()
+        .zip(c.iter())
+        .map(|(x, y)| (x.unwrap(), y.unwrap()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Standard: NaN = NaN in equi-join keys and IN membership (list and
+/// subquery); NULL never matches.
+#[test]
+#[ignore = "gpu:e2e — Standard NaN equality in joins and IN"]
+fn standard_nan_keys_match_in_joins_and_in() {
+    for policy in POLICIES {
+        let e = join_engine(Some(SqlSemantics::Standard), policy);
+        assert_eq!(
+            id_pairs(&e, "SELECT lid, rid FROM l JOIN r ON lk = rk"),
+            vec![(0, 0), (1, 1), (3, 0)],
+            "{policy:?}"
+        );
+        for (q, want) in [
+            ("SELECT lid FROM l WHERE lk IN (SELECT rk FROM r) ORDER BY lid", vec![0, 1, 3]),
+            (
+                "SELECT lid FROM l WHERE lk NOT IN (SELECT rk FROM r WHERE rk IS NOT NULL) ORDER BY lid",
+                vec![],
+            ),
+            ("SELECT lid FROM l WHERE lk IN (0.0 / 0.0) ORDER BY lid", vec![0, 3]),
+            ("SELECT lid FROM l WHERE lk NOT IN (1, 0.0 / 0.0) ORDER BY lid", vec![]),
+        ] {
+            assert_eq!(ids(&e, q), want, "{policy:?}: {q}");
+        }
+    }
+}
+
+/// Standard: a float-to-integer CAST of NaN, +-inf or an out-of-range value
+/// is an out-of-range error; in-range values convert as before.
+#[test]
+#[ignore = "gpu:e2e — Standard float-to-int CAST overflow is an error"]
+fn standard_float_to_int_cast_overflow_is_an_error() {
+    for policy in POLICIES {
+        let mut e = engine(Some(SqlSemantics::Standard), policy);
+        e.register_table(
+            "f",
+            float_keys(
+                "f",
+                vec![
+                    Some(2.25),
+                    Some(-2.25),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(3e9),
+                    Some(1e19),
+                    None,
+                    Some(f64::NEG_INFINITY),
+                ],
+            ),
+        )
+        .unwrap();
+        for q in [
+            "SELECT CAST(fk AS INT) FROM f WHERE fid = 2",
+            "SELECT CAST(fk AS BIGINT) FROM f WHERE fid = 2",
+            "SELECT CAST(fk AS INT) FROM f WHERE fid = 3",
+            "SELECT CAST(fk AS BIGINT) FROM f WHERE fid = 7",
+            "SELECT CAST(fk AS INT) FROM f WHERE fid = 4",
+            "SELECT CAST(fk AS BIGINT) FROM f WHERE fid = 5",
+        ] {
+            overflow_error(&e, q);
+        }
+        let b = e
+            .sql("SELECT CAST(fk AS INT) FROM f WHERE fid IN (0, 1, 6)")
+            .unwrap_or_else(|err| panic!("{policy:?}: {err}"))
+            .into_record_batch();
+        let c = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let got: Vec<Option<i32>> = c.iter().collect();
+        assert_eq!(got, vec![Some(2), Some(-2), None], "{policy:?}");
+        assert_eq!(
+            rows(&e, "SELECT CAST(fk AS BIGINT) FROM f WHERE fid = 4"),
+            1,
+            "{policy:?}: 3e9 fits BIGINT"
+        );
+    }
+}
+
+/// The default mode keeps today's float-key behaviour: join keys compare
+/// bit patterns (so only identical NaN payloads match) and IN membership uses
+/// IEEE `=` (a NaN never matches).
+#[test]
+#[ignore = "gpu:e2e — default mode keeps bitwise NaN join keys"]
+fn default_mode_keeps_float_key_equality() {
+    for policy in POLICIES {
+        let e = join_engine(None, policy);
+        assert_eq!(
+            id_pairs(&e, "SELECT lid, rid FROM l JOIN r ON lk = rk"),
+            vec![(1, 1), (3, 0)],
+            "{policy:?}"
+        );
+        for (q, want) in [
+            (
+                "SELECT lid FROM l WHERE lk IN (SELECT rk FROM r) ORDER BY lid",
+                vec![1],
+            ),
+            (
+                "SELECT lid FROM l WHERE lk IN (0.0 / 0.0) ORDER BY lid",
+                vec![],
+            ),
+        ] {
+            assert_eq!(ids(&e, q), want, "{policy:?}: {q}");
+        }
+    }
+}
