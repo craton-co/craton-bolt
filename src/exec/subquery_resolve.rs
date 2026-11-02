@@ -31,6 +31,7 @@
 //! inject its `&self` execution path without this module taking an `Engine`
 //! dependency.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -341,6 +342,28 @@ fn fold_balanced(mut leaves: Vec<Expr>, op: BinaryOp) -> Expr {
     leaves.pop().expect("non-empty leaves")
 }
 
+thread_local! {
+    /// Set by [`with_total_order`] while a `SqlSemantics::Standard` plan's
+    /// subqueries are resolved. The membership folds built here are created
+    /// *after* the plan's total-order comparison rewrite ran, so they have to
+    /// be built in total-order form directly.
+    static TOTAL_ORDER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with [`build_in_predicate`] building total-order (`on`) or IEEE
+/// membership leaves; the previous setting is restored afterwards (nested
+/// subquery compiles set their own).
+pub(crate) fn with_total_order<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TOTAL_ORDER.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(TOTAL_ORDER.with(|c| c.replace(on)));
+    f()
+}
+
 /// Build the boolean expression that replaces an `expr [NOT] IN (subquery)`
 /// node once the subquery's value set is known.
 ///
@@ -446,12 +469,40 @@ pub fn build_in_predicate(
 
     // One comparison leaf per non-NULL element, folded into a BALANCED tree so
     // the nesting depth is O(log N) rather than O(N) (see `fold_balanced`).
+    let total_order = TOTAL_ORDER.with(Cell::get);
     let leaves: Vec<Expr> = non_null
         .into_iter()
-        .map(|v| Expr::Binary {
-            op: cmp_op,
-            left: Box::new(expr.clone()),
-            right: Box::new(Expr::Literal(v.clone())),
+        .map(|v| {
+            let cmp = |op| Expr::Binary {
+                op,
+                left: Box::new(expr.clone()),
+                right: Box::new(Expr::Literal(v.clone())),
+            };
+            if !total_order {
+                return cmp(cmp_op);
+            }
+            // Total order (`SqlSemantics::Standard`, which rewrites every
+            // other comparison before the subquery is folded here): a NaN
+            // element equals exactly the NaN probes (`isnan(x)` is
+            // `NOT (x = x)`, UNKNOWN for NULL), any other element is plain
+            // `=`, and `<>` is the negation of `=`.
+            let nan = matches!(v, Literal::Float64(f) if f.is_nan())
+                || matches!(v, Literal::Float32(f) if f.is_nan());
+            let self_eq = Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(expr.clone()),
+                right: Box::new(expr.clone()),
+            };
+            let not = |e| Expr::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(e),
+            };
+            match (negated, nan) {
+                (false, false) => cmp(BinaryOp::Eq),
+                (false, true) => not(self_eq),
+                (true, false) => not(cmp(BinaryOp::Eq)),
+                (true, true) => self_eq,
+            }
         })
         .collect();
     let folded = fold_balanced(leaves, fold_op);
@@ -939,6 +990,24 @@ mod tests {
             }
             other => panic!("expected OR of equalities, got {other:?}"),
         }
+    }
+
+    /// `SqlSemantics::Standard` membership: a NaN element matches a NaN probe
+    /// (`NOT (x = x)`), and `NOT IN` leaves are `NOT (x = v)` (TRUE for a NaN
+    /// probe against a number); the default keeps IEEE `=` / `<>` leaves.
+    #[test]
+    fn total_order_in_set_matches_nan() {
+        let probe = Expr::Column("x".into());
+        let set = [Literal::Float64(1.0), Literal::Float64(f64::NAN)];
+        let fmt = crate::plan::explain::format_expr;
+        let ieee = fmt(&build_in_predicate(&probe, &set, false, true));
+        assert_eq!(ieee, "((x = 1) OR (x = NaN))");
+        let std_in = with_total_order(true, || build_in_predicate(&probe, &set, false, true));
+        assert_eq!(fmt(&std_in), "((x = 1) OR (NOT (x = x)))");
+        let std_not_in = with_total_order(true, || build_in_predicate(&probe, &set, true, false));
+        assert_eq!(fmt(&std_not_in), "((NOT (x = 1)) AND (x = x))");
+        // The flag is scoped.
+        assert_eq!(fmt(&build_in_predicate(&probe, &set, false, true)), ieee);
     }
 
     /// Asserts `e` is `Binary { op, Column(col), Literal(lit) }`.

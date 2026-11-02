@@ -142,8 +142,16 @@ pub fn execute_join(
     // `Engine::execute`: every operator under a Join (Scan, Filter,
     // Project, even another Join down the road) runs through its normal
     // path.
-    let lhs = engine.execute(left)?.into_record_batch();
-    let rhs = engine.execute(right)?.into_record_batch();
+    let mut lhs = engine.execute(left)?.into_record_batch();
+    let mut rhs = engine.execute(right)?.into_record_batch();
+    // `SqlSemantics::Standard`: NaN equals NaN, so every NaN key gets one
+    // bit pattern before any join path hashes it. The default keeps the
+    // historical bitwise NaN key equality.
+    if engine.sql_semantics() == crate::SqlSemantics::Standard && !on.is_empty() {
+        let (left_keys, right_keys) = split_keys(on)?;
+        lhs = canonical_nan_keys(lhs, &left_keys)?;
+        rhs = canonical_nan_keys(rhs, &right_keys)?;
+    }
 
     // Non-equi fast-bail: any filter present routes through the nested-loop
     // executor regardless of join_type, since the existing equi-join
@@ -791,6 +799,29 @@ enum Indices {
 /// Pick out (left_keys, right_keys) from the `on` pair list. Both sides
 /// must be bare column references; the parser strips any `table.`
 /// qualifier in `lower_join_side`, so anything else here is a bug.
+/// `batch` with every NaN in the float key columns `keys` replaced by the
+/// positive quiet NaN (NULLs and other values unchanged), so all NaN keys
+/// compare equal. The output carries the canonical NaN too.
+fn canonical_nan_keys(batch: RecordBatch, keys: &[String]) -> BoltResult<RecordBatch> {
+    let schema = batch.schema();
+    let mut cols = batch.columns().to_vec();
+    let mut changed = false;
+    for k in keys {
+        let i = schema
+            .index_of(k)
+            .map_err(|_| BoltError::Plan(format!("join key '{k}' is not an input column")))?;
+        let c = crate::exec::sort::sort_key_values(&cols[i]);
+        if !Arc::ptr_eq(&c, &cols[i]) {
+            cols[i] = c;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    RecordBatch::try_new(schema, cols).map_err(|e| BoltError::Other(format!("join keys: {e}")))
+}
+
 fn split_keys(on: &[(Expr, Expr)]) -> BoltResult<(Vec<String>, Vec<String>)> {
     let mut left_keys: Vec<String> = Vec::with_capacity(on.len());
     let mut right_keys: Vec<String> = Vec::with_capacity(on.len());
@@ -1932,6 +1963,44 @@ mod tests {
         // Distinct single keys differ.
         let other = JoinKey::One(JoinKeyValue::I64(100));
         assert_ne!(one, other);
+    }
+}
+
+#[cfg(test)]
+mod nan_key_tests {
+    use super::*;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    /// `SqlSemantics::Standard`: every NaN key (either sign, any payload)
+    /// gets one key value, so NaN joins NaN; NULL stays NULL (no match).
+    #[test]
+    fn canonical_nan_keys_make_every_nan_one_key() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            ArrowDataType::Float64,
+            true,
+        )]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(-f64::NAN),
+                Some(f64::from_bits(0x7ff8_0000_0000_0001)),
+                None,
+                Some(1.0),
+            ]))],
+        )
+        .unwrap();
+        let before: Vec<_> = (0..5).map(|r| extract_key(&b, &[0], r).unwrap()).collect();
+        assert_ne!(before[0], before[1], "bitwise NaN keys differ by default");
+        let c = canonical_nan_keys(b, &["k".to_string()]).unwrap();
+        let after: Vec<_> = (0..5).map(|r| extract_key(&c, &[0], r).unwrap()).collect();
+        assert_eq!(after[0], after[1]);
+        assert_eq!(after[0], after[2]);
+        assert!(after[0].is_some());
+        assert_eq!(after[3], None);
+        assert_eq!(after[4], before[4]);
     }
 }
 

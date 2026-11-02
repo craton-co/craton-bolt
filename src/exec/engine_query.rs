@@ -134,7 +134,10 @@ impl QueryCompiler<'_> {
         };
         match subqueries {
             Subqueries::Resolve(exec) => Ok(CompiledLogical {
-                plan: crate::exec::subquery_resolve::resolve_plan(plan, &mut &mut *exec)?,
+                plan: crate::exec::subquery_resolve::with_total_order(
+                    self.semantics == SqlSemantics::Standard,
+                    || crate::exec::subquery_resolve::resolve_plan(plan, &mut &mut *exec),
+                )?,
                 deferred_subqueries: false,
             }),
             Subqueries::Defer => {
