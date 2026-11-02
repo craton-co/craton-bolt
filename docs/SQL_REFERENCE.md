@@ -140,6 +140,9 @@ let engine = Engine::builder().sql_semantics(SqlSemantics::Standard).build()?;
 | Comparison with a NULL operand | NULL (UNKNOWN) | NULL (UNKNOWN) |
 | Integer `+`, `-`, `*` overflow (`INTEGER` / `BIGINT` result) | Wraps (two's complement) | Error: `Out of Range Error: integer overflow (value out of range) in <expr>` |
 | `CAST(<BIGINT> AS INT)` out of range | Keeps the low 32 bits (wraps) | Error, as above |
+| `CAST(<float> AS INT / BIGINT)` of NaN, +-inf or a value whose truncation is out of range | No error; an unspecified value (the GPU `cvt.rzi` result) | Error, as above |
+| Float equi-join keys (`ON l.f = r.f`) | Bit-pattern equality: a NaN matches only a NaN with the same payload | Every NaN matches every NaN |
+| `x [NOT] IN (SELECT ...)`, `x [NOT] IN (list)` over floats | IEEE `=` / ordered `<>`: a NaN never matches | Total order: a NaN probe matches a NaN element |
 | `ORDER BY k` / `ORDER BY k DESC` without `NULLS FIRST` / `NULLS LAST` | `ASC NULLS FIRST`, `DESC NULLS LAST` | `NULLS LAST` in both directions (DuckDB; PostgreSQL puts NULLs first for `DESC`) |
 
 The Ieee row for `<>` is the GPU kernels' `setp.ne` (ordered); the host
@@ -170,9 +173,11 @@ How `Standard` is implemented, and what that means:
   derived from those two by swapping operands and `NOT`. A literal operand
   folds its NaN test, so `d > 3` is `(3 < d) OR NOT (d = d)` and `d = 3.4` is
   unchanged. Three-valued logic is preserved. `IN` lists and `BETWEEN` are
-  covered because they desugar to comparisons. Not rewritten: equi-join keys
-  (hash-join equality, see [JOIN](#join)) and the membership test of
-  `IN (SELECT ...)`.
+  covered because they desugar to comparisons. `IN (SELECT ...)` is folded
+  into comparisons only after its subquery runs, so that fold builds the
+  total-order form directly (`NOT (x = x)` for a NaN element, `NOT (x = v)`
+  for a `NOT IN` element). Float equi-join keys are hashed with every NaN
+  mapped to one bit pattern (NULL keys still never match).
 - **Integer overflow** is checked before the statement runs. Interval
   analysis over operand types and literals proves most arithmetic in range
   (an `INTEGER` column times a `BIGINT` literal, for example), and that
@@ -184,8 +189,9 @@ How `Standard` is implemented, and what that means:
   by `WHERE`, NULL operands and untaken `CASE` branches never raise. Each
   checked node costs one more pass over its input. Both operands of `AND` /
   `OR` and every argument of a function such as `COALESCE` count as evaluated.
-- Not checked in either mode: float-to-integer `CAST`, date / timestamp
-  arithmetic.
+- A float-to-integer `CAST` is checked the same way: NaN, +-inf and values
+  whose truncation leaves the target range raise. `TRY_CAST` never raises.
+- Not checked in either mode: date / timestamp arithmetic.
 
 ## Operators
 

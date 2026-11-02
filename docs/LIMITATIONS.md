@@ -269,9 +269,11 @@ These are real, code-level behaviors to be aware of:
   pass per plan node
   before the statement runs. Every operand of `AND` / `OR` and every function
   argument is treated as evaluated, so `x < 10 AND x * y > 0` raises when
-  `x * y` overflows on a row with `x >= 10`. Float equi-join keys and
-  `IN (SELECT ...)` membership keep their hash equality; float-to-integer
-  `CAST` and date / timestamp arithmetic are not overflow-checked.
+  `x * y` overflows on a row with `x >= 10`. Date / timestamp arithmetic
+  is not overflow-checked. In the default mode, float equi-join keys compare
+  bit patterns (a NaN matches only an identically encoded NaN) and a
+  float-to-integer `CAST` of NaN / inf / an out-of-range value returns an
+  unspecified value instead of an error.
 
 - **NULLs in GPU kernels.** Predicates and outputs over nullable columns are
   compiled with explicit validity checks (`plan::null_semantics`), which
