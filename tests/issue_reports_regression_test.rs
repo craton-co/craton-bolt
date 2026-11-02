@@ -860,9 +860,15 @@ fn residual_in_lists_over_decimal_and_projected_utf8() {
         decimal_table(),
         &[
             ("SELECT id FROM t WHERE dec IN (2.5, 3.75)", Want::Rows(2)),
-            ("SELECT id FROM t WHERE dec NOT IN (2.5, 3.75)", Want::Rows(83)),
+            (
+                "SELECT id FROM t WHERE dec NOT IN (2.5, 3.75)",
+                Want::Rows(83),
+            ),
             ("SELECT id FROM t WHERE dec IN (2.5, NULL)", Want::Rows(1)),
-            ("SELECT COUNT(*) FROM t WHERE dec BETWEEN 2.5 AND 5", Want::Value(3.0)),
+            (
+                "SELECT COUNT(*) FROM t WHERE dec BETWEEN 2.5 AND 5",
+                Want::Value(3.0),
+            ),
         ],
     );
     check(
@@ -874,6 +880,32 @@ fn residual_in_lists_over_decimal_and_projected_utf8() {
             (
                 "SELECT COUNT(*) FROM t WHERE (s IN ('v1', NULL)) IS NULL",
                 Want::Value(86.0),
+            ),
+            // Other host-evaluated expressions over a dictionary-folded `s`.
+            (
+                "SELECT id, s IN ('v1', NULL) FROM t WHERE id > 3",
+                Want::Rows(96),
+            ),
+            (
+                "SELECT CASE WHEN s = 'v1' THEN 1 END FROM t",
+                Want::Rows(100),
+            ),
+            (
+                "SELECT COUNT(CASE WHEN s = 'v1' THEN 1 END) FROM t",
+                Want::Value(14.0),
+            ),
+            (
+                "SELECT id FROM t WHERE CASE WHEN s = 'v1' THEN NULL ELSE true END",
+                Want::Rows(86),
+            ),
+            ("SELECT NULLIF(s = 'v1', true) FROM t", Want::Rows(100)),
+            (
+                "SELECT COUNT(*) FROM t WHERE (s = 'v1') IS NULL",
+                Want::Value(15.0),
+            ),
+            (
+                "SELECT s, COUNT(*) FROM t GROUP BY s HAVING s IN ('v1', NULL)",
+                Want::Rows(1),
             ),
         ],
     );

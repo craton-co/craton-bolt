@@ -3790,18 +3790,13 @@ fn build_kernel(
                     // unreachable: `all_bare` proved every expr is a bare Column.
                     _ => unreachable!("all_bare guarantees a bare Column here"),
                 };
-                // Skip the synthetic `__idx_<col>` dictionary-index columns that
-                // `DictRegistry::extended_schema` splices into the scan schema
-                // alongside the originals (see `string_literal_rewrite::
-                // index_column_name`). They are a GPU-only artefact for folding
-                // dict-encoded string equality into integer predicates; the
-                // host source batch that `StringProject` materialises has no
-                // such column, so passing one through would fail the executor's
-                // name lookup. The host consumer (a `Project` / `StringLikeFilter`)
-                // only ever references the original user columns.
-                if src.starts_with("__idx_") {
-                    continue;
-                }
+                // A rewriter-synthesised `__idx_<col>` / `__rank_<col>` column
+                // is in the scan projection only when an expression above
+                // reads it: a host `Project` / `Filter` evaluating a
+                // dictionary-folded expression (`SELECT s IN ('v1', NULL)`,
+                // `CASE WHEN s = 'v1' THEN 1 END`). Pass it through; the
+                // `StringProject` executor materialises it from the
+                // dictionary registry (`Engine::materialize_table_for_inputs`).
                 let field = scan_schema.field(&src)?;
                 output_fields.push(Field::new(name.clone(), field.dtype, field.nullable));
                 outputs.push(StringProjectOutput::Passthrough { source: src });
@@ -7397,6 +7392,44 @@ mod tests {
             },
             output_schema: Schema::new(vec![]),
         }
+    }
+
+    /// A host-evaluated expression over a dictionary-folded Utf8 column
+    /// (`SELECT s IN ('v1', NULL)` is `(__idx_s = 2) OR NULL`, which the
+    /// kernel cannot compile) reads `__idx_s`: the host input the projection
+    /// lowers to must pass that column through (the `StringProject` executor
+    /// materialises it from the dictionary registry), or the host evaluator
+    /// fails with "column '__idx_s' not found in evaluator env".
+    #[test]
+    fn host_expression_over_dictionary_index_passes_the_index_through() {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("__idx_s", DataType::Int32, false),
+        ]);
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Scan {
+                table: "t".into(),
+                projection: Some(vec!["__idx_s".into()]),
+                schema,
+            }),
+            exprs: vec![Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(Expr::Column("__idx_s".into())),
+                    right: Box::new(Expr::Literal(Literal::Int32(2))),
+                }),
+                right: Box::new(Expr::Literal(Literal::Null)),
+            }],
+        };
+        let phys = lower(&plan).expect("lower");
+        let PhysicalPlan::Project { input, .. } = &phys else {
+            panic!("expected a host Project, got {phys:?}");
+        };
+        assert!(
+            input.output_schema().field("__idx_s").is_ok(),
+            "host input must carry __idx_s: {input:?}"
+        );
     }
 
     /// A NULL literal under a logical operator — the shape the strict
