@@ -30,6 +30,7 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 /// Cached bloom filters: `(file, row group, leaf column)` → the filter, or
@@ -40,6 +41,7 @@ type BloomCache =
 use crate::error::{BoltError, BoltResult};
 use crate::plan::logical_plan::Literal;
 use crate::plan::logical_plan::Schema;
+use crate::storage::parquet_guard::{check_bloom_filter, check_column_chunk, read_footer};
 use crate::storage::stats::{array_value, ColumnStatistics, TableStatistics};
 use crate::storage::table::{widen_to_schema, BatchIter, ScanSelection, StorageTable};
 
@@ -60,6 +62,9 @@ struct ParquetFile {
     column_map: Vec<usize>,
     /// Value of each partition column for this file.
     partition_values: Vec<Option<Literal>>,
+    /// `(row group, leaf column)` chunks whose page headers passed
+    /// [`check_column_chunk`] (shared by clones of the table).
+    checked_chunks: Arc<std::sync::Mutex<std::collections::HashSet<(usize, usize)>>>,
 }
 
 /// A table backed by Parquet files. See the [module docs](self).
@@ -228,10 +233,7 @@ impl ParquetTable {
         }
         let mut metas = Vec::with_capacity(files.len());
         for p in files {
-            let f = File::open(p).map_err(|e| perr(&format!("opening {}", p.display()), e))?;
-            let meta = ArrowReaderMetadata::load(&f, ArrowReaderOptions::new())
-                .map_err(|e| perr(&format!("reading Parquet footer of {}", p.display()), e))?;
-            metas.push((p.clone(), meta));
+            metas.push((p.clone(), load_metadata(p)?));
         }
         // Table schema from the first file.
         let first = metas[0].1.schema().clone();
@@ -288,10 +290,7 @@ impl ParquetTable {
     pub fn with_schema(schema: SchemaRef, files: &[PathBuf]) -> BoltResult<Self> {
         let mut metas = Vec::with_capacity(files.len());
         for p in files {
-            let f = File::open(p).map_err(|e| perr(&format!("opening {}", p.display()), e))?;
-            let meta = ArrowReaderMetadata::load(&f, ArrowReaderOptions::new())
-                .map_err(|e| perr(&format!("reading Parquet footer of {}", p.display()), e))?;
-            metas.push((p.clone(), meta));
+            metas.push((p.clone(), load_metadata(p)?));
         }
         let n = metas.len();
         Self::build(schema, metas, vec![Vec::new(); n])
@@ -353,6 +352,7 @@ impl ParquetTable {
                 metadata: meta,
                 column_map,
                 partition_values,
+                checked_chunks: Arc::default(),
             });
         }
         Ok(ParquetTable {
@@ -390,6 +390,61 @@ impl ParquetTable {
     pub fn arrow_schema(&self) -> &SchemaRef {
         &self.arrow_schema
     }
+}
+
+/// Read the footer of `p`, bounds-checked by [`read_footer`] before
+/// `parquet` decodes it (its thrift lists are reserved at their claimed
+/// length).
+fn load_metadata(p: &Path) -> BoltResult<ArrowReaderMetadata> {
+    let ctx = || format!("reading Parquet footer of {}", p.display());
+    let mut f = File::open(p).map_err(|e| perr(&format!("opening {}", p.display()), e))?;
+    let len = f.metadata().map_err(|e| perr(&ctx(), e))?.len();
+    let bytes = read_footer(&mut f, len).map_err(|e| perr(&ctx(), e))?;
+    let meta = ParquetMetaDataReader::decode_metadata(&bytes).map_err(|e| perr(&ctx(), e))?;
+    ArrowReaderMetadata::try_new(Arc::new(meta), ArrowReaderOptions::new())
+        .map_err(|e| perr(&ctx(), e))
+}
+
+/// Check the page headers of every not-yet-checked chunk of `leaves` in
+/// `row_groups` before `parquet` decodes them (see
+/// [`crate::storage::parquet_guard`]); each chunk is checked once.
+fn check_chunks(file: &ParquetFile, row_groups: &[usize], leaves: &[usize]) -> BoltResult<()> {
+    let mut checked = file
+        .checked_chunks
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let pq = file.metadata.metadata();
+    let mut handle: Option<(File, u64)> = None;
+    for &rg in row_groups {
+        for &leaf in leaves {
+            if checked.contains(&(rg, leaf)) {
+                continue;
+            }
+            if handle.is_none() {
+                let f = File::open(&file.path)
+                    .map_err(|e| perr(&format!("opening {}", file.path.display()), e))?;
+                let len = f
+                    .metadata()
+                    .map_err(|e| perr(&format!("opening {}", file.path.display()), e))?
+                    .len();
+                handle = Some((f, len));
+            }
+            let (f, len) = handle.as_mut().expect("opened above");
+            let col = pq.row_group(rg).column(leaf);
+            let start = col
+                .dictionary_page_offset()
+                .unwrap_or(col.data_page_offset());
+            check_column_chunk(f, *len, start, col.compressed_size()).map_err(|e| {
+                BoltError::Other(format!(
+                    "Parquet file {}, row group {rg}, column '{}': {e}",
+                    file.path.display(),
+                    col.column_path().string()
+                ))
+            })?;
+            checked.insert((rg, leaf));
+        }
+    }
+    Ok(())
 }
 
 /// Per-row-group zone maps of one file, in table column order.
@@ -484,8 +539,32 @@ impl ParquetTable {
                         f, opts,
                     )
                     .ok()?;
+                let mut raw = File::open(&file.path).ok()?;
+                let len = raw.metadata().ok()?.len();
                 (0..reader.num_row_groups())
                     .map(|g| {
+                        // `get_row_group` reads every column's filter.
+                        let bad = reader
+                            .metadata()
+                            .row_group(g)
+                            .columns()
+                            .iter()
+                            .find_map(|c| {
+                                check_bloom_filter(
+                                    &mut raw,
+                                    len,
+                                    c.bloom_filter_offset(),
+                                    c.bloom_filter_length(),
+                                )
+                                .err()
+                            });
+                        if let Some(e) = bad {
+                            log::warn!(
+                                "Parquet file {}, row group {g}: ignoring bloom filters: {e}",
+                                file.path.display()
+                            );
+                            return Some(None);
+                        }
                         reader
                             .get_row_group(g)
                             .ok()
@@ -670,6 +749,11 @@ fn open_reader(
             roots.insert(first);
         }
     }
+    let descr = builder.parquet_schema();
+    let leaves: Vec<usize> = (0..descr.num_columns())
+        .filter(|&l| roots.contains(&descr.get_column_root_idx(l)))
+        .collect();
+    check_chunks(file, row_groups, &leaves)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
     let reader = builder
         .with_row_groups(row_groups.to_vec())

@@ -27,6 +27,8 @@ pub mod table;
 pub mod catalog;
 #[cfg(feature = "storage")]
 pub mod parquet;
+#[cfg(feature = "storage")]
+mod parquet_guard;
 
 pub use scan::{PruneOp, PrunePredicate, ScanRequest};
 pub use stats::{ColumnStatistics, TableStatistics};

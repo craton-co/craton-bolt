@@ -409,6 +409,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/storage/catalog.rs` | Persistent, snapshot-versioned table catalog. |
 | `src/storage/mod.rs` | Storage layer: tables whose data lives outside the engine's in-memory store, their statistics, and scan pruning. |
 | `src/storage/parquet.rs` | Parquet-backed tables and the Parquet writer. |
+| `src/storage/parquet_guard.rs` | Bounds checks on untrusted Parquet structure, run before `parquet` reads it. |
 | `src/storage/scan.rs` | Scan requests and zone-map pruning. |
 | `src/storage/stats.rs` | Table and column statistics. |
 | `src/storage/table.rs` | The storage-table contract and the in-memory implementation. |
