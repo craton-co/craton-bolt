@@ -211,6 +211,16 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   `key=value` directories become partition columns typed `Int64` or `Utf8`
   only (no date / decimal partition values), and every file must use the
   same partition keys.
+- **Untrusted Parquet files.** `parquet` 53 reserves sizes it reads from a
+  file (page sizes, footer list lengths, bloom filter lengths) before it
+  checks that the bytes exist, and a failed reservation aborts the process.
+  The engine therefore checks the footer when a table is opened and every
+  page header of a column chunk once, before the chunk is first decoded
+  (`src/storage/parquet_guard.rs`): a chunk outside the file, a page larger
+  than the rest of its chunk, or a page decompressing to more than 512 MiB
+  is an error naming the file, row group and column. A malformed bloom
+  filter is ignored (the row group is read). Decoder-internal sizes (value
+  counts inside a page body) are left to `parquet`.
 - **Statistics.** Chunk statistics come from Parquet footers (or are
   computed for in-memory chunks); table-level distinct estimates merged
   from chunks are lower bounds until `ANALYZE` records exact HyperLogLog
