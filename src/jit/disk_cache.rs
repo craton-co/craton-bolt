@@ -191,6 +191,9 @@ pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
 ///     `cvt.s64.s32` to unsigned `mul.wide.u32` in `ptx_gen.rs`; this
 ///     changes emitted PTX text for validity-carrying kernels, so the
 ///     disk key MUST rotate to avoid serving the old (mis-addressing) PTX.
+///   - v3: 0.10.1 — `I128ToF64` converts the magnitude and re-applies the
+///     sign (negative Decimal128 -> DOUBLE), predicate kernels emit only the
+///     ops the predicate reads, and the float MIN reduction identity is NaN.
 ///
 /// Defense-in-depth: [`codegen_salt`] *additionally* folds in an
 /// optional compile-time codegen fingerprint
@@ -199,7 +202,7 @@ pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
 /// salt automatically on any codegen change, so a forgotten bump of this
 /// constant no longer silently serves stale PTX. Until that env var is
 /// wired up, this constant remains the load-bearing in-release guard.
-pub(crate) const CODEGEN_VERSION: u32 = 2;
+pub(crate) const CODEGEN_VERSION: u32 = 3;
 
 /// Optional build-time codegen fingerprint env var.
 ///
