@@ -1560,12 +1560,15 @@ fn run_typed_agg_native_validity(
             // Float MIN/MAX is filtered out by `dispatch_native_validity`,
             // so only SUM reaches here.
             debug_assert!(matches!(op, ReduceOp::Sum));
-            let input_gpu = GpuVec::<f32>::from_slice_async(host, stream.raw())?;
-            let init: Vec<f32> = vec![identity_f32(op); k];
-            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
-            launch_agg_kernel_with_validity::<f32>(
+            // W8-B-007: SUM(Float32) accumulates in f64 (one rounding to the
+            // Float32 output in `pack_array`), not via f32 atomics.
+            let host: Vec<f64> = crate::exec::groupby::widen_f32(host);
+            let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<f64> = vec![identity_f64(op); k];
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel_with_validity::<f64>(
                 op,
-                DataType::Float32,
+                DataType::Float64,
                 group_col,
                 keys_table,
                 &input_gpu,
@@ -1576,7 +1579,7 @@ fn run_typed_agg_native_validity(
                 stream,
                 overflow_ptr,
             )?;
-            Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
+            Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
         (DataType::Float64, HostColValues::F64(host)) => {
             debug_assert!(matches!(op, ReduceOp::Sum));
@@ -1776,13 +1779,16 @@ fn run_typed_agg(
                     identity_f32(op),
                 )?));
             }
+            // W8-B-007: SUM(Float32) accumulates in f64 (one rounding to the
+            // Float32 output in `pack_array`), not via f32 atomics.
             let filtered: Vec<f32> = filter_by_validity(host, validity);
-            let input_gpu = GpuVec::<f32>::from_slice_async(&filtered, stream.raw())?;
-            let init: Vec<f32> = vec![identity_f32(op); k];
-            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
-            launch_agg_kernel::<f32>(
+            let filtered: Vec<f64> = crate::exec::groupby::widen_f32(&filtered);
+            let input_gpu = GpuVec::<f64>::from_slice_async(&filtered, stream.raw())?;
+            let init: Vec<f64> = vec![identity_f64(op); k];
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<f64>(
                 op,
-                DataType::Float32,
+                DataType::Float64,
                 eff_group_col,
                 keys_table,
                 &input_gpu,
@@ -1792,7 +1798,7 @@ fn run_typed_agg(
                 stream,
                 overflow_ptr,
             )?;
-            Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
+            Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
         (DataType::Float64, HostColValues::F64(host)) => {
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
@@ -2376,6 +2382,10 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
         (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
         (Scalars::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
         (Scalars::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
+        // W8-B-007: SUM(Float32) accumulated in f64, rounded once here.
+        (Scalars::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
+        )) as ArrayRef),
 
         // Cross-dtype paths consistent with the scalar reducer.
         (Scalars::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(

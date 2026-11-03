@@ -2127,6 +2127,28 @@ fn run_typed_agg(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
             let host: Vec<f32> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
+            if matches!(op, ReduceOp::Sum) {
+                // W8-B-007: SUM(Float32) accumulates in f64 (one rounding to
+                // the Float32 output in `pack_array`), not via f32 atomics.
+                let host: Vec<f64> = widen_f32(&host);
+                let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+                let init: Vec<f64> = vec![identity_f64(op); k];
+                let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+                launch_agg_kernel::<f64>(
+                    op,
+                    DataType::Float64,
+                    filtered.col(),
+                    keys_table,
+                    &input_gpu,
+                    &mut acc,
+                    n,
+                    k_u32,
+                    stream,
+                    None,
+                    overflow_ptr,
+                )?;
+                return Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?));
+            }
             let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
             let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
@@ -2545,13 +2567,15 @@ fn run_typed_agg_native_validity(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            let host: Vec<f32> = pa.values().to_vec();
-            let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
-            let init: Vec<f32> = vec![identity_f32(op); k];
-            let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
-            launch_agg_kernel::<f32>(
+            // W8-B-007: SUM(Float32) accumulates in f64 (one rounding to the
+            // Float32 output in `pack_array`), not via f32 atomics.
+            let host: Vec<f64> = widen_f32(pa.values());
+            let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+            let init: Vec<f64> = vec![identity_f64(op); k];
+            let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+            launch_agg_kernel::<f64>(
                 op,
-                DataType::Float32,
+                DataType::Float64,
                 group_col,
                 keys_table,
                 &input_gpu,
@@ -2563,7 +2587,7 @@ fn run_typed_agg_native_validity(
                 overflow_ptr,
             )?;
             let _ = validity_gpu;
-            Ok(AccDownload::F32(download_pinned_f32(&acc, stream)?))
+            Ok(AccDownload::F64(download_pinned_f64(&acc, stream)?))
         }
         DataType::Float64 => {
             debug_assert!(matches!(op, ReduceOp::Sum));
@@ -3091,6 +3115,10 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
         (Scalars::F32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
         )) as ArrayRef),
+        // W8-B-007: SUM(Float32) accumulated in f64, rounded once here.
+        (Scalars::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
+        )) as ArrayRef),
 
         // F7-finish: MIN/MAX(Date32) reduced on the i32-normalized storage;
         // rebuild a `Date32Array` so the grouped result preserves the date
@@ -3194,6 +3222,14 @@ fn identity_f64(op: ReduceOp) -> f64 {
         ReduceOp::Min => f64::NAN,
         ReduceOp::Max => f64::NEG_INFINITY,
     }
+}
+
+/// Widen a Float32 value column to f64 for a double-precision `SUM`
+/// accumulator (W8-B-007). Every f32 is exactly representable as f64, so the
+/// only rounding left is the single narrowing of each group's total back to
+/// the Float32 output dtype.
+pub(crate) fn widen_f32(values: &[f32]) -> Vec<f64> {
+    values.iter().map(|&v| f64::from(v)).collect()
 }
 
 // ---------------------------------------------------------------------------

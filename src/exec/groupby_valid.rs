@@ -1592,6 +1592,41 @@ fn run_typed_agg(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
             let host: Vec<f32> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
+            if matches!(op, ReduceOp::Sum) {
+                // W8-B-007: SUM(Float32) accumulates in f64 (one rounding to
+                // the Float32 output in `pack_array`), not via f32 atomics.
+                let host: Vec<f64> = crate::exec::groupby::widen_f32(&host);
+                let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+                let init: Vec<f64> = vec![identity_f64(op); k];
+                let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+                let (mut spill_keys, mut spill_values, mut spill_counter) =
+                    alloc_agg_spill::<f64>(stream)?;
+                launch_agg_kernel::<f64>(
+                    op,
+                    DataType::Float64,
+                    filtered.col(),
+                    keys_table,
+                    slot_valid,
+                    &input_gpu,
+                    &mut acc,
+                    &mut spill_keys,
+                    &mut spill_values,
+                    &mut spill_counter,
+                    max_spill,
+                    n,
+                    k_u32,
+                    stream,
+                    None,
+                )?;
+                let gpu_acc = download_pinned_f64(&acc, stream)?;
+                let spill = download_agg_spill(
+                    spill_keys,
+                    spill_values,
+                    spill_counter,
+                    "f32-as-f64 agg kernel",
+                )?;
+                return Ok(AccDownload::F64 { gpu_acc, spill });
+            }
             let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
             let mut acc = GpuVec::<f32>::from_slice_async(&init, stream.raw())?;
@@ -1825,6 +1860,35 @@ fn run_typed_agg_native_validity(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            if matches!(op, ReduceOp::Sum) {
+                // W8-B-007: SUM(Float32) accumulates in f64 (see above).
+                let host: Vec<f64> = crate::exec::groupby::widen_f32(pa.values());
+                let input_gpu = GpuVec::<f64>::from_slice_async(&host, stream.raw())?;
+                let init: Vec<f64> = vec![identity_f64(op); k];
+                let mut acc = GpuVec::<f64>::from_slice_async(&init, stream.raw())?;
+                let (mut sk, mut sv, mut sc) = alloc_agg_spill::<f64>(stream)?;
+                launch_agg_kernel::<f64>(
+                    op,
+                    DataType::Float64,
+                    group_col,
+                    keys_table,
+                    slot_valid,
+                    &input_gpu,
+                    &mut acc,
+                    &mut sk,
+                    &mut sv,
+                    &mut sc,
+                    max_spill,
+                    n_rows,
+                    k_u32,
+                    stream,
+                    validity_ptr,
+                )?;
+                let _ = validity_gpu;
+                let gpu_acc = download_pinned_f64(&acc, stream)?;
+                let spill = download_agg_spill(sk, sv, sc, "f32-as-f64 agg kernel (validity)")?;
+                return Ok(AccDownload::F64 { gpu_acc, spill });
+            }
             let host: Vec<f32> = pa.values().to_vec();
             let input_gpu = GpuVec::<f32>::from_slice_async(&host, stream.raw())?;
             let init: Vec<f32> = vec![identity_f32(op); k];
@@ -2584,6 +2648,10 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
         )) as ArrayRef),
         (Scalars::F32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
+        )) as ArrayRef),
+        // W8-B-007: SUM(Float32) accumulated in f64, rounded once here.
+        (Scalars::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
         )) as ArrayRef),
 
         (_, dt) => Err(BoltError::Type(format!(
