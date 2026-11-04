@@ -209,8 +209,7 @@ fn dispatch_native_validity(
 // pre stage, so it does NOT share the key-packing functions (`pack_keys` etc.)
 // — those stay specific to the no-pre executors. Call sites are unchanged.
 use crate::exec::groupby_common::{
-    download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64, next_pow2,
-    unique_count,
+    download_pinned_f64, download_pinned_i32, download_pinned_i64, next_pow2, unique_count,
 };
 
 /// Execute an `Aggregate` plan that has BOTH a pre kernel AND a non-empty
@@ -3057,7 +3056,7 @@ mod null_propagation_tests {
         else {
             return;
         };
-        let _ = download_pinned_f32(&v_f32, &stream);
+        let _ = crate::exec::groupby_common::download_pinned_f32(&v_f32, &stream);
         let Ok(v_f64) = GpuVec::<f64>::from_slice_async(&[1.0f64, 2.0, 3.0, 4.0], stream.raw())
         else {
             return;

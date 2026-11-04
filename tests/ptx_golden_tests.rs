@@ -1532,8 +1532,11 @@ fn golden_agg_kernel_sum_int64_smoke() {
 #[test]
 fn golden_agg_kernel_sum_float32_smoke() {
     let ptx = compile_reduction_kernel(ReduceOp::Sum, DataType::Float32).expect("compile");
-    assert!(ptx.contains("add.f32"), "{ptx}");
+    // W8-B-007: the f32 input is widened and reduced in f64.
     assert!(ptx.contains("ld.global.nc.f32"), "{ptx}");
+    assert!(ptx.contains("cvt.f64.f32"), "{ptx}");
+    assert!(ptx.contains("add.f64"), "{ptx}");
+    assert!(!ptx.contains("add.f32"), "{ptx}");
 }
 
 #[test]

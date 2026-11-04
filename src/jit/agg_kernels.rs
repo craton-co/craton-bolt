@@ -36,10 +36,16 @@ use crate::plan::logical_plan::{sum_output_dtype, AggregateExpr, DataType};
 /// buffer and to pick the matching Arrow array type. This must agree with
 /// `crate::plan::logical_plan::sum_output_dtype` — that helper is the single
 /// source of truth for the widening rule.
+///
+/// The one exception is `SUM(Float32)` (W8-B-007): its declared output stays
+/// `Float32`, but the kernel accumulates in `Float64` (each loaded `f32` is
+/// widened exactly with `cvt.f64.f32`) so the only rounding is the single
+/// narrowing of the final total, done by the host after the f64 finalize.
 pub fn reduction_output_dtype(op: ReduceOp, input_dtype: DataType) -> DataType {
-    match op {
-        ReduceOp::Sum | ReduceOp::Count => sum_output_dtype(input_dtype),
-        ReduceOp::Min | ReduceOp::Max => input_dtype,
+    match (op, input_dtype) {
+        (ReduceOp::Sum, DataType::Float32) => DataType::Float64,
+        (ReduceOp::Sum | ReduceOp::Count, _) => sum_output_dtype(input_dtype),
+        (ReduceOp::Min | ReduceOp::Max, _) => input_dtype,
     }
 }
 
@@ -454,7 +460,7 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
     if widens {
         // Load the narrow value into an input-class register, then
         // sign-extend into the accumulator-class register. The acc class is
-        // always wider (currently only s64 from s32), so `cvt.<acc>.<in>`
+        // always wider (s64 from s32, or f64 from f32 for SUM(Float32)), so `cvt.<acc>.<in>`
         // is the right widening cvt mnemonic.
         //
         // The source column is a read-only input — route through .nc.
@@ -1122,6 +1128,36 @@ pub fn compile_avg_reduction_kernel(dtype: DataType) -> BoltResult<String> {
 #[cfg(test)]
 mod validity_reduction_tests {
     use super::*;
+
+    /// W8-B-007: `SUM(Float32)` keeps a Float32 output but the reduction
+    /// kernel (both variants) widens each f32 load and reduces in f64, so the
+    /// per-block partials are f64 and nothing is added in single precision.
+    #[test]
+    fn sum_float32_reduces_in_f64() {
+        assert_eq!(
+            reduction_output_dtype(ReduceOp::Sum, DataType::Float32),
+            DataType::Float64
+        );
+        assert_eq!(
+            reduction_output_dtype(ReduceOp::Min, DataType::Float32),
+            DataType::Float32
+        );
+        assert_eq!(
+            sum_output_dtype(DataType::Float32),
+            DataType::Float32,
+            "the declared SUM(Float32) output dtype is unchanged"
+        );
+        for ptx in [
+            compile_reduction_kernel(ReduceOp::Sum, DataType::Float32).unwrap(),
+            compile_reduction_kernel_with_validity(ReduceOp::Sum, DataType::Float32).unwrap(),
+        ] {
+            assert!(ptx.contains("ld.global.nc.f32"), "{ptx}");
+            assert!(ptx.contains("cvt.f64.f32"), "{ptx}");
+            assert!(ptx.contains("add.f64"), "{ptx}");
+            assert!(ptx.contains("st.global.f64"), "{ptx}");
+            assert!(!ptx.contains("add.f32"), "{ptx}");
+        }
+    }
 
     /// The no-validity reduction kernel must NOT emit the validity gate:
     /// no trailing `validity_ptr` param, no `bfe.u32` bit-extract, and the

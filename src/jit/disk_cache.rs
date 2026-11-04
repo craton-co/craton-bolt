@@ -194,6 +194,9 @@ pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
 ///   - v3: 0.10.1 — `I128ToF64` converts the magnitude and re-applies the
 ///     sign (negative Decimal128 -> DOUBLE), predicate kernels emit only the
 ///     ops the predicate reads, and the float MIN reduction identity is NaN.
+///   - v4: 0.10.1 — the scalar `SUM(Float32)` reduction kernel widens each
+///     load with `cvt.f64.f32` and reduces in f64 (W8-B-007); its partials
+///     are now 8 bytes wide, so an old f32-partials entry must not be reused.
 ///
 /// Defense-in-depth: [`codegen_salt`] *additionally* folds in an
 /// optional compile-time codegen fingerprint
@@ -202,7 +205,7 @@ pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
 /// salt automatically on any codegen change, so a forgotten bump of this
 /// constant no longer silently serves stale PTX. Until that env var is
 /// wired up, this constant remains the load-bearing in-release guard.
-pub(crate) const CODEGEN_VERSION: u32 = 3;
+pub(crate) const CODEGEN_VERSION: u32 = 4;
 
 /// Optional build-time codegen fingerprint env var.
 ///

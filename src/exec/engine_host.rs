@@ -645,3 +645,41 @@ impl Engine {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Float32Array;
+
+    /// W8-B-007: the host tier sums a Float32 column in f64 and rounds the
+    /// total to the Float32 output once, matching an f64 reference.
+    #[test]
+    fn host_sum_float32_accumulates_in_f64() {
+        let n = 1_000_000;
+        let col = HostColumn::F32(
+            (0..n)
+                .map(|i| Some(if i % 2 == 0 { 0.1 } else { 3.7 }))
+                .collect(),
+        );
+        let reference: f64 = (0..n)
+            .map(|i| f64::from(if i % 2 == 0 { 0.1_f32 } else { 3.7_f32 }))
+            .sum();
+        let sum = AggregateExpr::Sum(Expr::Column("x".into()));
+        let out = host_aggregate(&sum, &col, DataType::Float32).expect("host SUM");
+        let got = out
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(got, reference as f32);
+
+        let avg = AggregateExpr::Avg(Expr::Column("x".into()));
+        let out = host_aggregate(&avg, &col, DataType::Float64).expect("host AVG");
+        let got = out
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!(((got - reference / n as f64) / got).abs() < 1e-12, "{got}");
+    }
+}

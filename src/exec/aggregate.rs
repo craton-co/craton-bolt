@@ -750,20 +750,39 @@ fn reduce_column_from_batch(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            // W8-B-007: SUM(Float32) accumulates in f64 on the device (the
+            // kernel widens each load) and is narrowed once in
+            // `scalar_to_array`; MIN/MAX/COUNT stay at f32.
+            let widened_sum = matches!(op, ReduceOp::Sum);
             if has_nulls {
                 let validity_gpu = upload_validity_async(arr, &stream)?;
                 let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
-                reduce_gpu_vec_with_validity::<f32>(
-                    op,
-                    col_io.dtype,
-                    &dev,
-                    &validity_gpu,
-                    n_rows,
-                    &stream,
-                )
+                if widened_sum {
+                    reduce_gpu_vec_widened_with_validity::<f32, f64>(
+                        op,
+                        col_io.dtype,
+                        &dev,
+                        &validity_gpu,
+                        n_rows,
+                        &stream,
+                    )
+                } else {
+                    reduce_gpu_vec_with_validity::<f32>(
+                        op,
+                        col_io.dtype,
+                        &dev,
+                        &validity_gpu,
+                        n_rows,
+                        &stream,
+                    )
+                }
             } else {
                 let dev = upload_primitive_values_async::<f32>(pa.values(), &stream)?;
-                reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows, &stream)
+                if widened_sum {
+                    reduce_gpu_vec_widened::<f32, f64>(op, col_io.dtype, &dev, n_rows, &stream)
+                } else {
+                    reduce_gpu_vec::<f32>(op, col_io.dtype, &dev, n_rows, &stream)
+                }
             }
         }
         DataType::Float64 => {
@@ -1606,6 +1625,14 @@ fn reduce_gpu_vec<T>(
 where
     T: Pod + ReduceScalar,
 {
+    // The kernel writes one accumulator per block and `partials` is sized for
+    // `T`; a widening reduction (e.g. SUM(Float32) -> f64) must go through
+    // the `_widened` launcher or it would write past the buffer.
+    if matches!((op, dtype), (ReduceOp::Sum, DataType::Float32)) {
+        return Err(BoltError::Other(format!(
+            "internal: {op:?} over {dtype:?} accumulates in f64; use the widened launcher"
+        )));
+    }
     // 0-row degenerate case: skip the launch entirely and return the identity.
     // The stream may still have a pending (empty) H2D queued — synchronize so
     // the next user of the default-device stream doesn't observe stale work.
@@ -1835,6 +1862,14 @@ fn reduce_gpu_vec_with_validity<T>(
 where
     T: Pod + ReduceScalar,
 {
+    // The kernel writes one accumulator per block and `partials` is sized for
+    // `T`; a widening reduction (e.g. SUM(Float32) -> f64) must go through
+    // the `_widened` launcher or it would write past the buffer.
+    if matches!((op, dtype), (ReduceOp::Sum, DataType::Float32)) {
+        return Err(BoltError::Other(format!(
+            "internal: {op:?} over {dtype:?} accumulates in f64; use the widened launcher"
+        )));
+    }
     if n_rows == 0 {
         stream.synchronize()?;
         return T::identity_scalar(op, dtype);
@@ -2340,6 +2375,10 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
         }
         (Scalar::I64(v), DataType::Float64) => {
             Ok(Arc::new(Float64Array::from(vec![v as f64])) as ArrayRef)
+        }
+        // W8-B-007: SUM(Float32) accumulated in f64, rounded once here.
+        (Scalar::F64(v), DataType::Float32) => {
+            Ok(Arc::new(Float32Array::from(vec![v as f32])) as ArrayRef)
         }
         (Scalar::F32(v), DataType::Float64) => {
             Ok(Arc::new(Float64Array::from(vec![v as f64])) as ArrayRef)

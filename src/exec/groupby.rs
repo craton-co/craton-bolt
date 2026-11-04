@@ -4917,6 +4917,24 @@ mod tests {
 
     /// `pack_array` rebuilds a grouped `Date32` MIN/MAX result (reduced on the
     /// i32-normalized accumulator) as a `Date32Array`.
+    /// W8-B-007: a grouped SUM(Float32) total accumulated in f64 is rounded
+    /// to the Float32 output exactly once.
+    #[test]
+    fn pack_array_narrows_f64_sum_to_float32_once() {
+        let values = vec![0.1_f32; 1_000_000];
+        let wide = widen_f32(&values);
+        let total: f64 = wide.iter().sum();
+        let naive: f32 = values.iter().sum();
+        assert_ne!(naive, total as f32, "the f32 running sum drifts");
+        let arr = pack_array(DataType::Float32, Scalars::F64(vec![total])).expect("pack");
+        let out = arr
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Float32 output");
+        assert_eq!(out.value(0), total as f32);
+        assert_eq!(out.value(0), 100_000.0);
+    }
+
     #[test]
     fn pack_array_rebuilds_date32() {
         let arr =

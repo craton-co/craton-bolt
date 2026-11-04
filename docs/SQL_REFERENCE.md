@@ -329,7 +329,7 @@ If the query has any aggregate function in the SELECT list, OR a `GROUP BY` clau
 | `COUNT(bool)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `COUNT(utf8)`  | `Int64`                       | Honours nulls (host-side path).                            |
 | `COUNT(date32 \| timestamp)` | `Int64`         | Counts non-NULL temporal rows; works end-to-end (dtype-agnostic count path). |
-| `SUM(int|float)` | Same dtype as input         | `SUM(Int32) -> Int64` widening; SUM(Int64), SUM(Float*) unchanged. |
+| `SUM(int|float)` | Same dtype as input         | `SUM(Int32) -> Int64` widening; SUM(Int64), SUM(Float*) unchanged. `SUM(Float32)` accumulates in double precision and rounds once to `Float32`. |
 | `SUM(bool)`    | `Int64`                       | Count of `TRUE` rows.                                      |
 | `MIN(int|float)` | Same dtype as input         | Float MIN via `atom.cas` loop on bit pattern (sm_70).      |
 | `MIN(bool)`    | `Bool`                        | `FALSE < TRUE`. NULL if all-null group.                    |
@@ -357,7 +357,7 @@ Primitive scalar aggregates strip NULL positions before device reduction
 (with a zero-copy fast path when `null_count == 0`), while Bool/Utf8 paths
 thread validity through `extended_agg`.
 
-`SUM` widens narrow integer inputs to the corresponding 64-bit type: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`.
+`SUM` widens narrow integer inputs to the corresponding 64-bit type: `SUM(Int32) -> Int64`. `SUM(Int64)` and `SUM(Float32|Float64)` are unchanged. The widening is applied consistently in both the scalar and GROUP BY paths via `crate::plan::logical_plan::sum_output_dtype`. `SUM(Float32)` keeps its `Float32` output dtype but is accumulated in `Float64` on every path (scalar and GROUP BY, GPU and host tier): the inputs are widened exactly, summed in double precision, and the total is rounded to `Float32` once, so the result matches a double-precision (DuckDB / PostgreSQL style) sum rounded to single precision rather than drifting with a single-precision running sum. `AVG`, `VAR_*` and `STDDEV_*` over `Float32` already accumulate in `Float64` and return `Float64`.
 
 Integer `SUM` overflow is a **hard error**, not silent wraparound and not
 undefined behaviour. Device accumulation records overflow and streaming

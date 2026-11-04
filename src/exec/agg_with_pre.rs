@@ -400,7 +400,7 @@ fn reduce_gathered(op: ReduceOp, gathered: &GatheredCol) -> BoltResult<Scalar> {
     match gathered {
         GatheredCol::I32(v) => reduce_gpu_vec::<i32>(op, DataType::Int32, v, n),
         GatheredCol::I64(v) => reduce_gpu_vec::<i64>(op, DataType::Int64, v, n),
-        GatheredCol::F32(v) => reduce_gpu_vec::<f32>(op, DataType::Float32, v, n),
+        GatheredCol::F32(v) => reduce_f32_gpu_vec(op, v, n),
         GatheredCol::F64(v) => reduce_gpu_vec::<f64>(op, DataType::Float64, v, n),
         GatheredCol::Bool(_) | GatheredCol::BoolNullable { .. } => Err(BoltError::Other(
             "resident on-device aggregate: cannot reduce a Bool gathered column".into(),
@@ -1076,6 +1076,12 @@ fn reduce_host_col(op: ReduceOp, col: &HostCol) -> BoltResult<Scalar> {
         }
         HostColValues::I32(v) => reduce_host_slice::<i32>(op, DataType::Int32, v),
         HostColValues::I64(v) => reduce_host_slice::<i64>(op, DataType::Int64, v),
+        // W8-B-007: SUM(Float32) accumulates in f64 (exact widening on the
+        // host, one rounding to the Float32 output in `scalar_to_array`).
+        HostColValues::F32(v) if op == ReduceOp::Sum => {
+            let wide: Vec<f64> = v.iter().map(|&x| f64::from(x)).collect();
+            reduce_host_slice::<f64>(op, DataType::Float64, &wide)
+        }
         HostColValues::F32(v) => reduce_host_slice::<f32>(op, DataType::Float32, v),
         HostColValues::F64(v) => reduce_host_slice::<f64>(op, DataType::Float64, v),
     }
@@ -1217,6 +1223,17 @@ where
     reduce_gpu_vec::<T>(op, dtype, &dev, host.len())
 }
 
+/// Reduce a device-resident Float32 column. `SUM` runs the widening kernel
+/// (f64 accumulator, W8-B-007) so the total is rounded to f32 only once, in
+/// `scalar_to_array`; MIN/MAX/COUNT reduce at f32.
+fn reduce_f32_gpu_vec(op: ReduceOp, input: &GpuVec<f32>, n_rows: usize) -> BoltResult<Scalar> {
+    if op == ReduceOp::Sum {
+        reduce_gpu_vec_acc::<f32, f64>(op, DataType::Float32, input, n_rows)
+    } else {
+        reduce_gpu_vec::<f32>(op, DataType::Float32, input, n_rows)
+    }
+}
+
 /// Launch the per-block reduction kernel against `input` and finish the
 /// reduction on the host. Returns the final scalar as a `Scalar`.
 fn reduce_gpu_vec<T>(
@@ -1228,10 +1245,6 @@ fn reduce_gpu_vec<T>(
 where
     T: Pod + ReduceScalar,
 {
-    // 0-row degenerate case: skip the launch entirely and return the identity.
-    if n_rows == 0 {
-        return T::identity_scalar(op, dtype);
-    }
     // The kernel writes one accumulator per block; `partials` is sized for
     // `T`, so the accumulator must be `T` too (a widening reduction would
     // write past the buffer).
@@ -1240,11 +1253,32 @@ where
             "internal: {op:?} over {dtype:?} accumulates in a wider type; widen the input first"
         )));
     }
+    reduce_gpu_vec_acc::<T, T>(op, dtype, input, n_rows)
+}
+
+/// [`reduce_gpu_vec`] with the per-block partials (and host finalize) at the
+/// kernel's accumulator type `TAcc`, which is wider than the input `TIn` for
+/// a widening reduction (`reduction_output_dtype(op, dtype) != dtype`).
+fn reduce_gpu_vec_acc<TIn, TAcc>(
+    op: ReduceOp,
+    dtype: DataType,
+    input: &GpuVec<TIn>,
+    n_rows: usize,
+) -> BoltResult<Scalar>
+where
+    TIn: Pod,
+    TAcc: Pod + ReduceScalar,
+{
+    let acc_dtype = crate::jit::agg_kernels::reduction_output_dtype(op, dtype);
+    // 0-row degenerate case: skip the launch entirely and return the identity.
+    if n_rows == 0 {
+        return TAcc::identity_scalar(op, acc_dtype);
+    }
 
     let block = BLOCK_SIZE;
     let mut n_rows_u32: u32 = n_rows_to_u32(n_rows)?;
     let grid_x = crate::exec::launch::grid_x_for(n_rows_u32, block);
-    let partials = GpuVec::<T>::zeros(grid_x as usize)?;
+    let partials = GpuVec::<TAcc>::zeros(grid_x as usize)?;
 
     let module = module_cache::get_or_build_module(
         module_path!(),
@@ -1288,7 +1322,7 @@ where
 
     let host_partials = partials.to_vec()?;
     drop(partials);
-    T::finalize(op, dtype, &host_partials)
+    TAcc::finalize(op, acc_dtype, &host_partials)
 }
 
 /// Heterogenous owned device column for the pre kernel's inputs and outputs.
@@ -1489,7 +1523,7 @@ impl PreCol {
         match &self.values {
             PreColValues::I32(v) => reduce_gpu_vec::<i32>(op, DataType::Int32, v, n_rows),
             PreColValues::I64(v) => reduce_gpu_vec::<i64>(op, DataType::Int64, v, n_rows),
-            PreColValues::F32(v) => reduce_gpu_vec::<f32>(op, DataType::Float32, v, n_rows),
+            PreColValues::F32(v) => reduce_f32_gpu_vec(op, v, n_rows),
             PreColValues::F64(v) => reduce_gpu_vec::<f64>(op, DataType::Float64, v, n_rows),
             PreColValues::Dec128(_) => Err(decimal_output_err()),
         }
@@ -1869,6 +1903,10 @@ fn scalar_to_array(scalar: Scalar, out_dtype: DataType) -> BoltResult<ArrayRef> 
         }
         (Scalar::F32(v), DataType::Float64) => {
             Ok(Arc::new(Float64Array::from(vec![v as f64])) as ArrayRef)
+        }
+        // W8-B-007: SUM(Float32) accumulated in f64, rounded once here.
+        (Scalar::F64(v), DataType::Float32) => {
+            Ok(Arc::new(Float32Array::from(vec![v as f32])) as ArrayRef)
         }
 
         (s, dt) => Err(BoltError::Type(format!(
