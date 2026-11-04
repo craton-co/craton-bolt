@@ -200,7 +200,7 @@ impl DictRegistry {
     /// table. The result equals [`Self::register_table`] over the
     /// concatenation of every batch so far. On error the table's entry may
     /// be partially extended; the caller must rebuild it.
-    pub fn append_batch(&mut self, table: &str, batch: &RecordBatch) -> BoltResult<()> {
+    pub(crate) fn append_batch(&mut self, table: &str, batch: &RecordBatch) -> BoltResult<()> {
         let schema = batch.schema();
         for (idx, field) in schema.fields().iter().enumerate() {
             let arr = batch.column(idx);

@@ -160,7 +160,7 @@ pub fn normalize_device_validity_to_packed(
 /// the **unpacked** one-`u8`-per-row layout (`1` = present, `0` = NULL) that
 /// the projection / predicate kernels' `Op::IsNullCheck` reads. Rows past the
 /// end of a short packed buffer are NULL.
-pub fn normalize_device_validity_to_unpacked(
+pub(crate) fn normalize_device_validity_to_unpacked(
     buf: &[u8],
     format: DeviceValidityFormat,
     n_rows: usize,

@@ -25,7 +25,7 @@ where
 /// [`map_plan_exprs`], except that a `Filter` predicate is mapped by
 /// `map_predicate` instead of `map_expr` (a filter keeps only the rows where
 /// it is TRUE, so a pass may treat UNKNOWN there as FALSE).
-pub fn map_plan_exprs_and_predicates<E, P, A>(
+pub(crate) fn map_plan_exprs_and_predicates<E, P, A>(
     plan: LogicalPlan,
     map_expr: &E,
     map_predicate: &P,
