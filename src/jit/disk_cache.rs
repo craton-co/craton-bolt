@@ -66,18 +66,57 @@
 //! both produce identical bytes (the codegen pipeline is
 //! deterministic), so the last-writer-wins outcome is harmless.
 //!
-//! # Security boundary (V-7) — fail-closed directory trust
+//! # Security boundary (V-7, W2-D-003) — directory trust + keyed integrity
 //!
 //! The bytes in this cache are read back and **launched** as PTX, so a
 //! cache directory another local user can write is a code-execution
-//! surface. The integrity boundary is therefore **directory ownership +
-//! permissions plus key-bound integrity**, NOT the strength of the
-//! integrity hash. The hash is a non-cryptographic FNV-1a digest (an
-//! explicit, toolchain-stable in-file primitive — see [`fnv1a64`] / C-1)
-//! and lives in the same directory as the body, so an attacker who can
-//! write the directory could also recompute it — it only guards against
-//! accidental corruption, naive tampering, and (via key binding) cross-key
-//! content replay.
+//! surface. Two independent, fail-closed layers protect it:
+//!
+//! 1. **Directory trust** (below): the cache directory must be private to
+//!    the current user.
+//! 2. **Keyed integrity**: every entry carries an HMAC-SHA-256 tag over
+//!    `(codegen salt, cache key, PTX bytes)` under a 32-byte secret key that
+//!    is **not stored in the cache directory**. Someone who can write the
+//!    directory but cannot read the key cannot forge an entry: a forged,
+//!    tampered, renamed, unkeyed (`v1`, FNV-1a) or foreign-key entry fails
+//!    the constant-time tag check ([`hmac::Mac::verify_slice`]), is treated
+//!    as a miss and is removed, and the caller recompiles. Nothing is ever
+//!    launched without a valid tag.
+//!
+//! ## Where the key comes from (decided in one place: `key_source`)
+//!
+//! 1. [`EngineBuilder::persistent_cache_key`](crate::EngineBuilder::persistent_cache_key)
+//!    — the embedder supplies the key; no file is involved.
+//! 2. Otherwise the file named by [`DISK_PTX_CACHE_KEY_FILE_ENV`]
+//!    (`BOLT_PTX_CACHE_KEY_FILE`, an absolute path).
+//! 3. Otherwise a per-user default file, `ptx-cache.key` in the per-user
+//!    data directory — `%LOCALAPPDATA%\craton-bolt\` (Windows),
+//!    `~/Library/Application Support/craton-bolt/` (macOS),
+//!    `$XDG_CONFIG_HOME/craton-bolt/` or `~/.config/craton-bolt/` (others).
+//!    It does not depend on the cache directory, so one key serves every
+//!    cache directory of that user.
+//!
+//! A key file that does not exist is created once with a fresh random key
+//! (hex text) from the operating system's RNG via `getrandom` — the same
+//! source `std`'s `HashMap` seeding uses, already in the dependency graph,
+//! with no user-space PRNG in between. It is written to a temporary file
+//! with owner-only permissions, then hard-linked into place, so a racing
+//! process either wins or reads the winner's complete key. Every open then
+//! checks the key file **fail-closed**, like the directory:
+//!
+//! - the path must be absolute and must not lie inside the cache directory
+//!   (compared after resolving symlinks / junctions, case-insensitively on
+//!   Windows);
+//! - Unix: opened with `O_NOFOLLOW` (no symlinks); a regular file owned by
+//!   the effective uid with no group/world permission bits
+//!   (`mode & 0o077 == 0`), checked on the open handle;
+//! - Windows: not a symlink; its ACL is reset to the current user only with
+//!   `icacls` (as for the directory), and a failure rejects it;
+//! - the content must be exactly 64 hex digits (surrounding whitespace is
+//!   ignored).
+//!
+//! If the key cannot be obtained or trusted, the disk layer is **disabled**
+//! with a warning, exactly as for an untrusted directory.
 //!
 //! On [`DiskPtxCache::open`] the cache directory is verified **fail-closed**:
 //!
@@ -92,18 +131,26 @@
 //! deterministically re-derivable from source, a disabled disk cache is
 //! always safe.
 //!
-//! Each on-disk entry additionally carries a `#bolt-ptx-cache v1 <digest>`
-//! header whose digest is **bound to the cache key**, so a file's bytes
-//! cannot be replayed under a different `<key>.ptx` filename. Lookups read
-//! the bytes once and verify before returning them (TOCTOU-safe — no
-//! re-open between check and use).
+//! Each on-disk entry starts with a `#bolt-ptx-cache v2 hmac-sha256 <tag>`
+//! header line. Lookups read the bytes once and verify before returning them
+//! (TOCTOU-safe — no re-open between check and use).
+//!
+//! What this does not cover: a process running as the same user (it can read
+//! the key), an administrator, or two processes sharing a cache directory
+//! with different keys (each treats the other's entries as forged and
+//! replaces them — correct, but no cache sharing). The header version, not
+//! [`CODEGEN_VERSION`], marks the format change: entries keep their file
+//! names, so a `v1` file is overwritten in place on the next store instead
+//! of being orphaned under an old name.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
+use sha2::Sha256;
 
 /// Environment variable that enables the disk-backed PTX cache and
 /// names its root directory. Unset, empty, or unreadable → cache
@@ -130,6 +177,41 @@ pub const DEFAULT_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 /// bound so a pathological flood of tiny entries can't blow up the directory
 /// inode count even while staying under the byte cap.
 pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
+
+/// Environment variable naming the file that holds the disk cache's
+/// integrity key (64 hex digits). Must be an absolute path outside the cache
+/// directory; created with a random key if missing. Ignored when the
+/// embedder supplies the key with
+/// [`EngineBuilder::persistent_cache_key`](crate::EngineBuilder::persistent_cache_key).
+/// See the module docs for the trust checks.
+pub const DISK_PTX_CACHE_KEY_FILE_ENV: &str = "BOLT_PTX_CACHE_KEY_FILE";
+
+/// File name of the per-user default key file (see the module docs).
+const KEY_FILE_NAME: &str = "ptx-cache.key";
+
+/// Integrity key length in bytes (the HMAC-SHA-256 output size).
+pub(crate) const KEY_LEN: usize = 32;
+
+/// The disk cache's secret integrity key. `Debug` never prints the bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheKey(pub(crate) [u8; KEY_LEN]);
+
+impl std::fmt::Debug for CacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheKey(<redacted>)")
+    }
+}
+
+/// Where the integrity key comes from; chosen by [`key_source`] only.
+#[derive(Debug, Clone)]
+enum KeySource {
+    /// Supplied by the embedder (builder); no file.
+    Explicit(CacheKey),
+    /// Read from (or created at) this file.
+    File(PathBuf),
+    /// No key can be had; the reason is logged and the disk layer disabled.
+    Unavailable(String),
+}
 
 /// Codegen-version salt for the **on-disk** PTX cache key (fixes
 /// JIT-M1).
@@ -169,9 +251,9 @@ pub const DEFAULT_MAX_CACHE_ENTRIES: u64 = 4096;
 ///
 /// # C-1: toolchain-stable hashing primitive (resolved)
 ///
-/// The on-disk key tail and the V-7 integrity digest are now derived from an
-/// explicit, in-file **FNV-1a** hash ([`fnv1a64`]) whose byte output is fixed
-/// across all Rust toolchains — **not** from
+/// The on-disk key and the entry integrity tag (HMAC-SHA-256 since
+/// W2-D-003; FNV-1a before) are derived from primitives whose byte output is
+/// fixed across all Rust toolchains — **not** from
 /// `std::collections::hash_map::DefaultHasher` (SipHash-1-3), whose byte output
 /// is documented as *not* stable across Rust std versions. Previously a *local*
 /// `rustc`/std upgrade (same crate version) could silently change every key /
@@ -416,6 +498,62 @@ pub fn set_override_dir(dir: Option<PathBuf>) {
     *HANDLE.get_or_init(|| Mutex::new(None)).lock() = None;
 }
 
+/// Builder-supplied integrity key (see [`set_override_key`]).
+static OVERRIDE_KEY: OnceLock<Mutex<Option<CacheKey>>> = OnceLock::new();
+
+fn override_key_slot() -> &'static Mutex<Option<CacheKey>> {
+    OVERRIDE_KEY.get_or_init(|| Mutex::new(None))
+}
+
+/// Install (or clear, with `None`) the embedder-supplied integrity key. It
+/// takes precedence over [`DISK_PTX_CACHE_KEY_FILE_ENV`] and the default key
+/// file. Invalidates the memoised handle like [`set_override_dir`].
+pub(crate) fn set_override_key(key: Option<[u8; KEY_LEN]>) {
+    *override_key_slot().lock() = key.map(CacheKey);
+    *HANDLE.get_or_init(|| Mutex::new(None)).lock() = None;
+}
+
+/// The single decision of where the integrity key comes from: the builder
+/// key, else the [`DISK_PTX_CACHE_KEY_FILE_ENV`] file, else the per-user
+/// default file ([`default_key_path`]).
+fn key_source() -> KeySource {
+    if let Some(k) = *override_key_slot().lock() {
+        return KeySource::Explicit(k);
+    }
+    if let Some(raw) = std::env::var_os(DISK_PTX_CACHE_KEY_FILE_ENV) {
+        if !raw.is_empty() {
+            return KeySource::File(PathBuf::from(raw));
+        }
+    }
+    match default_key_path() {
+        Some(p) => KeySource::File(p),
+        None => KeySource::Unavailable(format!(
+            "no per-user directory for the default key file; set \
+             {DISK_PTX_CACHE_KEY_FILE_ENV} or EngineBuilder::persistent_cache_key"
+        )),
+    }
+}
+
+/// Per-user default key file path (see the module docs), independent of the
+/// cache directory. `None` when the relevant environment variables are unset.
+fn default_key_path() -> Option<PathBuf> {
+    let non_empty = |v: &str| {
+        std::env::var_os(v)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    #[cfg(target_os = "windows")]
+    let base = non_empty("LOCALAPPDATA")
+        .or_else(|| non_empty("USERPROFILE").map(|p| p.join("AppData").join("Local")));
+    #[cfg(target_os = "macos")]
+    let base = non_empty("HOME").map(|h| h.join("Library").join("Application Support"));
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let base = non_empty("XDG_CONFIG_HOME")
+        .filter(|p| p.is_absolute())
+        .or_else(|| non_empty("HOME").map(|h| h.join(".config")));
+    Some(base?.join("craton-bolt").join(KEY_FILE_NAME))
+}
+
 /// Snapshot the current builder-supplied override directory (if any).
 ///
 /// Returns `Some(path)` when [`set_override_dir`] has been called with a
@@ -552,26 +690,27 @@ pub fn platform_default_dir() -> Option<PathBuf> {
 
 /// Handle to the on-disk PTX cache rooted at a particular directory.
 ///
-/// Cheap to clone — wraps a single `Arc<PathBuf>` so concurrent callers
-/// can each carry their own handle without lock contention. Per-entry
-/// I/O takes no shared lock; the only synchronisation is the inherent
-/// atomicity of `rename`.
+/// Cheap to clone — an `Arc<PathBuf>` plus the 32-byte key, so concurrent
+/// callers can each carry their own handle without lock contention.
+/// Per-entry I/O takes no shared lock; the only synchronisation is the
+/// inherent atomicity of `rename`.
 ///
 /// # Disabled (fail-closed) state — V-7
 ///
-/// A handle whose `disk_enabled` flag is `false` is a **disk no-op**:
+/// A handle without an integrity key is a **disk no-op**:
 /// [`Self::lookup`] always misses and [`Self::store`] silently writes
 /// nothing. [`Self::open`] returns such a handle when the cache directory
-/// fails the ownership / permission trust check (see the `open` doc). The
-/// engine keeps running and falls back to its in-process module cache +
-/// codegen, so a disabled disk layer is always safe: PTX is deterministically
-/// re-derivable from source.
+/// fails the ownership / permission trust check, or when no trusted
+/// integrity key can be had (see the module docs). The engine keeps running
+/// and falls back to its in-process module cache + codegen, so a disabled
+/// disk layer is always safe: PTX is deterministically re-derivable from
+/// source.
 #[derive(Clone)]
 pub struct DiskPtxCache {
     root: std::sync::Arc<PathBuf>,
-    /// Whether disk I/O is permitted. `false` after a failed directory
-    /// trust check (V-7) turns this handle into a disk no-op.
-    disk_enabled: bool,
+    /// The entry-integrity key; `None` (disk no-op) after a failed directory
+    /// trust check or key load.
+    mac_key: Option<CacheKey>,
 }
 
 impl DiskPtxCache {
@@ -585,12 +724,9 @@ impl DiskPtxCache {
     /// The on-disk cache stores PTX that is later read back and **launched**
     /// via `cuModuleLoadDataEx`. A cache directory that another local user
     /// can write — or that we don't even own — is therefore a code-execution
-    /// surface: an attacker who can plant `<key>.ptx` files (and recompute
-    /// the non-cryptographic integrity digest, which lives in the same
-    /// directory) could get arbitrary PTX launched in our process. The hash
-    /// strength is *not* the security boundary; **directory ownership +
-    /// permissions** is. We therefore verify trust before using the dir and
-    /// **fail closed** if it is not met.
+    /// surface. Entries carry a keyed HMAC tag (module docs), and the
+    /// directory must additionally be private to us: we verify trust before
+    /// using the dir and **fail closed** if it is not met.
     ///
     /// After `create_dir_all`, we tighten then *verify* the root:
     ///
@@ -617,12 +753,24 @@ impl DiskPtxCache {
     /// # Fail-closed behavior
     ///
     /// If the trust check fails we do **not** hard-error the engine — we log
-    /// a clear warning and return a handle with `disk_enabled == false`, so
+    /// a clear warning and return a disabled handle (no integrity key), so
     /// every subsequent [`Self::lookup`] misses and [`Self::store`] is a
     /// disk no-op. The in-process module cache and codegen path are
     /// untouched, and because PTX is deterministically re-derivable a
     /// disabled disk layer is always safe.
+    ///
+    /// # Integrity key (W2-D-003)
+    ///
+    /// After the directory passes, the integrity key is obtained as the
+    /// module docs describe (builder key, `BOLT_PTX_CACHE_KEY_FILE`, or the
+    /// per-user default file, created on first use). A key that cannot be
+    /// obtained or trusted also yields a disabled handle with a warning.
     pub fn open(dir: PathBuf) -> io::Result<Self> {
+        Self::open_with(dir, &key_source())
+    }
+
+    /// [`Self::open`] with an explicit key source (tests pass their own).
+    fn open_with(dir: PathBuf, source: &KeySource) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
 
         // V-7: tighten the cache root, then VERIFY ownership + permissions.
@@ -659,15 +807,32 @@ impl DiskPtxCache {
             );
         }
 
+        // W2-D-003: only a trusted directory gets a key; no key, no disk I/O.
+        let mac_key = if disk_enabled {
+            match load_key(source, &dir) {
+                Ok(k) => Some(k),
+                Err(why) => {
+                    log::warn!(
+                        "PTX disk cache at {} disabled: no trusted integrity key \
+                         ({why}); falling back to in-memory PTX only.",
+                        dir.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let cache = Self {
             root: std::sync::Arc::new(dir),
-            disk_enabled,
+            mac_key,
         };
         // JIT-cache-bound: enforce the size / entry-count caps on open so a
         // directory left oversized by a previous process (or a lowered cap)
         // is trimmed before we start serving from it. Best-effort, and only
         // meaningful when the disk layer is enabled.
-        if cache.disk_enabled {
+        if cache.is_disk_enabled() {
             cache.enforce_bounds();
         }
         Ok(cache)
@@ -680,12 +845,13 @@ impl DiskPtxCache {
     }
 
     /// Whether this handle's disk layer is enabled. `false` after the V-7
-    /// directory trust check in [`Self::open`] failed — every `lookup`
-    /// misses and every `store` is a disk no-op. Exposed for tests and for
-    /// callers that want to surface "disk cache disabled" diagnostics.
+    /// directory trust check or the integrity-key load in [`Self::open`]
+    /// failed — every `lookup` misses and every `store` is a disk no-op.
+    /// Exposed for tests and for callers that want to surface "disk cache
+    /// disabled" diagnostics.
     #[must_use]
     pub fn is_disk_enabled(&self) -> bool {
-        self.disk_enabled
+        self.mac_key.is_some()
     }
 
     /// Construct a disk-disabled handle directly (test-only) so the
@@ -695,7 +861,7 @@ impl DiskPtxCache {
     fn disabled_for_test(dir: PathBuf) -> Self {
         Self {
             root: std::sync::Arc::new(dir),
-            disk_enabled: false,
+            mac_key: None,
         }
     }
 
@@ -742,19 +908,18 @@ impl DiskPtxCache {
     /// [`Self::entry_path`] returns `None` and we never touch the
     /// filesystem with an unsanitised path.
     ///
-    /// # Content-integrity check (V-7)
+    /// # Content-integrity check (V-7, W2-D-003)
     ///
-    /// The cache file carries a `#bolt-ptx-cache v1 <digest>` header line
-    /// (see [`CACHE_HEADER_MAGIC`]). We parse that header, recompute
-    /// [`body_digest`] over the body **bound to the lookup `key`**, and
-    /// return the body **only** if the digests match. Binding the digest to
+    /// The cache file carries a `#bolt-ptx-cache v2 hmac-sha256 <tag>`
+    /// header line (see [`CACHE_HEADER_MAGIC`]). We verify the tag in
+    /// constant time against an HMAC-SHA-256 under this handle's secret key
+    /// over the codegen salt, the **lookup `key`** and the body
+    /// ([`entry_mac`]), and return the body **only** if it matches. Binding
     /// the key means a file's contents cannot be replayed under a different
-    /// `<key>.ptx` filename — a moved/renamed entry mismatches and misses.
-    /// This catches accidental corruption / partial writes and trips on
-    /// naive tampering. A file with no/old/garbled header (e.g. a raw-PTX
-    /// entry from an older binary, or a digest mismatch) is treated as a miss
-    /// so the caller recompiles and rewrites it in the current format. See
-    /// [`Self::store`] for the write side.
+    /// `<key>.ptx` filename. A file with no/old/garbled header (a raw-PTX or
+    /// unkeyed `v1` entry from an older binary), a bad tag, or a tag made
+    /// with another key is treated as a miss **and removed**, so the caller
+    /// recompiles and rewrites it. See [`Self::store`] for the write side.
     ///
     /// # Fail-closed disk layer (V-7)
     ///
@@ -770,26 +935,19 @@ impl DiskPtxCache {
     /// window between the integrity check and the bytes the caller launches.
     #[must_use]
     pub fn lookup(&self, key: &str) -> Option<String> {
-        // V-7: a disabled (untrusted-dir) handle never touches disk.
-        if !self.disk_enabled {
-            return None;
-        }
+        // V-7: a disabled (untrusted-dir / no-key) handle never touches disk.
+        let mac_key = self.mac_key.as_ref()?;
         // V-3: refuse to read through an unsanitised key.
         let path = self.entry_path(key)?;
         // TOCTOU-safe: read the bytes ONCE, then verify those same bytes.
-        let raw = fs::read_to_string(path).ok()?;
-        // V-7: require a well-formed integrity header, else miss.
-        let (header_line, body) = split_header(&raw)?;
-        let stored_digest = header_line.strip_prefix(CACHE_HEADER_MAGIC)?.trim();
-        // V-7: the digest is bound to `key`, so contents planted under a
-        // different filename (or a renamed entry) mismatch and miss.
-        if stored_digest != body_digest(key, body) {
-            // Corrupt, tampered, or replayed-under-another-key body -> treat
-            // as a miss so the caller recompiles rather than launching
-            // untrusted PTX.
-            return None;
+        let raw = fs::read_to_string(&path).ok()?;
+        if let Some(body) = verified_body(mac_key, key, &raw) {
+            return Some(body.to_string());
         }
-        Some(body.to_string())
+        // Unkeyed, legacy, tampered, replayed or foreign-key entry: never
+        // launched; removed so the next store rewrites it.
+        let _ = fs::remove_file(&path);
+        None
     }
 
     /// Persist `ptx` under `key` using a tempfile-then-rename to keep
@@ -819,10 +977,10 @@ impl DiskPtxCache {
     ///
     /// # Content-integrity header (V-7)
     ///
-    /// The file is written as a `#bolt-ptx-cache v1 <digest>\n` header line
-    /// (the [`body_digest`] of `ptx` **bound to `key`**) followed by the
-    /// verbatim PTX body, so [`Self::lookup`] can verify the body — and that
-    /// it was stored under this exact filename — on read.
+    /// The file is written as a `#bolt-ptx-cache v2 hmac-sha256 <tag>\n`
+    /// header line (the keyed [`entry_mac`] of `ptx` **bound to `key`**)
+    /// followed by the verbatim PTX body, so [`Self::lookup`] can verify the
+    /// body — and that it was stored under this exact filename — on read.
     ///
     /// # Fail-closed disk layer (V-7)
     ///
@@ -831,20 +989,18 @@ impl DiskPtxCache {
     /// without writing anything, so a disabled disk layer never plants files
     /// in a directory we don't trust.
     pub fn store(&self, key: &str, ptx: &str) -> io::Result<()> {
-        // V-7: a disabled (untrusted-dir) handle never writes to disk.
-        if !self.disk_enabled {
+        // V-7: a disabled (untrusted-dir / no-key) handle never writes.
+        let Some(mac_key) = self.mac_key.as_ref() else {
             return Ok(());
-        }
+        };
         // V-3: refuse to write through an unsanitised key. Best-effort
         // contract: a refused store is a silent no-op, not an error.
         let Some(target) = self.entry_path(key) else {
             return Ok(());
         };
-        // V-7: prepend the integrity header. `body_digest` binds the body to
-        // `key`, so the header line is self-describing and `lookup`
-        // re-derives the same key-bound digest from the bytes after the
-        // first `\n`.
-        let contents = format!("{}{}\n{}", CACHE_HEADER_MAGIC, body_digest(key, ptx), ptx);
+        // V-7 / W2-D-003: prepend the keyed integrity header.
+        let tag = hex_encode(&entry_mac(mac_key, key, ptx).finalize().into_bytes());
+        let contents = format!("{CACHE_HEADER_MAGIC}{tag}\n{ptx}");
         // Tempfile name: same directory, suffixed with the OS PID and a
         // process-monotonic counter so concurrent writers in the same
         // process don't collide. We use a counter (not a random number)
@@ -1058,6 +1214,14 @@ fn dir_is_trusted_unix(dir: &Path) -> bool {
 /// than silently launching PTX out of a directory we couldn't lock down.
 #[cfg(windows)]
 fn harden_windows_dir(dir: &Path) -> bool {
+    harden_windows_path(dir, "(OI)(CI)F")
+}
+
+/// Reset `path`'s ACL to a sole current-user grant `rights` with `icacls`
+/// (see [`harden_windows_dir`]); `true` only on success. Shared by the cache
+/// directory (`(OI)(CI)F`) and the key file (`F`).
+#[cfg(windows)]
+fn harden_windows_path(path: &Path, rights: &str) -> bool {
     use std::process::{Command, Stdio};
 
     // Prefer the domain-qualified principal `DOMAIN\USER`; fall back to a
@@ -1075,10 +1239,10 @@ fn harden_windows_dir(dir: &Path) -> bool {
     // as a single argument (no shell involved, so the `(OI)(CI)F` parens and
     // the `:` are passed literally to icacls).
     match Command::new("icacls")
-        .arg(dir)
+        .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{user}:(OI)(CI)F"))
+        .arg(format!("{user}:{rights}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1194,121 +1358,259 @@ pub(crate) fn valid_key(key: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
-/// Compute the **key-bound** content-integrity digest of a PTX body
-/// (V-7).
-///
-/// Returns a fixed-width 32-char lowercase hex string — the same shape as
-/// [`hash_to_key`] — derived from `(key, body)` via two domain-separated
-/// [`fnv1a64`] passes packed into 128 bits, using **no new dependency**.
-///
-/// # Toolchain-stable primitive (C-1)
-///
-/// This digest is built from an explicit, in-file FNV-1a implementation
-/// ([`fnv1a64`]) whose byte output is fixed forever — **not** from std's
-/// `DefaultHasher` (SipHash-1-3), whose output is documented as unstable
-/// across Rust std versions. Using the stable primitive means an `rustc` /
-/// std upgrade no longer silently rotates every on-disk digest (and, via the
-/// matching change in the upstream key composer, every key), which would
-/// otherwise cold-invalidate the entire on-disk PTX cache on a toolchain bump.
-/// The 128-bit width and the `(key, body)` framing below are unchanged from
-/// the previous `DefaultHasher`-pair shape, so only the hashing *primitive*
-/// moved — the digest *semantics* (determinism, key binding, content
-/// sensitivity) are identical.
-///
-/// # Key binding
-///
-/// The cache `key` (the `<key>.ptx` filename stem) is mixed into the digest
-/// — with a length prefix so `key`/`body` can't be ambiguously concatenated
-/// — *before* the body bytes. This binds a stored entry to the exact
-/// filename it was written under: a file whose contents are copied or
-/// renamed to a different `<key>.ptx` will fail [`DiskPtxCache::lookup`]'s
-/// comparison (which re-derives the digest from the *lookup* key) and miss,
-/// so contents can't be replayed under another key.
-///
-/// # This is NOT the security boundary
-///
-/// This is **not** a cryptographic MAC and the hash strength is **not** the
-/// integrity boundary. The header and body live in the same directory, so an
-/// attacker who can write that directory can recompute and rewrite the
-/// digest. The actual confidentiality/integrity boundary for V-7 is the
-/// **directory ownership + permission trust check** enforced fail-closed in
-/// [`DiskPtxCache::open`] (owner-only on Unix; ACL-locked-to-current-user on
-/// Windows — an untrusted dir disables the disk layer entirely). This digest
-/// only provides integrity against accidental corruption / partial writes,
-/// is a tripwire against naive tampering, and — via the key binding above —
-/// prevents cross-key content replay within an otherwise-trusted directory.
-#[must_use]
-fn body_digest(key: &str, body: &str) -> String {
-    // Frame the message with a leading domain byte (0xD1 / 0xD2), then a fixed
-    // big-endian u64 length prefix on `key`, then the key and body bytes. The
-    // two distinct domain bytes produce two independent 64-bit FNV-1a halves
-    // that pack into a 128-bit digest; the domains differ from the key-hash
-    // domains used in `exec::module_cache` so a digest can never be confused
-    // with a key. The length prefix means `(key, body)` can never be re-parsed
-    // as a different `(key', body')` split (length-prefix framing). Everything
-    // is fixed-byte-order (big-endian length, raw UTF-8 bytes) so the framed
-    // stream — and therefore the digest — is identical on every target and
-    // every toolchain (C-1: no `DefaultHasher`/SipHash native-endian output).
-    let frame = |domain: u8| -> u64 {
-        let mut framed: Vec<u8> = Vec::with_capacity(1 + 8 + key.len() + body.len());
-        framed.push(domain);
-        framed.extend_from_slice(&(key.len() as u64).to_be_bytes());
-        framed.extend_from_slice(key.as_bytes());
-        framed.extend_from_slice(body.as_bytes());
-        fnv1a64(&framed)
-    };
-    hash_to_key(frame(0xD1), frame(0xD2))
-}
-
-/// FNV-1a 64-bit hash of `bytes` — an explicit, version-stable hashing
-/// primitive (fixes C-1).
-///
-/// # Why an in-file FNV-1a instead of `DefaultHasher`
-///
-/// The on-disk cache keys and the [`body_digest`] integrity digest must be
-/// **byte-stable across Rust toolchains**: a digest that silently changes when
-/// `rustc` / std is upgraded cold-invalidates the entire on-disk PTX cache
-/// (every `<key>.ptx` filename and every header digest rotates), a per-query
-/// recompile cliff. `std::collections::hash_map::DefaultHasher` (SipHash-1-3)
-/// explicitly does **not** guarantee a stable byte output across std versions,
-/// so it cannot back a persistent on-disk key.
-///
-/// FNV-1a is a tiny, fully-specified, dependency-free hash whose output is
-/// fixed forever: starting from the 64-bit offset basis
-/// `0xcbf29ce484222325`, for each input byte we XOR it into the accumulator
-/// then multiply by the 64-bit FNV prime `0x100000001b3` (wrapping). The
-/// result is deterministic on every platform and every toolchain. It is
-/// **not** cryptographic — and per the V-7 doc, the hash strength was never
-/// the integrity boundary (directory ownership/permissions is) — so a
-/// non-cryptographic but *stable* digest is exactly what this cache needs.
-#[must_use]
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
 /// Header-line prefix written ahead of the PTX body in every cache file
-/// (V-7 content-integrity check).
+/// (V-7 / W2-D-003 keyed content integrity).
 ///
-/// Format of a v0.7-and-later cache file:
+/// Format of a 0.10.1-and-later cache file:
 /// ```text
-/// #bolt-ptx-cache v1 <32-char-hex-digest>\n
+/// #bolt-ptx-cache v2 hmac-sha256 <64-hex-char tag>\n
 /// <ptx body bytes...>
 /// ```
-/// The header is a single `\n`-terminated line. On lookup we parse the
-/// first line, recompute [`body_digest`] over everything after it, and
-/// serve the body only if the digests match. The format is
-/// **backward-tolerant**: a file whose first line is not a well-formed
-/// header (e.g. an entry written by an older binary, which is just raw
-/// PTX) is treated as a **miss** rather than served unchecked — the old
-/// raw entry simply gets recompiled and rewritten in the new format.
-const CACHE_HEADER_MAGIC: &str = "#bolt-ptx-cache v1 ";
+/// The tag is [`entry_mac`] under the handle's secret key. Anything else —
+/// a raw-PTX file, a `#bolt-ptx-cache v1 <fnv digest>` entry from an older
+/// binary, or a bad tag — is a miss (and removed), never served unchecked.
+const CACHE_HEADER_MAGIC: &str = "#bolt-ptx-cache v2 hmac-sha256 ";
+
+/// Domain-separation prefix of every entry MAC, so the key can never be
+/// confused with a MAC computed for another purpose.
+const MAC_DOMAIN: &[u8] = b"craton-bolt/ptx-disk-cache/v2\0";
+
+/// HMAC-SHA-256 over `(codegen salt, cache key, body)` under `mac_key`
+/// (W2-D-003).
+///
+/// Framing: [`MAC_DOMAIN`], then the salt and the cache key each with a
+/// big-endian `u64` length prefix (so no `(salt, key, body)` split can be
+/// re-parsed as another), then the body bytes. The salt is already part of
+/// every key composed by [`disk_key`]; folding it in again keeps the tag
+/// bound to this binary's codegen even for keys composed elsewhere.
+fn entry_mac(mac_key: &CacheKey, key: &str, body: &str) -> Hmac<Sha256> {
+    // HMAC accepts keys of any length, so `new_from_slice` cannot fail.
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key.0)
+        .unwrap_or_else(|_| unreachable!("HMAC takes any key length"));
+    mac.update(MAC_DOMAIN);
+    for part in [codegen_salt().as_bytes(), key.as_bytes()] {
+        mac.update(&(part.len() as u64).to_be_bytes());
+        mac.update(part);
+    }
+    mac.update(body.as_bytes());
+    mac
+}
+
+/// Return the body of `raw` only if its header is a `v2` tag that verifies
+/// (constant time, [`Mac::verify_slice`]) for `key` under `mac_key`.
+fn verified_body<'a>(mac_key: &CacheKey, key: &str, raw: &'a str) -> Option<&'a str> {
+    let (header_line, body) = split_header(raw)?;
+    let tag = hex_decode(header_line.strip_prefix(CACHE_HEADER_MAGIC)?)?;
+    entry_mac(mac_key, key, body).verify_slice(&tag).ok()?;
+    Some(body)
+}
+
+/// Lowercase hex encoding.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode an even-length hex string (either case); `None` on anything else.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
+        .collect()
+}
+
+/// Obtain the integrity key from `source` for a cache rooted at `cache_dir`
+/// (W2-D-003). A key file must be an absolute path outside `cache_dir`; it is
+/// created with a random key if missing, then loaded through the trust
+/// checks of [`read_trusted_key_file`]. `Err` carries the reason to log.
+fn load_key(source: &KeySource, cache_dir: &Path) -> Result<CacheKey, String> {
+    let path = match source {
+        KeySource::Explicit(k) => return Ok(*k),
+        KeySource::Unavailable(why) => return Err(why.clone()),
+        KeySource::File(p) => p,
+    };
+    let show = path.display();
+    if key_file_inside_cache_dir(path, cache_dir)? {
+        return Err(format!(
+            "key file {show} must not be inside the cache directory {}",
+            cache_dir.display()
+        ));
+    }
+    match read_trusted_key_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            create_key_file(path).map_err(|e| format!("cannot create key file {show}: {e}"))?;
+            log::info!("created PTX disk cache integrity key file {show}");
+            read_trusted_key_file(path)
+        }
+        other => other,
+    }
+    .map_err(|e| format!("key file {show}: {e}"))
+}
+
+/// Whether `key_file` is `cache_dir` or lies below it, comparing resolved
+/// paths (symlinks / junctions followed, case-folded on Windows). A path
+/// that cannot be resolved — relative, or with a `..` below its deepest
+/// existing ancestor — is an `Err` (fail closed).
+fn key_file_inside_cache_dir(key_file: &Path, cache_dir: &Path) -> Result<bool, String> {
+    let resolve = |p: &Path| {
+        resolve_lenient(p).ok_or_else(|| {
+            format!(
+                "cannot resolve {} (key file paths must be absolute)",
+                p.display()
+            )
+        })
+    };
+    if !key_file.is_absolute() {
+        return Err(format!(
+            "key file path {} is not absolute",
+            key_file.display()
+        ));
+    }
+    Ok(resolve(key_file)?.starts_with(resolve(cache_dir)?))
+}
+
+/// Canonicalize the deepest existing ancestor of `p` and re-append the rest;
+/// lowercased on Windows, whose file names compare case-insensitively.
+fn resolve_lenient(p: &Path) -> Option<PathBuf> {
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let mut existing = p.as_path();
+    let mut tail = Vec::new();
+    while fs::symlink_metadata(existing).is_err() {
+        // `None` (ends in `..` / `.`, or a root we cannot stat): give up.
+        tail.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?;
+    }
+    let mut out = fs::canonicalize(existing).ok()?;
+    out.extend(tail.iter().rev());
+    #[cfg(windows)]
+    let out = PathBuf::from(out.to_string_lossy().to_lowercase());
+    Some(out)
+}
+
+/// Upper bound on a key file's size; a valid one is 64 hex digits plus
+/// whitespace.
+const MAX_KEY_FILE_BYTES: u64 = 256;
+
+/// Read the key from `path` after checking it is a private regular file
+/// owned by us (see the module docs). `NotFound` is returned as such so the
+/// caller can create the file; every other failure means "not trusted".
+fn read_trusted_key_file(path: &Path) -> io::Result<CacheKey> {
+    let untrusted = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, why.to_string());
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        // O_NOFOLLOW: a symlink fails to open (ELOOP) instead of being followed.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        // Check the handle we will read from, not the path (no TOCTOU).
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(untrusted("not a regular file"));
+        }
+        // SAFETY: `geteuid` has no preconditions.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(untrusted("not owned by the current user"));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(untrusted(
+                "group or other users have access (need mode 0600)",
+            ));
+        }
+        file
+    };
+    #[cfg(windows)]
+    let file = {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(untrusted("not a regular file"));
+        }
+        if !harden_windows_path(path, "F") {
+            return Err(untrusted("cannot restrict its ACL to the current user"));
+        }
+        fs::File::open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file: fs::File = return Err(untrusted("cannot verify file ownership on this platform"));
+
+    let mut text = String::new();
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    match hex_decode(text.trim()) {
+        Some(bytes) if bytes.len() == KEY_LEN && (text.len() as u64) <= MAX_KEY_FILE_BYTES => {
+            let mut key = [0u8; KEY_LEN];
+            key.copy_from_slice(&bytes);
+            Ok(CacheKey(key))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("must contain exactly {} hex digits", KEY_LEN * 2),
+        )),
+    }
+}
+
+/// Create `path` holding a fresh random key, without ever exposing a partial
+/// or loosely-permissioned file: the key is written to an owner-only temp
+/// file next to it, which is then hard-linked into place. If another
+/// process created `path` first, its key wins and ours is discarded.
+fn create_key_file(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "key file has no parent"))?;
+    let mut dirs = fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dirs, 0o700);
+    dirs.create(parent)?;
+
+    // OS RNG (see the module docs); never a user-space PRNG.
+    let mut key = [0u8; KEY_LEN];
+    getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
+
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = parent.join(format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        next_temp_suffix()
+    ));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let result = (|| {
+        let mut f = opts.open(&tmp)?;
+        #[cfg(windows)]
+        if !harden_windows_path(&tmp, "F") {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cannot restrict the key file's ACL to the current user",
+            ));
+        }
+        f.write_all(format!("{}\n", hex_encode(&key)).as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        match fs::hard_link(&tmp, path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        }
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
+}
 
 /// Split a cache-file's contents into `(header_line, body)` (V-7).
 ///
@@ -1366,7 +1668,7 @@ mod tests {
     #[test]
     fn store_then_lookup_round_trips() {
         let dir = fresh_tempdir("rt");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(0xdead_beef_dead_beef, 0xcafe_babe_cafe_babe);
         let ptx = "// test ptx\n.version 7.0\n.target sm_70\n";
         cache.store(&key, ptx).expect("store");
@@ -1379,7 +1681,7 @@ mod tests {
     #[test]
     fn lookup_on_empty_dir_is_none() {
         let dir = fresh_tempdir("miss");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(1, 2);
         assert!(cache.lookup(&key).is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -1391,7 +1693,7 @@ mod tests {
         // instead we assert the invariant that store() never leaves a
         // ".tmp." file behind on success.
         let dir = fresh_tempdir("atomic");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(0x1234, 0x5678);
         cache.store(&key, "x").expect("store");
         let mut found_tmp = false;
@@ -1409,7 +1711,7 @@ mod tests {
     #[test]
     fn store_overwrites_existing_entry() {
         let dir = fresh_tempdir("overwrite");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(7, 8);
         cache.store(&key, "v1").expect("store v1");
         cache.store(&key, "v2").expect("store v2");
@@ -1423,7 +1725,7 @@ mod tests {
         dir.push("deeply");
         dir.push("nested");
         dir.push("ptx");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open creates dirs");
+        let cache = open_test(dir.clone()).expect("open creates dirs");
         assert!(dir.is_dir(), "open() should create the target directory");
         // Round-trip works on the freshly created path.
         cache.store("abc", "ptx").expect("store");
@@ -1453,7 +1755,7 @@ mod tests {
         // assert lookup() returns None rather than panicking.
         let dir = fresh_tempdir("corrupt");
         fs::create_dir_all(&dir).expect("mkdir");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = "bogus";
         let p = dir.join(format!("{key}.ptx"));
         fs::write(&p, [0xff, 0xfe, 0xfd]).expect("write garbage");
@@ -1696,7 +1998,7 @@ mod tests {
         std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "1");
 
         let dir = fresh_tempdir("evict_entries");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         cache.store(&hash_to_key(1, 1), "first").expect("store 1");
         cache.store(&hash_to_key(2, 2), "second").expect("store 2");
 
@@ -1725,7 +2027,7 @@ mod tests {
         std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "0");
 
         let dir = fresh_tempdir("evict_off");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         for i in 0..5u64 {
             cache.store(&hash_to_key(i, i), "ptx").expect("store");
         }
@@ -1775,7 +2077,7 @@ mod tests {
         std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "0");
 
         let dir = fresh_tempdir("evict_bytes");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         // Each stored file is header (~`#bolt-ptx-cache v1 ` + 32 hex + `\n`,
         // ~52 bytes) plus a 100-byte body => well over 100 bytes apiece, so a
         // handful of them blows past the 200-byte cap and forces eviction.
@@ -1825,7 +2127,7 @@ mod tests {
         std::env::set_var(DISK_PTX_CACHE_MAX_ENTRIES_ENV, "1000");
 
         let dir = fresh_tempdir("evict_noop");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         for i in 0..5u64 {
             cache.store(&hash_to_key(i, i), "small").expect("store");
         }
@@ -1876,7 +2178,7 @@ mod tests {
         assert_eq!(count_ptx_entries(&dir), 5, "precondition: over-cap dir");
 
         // open() runs enforce_bounds() on an enabled handle, trimming to cap.
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         if cache.is_disk_enabled() {
             assert_eq!(
                 count_ptx_entries(&dir),
@@ -1928,7 +2230,7 @@ mod tests {
         assert_eq!(count_ptx_entries(&dir), 4, "precondition: 4 entries");
 
         // open -> enforce_bounds trims to the newest 2 (highest mtime).
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         if cache.is_disk_enabled() {
             assert_eq!(count_ptx_entries(&dir), 2, "entry cap of 2 after trim");
             // The two OLDEST (keys[0], keys[1]) must be gone; the two NEWEST
@@ -2085,7 +2387,7 @@ mod tests {
             // The gate must also deny it a filesystem path everywhere it is
             // consulted: a fresh cache yields no entry_path / lookup / store.
             let dir = fresh_tempdir("vk_table");
-            let cache = DiskPtxCache::open(dir.clone()).expect("open");
+            let cache = open_test(dir.clone()).expect("open");
             assert!(
                 cache.entry_path(bad).is_none(),
                 "entry_path({bad:?}) must be None ({why})"
@@ -2162,7 +2464,7 @@ mod tests {
     #[test]
     fn traversal_key_is_lookup_miss_and_store_noop() {
         let dir = fresh_tempdir("traversal");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
 
         for bad in ["../../evil", "a/b", "a\\b", "..", "/abs"] {
             // Lookup must be a miss, never an out-of-root read.
@@ -2190,7 +2492,7 @@ mod tests {
     #[test]
     fn normal_hex_key_still_round_trips_after_validation() {
         let dir = fresh_tempdir("validrt");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
         let ptx = ".version 7.0\n.target sm_70\n";
         cache.store(&key, ptx).expect("store");
@@ -2207,7 +2509,7 @@ mod tests {
     #[test]
     fn store_writes_header_and_lookup_strips_it() {
         let dir = fresh_tempdir("v7header");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(1, 1);
         let ptx = "// body\n.version 7.0\n";
         cache.store(&key, ptx).expect("store");
@@ -2228,7 +2530,7 @@ mod tests {
     #[test]
     fn tampered_body_is_a_miss() {
         let dir = fresh_tempdir("v7tamper");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(2, 2);
         cache.store(&key, "original").expect("store");
 
@@ -2248,7 +2550,7 @@ mod tests {
     #[test]
     fn headerless_legacy_entry_is_a_miss() {
         let dir = fresh_tempdir("v7legacy");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key = hash_to_key(3, 3);
         // No header, no newline at all -> split_header returns None -> miss.
         fs::write(
@@ -2260,75 +2562,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `body_digest` is deterministic and content-sensitive: identical
-    /// `(key, body)` pairs hash equal, different bodies (almost surely)
-    /// differ, and — crucially for V-7 — the SAME body under a DIFFERENT key
-    /// produces a different digest (key binding prevents cross-key replay).
-    #[test]
-    fn body_digest_is_deterministic_and_content_sensitive() {
-        let k = "key0";
-        assert_eq!(body_digest(k, "abc"), body_digest(k, "abc"));
-        assert_ne!(body_digest(k, "abc"), body_digest(k, "abd"));
-        assert_eq!(body_digest(k, "abc").len(), 32);
-        // Key binding: identical body, different key -> different digest.
-        assert_ne!(body_digest("key0", "abc"), body_digest("key1", "abc"));
-    }
-
-    /// C-1: the stable hashing primitive returns FIXED, known values for fixed
-    /// inputs — these are pinned so a future change to the primitive (e.g. an
-    /// accidental revert to `DefaultHasher`, or a tweak to the offset
-    /// basis/prime) is caught immediately, because it would silently
-    /// cold-invalidate every on-disk cache entry across the fleet.
-    #[test]
-    fn fnv1a64_is_stable_and_matches_canonical_vectors() {
-        // Canonical FNV-1a 64-bit reference vectors (from the FNV spec):
-        //   "" -> the offset basis itself (no bytes mixed),
-        //   "a" / "foobar" -> well-known published digests.
-        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
-        // Determinism: same input -> same output, every call.
-        assert_eq!(fnv1a64(b"craton-bolt"), fnv1a64(b"craton-bolt"));
-        // Two different inputs differ.
-        assert_ne!(fnv1a64(b"abc"), fnv1a64(b"abd"));
-        // `body_digest` domain-separates its two halves by prepending a single
-        // domain byte (0xD1 / 0xD2) before hashing. Pin those framed values and
-        // confirm distinct domains over the SAME bytes diverge (so the two
-        // packed halves are independent).
-        assert_eq!(fnv1a64(b"\xD1foobar"), 0x8e7a_b894_3bd9_2391);
-        assert_eq!(fnv1a64(b"\xD2foobar"), 0xaf12_6b44_bf9a_3cd8);
-        assert_ne!(
-            fnv1a64(b"\xD1foobar"),
-            fnv1a64(b"\xD2foobar"),
-            "distinct domain bytes must yield independent halves"
-        );
-    }
-
-    /// C-1: the full key-bound `body_digest` is pinned to a fixed known value
-    /// for a fixed `(key, body)` vector. This proves the digest is stable
-    /// across toolchains (it is built from the explicit FNV-1a primitive, not
-    /// `DefaultHasher`), so an `rustc`/std upgrade no longer rotates on-disk
-    /// keys/digests and cold-invalidates the PTX cache.
-    #[test]
-    fn body_digest_pins_a_known_value() {
-        // Golden vector: stable forever. If this assertion ever needs updating
-        // for a reason OTHER than an intentional cache-format bump, the
-        // hashing primitive has regressed.
-        assert_eq!(
-            body_digest("key0", "abc"),
-            "7dbbd585c9f2a5a3dfc19f04becf51d0"
-        );
-        // A different body and a different key both diverge from it.
-        assert_eq!(
-            body_digest("key0", "abd"),
-            "7dbbda85c9f2ae22dfc1a604becf5db5"
-        );
-        assert_eq!(
-            body_digest("key1", "abc"),
-            "4584617ff2fd670ec4d91b0f80a4befd"
-        );
-    }
-
     /// V-7 key binding, end-to-end: an entry's bytes copied verbatim to a
     /// DIFFERENT `<key>.ptx` filename must miss, because `lookup` re-derives
     /// the digest from the *lookup* key and it won't match the header the
@@ -2336,7 +2569,7 @@ mod tests {
     #[test]
     fn replayed_content_under_different_key_is_a_miss() {
         let dir = fresh_tempdir("v7replay");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let key_a = hash_to_key(0x1111, 0x2222);
         let key_b = hash_to_key(0x3333, 0x4444);
         let ptx = "// body\n.version 7.0\n";
@@ -2390,7 +2623,7 @@ mod tests {
     fn open_sets_owner_only_perms_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let dir = fresh_tempdir("v7perms");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open");
+        let cache = open_test(dir.clone()).expect("open");
         let mode = fs::metadata(&dir).expect("metadata").permissions().mode();
         // Compare the low 9 permission bits; the file-type bits above are
         // irrelevant here.
@@ -2415,7 +2648,7 @@ mod tests {
     fn group_world_writable_dir_disables_disk_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let dir = fresh_tempdir("v7ww");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open must not hard-error");
+        let cache = open_test(dir.clone()).expect("open must not hard-error");
         // Loosen the perms AFTER open's chmod to simulate a pre-existing
         // world-writable dir, then re-run the trust check directly.
         fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod 0777");
@@ -2439,7 +2672,7 @@ mod tests {
     #[test]
     fn open_hardens_and_round_trips_on_windows() {
         let dir = fresh_tempdir("winacl");
-        let cache = DiskPtxCache::open(dir.clone()).expect("open must succeed after icacls pass");
+        let cache = open_test(dir.clone()).expect("open must succeed after icacls pass");
         assert!(dir.is_dir(), "open() must create the cache root");
         let key = hash_to_key(0xfeed_face_dead_beef, 0x0bad_cafe_f00d_d00d);
         let ptx = "// win ptx\n.version 7.0\n.target sm_70\n";
@@ -2450,5 +2683,358 @@ mod tests {
             "round-trip after hardening"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // W2-D-003 item 5: keyed (HMAC-SHA-256) entry integrity + key files.
+    // -----------------------------------------------------------------
+
+    const TEST_KEY: [u8; KEY_LEN] = [0x5a; KEY_LEN];
+
+    /// Open a cache under an explicit test key so unit tests never touch the
+    /// per-user default key file.
+    fn open_test(dir: PathBuf) -> io::Result<DiskPtxCache> {
+        open_keyed(dir, TEST_KEY)
+    }
+
+    fn open_keyed(dir: PathBuf, key: [u8; KEY_LEN]) -> io::Result<DiskPtxCache> {
+        DiskPtxCache::open_with(dir, &KeySource::Explicit(CacheKey(key)))
+    }
+
+    /// A `v1` entry exactly as a pre-HMAC binary wrote it: FNV-1a key-bound
+    /// digest in the header. Kept here (not in the library) only so the test
+    /// can plant a genuine legacy file.
+    fn legacy_v1_entry(key: &str, body: &str) -> String {
+        fn fnv(bytes: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        }
+        let frame = |d: u8| {
+            let mut f = vec![d];
+            f.extend_from_slice(&(key.len() as u64).to_be_bytes());
+            f.extend_from_slice(key.as_bytes());
+            f.extend_from_slice(body.as_bytes());
+            fnv(&f)
+        };
+        format!(
+            "#bolt-ptx-cache v1 {}\n{body}",
+            hash_to_key(frame(0xD1), frame(0xD2))
+        )
+    }
+
+    #[test]
+    fn keyed_round_trip_writes_a_v2_hmac_header() {
+        let dir = fresh_tempdir("hmac-rt");
+        let cache = open_test(dir.clone()).expect("open");
+        assert!(cache.is_disk_enabled());
+        let key = hash_to_key(0xabc, 0xdef);
+        let ptx = "// keyed\n.version 7.5\n";
+        cache.store(&key, ptx).expect("store");
+        let raw = fs::read_to_string(dir.join(format!("{key}.ptx"))).expect("raw");
+        let header = raw.lines().next().expect("header");
+        let tag = header
+            .strip_prefix(CACHE_HEADER_MAGIC)
+            .expect("v2 hmac-sha256 header");
+        assert_eq!(tag.len(), 64, "HMAC-SHA-256 tag is 32 bytes of hex");
+        assert_eq!(cache.lookup(&key).as_deref(), Some(ptx));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampered_body_under_a_valid_tag_misses_and_is_removed() {
+        let dir = fresh_tempdir("hmac-tamper");
+        let cache = open_test(dir.clone()).expect("open");
+        let key = hash_to_key(4, 4);
+        cache.store(&key, "original").expect("store");
+        let p = dir.join(format!("{key}.ptx"));
+        let raw = fs::read_to_string(&p).expect("read");
+        let header = raw.lines().next().expect("header");
+        fs::write(&p, format!("{header}\nEVIL PAYLOAD")).expect("tamper");
+        assert!(cache.lookup(&key).is_none(), "tampered entry must miss");
+        assert!(!p.exists(), "a rejected entry is removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unkeyed_digest_in_a_v2_header_is_a_miss() {
+        use sha2::Digest;
+        let dir = fresh_tempdir("hmac-unkeyed");
+        let cache = open_test(dir.clone()).expect("open");
+        let key = hash_to_key(5, 5);
+        let body = "EVIL PAYLOAD";
+        // An attacker without the key can only compute an unkeyed digest.
+        let forged = hex_encode(&sha2::Sha256::digest(body.as_bytes()));
+        let p = dir.join(format!("{key}.ptx"));
+        fs::write(&p, format!("{CACHE_HEADER_MAGIC}{forged}\n{body}")).expect("plant");
+        assert!(cache.lookup(&key).is_none(), "unkeyed digest must miss");
+        // Same for a recomputed legacy FNV digest relabelled as v2.
+        let legacy = legacy_v1_entry(&key, body);
+        let fnv_hex = legacy.lines().next().unwrap().rsplit(' ').next().unwrap();
+        fs::write(&p, format!("{CACHE_HEADER_MAGIC}{fnv_hex}\n{body}")).expect("plant");
+        assert!(cache.lookup(&key).is_none(), "FNV digest must miss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entry_written_under_a_different_key_is_a_miss() {
+        let dir = fresh_tempdir("hmac-otherkey");
+        let writer = open_keyed(dir.clone(), [1; KEY_LEN]).expect("open a");
+        let reader = open_keyed(dir.clone(), [2; KEY_LEN]).expect("open b");
+        let key = hash_to_key(6, 6);
+        writer.store(&key, "ptx").expect("store");
+        assert!(reader.lookup(&key).is_none(), "foreign-key entry must miss");
+        // The reader re-stores; now its own key verifies.
+        reader.store(&key, "ptx2").expect("restore");
+        assert_eq!(reader.lookup(&key).as_deref(), Some("ptx2"));
+        assert!(writer.lookup(&key).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_v1_entry_is_not_served_when_keyed() {
+        let dir = fresh_tempdir("hmac-v1");
+        let cache = open_test(dir.clone()).expect("open");
+        let key = hash_to_key(7, 7);
+        let p = dir.join(format!("{key}.ptx"));
+        fs::write(&p, legacy_v1_entry(&key, "old ptx")).expect("plant v1");
+        assert!(cache.lookup(&key).is_none(), "v1 entry must not be served");
+        assert!(!p.exists(), "v1 entry is removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_key_debug_is_redacted() {
+        let s = format!("{:?}", CacheKey([0xab; KEY_LEN]));
+        assert!(!s.contains("ab") && !s.contains("171"), "{s}");
+    }
+
+    #[test]
+    fn key_source_prefers_builder_key_then_env_file_then_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_env = std::env::var_os(DISK_PTX_CACHE_KEY_FILE_ENV);
+        let prev_key = *override_key_slot().lock();
+
+        set_override_key(Some([3; KEY_LEN]));
+        std::env::set_var(DISK_PTX_CACHE_KEY_FILE_ENV, "/somewhere/ptx.key");
+        assert!(matches!(key_source(), KeySource::Explicit(k) if k == CacheKey([3; KEY_LEN])));
+
+        set_override_key(None);
+        assert!(
+            matches!(key_source(), KeySource::File(ref p) if p == Path::new("/somewhere/ptx.key"))
+        );
+
+        std::env::remove_var(DISK_PTX_CACHE_KEY_FILE_ENV);
+        match key_source() {
+            KeySource::File(p) => assert_eq!(p, default_key_path().expect("default")),
+            KeySource::Unavailable(_) => assert!(default_key_path().is_none()),
+            KeySource::Explicit(_) => panic!("no explicit key installed"),
+        }
+
+        *override_key_slot().lock() = prev_key;
+        match prev_env {
+            Some(v) => std::env::set_var(DISK_PTX_CACHE_KEY_FILE_ENV, v),
+            None => std::env::remove_var(DISK_PTX_CACHE_KEY_FILE_ENV),
+        }
+    }
+
+    #[test]
+    fn default_key_path_is_outside_the_default_cache_dir() {
+        if let (Some(k), Some(c)) = (default_key_path(), platform_default_dir()) {
+            assert!(!k.starts_with(&c), "{} inside {}", k.display(), c.display());
+            assert_eq!(k.file_name().unwrap(), KEY_FILE_NAME);
+        }
+    }
+
+    /// `(cache_dir, key_file)` under one fresh temp root, key file a sibling
+    /// of the cache directory.
+    fn key_file_layout(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = fresh_tempdir(tag);
+        (
+            root.join("cache"),
+            root.join("keys").join(KEY_FILE_NAME),
+            root,
+        )
+    }
+
+    #[test]
+    fn missing_key_file_is_created_once_and_reused() {
+        let (cache_dir, key_file, root) = key_file_layout("kf-create");
+        assert!(!key_file.exists());
+        let src = KeySource::File(key_file.clone());
+        let first = DiskPtxCache::open_with(cache_dir.clone(), &src).expect("open 1");
+        assert!(first.is_disk_enabled(), "generated key must be trusted");
+        let contents = fs::read(&key_file).expect("key file created");
+        let k = hash_to_key(10, 10);
+        first.store(&k, "ptx").expect("store");
+
+        let second = DiskPtxCache::open_with(cache_dir.clone(), &src).expect("open 2");
+        assert_eq!(
+            fs::read(&key_file).expect("still there"),
+            contents,
+            "reused"
+        );
+        assert_eq!(
+            second.lookup(&k).as_deref(),
+            Some("ptx"),
+            "same key verifies"
+        );
+        // No temp files left next to the key file.
+        let leftovers = fs::read_dir(key_file.parent().unwrap())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != KEY_FILE_NAME)
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generated_keys_differ() {
+        let (cache_a, key_a, root_a) = key_file_layout("kf-rand-a");
+        let (cache_b, key_b, root_b) = key_file_layout("kf-rand-b");
+        DiskPtxCache::open_with(cache_a, &KeySource::File(key_a.clone())).expect("a");
+        DiskPtxCache::open_with(cache_b, &KeySource::File(key_b.clone())).expect("b");
+        assert_ne!(fs::read(&key_a).unwrap(), fs::read(&key_b).unwrap());
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+    }
+
+    #[test]
+    fn provisioned_hex_key_file_is_used() {
+        let (cache_dir, key_file, root) = key_file_layout("kf-provisioned");
+        fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+        // Created by us, so it passes the ownership check; tighten as an
+        // operator would (`chmod 600` / the user-only ACL).
+        fs::write(&key_file, format!("{}\n", hex_encode(&TEST_KEY))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let from_file =
+            DiskPtxCache::open_with(cache_dir.clone(), &KeySource::File(key_file)).expect("open");
+        let explicit = open_test(cache_dir).expect("open explicit");
+        let k = hash_to_key(11, 11);
+        from_file.store(&k, "ptx").expect("store");
+        assert_eq!(explicit.lookup(&k).as_deref(), Some("ptx"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_key_file_disables_the_disk_cache() {
+        let (cache_dir, key_file, root) = key_file_layout("kf-malformed");
+        fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+        fs::write(&key_file, "not a hex key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let cache = DiskPtxCache::open_with(cache_dir, &KeySource::File(key_file.clone()))
+            .expect("open must not hard-error");
+        assert!(!cache.is_disk_enabled());
+        assert_eq!(fs::read_to_string(&key_file).unwrap(), "not a hex key");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn key_file_inside_the_cache_dir_is_rejected() {
+        let root = fresh_tempdir("kf-inside");
+        let cache_dir = root.join("cache");
+        for key_file in [
+            cache_dir.join(KEY_FILE_NAME),
+            cache_dir.join("nested").join(KEY_FILE_NAME),
+            cache_dir.clone(),
+            cache_dir.join("sub").join("..").join(KEY_FILE_NAME),
+        ] {
+            let cache =
+                DiskPtxCache::open_with(cache_dir.clone(), &KeySource::File(key_file.clone()))
+                    .expect("open");
+            assert!(!cache.is_disk_enabled(), "{} accepted", key_file.display());
+            assert!(!cache_dir.join(KEY_FILE_NAME).exists(), "nothing created");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_key_file_path_is_rejected() {
+        let root = fresh_tempdir("kf-relative");
+        let cache = DiskPtxCache::open_with(
+            root.join("cache"),
+            &KeySource::File(PathBuf::from("relative").join(KEY_FILE_NAME)),
+        )
+        .expect("open");
+        assert!(!cache.is_disk_enabled());
+        assert!(!Path::new("relative").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unavailable_key_source_disables_the_disk_cache() {
+        let dir = fresh_tempdir("kf-unavailable");
+        let cache = DiskPtxCache::open_with(dir.clone(), &KeySource::Unavailable("no home".into()))
+            .expect("open");
+        assert!(!cache.is_disk_enabled());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_file_inside_the_cache_dir_is_rejected_case_insensitively_on_windows() {
+        let root = fresh_tempdir("kf-case");
+        let cache_dir = root.join("cache");
+        let shouted = PathBuf::from(cache_dir.to_string_lossy().to_uppercase()).join(KEY_FILE_NAME);
+        let cache =
+            DiskPtxCache::open_with(cache_dir.clone(), &KeySource::File(shouted)).expect("open");
+        assert!(!cache.is_disk_enabled());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cache_dir, key_file, root) = key_file_layout("kf-0600");
+        let cache =
+            DiskPtxCache::open_with(cache_dir, &KeySource::File(key_file.clone())).expect("open");
+        assert!(cache.is_disk_enabled());
+        let mode = fs::metadata(&key_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_accessible_key_file_is_rejected_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o640, 0o604, 0o620, 0o602] {
+            let (cache_dir, key_file, root) = key_file_layout("kf-loose");
+            DiskPtxCache::open_with(cache_dir.clone(), &KeySource::File(key_file.clone()))
+                .expect("create");
+            fs::set_permissions(&key_file, fs::Permissions::from_mode(mode)).unwrap();
+            let cache =
+                DiskPtxCache::open_with(cache_dir, &KeySource::File(key_file)).expect("open");
+            assert!(!cache.is_disk_enabled(), "mode {mode:o} accepted");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_key_file_is_rejected_on_unix() {
+        let (cache_dir, key_file, root) = key_file_layout("kf-symlink");
+        let real = root.join("real.key");
+        DiskPtxCache::open_with(cache_dir.clone(), &KeySource::File(real.clone())).expect("mk");
+        fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &key_file).unwrap();
+        let cache = DiskPtxCache::open_with(cache_dir, &KeySource::File(key_file)).expect("open");
+        assert!(
+            !cache.is_disk_enabled(),
+            "a symlinked key file must not be trusted"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

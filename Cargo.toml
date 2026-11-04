@@ -66,6 +66,13 @@ log = "0.4"
 # installing a subscriber (`tracing_subscriber::fmt().init()` is the simplest
 # choice). See `src/observability.rs` for the span-name catalogue.
 tracing = "0.1"
+# Keyed integrity for the optional disk PTX cache (`jit::disk_cache`): entries are
+# HMAC-SHA-256 tagged with a per-user secret key, verified in constant time.
+# RustCrypto, MIT OR Apache-2.0. `getrandom` (already in the graph via ahash)
+# generates that key from the OS RNG when none is supplied.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
 # cudarc is the default pure-Rust CUDA Driver API/context adapter. The
 # dependency's own optional features stay narrow: Bolt needs only its driver
 # surface and routes remaining unsupported calls through raw FFI on the same

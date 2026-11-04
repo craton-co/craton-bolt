@@ -1379,6 +1379,8 @@ pub struct EngineBuilder {
     memory_budget_bytes: Option<usize>,
     /// Optional disk-backed PTX cache directory.
     persistent_cache_path: Option<std::path::PathBuf>,
+    /// Optional disk PTX cache integrity key (redacted in `Debug`).
+    persistent_cache_key: Option<crate::jit::disk_cache::CacheKey>,
     /// Install a default tracing subscriber from [`build`](Self::build).
     enable_tracing: bool,
     /// Host memory budget in bytes (see [`EngineBuilder::host_memory_budget`]).
@@ -1415,6 +1417,7 @@ impl EngineBuilder {
             device: None,
             memory_budget_bytes: None,
             persistent_cache_path: None,
+            persistent_cache_key: None,
             enable_tracing: false,
             disable_optimizer: false,
             host_memory_budget_bytes: None,
@@ -1531,6 +1534,17 @@ impl EngineBuilder {
     /// responsibility to ensure the location is writable.
     pub fn persistent_cache(mut self, path: std::path::PathBuf) -> Self {
         self.persistent_cache_path = Some(path);
+        self
+    }
+
+    /// Supply the 32-byte secret key that authenticates disk PTX cache
+    /// entries (HMAC-SHA-256). Without it the key is read from the file named
+    /// by `BOLT_PTX_CACHE_KEY_FILE`, or from a per-user key file created on
+    /// first use; see [`crate::jit::disk_cache`]. Takes precedence over both.
+    /// Do not store the key in the cache directory. An entry written under
+    /// another key is never launched; it is recompiled and replaced.
+    pub fn persistent_cache_key(mut self, key: [u8; 32]) -> Self {
+        self.persistent_cache_key = Some(crate::jit::disk_cache::CacheKey(key));
         self
     }
 
@@ -1652,6 +1666,9 @@ impl EngineBuilder {
         // `persistent_cache` must not clobber disk-cache configuration that
         // other code (or the env var) installed. See
         // `install_persistent_cache_override` for the precedence contract.
+        if let Some(key) = self.persistent_cache_key {
+            crate::jit::disk_cache::set_override_key(Some(key.0));
+        }
         if self.persistent_cache_path.is_some() {
             install_persistent_cache_override(self.persistent_cache_path.as_deref());
         }
@@ -7115,6 +7132,18 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    /// The builder's integrity key is never printed by `Debug`.
+    #[test]
+    fn builder_debug_redacts_the_persistent_cache_key() {
+        let b = EngineBuilder::new().persistent_cache_key([0xab; 32]);
+        let s = format!("{b:?}");
+        assert!(
+            s.contains("persistent_cache_key: Some(CacheKey(<redacted>))"),
+            "{s}"
+        );
+        assert!(!s.contains("171"), "{s}");
     }
 
     #[test]
