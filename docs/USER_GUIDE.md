@@ -142,6 +142,20 @@ Dictionaries are **unioned across all registered batches**: a string
 literal that appears only in batch 2 still resolves correctly in
 `WHERE col = 'literal'`.
 
+Each append costs time proportional to the new batch, not the table: the
+Utf8 dictionaries are extended with the batch's values only, and the
+stored chunks are merged geometrically rather than on every call.
+
+### Removing one table — `deregister_table` / `drop_table`
+
+`engine.deregister_table("sales")?` removes one table without touching the
+others or rebuilding the engine: its host batches, resident GPU copy,
+Utf8 dictionaries, statistics and cached plans are released, and the name
+can be registered again with any schema. `drop_table` does the same and
+also drops the table from an attached catalog; SQL `DROP TABLE [IF EXISTS]`
+goes through `drop_table`. Both return `BoltError::Plan` when the table is
+not registered; check `table_names()` first for drop-if-exists semantics.
+
 ### Streaming — `register_table_stream` / `register_table_stream_lazy`
 
 `Engine::register_table_stream(name, schema, iter)` drains a `RecordBatch`

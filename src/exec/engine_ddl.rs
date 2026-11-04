@@ -1343,6 +1343,59 @@ fn read_copy_file(
 mod tests {
     use super::*;
 
+    /// `deregister_table` forgets every per-table structure: the resident
+    /// device copy, the Utf8 dictionaries, the provider entry and the host
+    /// batches, so a dropped table holds no device memory (W1-B-006).
+    #[test]
+    #[ignore = "gpu:projection"]
+    fn deregister_releases_device_and_dictionary_state() {
+        use arrow_array::{Int64Array, StringArray};
+        let mut e = Engine::new().expect("ctx");
+        let t = batch(vec![
+            (
+                "x",
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef,
+            ),
+            (
+                "s",
+                Arc::new(StringArray::from(vec!["a", "b", "a"])) as ArrayRef,
+            ),
+        ]);
+        e.register_table("t", t).unwrap();
+        e.register_table(
+            "u",
+            batch(vec![(
+                "y",
+                Arc::new(Int64Array::from(vec![7i64])) as ArrayRef,
+            )]),
+        )
+        .unwrap();
+        e.sql("SELECT x + 1 FROM t WHERE x > 1").unwrap();
+        e.sql("SELECT y + 1 FROM u WHERE y > 1").unwrap();
+        assert_eq!(
+            e.sql("SELECT x FROM t WHERE s = 'a'")
+                .unwrap()
+                .record_batch()
+                .num_rows(),
+            2
+        );
+        assert!(
+            e.gpu_tables.borrow().contains_key("t"),
+            "the projection made t resident"
+        );
+        assert!(e.dict_registry.borrow().dictionary("t", "s").is_some());
+
+        e.deregister_table("t").unwrap();
+        assert!(!e.has_table("t"));
+        assert!(!e.gpu_tables.borrow().contains_key("t"));
+        assert!(e.dict_registry.borrow().dictionary("t", "s").is_none());
+        assert!(
+            e.gpu_tables.borrow().contains_key("u"),
+            "other tables stay resident"
+        );
+        assert!(e.sql("SELECT y FROM u").is_ok());
+    }
+
     #[test]
     fn ddl_types_cover_common_spellings() {
         assert_eq!(ddl_type("INT").unwrap(), DataType::Int32);
