@@ -70,7 +70,8 @@
 //!     an ordering predicate — the correct projection of SQL 3VL into a boolean
 //!     filter. This is **binary** collation, NOT locale-aware / ICU collation,
 //!     which is out of scope.
-//!   * Column-vs-column Utf8 ordering (`col_a < col_b`, both dict columns) is
+//!   * Column-vs-column Utf8 comparison (`col_a < col_b`, `col_a = col_b`,
+//!     both dict columns) is
 //!     lowered to a GPU rank comparison by finding F12 below: the rewriter emits
 //!     a NULL-safe integer predicate over two materialised per-row rank columns.
 //!     Any shape the rank path can't cover (a non-dict or protected column,
@@ -81,9 +82,10 @@
 //!   * `col_a OP col_b` (`OP` in `< <= > >=`) over two dict-encoded Utf8
 //!     columns is order-equivalent to comparing the two rows' **collation
 //!     ranks**: `rank(a_row) OP rank(b_row)`, where `rank` maps a row's
-//!     dictionary index to the byte-sorted position of its string. Equality
-//!     already works via index equality; ordering needs ranks because a
-//!     dictionary's insertion-index order is not its lexicographic order.
+//!     dictionary index to the byte-sorted position of its string. Ordering
+//!     needs ranks because a dictionary's insertion-index order is not its
+//!     lexicographic order; `=` / `<>` (`OP` in `= <>` too) need them because
+//!     two columns' dictionaries assign unrelated indices.
 //!   * CROSS-DICTIONARY CORRECTNESS: `col_a` and `col_b` may carry DIFFERENT
 //!     dictionaries, so each column's *own* collation rank is meaningless to the
 //!     other (rank 2 in dict A and rank 2 in dict B name unrelated strings).
@@ -601,7 +603,7 @@ fn collect_rank_needed_columns<R: LiteralResolver>(
             return;
         }
         if let Expr::Binary { op, left, right } = e {
-            if is_ordering(*op) {
+            if is_rank_comparison(*op) {
                 if let Some((a, b)) = extract_two_columns(left, right) {
                     if r.knows(&a)
                         && r.knows(&b)
@@ -819,6 +821,14 @@ fn is_eq_or_neq(op: BinaryOp) -> bool {
     matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
 }
 
+/// True for the comparisons a column-vs-column rank comparison lowers: the
+/// orderings, and `=` / `<>` (two strings are equal exactly when their ranks in
+/// the shared universe are; the two columns' own dictionary indices are not
+/// comparable across dictionaries).
+fn is_rank_comparison(op: BinaryOp) -> bool {
+    is_ordering(op) || matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
+}
+
 /// True for ordering comparisons.
 fn is_ordering(op: BinaryOp) -> bool {
     matches!(
@@ -906,7 +916,7 @@ pub fn plan_col_vs_col_rank<R: LiteralResolver>(
     right: &Expr,
     r: &R,
 ) -> Option<(BinaryOp, ColVsColRankPlan)> {
-    if !is_ordering(op) {
+    if !is_rank_comparison(op) {
         return None;
     }
     let (col_a, col_b) = extract_two_columns(left, right)?;
@@ -3183,15 +3193,29 @@ mod tests {
         }
     }
 
-    /// Equality / non-ordering ops do NOT match the F12 ordering path (equality
-    /// is already handled by index equality elsewhere).
+    /// `=` / `<>` between two dictionary columns also lower to a rank
+    /// comparison (the two dictionaries' indices are not comparable): equal
+    /// ranks in the shared universe mean equal strings. Non-comparison ops do
+    /// not match.
     #[test]
-    fn f12_plan_rejects_non_ordering_ops() {
+    fn f12_plan_ranks_equality_and_rejects_non_comparisons() {
         let r = MockResolver::new()
-            .with_dict("a", &["x"])
-            .with_dict("b", &["y"]);
-        assert!(plan_col_vs_col_rank(BinaryOp::Eq, &col("a"), &col("b"), &r).is_none());
-        assert!(plan_col_vs_col_rank(BinaryOp::NotEq, &col("a"), &col("b"), &r).is_none());
+            .with_dict("a", &["x", "y"])
+            .with_dict("b", &["y", "z"]);
+        let (_, plan) = plan_col_vs_col_rank(BinaryOp::Eq, &col("a"), &col("b"), &r).unwrap();
+        let (a, b) = (["x", "y"], ["y", "z"]);
+        for (i, a_s) in a.iter().enumerate() {
+            for (j, b_s) in b.iter().enumerate() {
+                assert_eq!(
+                    plan.rank_a[i + 1] == plan.rank_b[j + 1],
+                    a_s == b_s,
+                    "{a_s} = {b_s}"
+                );
+            }
+        }
+        assert!(plan_col_vs_col_rank(BinaryOp::NotEq, &col("a"), &col("b"), &r).is_some());
+        assert!(plan_col_vs_col_rank(BinaryOp::Add, &col("a"), &col("b"), &r).is_none());
+        assert!(plan_col_vs_col_rank(BinaryOp::And, &col("a"), &col("b"), &r).is_none());
     }
 
     /// If EITHER column is not a registered dict column, the plan declines and
