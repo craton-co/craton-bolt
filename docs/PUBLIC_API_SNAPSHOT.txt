@@ -541,6 +541,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::host_memory_budget(self, usize)
 pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache_key(self, [u8; 32]) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::sql_semantics(self, craton_bolt::plan::sql_semantics::SqlSemantics) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
@@ -1231,6 +1232,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::host_memory_budget(self, usize)
 pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache_key(self, [u8; 32]) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::sql_semantics(self, craton_bolt::plan::sql_semantics::SqlSemantics) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self
@@ -1306,6 +1308,7 @@ pub fn craton_bolt::jit::disk_cache::DiskPtxCache::store(&self, &str, &str) -> s
 pub const craton_bolt::jit::disk_cache::DEFAULT_MAX_CACHE_BYTES: u64
 pub const craton_bolt::jit::disk_cache::DEFAULT_MAX_CACHE_ENTRIES: u64
 pub const craton_bolt::jit::disk_cache::DISK_PTX_CACHE_ENV: &str
+pub const craton_bolt::jit::disk_cache::DISK_PTX_CACHE_KEY_FILE_ENV: &str
 pub const craton_bolt::jit::disk_cache::DISK_PTX_CACHE_MAX_BYTES_ENV: &str
 pub const craton_bolt::jit::disk_cache::DISK_PTX_CACHE_MAX_ENTRIES_ENV: &str
 pub fn craton_bolt::jit::disk_cache::current_override_dir() -> core::option::Option<std::path::PathBuf>
@@ -3654,6 +3657,7 @@ pub fn craton_bolt::exec::engine::EngineBuilder::host_memory_budget(self, usize)
 pub fn craton_bolt::exec::engine::EngineBuilder::memory_budget(self, usize) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::new() -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache(self, std::path::PathBuf) -> Self
+pub fn craton_bolt::exec::engine::EngineBuilder::persistent_cache_key(self, [u8; 32]) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::spill_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::sql_semantics(self, craton_bolt::plan::sql_semantics::SqlSemantics) -> Self
 pub fn craton_bolt::exec::engine::EngineBuilder::tier_policy(self, craton_bolt::exec::cost::TierPolicy) -> Self

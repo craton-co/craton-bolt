@@ -237,9 +237,34 @@ PTX-cache directory, are not configuration knobs and are omitted.)
   overrides this env var when set (see `jit::set_disk_ptx_cache_dir`).
   Writes are atomic (tempfile + rename); read failures fall back to the
   codegen path silently — a corrupt cache entry never produces a wrong
-  result.
+  result. Entries are authenticated with HMAC-SHA-256 under a secret key
+  kept outside the directory (see `BOLT_PTX_CACHE_KEY_FILE`); an entry
+  without a valid tag is removed and never launched.
 - **Source**: `src/jit/disk_cache.rs` (env var name constant:
   `DISK_PTX_CACHE_ENV`).
+
+### `BOLT_PTX_CACHE_KEY_FILE`
+- **Default**: unset — the key is read from (or created at) the per-user file
+  `%LOCALAPPDATA%\craton-bolt\ptx-cache.key` (Windows),
+  `~/Library/Application Support/craton-bolt/ptx-cache.key` (macOS), or
+  `$XDG_CONFIG_HOME/craton-bolt/ptx-cache.key` /
+  `~/.config/craton-bolt/ptx-cache.key` (others).
+- **Type**: absolute path to a file holding 64 hex digits (a 32-byte key;
+  surrounding whitespace ignored), e.g. `openssl rand -hex 32 > key`.
+- **What**: Names the secret key that authenticates disk PTX cache entries
+  (HMAC-SHA-256 over the codegen salt, cache key and PTX bytes). A missing
+  file is created once with a random key from the OS RNG and reused after.
+- **Rules (fail closed)**: the path must be absolute and must not be inside
+  the cache directory. Unix: a regular file (symlinks refused) owned by the
+  current user with no group/other permission bits (`chmod 600`). Windows:
+  not a symlink; its ACL is reset to the current user with `icacls`. If the
+  key cannot be read or trusted, the disk cache is disabled with a warning
+  and the engine runs on in-memory PTX only.
+- **Notes**: `EngineBuilder::persistent_cache_key(key)` takes precedence
+  over this variable. Two processes that share a cache directory must share
+  the key, or each replaces the other's entries.
+- **Source**: `src/jit/disk_cache.rs` (`DISK_PTX_CACHE_KEY_FILE_ENV`,
+  `key_source`).
 
 ### `CRATON_BOLT_PTX_CACHE_MAX_BYTES`
 - **Default**: `67_108_864` (64 MiB)

@@ -385,7 +385,14 @@ These are real, code-level behaviors to be aware of:
   entry-count cap (`CRATON_BOLT_PTX_CACHE_MAX_ENTRIES`, default 4096); setting
   either var to `0` disables that one cap. See
   [`ENV_VARS.md`](ENV_VARS.md) for the knobs and [`ROADMAP.md`](../ROADMAP.md)
-  "Known limitations" for remaining builder-surface gaps.
+  "Known limitations" for remaining builder-surface gaps. Entries are
+  HMAC-SHA-256 authenticated under a key kept outside the cache directory;
+  that key protects against other local users, not against a process
+  running as the same user (which can read the key file), and processes
+  sharing one cache directory must share the key or they keep replacing
+  each other's entries. The integrity key, like the directory override, is
+  process-global (`EngineBuilder::persistent_cache_key` installs it for
+  every later engine in the process).
 
 ---
 

@@ -647,6 +647,15 @@ CLI tools, and per-request workers that never benefit from the
 in-process cache alone. See [`ENV_VARS.md`](ENV_VARS.md) for the path
 conventions. The in-process cache still covers the steady-state case.
 
+Cached PTX is launched, so each entry is authenticated with HMAC-SHA-256
+under a secret key that is not stored in the cache directory. By default
+the key lives in a per-user file (`ptx-cache.key`, created on first use
+with owner-only permissions); point `BOLT_PTX_CACHE_KEY_FILE` at another
+file, or pass the key directly with
+`Engine::builder().persistent_cache_key(key)`. Processes that share a cache
+directory must share the key. If the key cannot be trusted the disk cache
+is turned off with a warning; queries still run.
+
 ### Multi-GPU
 
 One CUDA context per `Engine`, one `Engine` per GPU. To use multiple

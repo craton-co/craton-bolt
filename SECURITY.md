@@ -156,7 +156,8 @@ genuine trust boundary. The enforced controls are:
   the user's profile ACL, with a best-effort `icacls` tightening for explicit
   shared-dir overrides. **A locally-writable cache directory is the risk:** a
   different local user who can write the directory can plant or tamper with
-  `<key>.ptx` files that this process would load and launch.
+  `<key>.ptx` files; without the integrity key (below) those are rejected,
+  and with a trusted directory they cannot be planted at all.
 - **Fail-closed directory trust.** A handle that fails its directory trust
   check becomes a disk no-op (lookups miss, stores write nothing); the engine
   keeps running on in-process codegen, so a disabled disk layer is always
@@ -171,13 +172,25 @@ genuine trust boundary. The enforced controls are:
   + optional build-time fingerprint). This guards against serving *stale*
   PTX written by a structurally different binary; it is a correctness guard,
   not an authenticity guard.
-- **Integrity header is anti-corruption, not anti-tamper.** Each file carries
-  a `#bolt-ptx-cache v1 <digest>` header and the body is verified on read.
-  This is a non-cryptographic `DefaultHasher` digest: it catches accidental
-  corruption / partial writes and trips naive tampering, but it is **not a
-  MAC**. An attacker who can write the cache directory can recompute the
-  digest, so the header does **not** substitute for the directory permissions
-  above — those (the `0o700` / per-user ACL) are the load-bearing control.
+- **Keyed entry integrity (HMAC-SHA-256).** Each file carries a
+  `#bolt-ptx-cache v2 hmac-sha256 <tag>` header: an HMAC-SHA-256 (RustCrypto
+  `hmac` / `sha2`) over the codegen salt, the cache key and the PTX bytes,
+  under a 32-byte secret key that is **not stored in the cache directory**.
+  The tag is checked in constant time before the bytes are returned; a
+  missing, unkeyed (the old `v1` FNV-1a header), tampered, renamed or
+  foreign-key entry is a miss, is removed, and is never launched. The key
+  comes from `EngineBuilder::persistent_cache_key`, else the file named by
+  `BOLT_PTX_CACHE_KEY_FILE`, else a per-user file (`ptx-cache.key` under
+  `%LOCALAPPDATA%\craton-bolt\`, `~/Library/Application Support/craton-bolt/`
+  or `$XDG_CONFIG_HOME`/`~/.config/craton-bolt/`) created on first use with
+  32 bytes from the OS RNG (`getrandom`). A key file must be an absolute path
+  outside the cache directory and pass fail-closed checks like the directory:
+  Unix — a regular file (no symlink, `O_NOFOLLOW`) owned by the effective uid
+  with mode `0600` or stricter; Windows — not a symlink, ACL reset to the
+  current user with `icacls`. A key that cannot be obtained or trusted
+  disables the disk cache with a warning. **Residual:** a process running as
+  the same user (or an administrator) can read the key; the boundary is
+  "other local users", not "same user".
 
 If you cannot guarantee a single-owner cache directory, leave the disk cache
 disabled (the default).
@@ -271,7 +284,7 @@ build-toolchain tree, which was the reason one existed, has been removed.
 | Input byte/token-size DoS | Mitigated — parse-time caps enforced before the parser runs (`CRATON_MAX_SQL_BYTES` default 1 MiB, `CRATON_MAX_SQL_TOKENS` default 100k); tunable defaults, residual under-cap planning cost |
 | Query-time / row-count budget | **Not** enforced — caller's responsibility |
 | PTX cache integrity vs. accidental corruption | Enforced — integrity header verified on read |
-| PTX cache integrity vs. a writer of the cache dir | **Boundary is the dir permissions** (`0o700` / per-user ACL), not the header (no MAC) |
+| PTX cache integrity vs. a writer of the cache dir | Enforced — HMAC-SHA-256 tag under a key kept outside the cache dir, plus the dir permissions (`0o700` / per-user ACL); not against a same-user process that can read the key |
 | Cache path traversal | Enforced — strict key charset, fail-to-miss |
 | Host memory safety | Enforced at compile time (Rust + borrow-checked GPU handles) |
 | Device-side execution correctness | Blocking real-GPU CI plus conformance tests; still pre-1.0 |
