@@ -134,6 +134,10 @@ fn builder_knobs_propagate_to_engine() {
         .device(0)
         .memory_budget(128 * 1024 * 1024)
         .persistent_cache(cache_dir.clone())
+        // The disk-cache override is process-global and later tests in this
+        // binary may query through it: an explicit key keeps them from
+        // creating the real per-user key file.
+        .persistent_cache_key([0x24; 32])
         .enable_tracing()
         .build()
         .expect("build with knobs");

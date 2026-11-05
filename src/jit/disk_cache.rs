@@ -534,9 +534,22 @@ fn key_source() -> KeySource {
     }
 }
 
+/// Default key file path. Unit tests get a per-process file under the OS temp
+/// directory so a test run never creates or reads the real per-user key.
+fn default_key_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    return Some(
+        std::env::temp_dir()
+            .join(format!("craton-bolt-test-key-{}", std::process::id()))
+            .join(KEY_FILE_NAME),
+    );
+    #[cfg(not(test))]
+    profile_key_path()
+}
+
 /// Per-user default key file path (see the module docs), independent of the
 /// cache directory. `None` when the relevant environment variables are unset.
-fn default_key_path() -> Option<PathBuf> {
+fn profile_key_path() -> Option<PathBuf> {
     let non_empty = |v: &str| {
         std::env::var_os(v)
             .filter(|s| !s.is_empty())
@@ -2843,10 +2856,19 @@ mod tests {
 
     #[test]
     fn default_key_path_is_outside_the_default_cache_dir() {
-        if let (Some(k), Some(c)) = (default_key_path(), platform_default_dir()) {
+        // Path computation only; nothing is created.
+        if let (Some(k), Some(c)) = (profile_key_path(), platform_default_dir()) {
             assert!(!k.starts_with(&c), "{} inside {}", k.display(), c.display());
             assert_eq!(k.file_name().unwrap(), KEY_FILE_NAME);
         }
+    }
+
+    /// Unit tests never touch the real per-user key file.
+    #[test]
+    fn test_builds_keep_the_default_key_file_in_the_temp_dir() {
+        let k = default_key_path().expect("test default");
+        assert!(k.starts_with(std::env::temp_dir()), "{}", k.display());
+        assert_ne!(Some(k), profile_key_path());
     }
 
     /// `(cache_dir, key_file)` under one fresh temp root, key file a sibling
