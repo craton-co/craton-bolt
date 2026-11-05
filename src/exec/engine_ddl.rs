@@ -251,13 +251,14 @@ impl Engine {
     pub fn execute_sql(&mut self, sql: &str) -> BoltResult<QueryHandle> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         if is_maintenance_statement(trimmed) {
+            crate::exec::cancel::check()?;
             self.ensure_transaction_usable()?;
             let r = self.count_statement(|e| {
                 e.try_maintenance_statement(trimmed).unwrap_or_else(|| {
                     Err(BoltError::Sql(format!("malformed statement: {trimmed}")))
                 })
             });
-            if r.is_err() {
+            if r.as_ref().is_err_and(|e| !e.is_cancelled()) {
                 self.abort_transaction_on_error();
             }
             return r;
@@ -279,9 +280,14 @@ impl Engine {
                     | Statement::ReleaseSavepoint { .. }
             );
             if control {
+                // Transaction control is never interrupted: a cancelled
+                // token must still be able to ROLLBACK, and a COMMIT that
+                // started applies whole.
+                let _whole = crate::exec::cancel::uninterruptible();
                 last = Some(self.count_statement(|e| e.transaction_statement(stmt))?);
                 continue;
             }
+            crate::exec::cancel::check()?;
             self.ensure_transaction_usable()?;
             let r = (|| {
                 // Catch up on-commit views with changes made through the
@@ -300,12 +306,37 @@ impl Engine {
             match r {
                 Ok(h) => last = Some(h),
                 Err(e) => {
-                    self.abort_transaction_on_error();
+                    // A cancelled statement changed nothing (it stops only
+                    // before its commit point), so the transaction stays
+                    // usable.
+                    if !e.is_cancelled() {
+                        self.abort_transaction_on_error();
+                    }
                     return Err(e);
                 }
             }
         }
         Ok(last.expect("at least one statement"))
+    }
+
+    /// [`Engine::execute_sql`] that stops early, with
+    /// [`BoltError::Cancelled`], once `token` is cancelled or its deadline
+    /// passes (polled as described on [`Engine::sql_with_cancel`]).
+    ///
+    /// A data-changing statement polls the token for the last time just
+    /// before it applies its change; once applying, it completes. So a
+    /// cancelled statement leaves every table as it was, statements after
+    /// it do not run, and statements before it keep their effect. Inside a
+    /// transaction a cancelled statement does not abort the transaction.
+    /// Transaction control (`BEGIN` / `COMMIT` / `ROLLBACK` / savepoints) is
+    /// never interrupted, so a cancelled token can still `ROLLBACK`.
+    pub fn execute_sql_with_cancel(
+        &mut self,
+        sql: &str,
+        token: &crate::CancellationToken,
+    ) -> BoltResult<QueryHandle> {
+        let _active = crate::exec::cancel::scope(token);
+        self.execute_sql(sql)
     }
 
     /// `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints.
@@ -491,6 +522,7 @@ impl Engine {
                         ))
                     }
                 };
+                let _commit = crate::exec::cancel::commit_point()?;
                 if self.has_table(&name) {
                     self.drop_table(&name)?;
                 }
@@ -622,6 +654,7 @@ impl Engine {
                         CopySource::Query(q) => q.to_string(),
                     };
                     let rows = self.sql(&query)?.into_record_batch();
+                    let _commit = crate::exec::cancel::commit_point()?;
                     write_copy_file(std::path::Path::new(&path), &rows, format)?;
                     Ok(status(rows.num_rows() as u64))
                 } else {
@@ -763,6 +796,7 @@ impl Engine {
         if n == 0 {
             return Ok(0);
         }
+        let _commit = crate::exec::cancel::commit_point()?;
         #[cfg(feature = "storage")]
         if let Some(cat) = self.catalog.as_mut() {
             if cat.table(name).is_some() {

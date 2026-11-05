@@ -359,6 +359,8 @@ impl Engine {
                 crate::metrics::metrics().inc(crate::metrics::Counter::HostTierQueries);
                 Ok(Some(QueryHandle::from_record_batch(b)))
             }
+            // A cancelled statement stops; it does not retry on the GPU.
+            Err(e) if e.is_cancelled() => Err(e),
             Err(e) => {
                 log::debug!("host tier: falling back to the GPU path ({e})");
                 Ok(None)
@@ -384,6 +386,8 @@ impl Engine {
     }
 
     fn host_eval(&self, plan: &LogicalPlan) -> BoltResult<RecordBatch> {
+        // Host-tier operator boundary.
+        crate::exec::cancel::check()?;
         let out_schema = plan.schema()?;
         match plan {
             LogicalPlan::Scan { table, .. } => {

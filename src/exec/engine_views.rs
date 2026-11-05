@@ -520,12 +520,16 @@ impl Engine {
         refresh: RefreshMode,
         or_replace: bool,
     ) -> BoltResult<u64> {
+        // Replacing a view drops it before recomputing it, so the statement
+        // commits (stops being cancellable) here.
+        let mut _commit = None;
         if self.view_exists(name) {
             if !or_replace {
                 return Err(BoltError::Plan(format!(
                     "materialized view '{name}' already exists"
                 )));
             }
+            _commit = Some(crate::exec::cancel::commit_point()?);
             self.drop_view(name)?;
         } else if self.has_table(name) {
             return Err(BoltError::Plan(format!(
@@ -553,6 +557,7 @@ impl Engine {
         }
         let rows = self.sql(sql)?.into_record_batch();
         let n = rows.num_rows() as u64;
+        let _commit = crate::exec::cancel::commit_point()?;
         self.create_table(name, rows, !durable)?;
         let def = ViewDef {
             sql: sql.to_string(),
@@ -603,6 +608,7 @@ impl Engine {
         };
         let n = rows.num_rows() as u64;
         let rows = crate::exec::engine_ddl::align_batch(&rows, &target, &[])?;
+        let _commit = crate::exec::cancel::commit_point()?;
         let updated = ViewDef {
             base_versions: self.snapshot_versions(&def.dependencies),
             base_files: self.base_files(&def.dependencies),
@@ -678,6 +684,9 @@ impl Engine {
 
     /// Hook run after a statement changed table `name`.
     pub(crate) fn after_table_change(&mut self, name: &str) -> BoltResult<()> {
+        // The change is applied: finish its follow-up work whatever the
+        // statement's cancellation token says.
+        let _whole = crate::exec::cancel::uninterruptible();
         self.touch_table(name);
         self.refresh_stale_on_commit_views()
     }

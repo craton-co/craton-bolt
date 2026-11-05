@@ -216,6 +216,7 @@ impl Engine {
         }
         let (rows, affected) = self.rewritten(name, qualifier, predicate, set, &schema)?;
         if affected > 0 {
+            let _commit = crate::exec::cancel::commit_point()?;
             self.replace_table(name, rows)?;
             self.after_table_change(name)?;
         }
@@ -269,6 +270,7 @@ impl Engine {
         if affected == 0 {
             return Ok(0);
         }
+        let _commit = crate::exec::cancel::commit_point()?;
         self.catalog.as_mut().expect("checked").rewrite_files(
             name,
             &touched,
@@ -592,6 +594,7 @@ impl Engine {
 
     /// Store `rows` (with their new schema) as table `name`.
     fn store_altered(&mut self, name: &str, rows: RecordBatch) -> BoltResult<()> {
+        let _commit = crate::exec::cancel::commit_point()?;
         #[cfg(feature = "storage")]
         if let Some(cat) = self.catalog.as_mut() {
             if let Some(meta) = cat.table(name) {

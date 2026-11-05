@@ -1436,6 +1436,8 @@ fn run_radix_pipeline_i32(
         stream
             .synchronize()
             .map_err(|e| BoltError::Other(format!("radix i32 histogram synchronize: {e}")))?;
+        // The pass's kernels have retired: a safe point to stop.
+        crate::exec::cancel::check()?;
 
         // Build per-block-per-digit exclusive output offsets on the host (cheap
         // — `num_blocks * 16` u32s). This is what makes the scatter stable
@@ -1611,6 +1613,8 @@ fn run_radix_pipeline_i64(
             )?;
         }
         stream.synchronize()?;
+        // The pass's kernels have retired: a safe point to stop.
+        crate::exec::cancel::check()?;
 
         // Per-block-per-digit exclusive output offsets (cross-block stable).
         // See the i32 mirror and `compute_block_offsets` for the construction.
@@ -1754,6 +1758,8 @@ fn run_radix_pipeline_f32(
             )?;
         }
         stream.synchronize()?;
+        // The pass's kernels have retired: a safe point to stop.
+        crate::exec::cancel::check()?;
 
         compute_block_offsets(
             hist_host.as_slice(),
@@ -1879,6 +1885,8 @@ fn run_radix_pipeline_f64(
             )?;
         }
         stream.synchronize()?;
+        // The pass's kernels have retired: a safe point to stop.
+        crate::exec::cancel::check()?;
 
         compute_block_offsets(
             hist_host.as_slice(),

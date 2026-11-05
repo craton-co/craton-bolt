@@ -248,6 +248,7 @@ fn execute_inner_join(
     let mut build_pairs: Vec<u32> = Vec::new();
     let mut probe_pairs: Vec<u32> = Vec::new();
     for row in 0..probe_batch.num_rows() {
+        crate::exec::cancel::check_row(row)?;
         let Some(key) = extract_key(probe_batch, &probe_idx, row)? else {
             continue;
         };
@@ -420,6 +421,7 @@ fn execute_outer_join(
     };
 
     for row in 0..probe_batch.num_rows() {
+        crate::exec::cancel::check_row(row)?;
         let probe_u32 = row_to_u32(row)?;
         let key_opt = extract_key(probe_batch, &probe_idx, row)?;
         let matched = match key_opt {
@@ -513,6 +515,7 @@ fn execute_cross_join(
     {
         match crate::exec::gpu_join::execute_cross_join_on_gpu(&lhs, &rhs, arrow_schema.clone()) {
             Ok(batch) => return Ok(QueryHandle::from_record_batch(batch)),
+            Err(e) if e.is_cancelled() => return Err(e),
             Err(e) => {
                 log::debug!("gpu_join: CROSS GPU path declined ({e}); falling back to host");
             }
@@ -524,6 +527,7 @@ fn execute_cross_join(
     let mut left_pairs: Vec<u32> = Vec::with_capacity(total);
     let mut right_pairs: Vec<u32> = Vec::with_capacity(total);
     for l in 0..lhs.num_rows() {
+        crate::exec::cancel::check()?;
         let l_u32 = row_to_u32(l)?;
         for r in 0..rhs.num_rows() {
             left_pairs.push(l_u32);
@@ -704,6 +708,8 @@ fn execute_nested_loop_join_chunked(
     let mut matched: Vec<RecordBatch> = Vec::new();
     let mut start = 0usize;
     while start < outer_rows {
+        // One poll per block (`chunk_rows Г— inner` в‰¤ 1M cells).
+        crate::exec::cancel::check()?;
         let len = chunk_rows.min(outer_rows - start);
         // Slice only the larger side; hold the smaller side whole. Arrow's
         // `RecordBatch::slice` is a zero-copy view, so the only allocation
@@ -905,6 +911,7 @@ fn build_hash_map(
 ) -> BoltResult<HashMap<JoinKey, BuildSlot>> {
     let mut map: HashMap<JoinKey, BuildSlot> = HashMap::with_capacity(build_batch.num_rows());
     for row in 0..build_batch.num_rows() {
+        crate::exec::cancel::check_row(row)?;
         if let Some(key) = extract_key(build_batch, build_idx, row)? {
             let row_u32 = row_to_u32(row)?;
             map.entry(key)

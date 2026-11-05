@@ -4162,6 +4162,9 @@ impl Engine {
     /// per-shape executor on a single installed morsel, guaranteeing the
     /// morsel-by-morsel result is identical to the whole-table result.
     fn execute_leaf_whole(&self, phys: &PhysicalPlan) -> BoltResult<QueryHandle> {
+        // Operator boundary: every physical operator (and every morsel the
+        // streaming drivers run through here) polls the statement's token.
+        crate::exec::cancel::check()?;
         match phys {
             PhysicalPlan::Projection {
                 table,

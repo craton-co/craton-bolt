@@ -228,6 +228,17 @@ impl DataFrame {
         let handle = engine.run_logical_plan(&self.plan)?;
         Ok(handle.into_record_batch())
     }
+
+    /// [`DataFrame::collect`] that stops early once `token` is cancelled or
+    /// its deadline passes (see [`Engine::sql_with_cancel`]).
+    pub fn collect_with_cancel(
+        self,
+        engine: &mut Engine,
+        token: &crate::CancellationToken,
+    ) -> BoltResult<RecordBatch> {
+        let _active = crate::exec::cancel::scope(token);
+        self.collect(engine)
+    }
 }
 
 /// Intermediate produced by `DataFrame::group_by`.

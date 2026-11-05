@@ -804,6 +804,7 @@ impl Engine {
     /// The result of `plan` as a device table, when the whole subplan can
     /// stay on the device (see the [module docs](self)); `None` otherwise.
     pub(crate) fn execute_device(&self, plan: &PhysicalPlan) -> BoltResult<Option<GpuTable>> {
+        crate::exec::cancel::check()?;
         match plan {
             PhysicalPlan::Projection {
                 table,

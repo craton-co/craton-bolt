@@ -608,10 +608,31 @@ impl Session {
         self.submit(sql).wait()
     }
 
+    /// [`Session::sql`] that stops early once `token` is cancelled or its
+    /// deadline passes (see [`Engine::execute_sql_with_cancel`]).
+    pub fn sql_with_cancel(
+        &self,
+        sql: &str,
+        token: &crate::CancellationToken,
+    ) -> BoltResult<RecordBatch> {
+        self.submit_with_cancel(sql, token).wait()
+    }
+
     /// Queue `sql`, blocking while the queue is full; returns immediately
     /// with a [`PendingResult`].
     pub fn submit(&self, sql: &str) -> PendingResult {
-        match self.make_job(sql) {
+        self.submit_job(self.make_job(sql, None))
+    }
+
+    /// [`Session::submit`] whose statement stops early once `token` is
+    /// cancelled or its deadline passes вЂ” whether it is still queued or
+    /// already running (see [`Engine::execute_sql_with_cancel`]).
+    pub fn submit_with_cancel(&self, sql: &str, token: &crate::CancellationToken) -> PendingResult {
+        self.submit_job(self.make_job(sql, Some(token.clone())))
+    }
+
+    fn submit_job(&self, job: BoltResult<(Job, PendingResult)>) -> PendingResult {
+        match job {
             Ok((job, pending)) => match self.inner.sender() {
                 Ok(tx) => match tx.send(job) {
                     Ok(()) => pending,
@@ -627,7 +648,7 @@ impl Session {
 
     /// [`Session::submit`] without blocking: fails when the queue is full.
     pub fn try_submit(&self, sql: &str) -> BoltResult<PendingResult> {
-        let (job, pending) = self.make_job(sql)?;
+        let (job, pending) = self.make_job(sql, None)?;
         match self.inner.sender()?.try_send(job) {
             Ok(()) => Ok(pending),
             Err(TrySendError::Full(_)) => {
@@ -639,7 +660,11 @@ impl Session {
         }
     }
 
-    fn make_job(&self, sql: &str) -> BoltResult<(Job, PendingResult)> {
+    fn make_job(
+        &self,
+        sql: &str,
+        token: Option<crate::CancellationToken>,
+    ) -> BoltResult<(Job, PendingResult)> {
         self.statements.fetch_add(1, Ordering::Relaxed);
         let read_only = self.settings().read_only;
         let shared = Arc::new(Shared {
@@ -666,6 +691,7 @@ impl Session {
             c.wait_nanos.fetch_add(waited, Ordering::Relaxed);
             c.max_wait_nanos.fetch_max(waited, Ordering::Relaxed);
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _active = token.as_ref().map(crate::exec::cancel::scope);
                 if read_only {
                     engine.sql(&sql)
                 } else {

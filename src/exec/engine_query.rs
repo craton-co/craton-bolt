@@ -499,7 +499,27 @@ impl Engine {
         self.run_top_level(|| self.sql_inner(query))
     }
 
+    /// [`Engine::sql`] that stops early, with
+    /// [`BoltError::Cancelled`](crate::BoltError::Cancelled), once `token`
+    /// is cancelled or its deadline passes.
+    ///
+    /// The token is polled before the statement starts, before every
+    /// physical operator, at the head of every morsel / partition / chunk
+    /// loop and between the synchronised passes of multi-kernel operators; a
+    /// kernel already running finishes first. A stopped statement releases
+    /// its device memory and leaves the engine ready for the next one. See
+    /// [`CancellationToken`](crate::CancellationToken).
+    pub fn sql_with_cancel(
+        &self,
+        query: &str,
+        token: &crate::CancellationToken,
+    ) -> BoltResult<QueryHandle> {
+        let _active = crate::exec::cancel::scope(token);
+        self.sql(query)
+    }
+
     fn sql_inner(&self, query: &str) -> BoltResult<QueryHandle> {
+        crate::exec::cancel::check()?;
         reject_table_statement(query)?;
         // User hooks may be stateful or nondeterministic, so their presence
         // disables plan reuse (the contract runs them on every compile).
@@ -728,7 +748,10 @@ impl Engine {
     /// signature; the engine state mutated here is bounded to the
     /// pool-stats throttle and the interior-mutable caches `sql()` touches.
     pub fn run_logical_plan(&mut self, plan: &LogicalPlan) -> BoltResult<QueryHandle> {
-        self.run_top_level(|| self.execute_logical(plan, true, true))
+        self.run_top_level(|| {
+            crate::exec::cancel::check()?;
+            self.execute_logical(plan, true, true)
+        })
     }
 
     /// Execute a self-contained component subplan of a host-orchestrated

@@ -265,7 +265,10 @@ mod tests {
         assert!(!far.is_cancelled());
         let earlier = far.with_timeout(Duration::from_secs(60));
         assert!(earlier.deadline() < far.deadline());
-        assert_eq!(earlier.with_timeout(Duration::from_secs(7200)).deadline(), earlier.deadline());
+        assert_eq!(
+            earlier.with_timeout(Duration::from_secs(7200)).deadline(),
+            earlier.deadline()
+        );
         // A timeout too large for `Instant` means no deadline.
         assert!(!t.with_timeout(Duration::MAX).is_cancelled());
     }
@@ -286,7 +289,10 @@ mod tests {
         assert!(check_row(1).is_ok());
         assert!(check_row(ROWS_PER_CHECK - 1).is_ok());
         assert!(is_cancelled(check_row(0), CancelReason::Cancelled));
-        assert!(is_cancelled(check_row(ROWS_PER_CHECK), CancelReason::Cancelled));
+        assert!(is_cancelled(
+            check_row(ROWS_PER_CHECK),
+            CancelReason::Cancelled
+        ));
     }
 
     #[test]
@@ -340,7 +346,10 @@ mod tests {
         let t = CancellationToken::new();
         t.cancel();
         let _g = scope(&t);
-        assert!(is_cancelled(commit_point().map(drop), CancelReason::Cancelled));
+        assert!(is_cancelled(
+            commit_point().map(drop),
+            CancelReason::Cancelled
+        ));
         assert!(is_cancelled(check(), CancelReason::Cancelled));
     }
 
@@ -353,7 +362,10 @@ mod tests {
 
     #[test]
     fn error_display_names_the_reason() {
-        assert_eq!(BoltError::Cancelled(CancelReason::Cancelled).to_string(), "query cancelled");
+        assert_eq!(
+            BoltError::Cancelled(CancelReason::Cancelled).to_string(),
+            "query cancelled"
+        );
         assert_eq!(
             BoltError::Cancelled(CancelReason::DeadlineExceeded).to_string(),
             "query deadline exceeded"

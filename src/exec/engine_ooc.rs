@@ -419,6 +419,7 @@ impl Engine {
             self.memory.record_out_of_core();
             let schema = scan.input.schema()?;
             let mut out = Vec::new();
+            // Each chunk group polls the token (`ChunkedRun::step`).
             for b in self.chunked_run(scan)? {
                 out.push(b?);
             }
@@ -537,6 +538,7 @@ impl Engine {
         let mut pending: Vec<(SpillFile, usize)> =
             files.into_iter().flatten().map(|f| (f, 0)).collect();
         while let Some((file, level)) = pending.pop() {
+            crate::exec::cancel::check()?;
             if file.bytes as usize > budget && level < MAX_REPARTITION_LEVELS {
                 let parts = partitions_for(file.bytes as usize, budget);
                 let seed = seed.wrapping_mul(31).wrapping_add(level as u64 + 1);
@@ -619,6 +621,7 @@ impl Engine {
             .map(|(fa, fb)| (fa, fb, 0))
             .collect();
         while let Some((fa, fb, level)) = pending.pop() {
+            crate::exec::cancel::check()?;
             let bytes = fa.as_ref().map_or(0, |f| f.bytes) + fb.as_ref().map_or(0, |f| f.bytes);
             if bytes as usize > budget && level < MAX_REPARTITION_LEVELS {
                 // Split both sides of the pair with one new seed so matching
@@ -746,6 +749,7 @@ impl Engine {
             };
         let request = self.request_for(plan, &table);
         for batch in self.table_batches(&table, &request)? {
+            crate::exec::cancel::check()?;
             let batch = batch?;
             pending_rows += batch.num_rows();
             pending.push(batch);
@@ -930,6 +934,7 @@ impl Engine {
             Ok(())
         };
         for b in self.table_batches(&table, &request)? {
+            crate::exec::cancel::check()?;
             let b = b?;
             pending_rows += b.num_rows();
             if b.num_rows() > 0 {
@@ -1103,6 +1108,7 @@ impl Engine {
     /// Concatenating the batches gives the rows [`Engine::sql`] returns; the
     /// order of a query without `ORDER BY` follows the table's chunks.
     pub fn sql_stream(&self, query: &str) -> BoltResult<ResultStream<'_>> {
+        crate::exec::cancel::check()?;
         let shape = crate::exec::engine_query::classify_for_stream(self, query)?;
         let plan = match shape {
             Some(plan) => plan,
@@ -1111,6 +1117,7 @@ impl Engine {
                 return Ok(ResultStream {
                     schema: b.schema(),
                     inner: StreamInner::Once(Some(b)),
+                    cancel: None,
                 });
             }
         };
@@ -1126,6 +1133,9 @@ impl Engine {
                         &run.out_schema,
                     )?,
                     inner: StreamInner::Chunked(Box::new(run)),
+                    // Each later `next` polls the token the stream was
+                    // opened with.
+                    cancel: crate::exec::cancel::active_token(),
                 })
             }
             None => {
@@ -1133,9 +1143,24 @@ impl Engine {
                 Ok(ResultStream {
                     schema: b.schema(),
                     inner: StreamInner::Once(Some(b)),
+                    cancel: None,
                 })
             }
         }
+    }
+
+    /// [`Engine::sql_stream`] that stops early once `token` is cancelled or
+    /// its deadline passes: opening the stream polls it as
+    /// [`Engine::sql_with_cancel`] does, and an incremental stream polls it
+    /// again for every chunk group it reads, yielding one
+    /// `Err(`[`BoltError::Cancelled`]`)` and then ending.
+    pub fn sql_stream_with_cancel(
+        &self,
+        query: &str,
+        token: &crate::CancellationToken,
+    ) -> BoltResult<ResultStream<'_>> {
+        let _active = crate::exec::cancel::scope(token);
+        self.sql_stream(query)
     }
 
     /// Whether `node` (an `Aggregate` / `Distinct`) runs as a partitioned
@@ -1505,6 +1530,7 @@ impl Engine {
         let mut writers: Vec<Option<SpillWriter>> = (0..partitions).map(|_| None).collect();
         let mut keys: Option<Vec<usize>> = None;
         for batch in batches {
+            crate::exec::cancel::check()?;
             let batch = batch?;
             if batch.num_rows() == 0 {
                 continue;
@@ -1581,6 +1607,7 @@ impl ChunkedRun<'_> {
             if self.done || self.remaining == Some(0) {
                 return Ok(None);
             }
+            crate::exec::cancel::check()?;
             let mut pending = Vec::new();
             let mut rows = 0usize;
             while rows < self.scan.run_rows {
@@ -1656,6 +1683,9 @@ enum StreamInner<'a> {
 pub struct ResultStream<'a> {
     schema: SchemaRef,
     inner: StreamInner<'a>,
+    /// Token of [`Engine::sql_stream_with_cancel`], active while each batch
+    /// is produced.
+    cancel: Option<crate::CancellationToken>,
 }
 
 impl std::fmt::Debug for ResultStream<'_> {
@@ -1684,6 +1714,7 @@ impl Iterator for ResultStream<'_> {
     type Item = BoltResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _active = self.cancel.as_ref().map(crate::exec::cancel::scope);
         match &mut self.inner {
             StreamInner::Once(b) => b.take().map(Ok),
             StreamInner::Chunked(run) => run.next(),

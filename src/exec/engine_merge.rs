@@ -280,6 +280,7 @@ impl Engine {
             return Ok(0);
         }
         let new_rows = align_batch(&new_rows, &schema, &[])?;
+        let _commit = crate::exec::cancel::commit_point()?;
         #[cfg(feature = "storage")]
         if let Some(cat) = self.catalog.as_mut() {
             if let Some(meta) = cat.table(&target) {

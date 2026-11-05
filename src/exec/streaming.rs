@@ -1305,6 +1305,7 @@ impl MorselDriver {
         let stream = BatchStream::new(batches, self.morsel_rows)?;
         let mut count = 0usize;
         for morsel in stream.morsels() {
+            crate::exec::cancel::check()?;
             let bytes = estimate_batch_bytes(&morsel);
             // Bounded double-buffering: a morsel must fit the *remaining*
             // budget. With the host-only callback below releasing immediately,
@@ -1378,6 +1379,7 @@ impl MorselDriver {
         let stream_iter = BatchStream::new(batches, self.morsel_rows)?;
         let mut count = 0usize;
         for morsel in stream_iter.morsels() {
+            crate::exec::cancel::check()?;
             let bytes = estimate_batch_bytes(&morsel);
             self.budget.reserve(bytes)?;
 
