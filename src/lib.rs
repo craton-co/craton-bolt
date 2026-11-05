@@ -69,6 +69,7 @@ pub use cuda::{GpuBuffer, GpuVec, GpuView, GpuViewMut};
 pub use exec::cost::{
     CostInputs, CostModel, DefaultCostModel, OperatorCost, OperatorKind, TierPolicy,
 };
+pub use exec::cancel::{CancelReason, CancellationToken};
 pub use exec::engine_ooc::ResultStream;
 pub use exec::engine_views::{RefreshMode, ViewStatus};
 pub use exec::memory::{

@@ -134,6 +134,13 @@ pub enum BoltError {
     #[error("{0}")]
     Unsupported(String),
 
+    /// The statement stopped early because its
+    /// [`CancellationToken`](crate::CancellationToken) was cancelled or its
+    /// deadline passed. The engine is unchanged by the stopped statement and
+    /// can run the next one; see [`crate::exec::cancel`].
+    #[error("{0}")]
+    Cancelled(crate::exec::cancel::CancelReason),
+
     #[error("{0}")]
     Other(String),
 }
@@ -168,10 +175,17 @@ impl BoltError {
             //     non-spanning variant.
             //  2. None of the other current variants ([`Cuda`],
             //     [`CudaWithCode`], [`Sql`], [`Plan`], [`Type`],
-            //     [`Memory`], [`Io`], [`GpuCapacity`], [`Other`]) carries
+            //     [`Memory`], [`Io`], [`GpuCapacity`], [`Unsupported`],
+            //     [`Cancelled`], [`Other`]) carries
             //     positional information.
             _ => None,
         }
+    }
+
+    /// `true` for [`BoltError::Cancelled`]: fallback paths that retry a
+    /// failed attempt another way must propagate this error instead.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, BoltError::Cancelled(_))
     }
 }
 

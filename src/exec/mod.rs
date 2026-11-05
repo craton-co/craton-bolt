@@ -19,6 +19,7 @@ pub(crate) mod engine_support;
 // builder, and top-level dispatch. `engine_query` / `engine_join_impl` are
 // reserved placeholders for follow-up extraction (see their module docs).
 pub mod aggregate;
+pub mod cancel;
 pub mod compact;
 pub mod cost;
 pub(crate) mod device_pipeline;
