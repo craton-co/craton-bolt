@@ -173,3 +173,73 @@ fn builder_constructed_engine_can_run_sql() {
         .expect("query the builder-constructed engine");
     assert_eq!(handle.record_batch().num_rows(), 5);
 }
+
+/// W2-D-003: with `persistent_cache` + `persistent_cache_key`, the JIT path
+/// writes HMAC-tagged entries that verify under that key, and a tampered
+/// entry is rejected (and removed) instead of being served.
+#[test]
+#[ignore = "gpu:e2e"]
+fn builder_persistent_cache_key_tags_and_verifies_entries() {
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("bolt-ptx-keyed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as _],
+    )
+    .expect("build record batch");
+    let mut engine = Engine::builder()
+        .device(0)
+        .persistent_cache(dir.clone())
+        .persistent_cache_key([0x42; 32])
+        .build()
+        .expect("build engine");
+    engine.register_table("t", batch).expect("register table");
+    let rows = engine
+        .sql("SELECT x * 7 + 1 AS y FROM t WHERE x > 2")
+        .expect("query")
+        .record_batch()
+        .num_rows();
+    assert_eq!(rows, 3);
+
+    let cache = craton_bolt::jit::disk_cache::disk_cache().expect("disk cache enabled");
+    assert!(cache.is_disk_enabled());
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("cache dir")
+        .map(|e| e.expect("dirent").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ptx"))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "the query must write at least one entry"
+    );
+    for p in &entries {
+        let raw = std::fs::read_to_string(p).expect("read entry");
+        assert!(
+            raw.starts_with("#bolt-ptx-cache v2 hmac-sha256 "),
+            "{}",
+            p.display()
+        );
+        let stem = p.file_stem().unwrap().to_str().unwrap();
+        assert!(cache.lookup(stem).is_some(), "entry must verify: {stem}");
+    }
+    let victim = &entries[0];
+    let raw = std::fs::read_to_string(victim).unwrap();
+    std::fs::write(
+        victim,
+        raw.replacen(".entry", ".entry ", 1) + "\n// planted",
+    )
+    .unwrap();
+    let stem = victim.file_stem().unwrap().to_str().unwrap();
+    assert!(
+        cache.lookup(stem).is_none(),
+        "tampered entry must not be served"
+    );
+    assert!(!victim.exists(), "tampered entry is removed");
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
