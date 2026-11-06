@@ -348,7 +348,7 @@ fn execute_inner(
         &host_out_set,
         num_partitions as usize,
         block_groups,
-    );
+    )?;
     let keys: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
     let vals: Vec<f64> = pairs.iter().map(|(_, v)| *v).collect();
 

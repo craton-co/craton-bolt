@@ -3311,11 +3311,17 @@ fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
     // SAFETY: each worker owns a disjoint mutable slice into `out`, so no
     // two threads alias the same byte. The scope guarantees every worker
     // is joined before we return, so the `out` slice outlives every borrow.
-    std::thread::scope(|scope| {
-        let mut handles: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::with_capacity(n_workers);
+    // Workers poll the statement's cancellation token like the caller.
+    let cancel = crate::exec::cancel::WorkerContext::capture();
+    std::thread::scope(|scope| -> BoltResult<()> {
+        let mut handles: Vec<std::thread::ScopedJoinHandle<'_, BoltResult<()>>> =
+            Vec::with_capacity(n_workers);
         for (s, slice) in row_starts.iter().copied().zip(out_slices) {
-            let h = scope.spawn(move || {
+            let cancel = cancel.clone();
+            let h = scope.spawn(move || -> BoltResult<()> {
+                let _active = cancel.enter();
                 for (j, slot) in slice.iter_mut().enumerate() {
+                    crate::exec::cancel::check_row(j)?;
                     let i = s + j;
                     let h = if arr.is_null(i) {
                         0
@@ -3324,15 +3330,20 @@ fn hash_rows_in_parallel(arr: &StringArray) -> BoltResult<Vec<u64>> {
                     };
                     *slot = h;
                 }
+                Ok(())
             });
             handles.push(h);
         }
+        let mut first_err = None;
         for h in handles {
             // join() returns Err only on panic — surface as a no-op since
             // there's no good recovery path for a hashing-thread panic.
-            let _ = h.join();
+            if let Ok(Err(e)) = h.join() {
+                first_err.get_or_insert(e);
+            }
         }
-    });
+        first_err.map_or(Ok(()), Err)
+    })?;
 
     Ok(out)
 }

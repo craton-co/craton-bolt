@@ -1464,6 +1464,8 @@ fn try_gpu_inner_join(
                     arrow_schema.clone(),
                 ) {
                     Ok(batch) => return Ok(Some(batch)),
+                    // A cancelled statement stops; it does not retry on the host.
+                    Err(e) if e.is_cancelled() => return Err(e),
                     Err(e) => {
                         log::debug!(
                             "gpu_join: Stage-1 fast path declined ({e}); \
@@ -1501,6 +1503,8 @@ fn try_gpu_inner_join(
             arrow_schema.clone(),
         ) {
             Ok(batch) => return Ok(Some(batch)),
+            // A cancelled statement stops; it does not retry on the host.
+            Err(e) if e.is_cancelled() => return Err(e),
             Err(e) => {
                 log::debug!("gpu_join: Utf8 path declined ({e}); falling back to host");
                 return Ok(None);
@@ -1543,6 +1547,8 @@ fn try_gpu_inner_join(
                 arrow_schema.clone(),
             ) {
                 Ok(batch) => return Ok(Some(batch)),
+                // A cancelled statement stops; it does not retry on the host.
+                Err(e) if e.is_cancelled() => return Err(e),
                 Err(e) => {
                     log::debug!(
                         "gpu_join: AoS routing declined ({e}); trying SoA verify-aware path"
@@ -1565,6 +1571,8 @@ fn try_gpu_inner_join(
         arrow_schema,
     ) {
         Ok(batch) => Ok(Some(batch)),
+        // A cancelled statement stops; it does not retry on the host.
+        Err(e) if e.is_cancelled() => Err(e),
         Err(e) => {
             log::debug!("gpu_join: Stage-2/3 path declined ({e}); falling back to host");
             Ok(None)
@@ -1663,6 +1671,8 @@ fn try_gpu_outer_join(
             arrow_schema,
         ) {
             Ok(batch) => Ok(Some(batch)),
+            // A cancelled statement stops; it does not retry on the host.
+            Err(e) if e.is_cancelled() => return Err(e),
             Err(e) => {
                 log::debug!("gpu_join: Utf8 outer-join path declined ({e}); falling back to host");
                 Ok(None)
@@ -1682,6 +1692,8 @@ fn try_gpu_outer_join(
         arrow_schema,
     ) {
         Ok(batch) => Ok(Some(batch)),
+        // A cancelled statement stops; it does not retry on the host.
+        Err(e) if e.is_cancelled() => Err(e),
         Err(e) => {
             log::debug!("gpu_join: outer-join path declined ({e}); falling back to host");
             Ok(None)

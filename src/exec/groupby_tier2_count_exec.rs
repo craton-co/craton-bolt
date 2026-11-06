@@ -320,7 +320,7 @@ fn execute_inner(plan: &PhysicalPlan, key_arr: &Int32Array) -> BoltResult<Record
         &host_out_set,
         num_partitions as usize,
         block_groups,
-    );
+    )?;
 
     let keys_out: Vec<i32> = pairs.iter().map(|(k, _)| *k).collect();
     let counts_out: Vec<i64> = pairs.iter().map(|(_, c)| *c as i64).collect();

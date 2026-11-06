@@ -224,6 +224,45 @@ pub(crate) fn uninterruptible() -> CommitGuard {
     CommitGuard { previous }
 }
 
+/// The calling thread's cancellation state, captured to carry into worker
+/// threads a statement spawns (`std::thread::scope` fan-outs): a worker that
+/// [`enter`](WorkerContext::enter)s it polls the statement's token exactly as
+/// the spawning thread would, commit-point suspension included.
+#[derive(Clone)]
+pub(crate) struct WorkerContext {
+    token: Option<CancellationToken>,
+    committing: bool,
+}
+
+impl WorkerContext {
+    /// Capture this thread's active token (if any).
+    pub(crate) fn capture() -> Self {
+        ACTIVE.with(|a| match a.borrow().as_ref() {
+            Some(active) => WorkerContext {
+                token: Some(active.token.clone()),
+                committing: active.committing,
+            },
+            None => WorkerContext {
+                token: None,
+                committing: false,
+            },
+        })
+    }
+
+    /// Install the captured state on the current (worker) thread until the
+    /// guard drops.
+    pub(crate) fn enter(&self) -> Option<ScopeGuard> {
+        let token = self.token.as_ref()?;
+        let guard = scope(token);
+        ACTIVE.with(|a| {
+            if let Some(active) = a.borrow_mut().as_mut() {
+                active.committing = self.committing;
+            }
+        });
+        Some(guard)
+    }
+}
+
 /// The active token of this thread, if any (to carry it into work that
 /// runs later, such as a lazily-pulled result stream).
 pub(crate) fn active_token() -> Option<CancellationToken> {
@@ -293,6 +332,35 @@ mod tests {
             check_row(ROWS_PER_CHECK),
             CancelReason::Cancelled
         ));
+    }
+
+    #[test]
+    fn worker_context_carries_the_token_and_commit_state_to_threads() {
+        let t = CancellationToken::new();
+        let _g = scope(&t);
+        let ctx = WorkerContext::capture();
+        let in_worker = |ctx: WorkerContext| {
+            std::thread::spawn(move || {
+                let _w = ctx.enter();
+                check()
+            })
+            .join()
+            .unwrap()
+        };
+        assert!(in_worker(ctx.clone()).is_ok());
+        t.cancel();
+        assert!(is_cancelled(in_worker(ctx), CancelReason::Cancelled));
+        // Captured past a commit point, the worker does not stop either.
+        let _c = uninterruptible();
+        assert!(in_worker(WorkerContext::capture()).is_ok());
+        // Without a scope there is nothing to carry.
+        drop(_c);
+        assert!(WorkerContext {
+            token: None,
+            committing: false
+        }
+        .enter()
+        .is_none());
     }
 
     #[test]

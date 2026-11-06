@@ -577,7 +577,7 @@ pub(crate) fn collect_populated_slots_sorted<T: Copy + Send + Sync>(
     host_set: &[u8],
     num_partitions: usize,
     block_groups: usize,
-) -> Vec<(i32, T)> {
+) -> BoltResult<Vec<(i32, T)>> {
     let n_slots = num_partitions * block_groups;
 
     // Hoist bounds checks: the flat pass only ever touches `0..n_slots`, so
@@ -591,13 +591,13 @@ pub(crate) fn collect_populated_slots_sorted<T: Copy + Send + Sync>(
     let host_vals = &host_vals[..n_slots];
 
     let mut pairs: Vec<(i32, T)> = if n_slots > PARALLEL_SLOT_SCAN_THRESHOLD {
-        collect_pairs_parallel(host_keys, host_vals, host_set, n_slots)
+        collect_pairs_parallel(host_keys, host_vals, host_set, n_slots)?
     } else {
         collect_pairs_serial(host_keys, host_vals, host_set, n_slots)
     };
 
     pairs.sort_by_key(|(k, _)| *k);
-    pairs
+    Ok(pairs)
 }
 
 /// Minimum slot count above which [`collect_populated_slots_sorted`] fans the
@@ -639,7 +639,7 @@ fn collect_pairs_parallel<T: Copy + Send + Sync>(
     host_vals: &[T],
     host_set: &[u8],
     n_slots: usize,
-) -> Vec<(i32, T)> {
+) -> BoltResult<Vec<(i32, T)>> {
     // Bound the fan-out by available parallelism, but never exceed the number
     // of slots and always use at least one chunk.
     let max_threads = std::thread::available_parallelism()
@@ -655,7 +655,9 @@ fn collect_pairs_parallel<T: Copy + Send + Sync>(
     // deterministic regardless of thread completion order.
     let mut chunk_outputs: Vec<Vec<(i32, T)>> = Vec::with_capacity(n_chunks);
 
-    std::thread::scope(|scope| {
+    // Workers poll the statement's cancellation token like the caller.
+    let cancel = crate::exec::cancel::WorkerContext::capture();
+    std::thread::scope(|scope| -> BoltResult<()> {
         let mut handles = Vec::with_capacity(n_chunks);
         for c in 0..n_chunks {
             let start = c * chunk_len;
@@ -666,30 +668,42 @@ fn collect_pairs_parallel<T: Copy + Send + Sync>(
             let set = &host_set[start..end];
             let keys = &host_keys[start..end];
             let vals = &host_vals[start..end];
-            handles.push(scope.spawn(move || {
+            let cancel = cancel.clone();
+            handles.push(scope.spawn(move || -> BoltResult<Vec<(i32, T)>> {
+                let _active = cancel.enter();
                 // Local pass mirrors the serial loop over this sub-range,
                 // preserving ascending index order within the chunk.
                 let mut local: Vec<(i32, T)> = Vec::with_capacity(end - start);
                 for i in 0..(end - start) {
+                    crate::exec::cancel::check_row(i)?;
                     if set[i] != 0 {
                         local.push((keys[i], vals[i]));
                     }
                 }
-                local
+                Ok(local)
             }));
         }
         // Join in spawn (chunk) order to rebuild the ascending sequence.
+        // Every worker is joined (the scope requires it); the first error,
+        // in chunk order, is the result.
+        let mut first_err = None;
         for h in handles {
-            chunk_outputs.push(h.join().expect("slot-scan worker panicked"));
+            match h.join().expect("slot-scan worker panicked") {
+                Ok(local) => chunk_outputs.push(local),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
         }
-    });
+        first_err.map_or(Ok(()), Err)
+    })?;
 
     let total: usize = chunk_outputs.iter().map(Vec::len).sum();
     let mut pairs: Vec<(i32, T)> = Vec::with_capacity(total);
     for mut chunk in chunk_outputs {
         pairs.append(&mut chunk);
     }
-    pairs
+    Ok(pairs)
 }
 
 #[cfg(test)]
@@ -917,7 +931,8 @@ mod tests {
             &host_set,
             num_partitions,
             block_groups,
-        );
+        )
+        .unwrap();
         assert_eq!(pairs, vec![(1, 10), (5, 50), (9, 90)]);
     }
 
@@ -953,7 +968,8 @@ mod tests {
             &host_set,
             num_partitions,
             block_groups,
-        );
+        )
+        .unwrap();
         assert_eq!(got, expected);
     }
 
@@ -1024,9 +1040,36 @@ mod tests {
             &host_set,
             num_partitions,
             block_groups,
-        );
+        )
+        .unwrap();
         assert_eq!(got.len(), expected.len());
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn parallel_slot_scan_workers_observe_the_statement_token() {
+        let n_slots = PARALLEL_SLOT_SCAN_THRESHOLD + 1;
+        let keys = vec![1i32; n_slots];
+        let vals = vec![1i64; n_slots];
+        let set = vec![1u8; n_slots];
+        let token = crate::CancellationToken::new();
+        let _active = crate::exec::cancel::scope(&token);
+        assert_eq!(
+            collect_pairs_parallel::<i64>(&keys, &vals, &set, n_slots)
+                .unwrap()
+                .len(),
+            n_slots
+        );
+        token.cancel();
+        // Only the workers poll: the error comes from inside them.
+        assert!(matches!(
+            collect_pairs_parallel::<i64>(&keys, &vals, &set, n_slots),
+            Err(crate::BoltError::Cancelled(crate::CancelReason::Cancelled))
+        ));
+        assert!(matches!(
+            collect_populated_slots_sorted::<i64>(&keys, &vals, &set, n_slots, 1),
+            Err(crate::BoltError::Cancelled(_))
+        ));
     }
 
     #[test]
@@ -1045,7 +1088,8 @@ mod tests {
             host_set.push((i % 3 != 0) as u8);
         }
         let serial = collect_pairs_serial::<f64>(&host_keys, &host_vals, &host_set, n_slots);
-        let parallel = collect_pairs_parallel::<f64>(&host_keys, &host_vals, &host_set, n_slots);
+        let parallel =
+            collect_pairs_parallel::<f64>(&host_keys, &host_vals, &host_set, n_slots).unwrap();
         // Pre-sort sequences must be identical (same selection, same order).
         assert_eq!(serial, parallel);
     }
