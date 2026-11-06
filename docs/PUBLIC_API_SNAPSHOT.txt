@@ -400,6 +400,21 @@ pub fn craton_bolt::exec::agg_with_pre::execute_aggregate_with_pre(&crate::plan:
 pub fn craton_bolt::exec::agg_with_pre::try_execute_resident(&crate::plan::physical_plan::PhysicalPlan, &craton_bolt::exec::gpu_table::GpuTable, &dyn core::ops::function::Fn(&str) -> core::option::Option<(craton_bolt::plan::logical_plan::DataType, craton_bolt::cuda::cuda_sys::CUdeviceptr)>) -> craton_bolt::BoltResult<core::option::Option<arrow_array::record_batch::RecordBatch>>
 pub mod craton_bolt::exec::aggregate
 pub fn craton_bolt::exec::aggregate::execute_aggregate(&crate::plan::physical_plan::PhysicalPlan, &arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub mod craton_bolt::exec::cancel
+#[non_exhaustive] pub enum craton_bolt::exec::cancel::CancelReason
+pub craton_bolt::exec::cancel::CancelReason::Cancelled
+pub craton_bolt::exec::cancel::CancelReason::DeadlineExceeded
+impl core::fmt::Display for craton_bolt::exec::cancel::CancelReason
+pub fn craton_bolt::exec::cancel::CancelReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craton_bolt::exec::cancel::CancellationToken
+impl craton_bolt::exec::cancel::CancellationToken
+pub fn craton_bolt::exec::cancel::CancellationToken::cancel(&self)
+pub fn craton_bolt::exec::cancel::CancellationToken::deadline(&self) -> core::option::Option<std::time::Instant>
+pub fn craton_bolt::exec::cancel::CancellationToken::is_cancelled(&self) -> bool
+pub fn craton_bolt::exec::cancel::CancellationToken::new() -> Self
+pub fn craton_bolt::exec::cancel::CancellationToken::reason(&self) -> core::option::Option<craton_bolt::exec::cancel::CancelReason>
+pub fn craton_bolt::exec::cancel::CancellationToken::with_deadline(&self, std::time::Instant) -> Self
+pub fn craton_bolt::exec::cancel::CancellationToken::with_timeout(&self, core::time::Duration) -> Self
 pub mod craton_bolt::exec::compact
 pub fn craton_bolt::exec::compact::alloc_mask_buffer(usize) -> craton_bolt::BoltResult<craton_bolt::cuda::smart_ptrs::GpuVec<u8>>
 pub fn craton_bolt::exec::compact::apply_mask(&arrow_array::array::ArrayRef, &[bool]) -> craton_bolt::BoltResult<arrow_array::array::ArrayRef>
@@ -468,6 +483,7 @@ pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str, core::o
 pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::execute_sql_with_cancel(&mut self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::ingest_stream<I>(&mut self, &str, I, usize) -> craton_bolt::BoltResult<u64> where I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
 pub fn craton_bolt::exec::engine::Engine::insert_batch(&mut self, &str, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
@@ -526,8 +542,10 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::sql_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::sql_stream(&self, &str) -> craton_bolt::BoltResult<craton_bolt::ResultStream<'_>>
+pub fn craton_bolt::exec::engine::Engine::sql_stream_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::ResultStream<'_>>
 #[non_exhaustive] pub struct craton_bolt::exec::engine::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::auto_compact(self, usize) -> Self
@@ -893,8 +911,10 @@ pub fn craton_bolt::exec::session::Session::id(&self) -> u64
 pub fn craton_bolt::exec::session::Session::set_read_only(&self, bool)
 pub fn craton_bolt::exec::session::Session::settings(&self) -> craton_bolt::exec::session::SessionSettings
 pub fn craton_bolt::exec::session::Session::sql(&self, &str) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::exec::session::Session::sql_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::exec::session::Session::statement_count(&self) -> u64
 pub fn craton_bolt::exec::session::Session::submit(&self, &str) -> craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::Session::submit_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::exec::session::PendingResult
 pub fn craton_bolt::exec::session::Session::try_submit(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::session::PendingResult>
 impl core::fmt::Debug for craton_bolt::exec::session::Session
 pub fn craton_bolt::exec::session::Session::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1159,6 +1179,7 @@ pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str, core::o
 pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::execute_sql_with_cancel(&mut self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::ingest_stream<I>(&mut self, &str, I, usize) -> craton_bolt::BoltResult<u64> where I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
 pub fn craton_bolt::exec::engine::Engine::insert_batch(&mut self, &str, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
@@ -1217,8 +1238,10 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::sql_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::sql_stream(&self, &str) -> craton_bolt::BoltResult<craton_bolt::ResultStream<'_>>
+pub fn craton_bolt::exec::engine::Engine::sql_stream_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::ResultStream<'_>>
 #[non_exhaustive] pub struct craton_bolt::exec::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::auto_compact(self, usize) -> Self
@@ -1775,6 +1798,7 @@ pub mod craton_bolt::plan::dataframe
 pub struct craton_bolt::plan::dataframe::DataFrame
 impl craton_bolt::plan::dataframe::DataFrame
 pub fn craton_bolt::plan::dataframe::DataFrame::collect(self, &mut craton_bolt::exec::engine::Engine) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::plan::dataframe::DataFrame::collect_with_cancel(self, &mut craton_bolt::exec::engine::Engine, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::plan::dataframe::DataFrame::filter(self, craton_bolt::plan::logical_plan::Expr) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::from_plan(craton_bolt::plan::logical_plan::LogicalPlan) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::group_by<I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::plan::logical_plan::Expr>>(self, I) -> craton_bolt::plan::dataframe::GroupedDataFrame
@@ -2854,6 +2878,7 @@ pub craton_bolt::plan::UnaryOp::Not
 pub struct craton_bolt::plan::DataFrame
 impl craton_bolt::plan::dataframe::DataFrame
 pub fn craton_bolt::plan::dataframe::DataFrame::collect(self, &mut craton_bolt::exec::engine::Engine) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::plan::dataframe::DataFrame::collect_with_cancel(self, &mut craton_bolt::exec::engine::Engine, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::plan::dataframe::DataFrame::filter(self, craton_bolt::plan::logical_plan::Expr) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::from_plan(craton_bolt::plan::logical_plan::LogicalPlan) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::group_by<I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::plan::logical_plan::Expr>>(self, I) -> craton_bolt::plan::dataframe::GroupedDataFrame
@@ -3310,6 +3335,7 @@ pub fn craton_bolt::storage::table::MemoryTable::statistics(&self) -> craton_bol
 pub fn craton_bolt::storage::write_parquet(&std::path::Path, &[arrow_array::record_batch::RecordBatch], &craton_bolt::storage::parquet::ParquetWriteOptions) -> craton_bolt::BoltResult<u64>
 pub type craton_bolt::storage::BatchIter = alloc::boxed::Box<(dyn core::iter::traits::iterator::Iterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>> + core::marker::Send)>
 #[non_exhaustive] pub enum craton_bolt::BoltError
+pub craton_bolt::BoltError::Cancelled(craton_bolt::exec::cancel::CancelReason)
 pub craton_bolt::BoltError::Cuda(alloc::string::String)
 pub craton_bolt::BoltError::CudaWithCode
 pub craton_bolt::BoltError::CudaWithCode::code: i32
@@ -3329,6 +3355,11 @@ impl craton_bolt::BoltError
 pub fn craton_bolt::BoltError::span(&self) -> core::option::Option<core::ops::range::Range<usize>>
 impl core::convert::From<sqlparser::parser::ParserError> for craton_bolt::BoltError
 pub fn craton_bolt::BoltError::from(sqlparser::parser::ParserError) -> Self
+#[non_exhaustive] pub enum craton_bolt::CancelReason
+pub craton_bolt::CancelReason::Cancelled
+pub craton_bolt::CancelReason::DeadlineExceeded
+impl core::fmt::Display for craton_bolt::exec::cancel::CancelReason
+pub fn craton_bolt::exec::cancel::CancelReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] #[repr(usize)] pub enum craton_bolt::Counter
 pub craton_bolt::Counter::DevicePipelines = 12
 pub craton_bolt::Counter::GpuLaunchesTotal = 4
@@ -3527,6 +3558,15 @@ pub fn craton_bolt::exec::streaming::BatchStream<'a>::morsels(&self) -> craton_b
 pub fn craton_bolt::exec::streaming::BatchStream<'a>::new(&'a [arrow_array::record_batch::RecordBatch], usize) -> craton_bolt::BoltResult<Self>
 pub fn craton_bolt::exec::streaming::BatchStream<'a>::num_morsels(&self) -> usize
 pub fn craton_bolt::exec::streaming::BatchStream<'a>::total_rows(&self) -> usize
+pub struct craton_bolt::CancellationToken
+impl craton_bolt::exec::cancel::CancellationToken
+pub fn craton_bolt::exec::cancel::CancellationToken::cancel(&self)
+pub fn craton_bolt::exec::cancel::CancellationToken::deadline(&self) -> core::option::Option<std::time::Instant>
+pub fn craton_bolt::exec::cancel::CancellationToken::is_cancelled(&self) -> bool
+pub fn craton_bolt::exec::cancel::CancellationToken::new() -> Self
+pub fn craton_bolt::exec::cancel::CancellationToken::reason(&self) -> core::option::Option<craton_bolt::exec::cancel::CancelReason>
+pub fn craton_bolt::exec::cancel::CancellationToken::with_deadline(&self, std::time::Instant) -> Self
+pub fn craton_bolt::exec::cancel::CancellationToken::with_timeout(&self, core::time::Duration) -> Self
 #[non_exhaustive] pub struct craton_bolt::CostInputs
 pub craton_bolt::CostInputs::compiled: bool
 pub craton_bolt::CostInputs::expressions: usize
@@ -3538,6 +3578,7 @@ pub craton_bolt::CostInputs::rows: u64
 pub struct craton_bolt::DataFrame
 impl craton_bolt::plan::dataframe::DataFrame
 pub fn craton_bolt::plan::dataframe::DataFrame::collect(self, &mut craton_bolt::exec::engine::Engine) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::plan::dataframe::DataFrame::collect_with_cancel(self, &mut craton_bolt::exec::engine::Engine, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::plan::dataframe::DataFrame::filter(self, craton_bolt::plan::logical_plan::Expr) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::from_plan(craton_bolt::plan::logical_plan::LogicalPlan) -> Self
 pub fn craton_bolt::plan::dataframe::DataFrame::group_by<I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::plan::logical_plan::Expr>>(self, I) -> craton_bolt::plan::dataframe::GroupedDataFrame
@@ -3584,6 +3625,7 @@ pub fn craton_bolt::exec::engine::Engine::compact_table(&mut self, &str, core::o
 pub fn craton_bolt::exec::engine::Engine::deregister_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::drop_table(&mut self, &str) -> craton_bolt::BoltResult<()>
 pub fn craton_bolt::exec::engine::Engine::execute_sql(&mut self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::execute_sql_with_cancel(&mut self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::ingest_stream<I>(&mut self, &str, I, usize) -> craton_bolt::BoltResult<u64> where I: core::iter::traits::collect::IntoIterator<Item = craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>>
 pub fn craton_bolt::exec::engine::Engine::insert_batch(&mut self, &str, arrow_array::record_batch::RecordBatch) -> craton_bolt::BoltResult<u64>
 pub fn craton_bolt::exec::engine::Engine::truncate_table(&mut self, &str) -> craton_bolt::BoltResult<()>
@@ -3642,8 +3684,10 @@ impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::explain_sql(&self, &str) -> craton_bolt::BoltResult<alloc::string::String>
 pub fn craton_bolt::exec::engine::Engine::run_logical_plan(&mut self, &craton_bolt::plan::logical_plan::LogicalPlan) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 pub fn craton_bolt::exec::engine::Engine::sql(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
+pub fn craton_bolt::exec::engine::Engine::sql_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::exec::engine::QueryHandle>
 impl craton_bolt::exec::engine::Engine
 pub fn craton_bolt::exec::engine::Engine::sql_stream(&self, &str) -> craton_bolt::BoltResult<craton_bolt::ResultStream<'_>>
+pub fn craton_bolt::exec::engine::Engine::sql_stream_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<craton_bolt::ResultStream<'_>>
 #[non_exhaustive] pub struct craton_bolt::EngineBuilder
 impl craton_bolt::exec::engine::EngineBuilder
 pub fn craton_bolt::exec::engine::EngineBuilder::auto_compact(self, usize) -> Self
@@ -3808,8 +3852,10 @@ pub fn craton_bolt::exec::session::Session::id(&self) -> u64
 pub fn craton_bolt::exec::session::Session::set_read_only(&self, bool)
 pub fn craton_bolt::exec::session::Session::settings(&self) -> craton_bolt::exec::session::SessionSettings
 pub fn craton_bolt::exec::session::Session::sql(&self, &str) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
+pub fn craton_bolt::exec::session::Session::sql_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::BoltResult<arrow_array::record_batch::RecordBatch>
 pub fn craton_bolt::exec::session::Session::statement_count(&self) -> u64
 pub fn craton_bolt::exec::session::Session::submit(&self, &str) -> craton_bolt::exec::session::PendingResult
+pub fn craton_bolt::exec::session::Session::submit_with_cancel(&self, &str, &craton_bolt::exec::cancel::CancellationToken) -> craton_bolt::exec::session::PendingResult
 pub fn craton_bolt::exec::session::Session::try_submit(&self, &str) -> craton_bolt::BoltResult<craton_bolt::exec::session::PendingResult>
 impl core::fmt::Debug for craton_bolt::exec::session::Session
 pub fn craton_bolt::exec::session::Session::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

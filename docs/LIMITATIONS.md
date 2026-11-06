@@ -82,6 +82,26 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   multi-context concurrency (per-context pools, streams, and caches) is
   post-1.0 work.
 
+## Cancellation granularity
+
+- A `CancellationToken` is polled between physical operators, per morsel /
+  partition / chunk group / sort run, every 64 Ki rows of the host hash
+  join, per block of the nested-loop join, and after the synchronised
+  passes of the radix sort.
+  **A single kernel launch, a single host operator step between polls (one
+  Arrow compute call, a Parquet file read, a JIT compile), or a single
+  catalog write is not interrupted**: a stop waits for the current one.
+- Statements that change data stop only *before* their commit point; once
+  they apply the change they run to completion, including the refresh of
+  dependent on-commit materialized views. `CREATE OR REPLACE MATERIALIZED
+  VIEW` over an existing view commits when it drops the old view, so it is
+  not cancellable while it recomputes. Transaction control is never
+  interrupted.
+- The token is per call: work queued behind a `Database` statement that is
+  waiting for another session's transaction is not woken early by a cancel
+  (it observes the cancel when it starts). `with_engine` closures take no
+  token.
+
 ---
 
 ## Pre-1.0 API instability

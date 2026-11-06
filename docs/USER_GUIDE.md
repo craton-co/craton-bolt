@@ -360,6 +360,47 @@ of blocking server threads, while other sessions keep writing.
 
 ---
 
+## Cancelling a query and timeouts
+
+Every statement entry point has a `_with_cancel` twin that takes a
+`CancellationToken`: `Engine::sql_with_cancel`, `execute_sql_with_cancel`,
+`sql_stream_with_cancel`, `DataFrame::collect_with_cancel`, and
+`Session::sql_with_cancel` / `submit_with_cancel`. Cancel the token from any
+thread (a Ctrl-C handler, a watchdog) and the statement stops with
+`BoltError::Cancelled(CancelReason::Cancelled)`. A statement timeout is a
+token with a deadline, which stops with `CancelReason::DeadlineExceeded`:
+
+```rust
+use std::time::Duration;
+use craton_bolt::{BoltError, CancelReason, CancellationToken};
+
+let token = CancellationToken::new();
+let stop = token.clone();
+std::thread::spawn(move || { wait_for_ctrl_c(); stop.cancel(); });
+
+let timed = token.with_timeout(Duration::from_secs(30)); // shares the flag
+match engine.sql_with_cancel("SELECT ...", &timed) {
+    Err(BoltError::Cancelled(CancelReason::DeadlineExceeded)) => { /* timed out */ }
+    Err(BoltError::Cancelled(_)) => { /* cancelled */ }
+    other => { /* ran to completion */ }
+}
+```
+
+The engine polls the token (an atomic load) before every operator, for
+every morsel, partition and chunk group, and between the passes of
+multi-kernel operators; a kernel that is already running finishes first, so
+a stop takes at most about one operator step. A stopped statement frees its
+device memory and spill files, and the engine runs the next statement
+normally. `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE TABLE ... AS`,
+`ALTER TABLE`, `COPY` and view refreshes poll the token for the last time
+just before they apply their change, then complete: a cancelled statement
+leaves the data unchanged. Inside a transaction it does not abort the
+transaction, and `BEGIN` / `COMMIT` / `ROLLBACK` are never interrupted (a
+cancelled token can still `ROLLBACK`). A cancelled incremental
+`ResultStream` yields one `Err(Cancelled)` and ends.
+
+---
+
 ## Supported SQL
 
 Craton Bolt's frontend is built on
@@ -502,6 +543,7 @@ enum (`src/error.rs`); the variants you'll see in normal use are:
 | `Cuda(String)`     | Runtime          | CUDA driver error without an associated `CUresult`.          |
 | `CudaWithCode { code, message }` | Runtime | Driver error with a numeric `CUresult`. Pattern-match `code` to recognise specific errors (e.g. `code == 2` is `CUDA_ERROR_OUT_OF_MEMORY`). |
 | `Io(io::Error)`    | Runtime          | Wraps `std::io::Error` via `#[from]`.                        |
+| `Cancelled(CancelReason)` | Runtime   | The statement's `CancellationToken` was cancelled or its deadline passed (see [Cancelling a query and timeouts](#cancelling-a-query-and-timeouts)). |
 
 Use the `Display` impl to render an error, or pattern-match on the
 variant to dispatch retry logic:
