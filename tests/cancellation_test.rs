@@ -389,3 +389,103 @@ fn session_statement_is_cancellable() {
     assert!(took < full * 3 / 4, "{took:?} vs {full:?}");
     assert_eq!(session.sql(JOIN_QUERY).unwrap(), reference);
 }
+
+/// `x(id3 Int32, ~1M distinct of 2M rows; v1 Float64)` — the Tier-2
+/// partitioned GROUP BY regime, whose slot scan fans out to worker threads.
+fn tier2_engine(policy: TierPolicy) -> Engine {
+    const N: usize = 2_000_000;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let id3: Vec<i32> = (0..N).map(|_| (next() % 1_000_000) as i32).collect();
+    let v1: Vec<f64> = (0..N).map(|i| i as f64).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id3", ArrowDataType::Int32, false),
+            ArrowField::new("v1", ArrowDataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(arrow_array::Int32Array::from(id3)),
+            Arc::new(arrow_array::Float64Array::from(v1)),
+        ],
+    )
+    .unwrap();
+    let mut e = Engine::builder().tier_policy(policy).build().expect("ctx");
+    e.register_table("x", batch).unwrap();
+    e
+}
+
+#[test]
+#[ignore = "gpu:e2e — cancel a Tier-2 GROUP BY (worker-thread slot scan) from a timer"]
+fn cancel_tier2_group_by_from_a_timer() {
+    const Q: &str = "SELECT id3, COUNT(v1) AS n FROM x GROUP BY id3 ORDER BY id3";
+    for policy in POLICIES {
+        let e = tier2_engine(policy);
+        let reference = e.sql(Q).unwrap().into_record_batch(); // warm (JIT, upload)
+        let (_, full) = timed(|| e.sql(Q).unwrap());
+        let baseline = device_used();
+        // Cancel at a sweep of points across the statement: every run either
+        // completes with the reference result or stops with Cancelled, never
+        // later than the uncancelled run plus slack; some stop mid-way.
+        let mut cancelled = 0;
+        for step in 1..10u32 {
+            let delay = full * step / 10;
+            let (r, took) = cancel_after(delay, |t| e.sql_with_cancel(Q, t));
+            match r {
+                Ok(h) => assert_eq!(h.into_record_batch(), reference, "{policy:?} {delay:?}"),
+                Err(BoltError::Cancelled(CancelReason::Cancelled)) => cancelled += 1,
+                Err(other) => panic!("{policy:?} at {delay:?}: {other}"),
+            }
+            assert!(
+                took < full * 2 + Duration::from_millis(200),
+                "{took:?} vs {full:?}"
+            );
+        }
+        assert!(cancelled > 0, "{policy:?}: no run was cancelled");
+        assert!(device_used() <= baseline + (16 << 20));
+        assert_eq!(e.sql(Q).unwrap().into_record_batch(), reference);
+    }
+}
+
+#[test]
+#[ignore = "gpu:e2e — a statement waiting for another session's transaction honours its deadline"]
+fn session_waiting_for_a_transaction_times_out_on_its_deadline() {
+    let db = Database::open(Engine::builder()).expect("open");
+    db.set_isolation(craton_bolt::IsolationLevel::Serializable);
+    let writer = db.session();
+    let reader = db.session();
+    writer.sql("CREATE TABLE t (k BIGINT)").unwrap();
+    writer.sql("INSERT INTO t VALUES (1)").unwrap();
+    writer.sql("BEGIN").unwrap();
+    writer.sql("INSERT INTO t VALUES (2)").unwrap();
+
+    // The reader's statement is held back by the open transaction; its
+    // 200 ms deadline ends the wait (well before the 30 s wait limit).
+    let token = CancellationToken::new().with_timeout(Duration::from_millis(200));
+    let (r, took) = timed(|| reader.sql_with_cancel("INSERT INTO t VALUES (3)", &token));
+    assert_cancelled(r, CancelReason::DeadlineExceeded);
+    assert!(
+        took >= Duration::from_millis(150) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+
+    // A cancel from another thread ends a wait too.
+    let (r, _) = cancel_after(Duration::from_millis(100), |t| {
+        reader.sql_with_cancel("INSERT INTO t VALUES (4)", t)
+    });
+    assert_cancelled(r, CancelReason::Cancelled);
+
+    // Neither waiting statement ran: after COMMIT only the writer's rows.
+    writer.sql("COMMIT").unwrap();
+    let sum = reader.sql("SELECT SUM(k) FROM t").unwrap();
+    assert_eq!(i64s(&sum, 0), vec![3]);
+    reader.sql("INSERT INTO t VALUES (5)").unwrap();
+    assert_eq!(
+        i64s(&reader.sql("SELECT SUM(k) FROM t").unwrap(), 0),
+        vec![8]
+    );
+}

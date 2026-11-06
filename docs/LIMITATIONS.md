@@ -97,10 +97,18 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
   VIEW` over an existing view commits when it drops the old view, so it is
   not cancellable while it recomputes. Transaction control is never
   interrupted.
-- The token is per call: work queued behind a `Database` statement that is
-  waiting for another session's transaction is not woken early by a cancel
-  (it observes the cancel when it starts). `with_engine` closures take no
-  token.
+- Worker threads a statement fans out to (the Tier-2 GROUP BY slot scan,
+  the join's parallel string hashing) poll the same token every 64 Ki
+  slots / rows.
+- A `Session` statement held back behind another session's transaction
+  (`IsolationLevel::Serializable`) re-checks its token at least every 20 ms
+  and at its deadline, and fails with `Cancelled` without having run. A
+  statement queued behind another *running* statement on the shared
+  runtime thread is only checked when it starts (one statement runs at a
+  time).
+- `Database::with_engine` closures take no token: they run to completion.
+  Call the `_with_cancel` methods on the engine inside the closure to make
+  their statements cancellable.
 
 ---
 

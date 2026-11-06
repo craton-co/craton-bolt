@@ -397,7 +397,10 @@ just before they apply their change, then complete: a cancelled statement
 leaves the data unchanged. Inside a transaction it does not abort the
 transaction, and `BEGIN` / `COMMIT` / `ROLLBACK` are never interrupted (a
 cancelled token can still `ROLLBACK`). A cancelled incremental
-`ResultStream` yields one `Err(Cancelled)` and ends.
+`ResultStream` yields one `Err(Cancelled)` and ends. A session statement
+waiting for another session's transaction stops waiting (without running)
+once its token is cancelled or its deadline passes. `Database::with_engine`
+closures take no token; use the engine's `_with_cancel` methods inside one.
 
 ---
 
