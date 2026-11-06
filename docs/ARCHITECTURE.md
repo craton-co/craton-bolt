@@ -243,6 +243,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/error.rs` | The engine-wide error type, [`BoltError`], and its [`BoltResult`] alias. |
 | `src/exec/agg_with_pre.rs` | Aggregate execution with a pre-projection / filter pass. |
 | `src/exec/aggregate.rs` | Scalar (no GROUP BY) aggregate execution. |
+| `src/exec/cancel.rs` | Query cancellation and statement timeouts. |
 | `src/exec/compact.rs` | Host-side filter compaction. |
 | `src/exec/cost.rs` | Cost-based CPU / GPU tier selection. |
 | `src/exec/device_pipeline.rs` | Device-resident operator pipelines: operators that hand their results to the next GPU operator as device columns instead of a host batch. |
