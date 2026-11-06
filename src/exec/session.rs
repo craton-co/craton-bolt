@@ -66,6 +66,9 @@ struct Job {
     run: Box<dyn FnOnce(&mut Engine) + Send>,
     /// Report that the job will not run.
     fail: Box<dyn FnOnce(BoltError) + Send>,
+    /// The statement's cancellation token: a job deferred behind another
+    /// session's transaction stops waiting once it fires.
+    cancel: Option<crate::CancellationToken>,
 }
 
 impl Job {
@@ -75,6 +78,7 @@ impl Job {
             queued: Instant::now(),
             run: Box::new(run),
             fail: Box::new(|_| {}),
+            cancel: None,
         }
     }
 }
@@ -380,30 +384,28 @@ fn run_jobs(
             }
             return;
         }
-        // Fail jobs that waited too long for the transaction.
+        // Fail jobs that waited too long for the transaction, or whose
+        // token was cancelled / expired while they waited (they never ran).
         let limit = Duration::from_nanos(wait_limit.load(Ordering::Relaxed));
         let mut i = 0;
         while i < deferred.len() {
-            if deferred[i].queued.elapsed() >= limit {
-                let job = deferred.remove(i).expect("index in range");
-                (job.fail)(BoltError::Plan(format!(
-                    "timed out after {limit:?} waiting for another session's transaction"
-                )));
-            } else {
-                i += 1;
+            match deferred_stop(&deferred[i], limit, Instant::now()) {
+                Some(e) => {
+                    let job = deferred.remove(i).expect("index in range");
+                    (job.fail)(e);
+                }
+                None => i += 1,
             }
         }
         // Wake up for the next view tick while idle.
         let tick = engine
             .has_scheduled_views()
             .then(|| VIEW_TICK.saturating_sub(last_tick.elapsed()));
-        let wait = match (deferred.iter().map(|j| j.queued).min(), tick) {
+        let now = Instant::now();
+        let wake = deferred.iter().map(|j| deferred_wake(j, limit, now)).min();
+        let wait = match (wake, tick) {
             (None, None) => None,
-            (None, Some(t)) => Some(t),
-            (Some(oldest), t) => {
-                let w = limit.saturating_sub(oldest.elapsed());
-                Some(t.map_or(w, |t| t.min(w)))
-            }
+            (w, t) => w.into_iter().chain(t).min(),
         };
         let next = match wait {
             None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
@@ -414,6 +416,38 @@ fn run_jobs(
             Ok(job) => deferred.push_back(job),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => connected = false,
+        }
+    }
+}
+
+/// How often a deferred job with a cancellation token (and no nearer
+/// deadline) re-checks it while waiting.
+const CANCEL_POLL: Duration = Duration::from_millis(20);
+
+/// Why deferred `job` must stop waiting at `now`, if it must: its token
+/// stopped it, or it waited `limit` for another session's transaction.
+fn deferred_stop(job: &Job, limit: Duration, now: Instant) -> Option<BoltError> {
+    if let Some(reason) = job.cancel.as_ref().and_then(|t| t.reason()) {
+        return Some(BoltError::Cancelled(reason));
+    }
+    (now.saturating_duration_since(job.queued) >= limit).then(|| {
+        BoltError::Plan(format!(
+            "timed out after {limit:?} waiting for another session's transaction"
+        ))
+    })
+}
+
+/// How long the runtime may sleep before deferred `job` needs a
+/// [`deferred_stop`] check.
+fn deferred_wake(job: &Job, limit: Duration, now: Instant) -> Duration {
+    let timeout = limit.saturating_sub(now.saturating_duration_since(job.queued));
+    match &job.cancel {
+        None => timeout,
+        Some(t) => {
+            let deadline = t
+                .deadline()
+                .map_or(CANCEL_POLL, |d| d.saturating_duration_since(now));
+            timeout.min(deadline).min(CANCEL_POLL)
         }
     }
 }
@@ -681,6 +715,7 @@ impl Session {
         let fail_counters = Arc::clone(&self.inner.counters);
         let sql = sql.to_string();
         let queued = Instant::now();
+        let job_cancel = token.clone();
         let run = move |engine: &mut Engine| {
             let c = &counters;
             if worker_side.cancelled.load(Ordering::Acquire) {
@@ -722,6 +757,7 @@ impl Session {
             queued,
             run: Box::new(run),
             fail: Box::new(fail),
+            cancel: job_cancel,
         };
         Ok((job, PendingResult { shared }))
     }
@@ -729,6 +765,48 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_jobs_stop_on_cancel_deadline_or_wait_limit() {
+        use crate::{CancelReason, CancellationToken};
+        let job = |cancel: Option<CancellationToken>| {
+            let mut j = super::Job::new(Some(1), |_| {});
+            j.cancel = cancel;
+            j
+        };
+        let now = Instant::now();
+        let limit = Duration::from_secs(30);
+        // No token: only the wait limit applies.
+        let plain = job(None);
+        assert!(super::deferred_stop(&plain, limit, now).is_none());
+        assert!(super::deferred_wake(&plain, limit, now) > Duration::from_secs(29));
+        assert!(matches!(
+            super::deferred_stop(&plain, Duration::ZERO, now),
+            Some(BoltError::Plan(_))
+        ));
+        // A token: polled every CANCEL_POLL, stops once cancelled.
+        let token = CancellationToken::new();
+        let with = job(Some(token.clone()));
+        assert!(super::deferred_stop(&with, limit, now).is_none());
+        assert_eq!(super::deferred_wake(&with, limit, now), super::CANCEL_POLL);
+        token.cancel();
+        assert!(matches!(
+            super::deferred_stop(&with, limit, now),
+            Some(BoltError::Cancelled(CancelReason::Cancelled))
+        ));
+        // A deadline: woken at it, stops after it.
+        let soon = job(Some(
+            CancellationToken::new().with_deadline(now + Duration::from_millis(5)),
+        ));
+        assert!(super::deferred_wake(&soon, limit, now) <= Duration::from_millis(5));
+        let late = job(Some(
+            CancellationToken::new().with_deadline(now - Duration::from_millis(1)),
+        ));
+        assert!(matches!(
+            super::deferred_stop(&late, limit, now),
+            Some(BoltError::Cancelled(CancelReason::DeadlineExceeded))
+        ));
+    }
+
     use super::*;
 
     #[test]
