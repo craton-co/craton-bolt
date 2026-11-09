@@ -903,3 +903,88 @@ fn extended_columns_in_distinct_windows_and_set_operations() {
         assert!(err.contains("List") || err.contains("Binary"), "{q}: {err}");
     }
 }
+
+/// `k` (non-nullable or not), `g = k % 4`, `s` Utf8 (NULL every 4th row),
+/// `b` Binary (NULL every 3rd row).
+fn count_table(k_nullable: bool) -> RecordBatch {
+    let n = N as i64;
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int64, k_nullable),
+            ArrowField::new("g", ArrowDataType::Int64, true),
+            ArrowField::new("s", ArrowDataType::Utf8, true),
+            ArrowField::new("b", ArrowDataType::Binary, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from((0..n).map(|k| k % 4).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                (0..n)
+                    .map(|k| (k % 4 != 1).then(|| format!("s{}", k % 5)))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from_iter(
+                (0..n).map(|k| (k % 3 != 2).then(|| vec![k as u8, 0xff])),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn i64_col(b: &RecordBatch, c: usize) -> Vec<i64> {
+    let a = b.column(c).as_any().downcast_ref::<Int64Array>().unwrap();
+    (0..a.len()).map(|i| a.value(i)).collect()
+}
+
+#[test]
+#[ignore = "gpu:e2e — COUNT(string / binary column) next to COUNT(*)"]
+fn count_of_a_string_or_binary_column_next_to_count_star() {
+    for k_nullable in [false, true] {
+        let mut e = Engine::new().expect("CUDA context");
+        e.register_table("t", count_table(k_nullable)).unwrap();
+        let s_ok = |k: i64| k % 4 != 1;
+        let b_ok = |k: i64| k % 3 != 2;
+        for p in POLICIES {
+            let what = format!("{p:?} k_nullable={k_nullable}");
+            for (filter, keep) in [
+                ("", (|_| true) as fn(i64) -> bool),
+                (" WHERE k >= 10", |k| k >= 10),
+            ] {
+                let rows: Vec<i64> = (0..N as i64).filter(|&k| keep(k)).collect();
+                let count = |f: &dyn Fn(i64) -> bool| rows.iter().filter(|&&k| f(k)).count() as i64;
+                let q = format!(
+                    "SELECT COUNT(s) AS a, COUNT(*) AS c, COUNT(b) AS d, SUM(k) AS e FROM t{filter}"
+                );
+                let got = run(&mut e, p, &q);
+                let want = vec![count(&s_ok), rows.len() as i64, count(&b_ok)];
+                assert_eq!(
+                    (0..3).map(|c| i64_col(&got, c)[0]).collect::<Vec<_>>(),
+                    want,
+                    "{what}: {q}"
+                );
+                assert_eq!(i64_col(&got, 3)[0], rows.iter().sum::<i64>(), "{what}: {q}");
+                let q = format!("SELECT COUNT(s) AS a FROM t{filter}");
+                assert_eq!(
+                    i64_col(&run(&mut e, p, &q), 0)[0],
+                    count(&s_ok),
+                    "{what}: {q}"
+                );
+                let q = format!(
+                    "SELECT g, COUNT(s) AS a, COUNT(*) AS c, COUNT(b) AS d FROM t{filter}                      GROUP BY g ORDER BY g"
+                );
+                let got = run(&mut e, p, &q);
+                assert_eq!(i64_col(&got, 0), vec![0, 1, 2, 3], "{what}: {q}");
+                for (c, f) in [
+                    (1, &s_ok as &dyn Fn(i64) -> bool),
+                    (2, &|_| true),
+                    (3, &b_ok),
+                ] {
+                    let want: Vec<i64> = (0..4)
+                        .map(|g| rows.iter().filter(|&&k| k % 4 == g && f(k)).count() as i64)
+                        .collect();
+                    assert_eq!(i64_col(&got, c), want, "{what}: {q} column {c}");
+                }
+            }
+        }
+    }
+}

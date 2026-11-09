@@ -4441,13 +4441,18 @@ fn lower_aggregate(
     }
     // `COUNT(*)` reaches the planner as `COUNT(<literal>)`, a computed feed
     // that needs the aggregate pre-kernel — which cannot output a `Utf8` /
-    // `Bool` / temporal / decimal group key. Count through a non-nullable
+    // `Bool` / temporal / decimal feed, whether a group key or another
+    // aggregate's input (`COUNT(s), COUNT(*)`). Count through a non-nullable
     // column instead (the same rows), which keeps the aggregate on the
     // pre-kernel-free path; with no such column, bind the input with a
     // synthetic row column (`lower_aggregate_over_input`).
-    if !group_by.is_empty() && aggregates.iter().any(is_count_star) {
+    if aggregates.iter().any(is_count_star) {
         let input_schema = input.schema()?;
-        let key_needs_passthrough = group_by.iter().any(|e| {
+        let other_inputs = aggregates
+            .iter()
+            .filter(|a| !is_count_star(a))
+            .map(aggregate_input_expr);
+        let key_needs_passthrough = group_by.iter().chain(other_inputs).any(|e| {
             matches!(
                 e.dtype(&input_schema),
                 Ok(DataType::Utf8
@@ -7419,6 +7424,45 @@ fn lower_depth(plan: &LogicalPlan, depth: usize) -> BoltResult<PhysicalPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `COUNT(*)` next to `COUNT(<Utf8 column>)` (with and without WHERE /
+    /// GROUP BY) lowers: the pre-kernel cannot output a Utf8 feed, so the
+    /// row count goes through a column or a synthetic row column.
+    #[test]
+    fn count_star_next_to_count_of_a_utf8_column_lowers() {
+        let scan = || LogicalPlan::Scan {
+            table: "t".into(),
+            projection: None,
+            schema: Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("s", DataType::Utf8, true),
+            ]),
+        };
+        let aggs = vec![
+            AggregateExpr::Count(Expr::Column("s".into())),
+            AggregateExpr::Count(Expr::Literal(Literal::Int64(1))),
+        ];
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("k".into())),
+                right: Box::new(Expr::Literal(Literal::Int64(3))),
+            },
+        };
+        for (input, keys) in [
+            (scan(), vec![]),
+            (filtered.clone(), vec![]),
+            (filtered, vec![Expr::Column("k".into())]),
+        ] {
+            let plan = LogicalPlan::Aggregate {
+                input: Box::new(input),
+                group_by: keys,
+                aggregates: aggs.clone(),
+            };
+            lower(&plan).expect("COUNT(s), COUNT(*) lowers");
+        }
+    }
     use crate::plan::logical_plan::{
         AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, Schema,
     };

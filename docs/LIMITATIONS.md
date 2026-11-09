@@ -387,10 +387,7 @@ These are real, code-level behaviors to be aware of:
   return one. Binary values are kept as hex strings (twice their size), and
   an opaque column's original arrays stay in host memory beside an `Int64`
   handle column for as long as the table is registered. `LargeUtf8` /
-  `Utf8View` columns come back as `Utf8`. `COUNT(binary_col)` next to
-  `COUNT(*)` in one scalar aggregate fails as it does for a `Utf8` column
-  (a pre-existing gap of the aggregate pre-kernel); count them in separate
-  statements.
+  `Utf8View` columns come back as `Utf8`.
 - **Temporal / decimal types: lowered, with residual gaps.** `Decimal128`,
   `Date32`, and `Timestamp` parse and lower to the GPU. GPU gather (filter /
   compaction) and column upload are wired for all three.
