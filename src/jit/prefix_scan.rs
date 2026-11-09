@@ -154,6 +154,7 @@ pub fn gather_kernel_entry(dtype: DataType) -> &'static str {
         // kernel — they emit the same PTX shape and same SM occupancy.
         DataType::Date32 => "bolt_gather_i32",
         DataType::Timestamp(_, _) => "bolt_gather_i64",
+        DataType::Extended(_) => "bolt_gather_extended_unsupported",
     }
 }
 
@@ -1404,6 +1405,11 @@ fn gather_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str, 
         // days / ticks. Same register classes as Int32 / Int64.
         DataType::Date32 => ("s32", "r", "b32"),
         DataType::Timestamp(_, _) => ("s64", "rl", "b64"),
+        DataType::Extended(t) => {
+            return Err(BoltError::Other(format!(
+                "{t}: extended types run on their storage type, not here"
+            )))
+        }
     })
 }
 

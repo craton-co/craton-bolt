@@ -196,12 +196,15 @@ impl ReduceOp {
             // `reduction_storage_dtype` has already collapsed Date32/Timestamp
             // to Int32/Int64 (or errored for SUM(temporal)); only the truly
             // unsupported dtypes remain here.
-            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => {
-                Err(BoltError::Type(format!(
-                    "agg_kernels: reduction over dtype {:?} is not supported",
-                    dtype
-                )))
-            }
+            (_, Bool)
+            | (_, Utf8)
+            | (_, Decimal128(_, _))
+            | (_, Date32)
+            | (_, Timestamp(_, _))
+            | (_, Extended(_)) => Err(BoltError::Type(format!(
+                "agg_kernels: reduction over dtype {:?} is not supported",
+                dtype
+            ))),
         }
     }
 
@@ -229,7 +232,12 @@ impl ReduceOp {
             (Max, Float32) => "max.f32",
             (Max, Float64) => "max.f64",
 
-            (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => {
+            (_, Bool)
+            | (_, Utf8)
+            | (_, Decimal128(_, _))
+            | (_, Date32)
+            | (_, Timestamp(_, _))
+            | (_, Extended(_)) => {
                 return Err(BoltError::Type(format!(
                     "agg_kernels: reduction over dtype {:?} is not supported",
                     dtype
@@ -694,7 +702,8 @@ fn emit_reduction_kernel(op: ReduceOp, dtype: DataType, with_validity: bool) -> 
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "agg_kernels: warp-shuffle reduction over dtype {:?} is not supported",
                     acc_dtype
@@ -788,7 +797,8 @@ fn ptx_type_info(
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => {
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "agg_kernels: dtype {:?} not supported in reduction kernels",
                 dtype

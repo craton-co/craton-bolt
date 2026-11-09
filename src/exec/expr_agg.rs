@@ -1927,7 +1927,7 @@ fn cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
                     .into(),
             ))
         }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
+        DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "cast to {to:?} is not supported in the expression evaluator"
             )));
@@ -1969,7 +1969,7 @@ fn safe_cast_column(col: HostColumn, to: DataType) -> BoltResult<HostColumn> {
                     .into(),
             ))
         }
-        Date32 | Timestamp(_, _) => {
+        Date32 | Timestamp(_, _) | Extended(_) => {
             return Err(BoltError::Type(format!(
                 "TRY_CAST to {to:?} is not supported in the expression evaluator"
             )));

@@ -103,6 +103,9 @@ impl DeviceCol {
                 // (see the output-allocation loop in `run_kernel`).
                 valid_mask: None,
             }),
+            DataType::Extended(t) => Err(BoltError::Type(format!(
+                "{t}: extended types run on their storage type, not here"
+            ))),
         }
     }
 

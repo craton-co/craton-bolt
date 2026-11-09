@@ -78,6 +78,9 @@ pub(crate) fn plan_dtype_to_arrow(d: DataType) -> BoltResult<ArrowDataType> {
             plan_time_unit_to_arrow(unit),
             tz.map(Arc::from),
         )),
+        // The logical (user-facing) type; executors never see one, they run
+        // on `extended_types::storage_dtype`.
+        DataType::Extended(t) => Ok(t.clone()),
     }
 }
 
@@ -98,32 +101,11 @@ pub(crate) fn plan_dtype_to_arrow_no_temporal(d: DataType, ctx: &str) -> BoltRes
     }
 }
 
-/// Full Arrow→plan dtype mapping, including `Date32`/`Timestamp` and
-/// `Dictionary(_, Utf8)` (mapped to `Utf8`). Errors on unsupported types.
+/// Full Arrow→plan dtype mapping: [`DataType::from_arrow`] (the native
+/// types, `LargeUtf8` / `Utf8View` / `Dictionary(_, Utf8)` as `Utf8`, and
+/// the extended types). Errors on unsupported types.
 pub(crate) fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    match d {
-        ArrowDataType::Int32 => Ok(DataType::Int32),
-        ArrowDataType::Int64 => Ok(DataType::Int64),
-        ArrowDataType::Float32 => Ok(DataType::Float32),
-        ArrowDataType::Float64 => Ok(DataType::Float64),
-        ArrowDataType::Boolean => Ok(DataType::Bool),
-        ArrowDataType::Utf8 => Ok(DataType::Utf8),
-        ArrowDataType::Decimal128(precision, scale) => Ok(DataType::Decimal128(*precision, *scale)),
-        ArrowDataType::Date32 => Ok(DataType::Date32),
-        ArrowDataType::Timestamp(unit, tz) => {
-            let interned: Option<&'static str> = tz
-                .as_deref()
-                .map(crate::plan::logical_plan::intern_timezone);
-            Ok(DataType::Timestamp(arrow_time_unit_to_plan(unit), interned))
-        }
-        ArrowDataType::Dictionary(_key, value) if matches!(value.as_ref(), ArrowDataType::Utf8) => {
-            Ok(DataType::Utf8)
-        }
-        other => Err(BoltError::Type(format!(
-            "unsupported Arrow dtype {:?}",
-            other
-        ))),
-    }
+    DataType::from_arrow(d)
 }
 
 /// Arrow→plan dtype mapping for paths that support the primitive +

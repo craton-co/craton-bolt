@@ -1695,6 +1695,9 @@ fn cast_source_is_supported(src: DataType) -> BoltResult<()> {
         DataType::Timestamp(_, _) => Err(BoltError::Plan(
             "CAST to/from Timestamp not yet lowered to GPU".into(),
         )),
+        DataType::Extended(t) => Err(BoltError::Plan(format!(
+            "CAST to/from {t} is not supported"
+        ))),
         DataType::Utf8 => Err(BoltError::Plan(
             "CAST to/from String not yet lowered to GPU".into(),
         )),
@@ -1719,6 +1722,9 @@ fn cast_target_is_supported(target: DataType) -> BoltResult<()> {
         DataType::Timestamp(_, _) => Err(BoltError::Plan(
             "CAST to/from Timestamp not yet lowered to GPU".into(),
         )),
+        DataType::Extended(t) => Err(BoltError::Plan(format!(
+            "CAST to/from {t} is not supported"
+        ))),
         DataType::Utf8 => Err(BoltError::Plan(
             "CAST to/from String not yet lowered to GPU".into(),
         )),
@@ -1756,7 +1762,9 @@ fn pow10_i128(exp: u32) -> BoltResult<i128> {
 ///   * `Some(Err(e))`→ `Err(e)`
 ///
 /// The match arms, success dtypes, and error message text are all owned by
-/// the logical helper; nothing is re-derived here.
+/// the logical helper; nothing is re-derived here. The physical plane
+/// computes on storage types, so an extended result (the `Duration` of
+/// `Timestamp - Timestamp`) is its storage type (`Int64` ticks).
 fn temporal_arith_result_dtype(
     op: BinaryOp,
     l: DataType,
@@ -1764,7 +1772,7 @@ fn temporal_arith_result_dtype(
 ) -> BoltResult<Option<DataType>> {
     match logical_temporal_arith_result(op, l, r) {
         None => Ok(None),
-        Some(Ok(dt)) => Ok(Some(dt)),
+        Some(Ok(dt)) => Ok(Some(crate::plan::extended_types::storage_dtype(dt))),
         Some(Err(e)) => Err(e),
     }
 }
@@ -2253,6 +2261,12 @@ impl<'a> Codegen<'a> {
             return Ok(self.emit_null_as(target));
         }
         let value = self.emit_expr(inner)?;
+        // `TIMESTAMP -> Int64` reinterprets the i64 tick register (the
+        // casts a lowered `TIMESTAMP - TIMESTAMP` carries): no instruction,
+        // only the dtype changes.
+        if crate::plan::logical_plan::ticks_reinterpret(value.dtype, target) {
+            return Ok(Value::single(value.reg, target));
+        }
         // Identity cast is always fine — emit_cast collapses it to no-op.
         if value.dtype == target {
             // A Decimal128 identity cast must preserve the (lo, hi) pair —
@@ -2543,6 +2557,32 @@ impl<'a> Codegen<'a> {
                 result_dtype: DataType::Int32,
             });
             return Ok(Value::single(dst, DataType::Date32));
+        }
+        // TIMESTAMP ± integer ticks (a lowered TIMESTAMP ± duration): `i64`
+        // arithmetic on the tick count, labelled with the timestamp type.
+        if op_is_arithmetic(op) {
+            if let Some(ts @ DataType::Timestamp(_, _)) =
+                temporal_arith_result_dtype(op, l.dtype, r.dtype)?
+            {
+                let mut ticks = |v: Value| {
+                    if matches!(v.dtype, DataType::Timestamp(_, _)) {
+                        Value::single(v.reg, DataType::Int64)
+                    } else {
+                        self.emit_cast(v, DataType::Int64)
+                    }
+                };
+                let (lv, rv) = (ticks(l), ticks(r));
+                let dst = self.fresh();
+                self.ops.push(Op::Binary {
+                    dst,
+                    op,
+                    lhs: lv.reg,
+                    rhs: rv.reg,
+                    dtype: DataType::Int64,
+                    result_dtype: DataType::Int64,
+                });
+                return Ok(Value::single(dst, ts));
+            }
         }
         let (lhs_v, rhs_v, operand_dtype, result_dtype) = if op_is_arithmetic(op) {
             // Date32 / Timestamp arithmetic. Only `Date32 - Date32`
@@ -3114,6 +3154,11 @@ impl<'a> Codegen<'a> {
                      coming in a follow-up"
                         .into(),
                 ))
+            }
+            DataType::Extended(t) => {
+                return Err(BoltError::Plan(format!(
+                    "CASE over {t} is not lowered to GPU"
+                )))
             }
             DataType::Bool
             | DataType::Int32
@@ -7649,7 +7694,8 @@ mod tests {
         /// across all dtype pairs and all binary ops. The two return shapes
         /// must encode the same outcome:
         ///   logical `None`        ⇔ physical `Ok(None)`
-        ///   logical `Some(Ok(d))` ⇔ physical `Ok(Some(d))`
+        ///   logical `Some(Ok(d))` ⇔ physical `Ok(Some(storage_dtype(d)))`
+        ///     (the physical plane computes on storage types)
         ///   logical `Some(Err)`   ⇔ physical `Err`
         #[test]
         fn temporal_arith_matches_logical_across_matrix() {
@@ -7669,7 +7715,11 @@ mod tests {
                         match (phys, logi) {
                             (Ok(None), None) => {}
                             (Ok(Some(pd)), Some(Ok(ld))) => {
-                                assert_eq!(pd, ld, "temporal {op:?} ({l:?},{r:?}) value drift")
+                                assert_eq!(
+                                    pd,
+                                    crate::plan::extended_types::storage_dtype(ld),
+                                    "temporal {op:?} ({l:?},{r:?}) value drift"
+                                )
                             }
                             (Err(_), Some(Err(_))) => {}
                             (phys, logi) => panic!(

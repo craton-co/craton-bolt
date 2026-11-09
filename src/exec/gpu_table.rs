@@ -674,6 +674,11 @@ impl GpuColumn {
                     validity: buf.1,
                 }
             }
+            DataType::Extended(t) => {
+                return Err(BoltError::Type(format!(
+                    "{t}: extended types run on their storage type, not here"
+                )))
+            }
         };
         Ok(Self {
             name,

@@ -295,7 +295,7 @@ fn resolve_key_columns<'a>(
                     io.name
                 )))
             }
-            DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "Date/Timestamp keys in wide GROUP BY not yet supported (column '{}')",
                     io.name
@@ -369,7 +369,8 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => Err(BoltError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
@@ -535,7 +536,8 @@ fn resolve_aggregates<'a>(
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: Bool/Utf8 aggregate inputs not supported (column '{}')",
                     io.name
@@ -605,7 +607,8 @@ fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> BoltResult<AggInputValue
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => Err(BoltError::Type(format!(
             "wide GROUP BY: aggregate input dtype {:?} not supported (column '{}')",
             plan.dtype, plan.name
         ))),
@@ -867,7 +870,8 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
             | (_, DataType::Utf8)
             | (_, DataType::Decimal128(_, _))
             | (_, DataType::Date32)
-            | (_, DataType::Timestamp(_, _)) => {
+            | (_, DataType::Timestamp(_, _))
+            | (_, DataType::Extended(_)) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: cannot make accumulator for ({:?}, {:?}) on column '{}'",
                     p.kind, p.dtype, p.name
@@ -911,7 +915,8 @@ fn build_key_arrays(
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: key dtype {:?} not supported on output",
                     kc.dtype
@@ -1106,7 +1111,8 @@ fn collect_sum_min_max(
                 | DataType::Utf8
                 | DataType::Decimal128(_, _)
                 | DataType::Date32
-                | DataType::Timestamp(_, _) => {
+                | DataType::Timestamp(_, _)
+                | DataType::Extended(_) => {
                     return Err(BoltError::Type(format!(
                         "wide GROUP BY: cannot emit empty {:?} aggregate column",
                         out_dtype

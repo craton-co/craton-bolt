@@ -1437,7 +1437,11 @@ impl PreCol {
                     .collect();
                 PreColValues::Dec128(GpuVec::from_slice(&rows)?)
             }
-            DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Bool
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -1468,7 +1472,8 @@ impl PreCol {
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "agg_with_pre: pre kernel output dtype {:?} not supported",
                     dtype

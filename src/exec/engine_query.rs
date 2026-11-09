@@ -309,7 +309,34 @@ impl Engine {
     /// `user_rewrites` — see [`QueryCompiler::compile`]. `top_level` controls
     /// whether the `Plan` / `Lower` / `Execute` phase histograms are observed
     /// (nested subplans are folded into their enclosing query's phases).
+    ///
+    /// A plan over extended types (`crate::plan::extended_types`) is
+    /// validated and rewritten onto their storage types first, and the
+    /// result's storage columns are converted back to the plan's output
+    /// types.
     pub(crate) fn execute_logical(
+        &self,
+        plan: &LogicalPlan,
+        user_rewrites: bool,
+        top_level: bool,
+    ) -> BoltResult<QueryHandle> {
+        let lowered = crate::plan::extended_types::lower_plan(plan)?;
+        if !lowered.changed {
+            return self.execute_storage_plan(plan, user_rewrites, top_level);
+        }
+        let mut h = self.execute_storage_plan(&lowered.plan, user_rewrites, top_level)?;
+        if let Some(schema) = &lowered.restore {
+            let batch = std::mem::replace(
+                &mut h.batch,
+                RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+            );
+            h.batch = self.extended.borrow().restore(batch, schema)?;
+        }
+        Ok(h)
+    }
+
+    /// [`Engine::execute_logical`] for a plan over storage types only.
+    fn execute_storage_plan(
         &self,
         plan: &LogicalPlan,
         user_rewrites: bool,
@@ -536,6 +563,14 @@ impl Engine {
         crate::metrics::metrics()
             .observe_duration(crate::metrics::Phase::Parse, parse_start.elapsed());
         match shape {
+            // Extended types: rewritten and converted back by
+            // `execute_logical` (and never cached: the cache holds physical
+            // plans, not the conversion).
+            QueryShape::Generic(plan)
+                if crate::plan::extended_types::lower_plan(&plan)?.changed =>
+            {
+                self.execute_logical(&plan, true, true)
+            }
             QueryShape::Generic(plan) => {
                 // A fresh materialized view of this very query.
                 if let Some(h) = self.answer_from_view(&plan)? {
@@ -665,6 +700,10 @@ impl Engine {
                 ))
             }
         };
+        // The plan that executes: extended types validated (so unsupported
+        // operations fail here exactly as they fail `sql`) and rewritten
+        // onto their storage types.
+        let plan = crate::plan::extended_types::lower_plan(&plan)?.plan;
         let registry = self.dict_registry.borrow();
         let compiled = self
             .compiler(&registry)

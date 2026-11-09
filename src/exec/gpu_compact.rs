@@ -1327,6 +1327,11 @@ fn alloc_gathered(dtype: DataType, len: usize) -> BoltResult<GatheredCol> {
             unit,
             tz,
         },
+        DataType::Extended(t) => {
+            return Err(BoltError::Type(format!(
+                "{t}: extended types run on their storage type, not here"
+            )))
+        }
     })
 }
 

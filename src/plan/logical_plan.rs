@@ -53,7 +53,15 @@ pub fn intern_timezone(name: &str) -> &'static str {
 /// `Option<&'static str>` interned via [`intern_timezone`] — semantically
 /// equivalent to `Option<String>`. The companion [`Literal::Timestamp`]
 /// constructor accepts a `String` and routes it through the interner.
+///
+/// **Extended types** (`Time32` / `Time64`, `Duration`, the binary family,
+/// `Interval`, `Decimal256`, `Null` and the nested types) are carried by the
+/// single [`DataType::Extended`] variant, which holds the column's exact Arrow
+/// type (interned, so the enum stays `Copy`). Build one with
+/// [`DataType::from_arrow`]. The enum is `#[non_exhaustive]`: match it with a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DataType {
     /// Boolean (one byte on device).
     Bool,
@@ -80,9 +88,79 @@ pub enum DataType {
     /// resolution, with an optional process-interned IANA time-zone name
     /// (see [`intern_timezone`]). A `None` timezone means "local / naive".
     Timestamp(TimeUnit, Option<&'static str>),
+    /// A column type the engine stores and returns but does not compute on
+    /// natively, carrying its exact Arrow type: `Time32` / `Time64`,
+    /// `Duration`, `Binary` / `LargeBinary` / `BinaryView` /
+    /// `FixedSizeBinary`, `Interval`, `Decimal256`, `Null`, and the nested
+    /// types (`List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`, `Union`).
+    ///
+    /// Which operations each one supports (comparison, `GROUP BY`, `ORDER BY`,
+    /// `MIN` / `MAX`, ...) is listed in `docs/SQL_REFERENCE.md`; every
+    /// extended column can be selected, filtered on other columns, joined,
+    /// sorted by other keys, `UNION ALL`-ed, tested with `IS [NOT] NULL` and
+    /// counted. Construct with [`DataType::from_arrow`], which interns the
+    /// Arrow type.
+    Extended(&'static arrow_schema::DataType),
+}
+
+/// Intern an Arrow type so a [`DataType::Extended`] value stays `Copy`.
+///
+/// Like [`intern_timezone`], the set of distinct column types a process sees
+/// is small, so the one-time leak per distinct type is bounded in practice.
+fn intern_arrow_type(t: &arrow_schema::DataType) -> &'static arrow_schema::DataType {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static INTERN: Mutex<Option<HashSet<&'static arrow_schema::DataType>>> = Mutex::new(None);
+    let mut guard = INTERN.lock().unwrap_or_else(|p| p.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    if let Some(existing) = set.get(t) {
+        return existing;
+    }
+    let leaked: &'static arrow_schema::DataType = Box::leak(Box::new(t.clone()));
+    set.insert(leaked);
+    leaked
 }
 
 impl DataType {
+    /// The engine type of an Arrow column type, as table registration maps
+    /// it: the natively computed types map to their own variant (`LargeUtf8`
+    /// and `Utf8View` to [`DataType::Utf8`], a `Dictionary` to its value
+    /// type), the extended types (see [`DataType::Extended`]) to
+    /// `Extended`, and anything else (for example `Int8`, `UInt32`,
+    /// `Float16`, `Date64`) is an error naming the type.
+    pub fn from_arrow(t: &arrow_schema::DataType) -> BoltResult<DataType> {
+        use arrow_schema::DataType as A;
+        Ok(match t {
+            A::Int32 => DataType::Int32,
+            A::Int64 => DataType::Int64,
+            A::Float32 => DataType::Float32,
+            A::Float64 => DataType::Float64,
+            A::Boolean => DataType::Bool,
+            A::Utf8 | A::LargeUtf8 | A::Utf8View => DataType::Utf8,
+            A::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+            A::Date32 => DataType::Date32,
+            A::Timestamp(unit, tz) => DataType::Timestamp(
+                crate::exec::schema_convert::arrow_time_unit_to_plan(unit),
+                tz.as_deref().map(intern_timezone),
+            ),
+            A::Dictionary(_, value) => match DataType::from_arrow(value)? {
+                // Only string dictionaries are kept encoded; any other
+                // dictionary is unpacked to its value type on ingest.
+                DataType::Utf8 if value.as_ref() == &A::Utf8 => DataType::Utf8,
+                DataType::Utf8 => {
+                    return Err(BoltError::Type(format!(
+                        "unsupported Arrow dtype {t}: only Utf8 dictionaries are supported"
+                    )))
+                }
+                other => other,
+            },
+            other if crate::plan::extended_types::is_extended_arrow(other) => {
+                DataType::Extended(intern_arrow_type(other))
+            }
+            other => return Err(BoltError::Type(format!("unsupported Arrow dtype {other}"))),
+        })
+    }
+
     /// Byte width for fixed-width types; `None` for variable-width.
     pub fn byte_width(self) -> Option<usize> {
         match self {
@@ -100,6 +178,9 @@ impl DataType {
             // `i64` ticks since epoch regardless of TimeUnit / tz
             // (mirrors Arrow `Timestamp*Array`).
             DataType::Timestamp(_, _) => Some(8),
+            // Extended types never reach the executors: they run on their
+            // storage type (see `crate::plan::extended_types`).
+            DataType::Extended(_) => None,
         }
     }
 
@@ -1121,9 +1202,9 @@ impl Expr {
                 let _ = depth; // depth threading enforced at function entry
                 if op.is_arithmetic() {
                     // Date32/Timestamp subtraction lowers to integer sub
-                    // on the underlying days/ticks. Only Sub is wired (Date - Date
-                    // yields a day count; Timestamp - Timestamp yields a tick
-                    // count in the source unit). Mixing two Timestamps with
+                    // on the underlying days/ticks (Date - Date yields a day
+                    // count; Timestamp - Timestamp a Duration in the source
+                    // unit; Timestamp +/- Duration a Timestamp). Mixing two Timestamps with
                     // different TimeUnits or non-matching tz literals is
                     // intentionally out of scope; rejected with a tighter
                     // message so the user knows what to do.
@@ -1147,7 +1228,7 @@ impl Expr {
                     }
                     unify_numeric(l, r)
                 } else if op.is_comparison() {
-                    if l == r {
+                    if l == r || crate::plan::extended_types::comparable(l, r) {
                         Ok(DataType::Bool)
                     } else if l.is_numeric() && r.is_numeric() {
                         // Allow numeric cross-comparisons; result is still Bool.
@@ -1321,6 +1402,12 @@ impl Expr {
                     safe_cast_is_supported(src, *target)
                 } else {
                     cast_is_supported(src, *target)
+                        // The `TIME` / `INTERVAL` / `X'..'` constant forms.
+                        || (matches!(expr.as_ref(), Expr::Literal(_))
+                            && crate::plan::extended_types::literal_cast_is_supported(
+                                src, *target,
+                            ))
+                        || ticks_reinterpret(src, *target)
                 };
                 if !supported {
                     return Err(BoltError::Type(format!(
@@ -1877,6 +1964,15 @@ pub(crate) fn cast_is_supported(src: DataType, target: DataType) -> bool {
 /// `TRY_CAST(decimal AS FLOAT)` surface a clear "unsupported" type error.
 /// (A `Decimal128 HostColumn` + the host scale/round + Arrow round-trip would
 /// be required to lift this; tracked as a follow-up.)
+/// `TIMESTAMP -> Int64` reinterpretation of the tick count. Only plans
+/// lowered by [`crate::plan::extended_types::lower_plan`] carry this cast
+/// (for `TIMESTAMP - TIMESTAMP`); the engine's plan validation rejects it in
+/// user plans, where `CAST` between a timestamp and an integer stays
+/// unsupported.
+pub(crate) fn ticks_reinterpret(src: DataType, target: DataType) -> bool {
+    matches!((src, target), (DataType::Timestamp(_, _), DataType::Int64))
+}
+
 pub(crate) fn safe_cast_is_supported(src: DataType, target: DataType) -> bool {
     use DataType::*;
     // Float<->Decimal128 is plain-CAST-only (GPU); not a safe cast — see the
@@ -1903,7 +1999,9 @@ pub(crate) fn safe_cast_is_supported(src: DataType, target: DataType) -> bool {
 ///
 /// Returns `Some(Ok(dtype))` if the op is in scope:
 ///   * `Date32 - Date32`              → `Int32` (number of days)
-///   * `Timestamp(u, tz) - Timestamp(u, tz)` → `Int64` (ticks in the source unit)
+///   * `Timestamp(u, tz) - Timestamp(u, tz)` → `Duration(u)` (an extended type)
+///   * `Timestamp(u, tz) ± Duration(_)`, `Duration(_) + Timestamp(u, tz)` →
+///     `Timestamp(u, tz)`
 ///
 /// Returns `Some(Err(_))` with a clear message for out-of-scope cases that
 /// touch Date32 / Timestamp (e.g. `Date32 + Date32`, mixed `TimeUnit`s, or
@@ -1939,6 +2037,22 @@ pub(crate) fn date_or_timestamp_arith_result(
         (BinaryOp::Add, Date32, Int32 | Int64)
         | (BinaryOp::Add, Int32 | Int64, Date32)
         | (BinaryOp::Sub, Date32, Int32 | Int64) => Some(Ok(Date32)),
+        // TIMESTAMP ± duration keeps the timestamp's type (the duration is
+        // rescaled to its unit, truncating toward zero).
+        (BinaryOp::Add | BinaryOp::Sub, Timestamp(u, tz), Extended(_))
+        | (BinaryOp::Add, Extended(_), Timestamp(u, tz))
+            if matches!(
+                crate::plan::extended_types::family_of(if l_is_temporal { r } else { l }),
+                Some(crate::plan::extended_types::Family::Duration(_))
+            ) =>
+        {
+            Some(Ok(Timestamp(u, tz)))
+        }
+        // The lowered form of TIMESTAMP ± duration: the duration as `Int64`
+        // ticks of the timestamp's unit. The engine's plan validation
+        // rejects it in user plans (add an INTERVAL instead).
+        (BinaryOp::Add | BinaryOp::Sub, Timestamp(u, tz), Int64)
+        | (BinaryOp::Add, Int64, Timestamp(u, tz)) => Some(Ok(Timestamp(u, tz))),
         (BinaryOp::Sub, Timestamp(lu, ltz), Timestamp(ru, rtz)) => {
             if lu != ru {
                 return Some(Err(BoltError::Type(format!(
@@ -1952,7 +2066,10 @@ pub(crate) fn date_or_timestamp_arith_result(
                      got {ltz:?} and {rtz:?}"
                 ))));
             }
-            Some(Ok(Int64))
+            // A duration in the operands' unit.
+            Some(DataType::from_arrow(&arrow_schema::DataType::Duration(
+                crate::exec::schema_convert::plan_time_unit_to_arrow(lu),
+            )))
         }
         // Catch-all: any other Date/Timestamp arithmetic shape is rejected
         // here with a tight message rather than falling through to the
@@ -1960,7 +2077,7 @@ pub(crate) fn date_or_timestamp_arith_result(
         _ => Some(Err(BoltError::Type(format!(
             "arithmetic {op:?} on Date/Timestamp operands ({l:?}, {r:?}) is not \
              supported; only Date32 - Date32, Date32 +/- integer days and \
-             Timestamp - Timestamp (matching unit and tz) are"
+             Timestamp - Timestamp (matching unit and tz) and Timestamp +/- Duration are"
         )))),
     }
 }
@@ -2260,7 +2377,11 @@ pub fn sum_output_dtype(input: DataType) -> DataType {
         // Other non-numeric types fall through unchanged; the downstream
         // typecheck (e.g. `ReduceOp::identity_ptx`) will reject the
         // aggregate.
-        DataType::Bool | DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) => input,
+        DataType::Bool
+        | DataType::Utf8
+        | DataType::Date32
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => input,
     }
 }
 

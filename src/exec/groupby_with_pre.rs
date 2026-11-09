@@ -305,7 +305,7 @@ pub fn execute_groupby_with_pre(
                     .into(),
             ))
         }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
+        DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "GROUP BY key dtype {:?} not yet supported",
                 original_key_dtype
@@ -2481,7 +2481,8 @@ impl PreCol {
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "groupby_with_pre: pre kernel column dtype {:?} not supported",
                     dtype
@@ -2502,7 +2503,8 @@ impl PreCol {
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "groupby_with_pre: pre kernel output dtype {:?} not supported",
                     dtype

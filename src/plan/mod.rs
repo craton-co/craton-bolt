@@ -4,6 +4,7 @@
 
 pub mod dataframe;
 pub mod explain;
+pub(crate) mod extended_types;
 pub(crate) mod literal_coercion;
 pub mod logical_plan;
 pub(crate) mod null_semantics;

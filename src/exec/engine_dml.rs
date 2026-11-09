@@ -170,6 +170,7 @@ impl Engine {
 
     /// Schema of table `name` if statements may change its rows.
     pub(crate) fn writable_schema(&self, name: &str) -> BoltResult<SchemaRef> {
+        self.reject_extended_write(name)?;
         if self.view_exists(name) {
             return Err(BoltError::Plan(format!(
                 "'{name}' is a materialized view; it changes only by REFRESH"

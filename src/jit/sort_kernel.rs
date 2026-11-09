@@ -265,6 +265,7 @@ pub fn key_reg_cost(dtype: DataType) -> u32 {
         // accounting is well-defined either way.
         DataType::Date32 => 2,
         DataType::Timestamp(_, _) => 4,
+        DataType::Extended(_) => 4,
     }
 }
 

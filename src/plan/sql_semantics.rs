@@ -67,7 +67,7 @@ pub enum SqlSemantics {
 /// of every node, where `schema` is the schema the expression is evaluated
 /// against. Subquery plans embedded in expressions are left alone (they are
 /// compiled, and transformed, on their own when they are resolved).
-fn map_exprs_with_schema(
+pub(crate) fn map_exprs_with_schema(
     plan: &LogicalPlan,
     f: &dyn Fn(&Expr, &Schema) -> BoltResult<Expr>,
 ) -> BoltResult<LogicalPlan> {
@@ -219,7 +219,10 @@ fn map_exprs_with_schema(
 
 /// Rebuild `e` with `f` applied to each direct child expression. Subquery
 /// plans are not entered; the probe of an `IN (SELECT ...)` is.
-fn map_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> BoltResult<Expr>) -> BoltResult<Expr> {
+pub(crate) fn map_children(
+    e: &Expr,
+    f: &mut dyn FnMut(&Expr) -> BoltResult<Expr>,
+) -> BoltResult<Expr> {
     let bx = |f: &mut dyn FnMut(&Expr) -> BoltResult<Expr>, e: &Expr| f(e).map(Box::new);
     Ok(match e {
         Expr::Column(_) | Expr::Literal(_) | Expr::ScalarSubquery(_) => e.clone(),

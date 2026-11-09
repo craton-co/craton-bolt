@@ -11918,9 +11918,8 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
             Ok(Expr::ScalarFn { kind, args })
         }
         // typed-string literals — `DATE '2024-01-01'`,
-        // `TIMESTAMP '2024-01-01 00:00:00'`. Other typed strings (TIME,
-        // INTERVAL, ...) are not yet supported and surface the generic
-        // "unsupported expression" error below.
+        // `TIMESTAMP '2024-01-01 00:00:00'`, `TIME '12:34:56[.fffffffff]'`.
+        // Other typed strings surface the error below.
         SqlExpr::TypedString { data_type, value } => {
             use sqlparser::ast::DataType as SqlDataType;
             match data_type {
@@ -11928,11 +11927,34 @@ fn lower_expr(e: &SqlExpr, resolver: &NameResolver<'_>, depth: usize) -> BoltRes
                 SqlDataType::Timestamp(_precision, tz) => {
                     parse_timestamp_text(value, timestamp_zone(tz).is_some()).map(Expr::Literal)
                 }
+                SqlDataType::Time(_precision, sqlparser::ast::TimezoneInfo::None) => {
+                    let (hh, mm, ss, nanos) =
+                        parse_hms_fraction(value.trim()).ok_or_else(|| {
+                            BoltError::Sql(format!(
+                                "TIME literal must be 'HH:MM:SS[.fffffffff]', got '{value}'"
+                            ))
+                        })?;
+                    let seconds = hh as i64 * 3600 + mm as i64 * 60 + ss as i64;
+                    Ok(crate::plan::extended_types::time_literal(
+                        seconds * 1_000_000_000 + nanos as i64,
+                    ))
+                }
                 other => Err(BoltError::Sql(format!(
                     "unsupported typed-string literal: {other} '{value}'"
                 ))),
             }
         }
+        // A fixed-length interval (microseconds up to weeks) is a
+        // `Duration(Microsecond)` constant.
+        SqlExpr::Interval(iv) => frame_interval_micros(iv)
+            .map(crate::plan::extended_types::duration_literal)
+            .ok_or_else(|| {
+                BoltError::Sql(format!(
+                    "unsupported INTERVAL literal {e}: only a non-negative number of \
+                     microseconds, milliseconds, seconds, minutes, hours, days or weeks is \
+                     supported"
+                ))
+            }),
         other => Err(BoltError::Sql(format!("unsupported expression: {other}"))),
     }
 }
@@ -12286,6 +12308,16 @@ fn lower_value(v: &Value) -> BoltResult<Expr> {
         Value::SingleQuotedString(s) => Ok(Expr::Literal(Literal::Utf8(s.clone()))),
         Value::Boolean(b) => Ok(Expr::Literal(Literal::Bool(*b))),
         Value::Null => Ok(Expr::Literal(Literal::Null)),
+        Value::HexStringLiteral(h) => {
+            let digits: Vec<u32> = h.chars().filter_map(|c| c.to_digit(16)).collect();
+            if digits.len() != h.len() || h.len() % 2 != 0 {
+                return Err(BoltError::Sql(format!(
+                    "X'{h}': a binary literal needs an even number of hex digits"
+                )));
+            }
+            let bytes: Vec<u8> = digits.chunks(2).map(|p| (p[0] * 16 + p[1]) as u8).collect();
+            Ok(crate::plan::extended_types::binary_literal(&bytes))
+        }
         other => Err(BoltError::Sql(format!("unsupported literal: {other}"))),
     }
 }

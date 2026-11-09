@@ -122,7 +122,8 @@ pub(crate) fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => Err(BoltError::Type(format!(
             "GROUP BY key dtype {:?} not supported in v1",
             dtype
         ))),
@@ -271,7 +272,8 @@ pub(crate) fn load_key_column_bits(
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => {
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "GROUP BY key dtype {:?} not supported in v1",
                 key_io.dtype
@@ -529,7 +531,8 @@ pub(crate) fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyVal
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 // pack_keys would have already rejected these dtypes — we
                 // can't reach this branch from the executors, but keep the
                 // match exhaustive and return a 0 placeholder.
@@ -545,7 +548,8 @@ pub(crate) fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyVal
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => KeyValue::I64(0),
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => KeyValue::I64(0),
         };
         out.push(val);
     }

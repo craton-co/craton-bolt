@@ -723,6 +723,26 @@ impl Engine {
         }
     }
 
+    /// SQL statements that change rows (`INSERT`, `UPDATE`, `DELETE`,
+    /// `MERGE`, `COPY ... FROM`) are not supported on a table with an
+    /// extended-type column (`crate::plan::extended_types`); its rows are
+    /// replaced through the registration API instead.
+    pub(crate) fn reject_extended_write(&self, name: &str) -> BoltResult<()> {
+        if !self.extended.borrow().has_extended(name) {
+            return Ok(());
+        }
+        let schema = crate::plan::TableProvider::schema(&self.provider, name)?;
+        let f = schema
+            .fields
+            .iter()
+            .find(|f| matches!(f.dtype, crate::plan::DataType::Extended(_)));
+        Err(BoltError::Plan(format!(
+            "table '{name}' has a column of an extended type ({}); INSERT, UPDATE, DELETE, \
+             MERGE and COPY FROM are not supported on it — use register_batch / replace_table",
+            f.map_or_else(String::new, |f| format!("'{}' {:?}", f.name, f.dtype))
+        )))
+    }
+
     /// Arrow schema rows must have to be stored in table `name`.
     pub(crate) fn table_arrow_schema(&self, name: &str) -> BoltResult<SchemaRef> {
         if let Some(b) = self.tables.get(name).and_then(|b| b.first()) {
@@ -790,6 +810,7 @@ impl Engine {
                 "'{name}' is a materialized view; it changes only by REFRESH"
             )));
         }
+        self.reject_extended_write(name)?;
         let target = self.table_arrow_schema(name)?;
         let aligned = align_batch(rows, &target, columns)?;
         let n = aligned.num_rows() as u64;
@@ -902,6 +923,7 @@ impl Engine {
         }
         self.bump_data_epoch();
         self.tables.remove(name);
+        self.extended.get_mut().forget(name);
         self.coalesced_reads.get_mut().remove(name);
         self.streaming_sources.borrow_mut().remove(name);
         self.storage_tables.borrow_mut().remove(name);

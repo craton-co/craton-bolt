@@ -635,7 +635,12 @@ fn atomic_for(op: ReduceOp, dtype: DataType) -> BoltResult<&'static str> {
             ))
         }
 
-        (_, Bool) | (_, Utf8) | (_, Decimal128(_, _)) | (_, Date32) | (_, Timestamp(_, _)) => {
+        (_, Bool)
+        | (_, Utf8)
+        | (_, Decimal128(_, _))
+        | (_, Date32)
+        | (_, Timestamp(_, _))
+        | (_, Extended(_)) => {
             return Err(BoltError::Type(format!(
                 "valid_flag_kernels: aggregate over dtype {:?} not supported",
                 dtype
@@ -655,7 +660,8 @@ fn ptx_type_info(dtype: DataType) -> BoltResult<(&'static str, &'static str)> {
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => {
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "valid_flag_kernels: dtype {:?} not supported in aggregate kernel",
                 dtype
@@ -677,7 +683,8 @@ fn ptx_store_suffix(dtype: DataType) -> BoltResult<&'static str> {
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => {
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "valid_flag_kernels: dtype {:?} not supported in aggregate kernel spill",
                 dtype
@@ -697,7 +704,8 @@ fn reg_decl_ty(dtype: DataType) -> BoltResult<&'static str> {
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => {
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "valid_flag_kernels: dtype {:?} not supported in aggregate kernel",
                 dtype

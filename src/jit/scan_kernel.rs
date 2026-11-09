@@ -189,6 +189,7 @@ impl RegAlloc {
             // `ptx_gen::RegAlloc::class_for`.
             DataType::Date32 => "r",
             DataType::Timestamp(_, _) => "rl",
+            DataType::Extended(t) => return Err(BoltError::Other(format!("scan_kernel: extended type {t} has no GPU representation (it runs on its storage type)"))),
             DataType::Utf8 => {
                 return Err(BoltError::Other(
                     "scan_kernel: Utf8 not supported in PTX codegen".into(),
@@ -814,7 +815,7 @@ fn emit_select(
                 "Decimal128 not yet lowered to GPU; coming in a follow-up".into(),
             ))
         }
-        DataType::Date32 | DataType::Timestamp(_, _) => {
+        DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
             return Err(BoltError::Other(
                 "Date/Timestamp not yet lowered to GPU".into(),
             ))
@@ -972,6 +973,11 @@ fn emit_cast(
                 // the underlying integer width.
                 Date32 => "s32",
                 Timestamp(_, _) => "s64",
+                Extended(t) => {
+                    return Err(BoltError::Other(format!(
+                        "{t}: extended types run on their storage type, not here"
+                    )))
+                }
             };
             format!("mov.{} {}, {};", mov_ty, dst_name, src_name)
         }
@@ -1454,6 +1460,11 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         // days / ticks. Matching unit + tz is enforced upstream.
         Date32 => "s32",
         Timestamp(_, _) => "s64",
+        Extended(t) => {
+            return Err(BoltError::Other(format!(
+                "{t}: extended types run on their storage type, not here"
+            )))
+        }
     };
     Ok(format!("setp.{}.{}", cond, ty))
 }
@@ -1488,6 +1499,11 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         // integer type. Matches `ptx_gen::ld_st_suffix`.
         DataType::Date32 => "s32",
         DataType::Timestamp(_, _) => "s64",
+        DataType::Extended(t) => {
+            return Err(BoltError::Other(format!(
+                "{t}: extended types run on their storage type, not here"
+            )))
+        }
     })
 }
 

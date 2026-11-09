@@ -130,6 +130,7 @@ impl RegAlloc {
             // downstream type-checks still see the temporal type.
             DataType::Date32 => "r",
             DataType::Timestamp(_, _) => "rl",
+            DataType::Extended(t) => return Err(BoltError::Other(format!("ptx_gen: extended type {t} has no GPU representation (it runs on its storage type)"))),
             DataType::Utf8 => {
                 return Err(BoltError::Other(
                     "Utf8 not supported in PTX codegen yet".into(),
@@ -1775,6 +1776,11 @@ fn emit_select(
         // `RegAlloc::class_for`), so the operand registers are already correct.
         DataType::Date32 => "b32",
         DataType::Timestamp(_, _) => "b64",
+        DataType::Extended(t) => {
+            return Err(BoltError::Other(format!(
+            "ptx_gen: extended type {t} has no GPU representation (it runs on its storage type)"
+        )))
+        }
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "ptx_gen: Select over Utf8 not supported \
@@ -2092,6 +2098,7 @@ fn emit_cast(
                 // both sides so the register class stays consistent.
                 Date32 => "s32",
                 Timestamp(_, _) => "s64",
+                Extended(t) => return Err(BoltError::Other(format!("ptx_gen: extended type {t} has no GPU representation (it runs on its storage type)"))),
                 Utf8 => return Err(BoltError::Other("ptx_gen: cannot cast Utf8".into())),
                 // Decimal128 identity cast cannot ride a single register (it
                 // would silently drop the hi half); the planner special-cases
@@ -2669,6 +2676,11 @@ fn cmp_mnemonic(op: BinaryOp, dtype: DataType) -> BoltResult<String> {
         // the PTX level it's identical to the corresponding integer cmp.
         Date32 => "s32",
         Timestamp(_, _) => "s64",
+        Extended(t) => {
+            return Err(BoltError::Other(format!(
+            "ptx_gen: extended type {t} has no GPU representation (it runs on its storage type)"
+        )))
+        }
         Utf8 => return Err(BoltError::Other("ptx_gen: cannot compare Utf8".into())),
         Decimal128(_, _) => {
             return Err(BoltError::Plan(
@@ -2699,6 +2711,11 @@ fn ld_st_suffix(dtype: DataType) -> BoltResult<&'static str> {
         // matches the underlying integer type bit-for-bit.
         DataType::Date32 => "s32",
         DataType::Timestamp(_, _) => "s64",
+        DataType::Extended(t) => {
+            return Err(BoltError::Other(format!(
+            "ptx_gen: extended type {t} has no GPU representation (it runs on its storage type)"
+        )))
+        }
         DataType::Utf8 => {
             return Err(BoltError::Other(
                 "Utf8 not supported in PTX codegen yet".into(),
@@ -6363,10 +6380,11 @@ mod temporal_plan_tests {
         assert_eq!(dt, DataType::Int32, "Date32 - Date32 must produce Int32");
     }
 
-    /// `a - b` over two matching Timestamps types as `Int64` (a count of
-    /// ticks in the source unit).
+    /// `a - b` over two matching Timestamps types as a `Duration` of the
+    /// source unit at the logical plane (its storage, and the physical
+    /// plane's register type, is `Int64` ticks).
     #[test]
-    fn timestamp_minus_timestamp_types_as_int64() {
+    fn timestamp_minus_timestamp_types_as_duration() {
         let schema = ts_schema(TimeUnit::Microsecond, None);
         let e = Expr::Binary {
             op: BinaryOp::Sub,
@@ -6376,8 +6394,15 @@ mod temporal_plan_tests {
         let dt = e.dtype(&schema).expect("typecheck");
         assert_eq!(
             dt,
-            DataType::Int64,
-            "Timestamp - Timestamp must produce Int64"
+            DataType::from_arrow(&arrow_schema::DataType::Duration(
+                arrow_schema::TimeUnit::Microsecond
+            ))
+            .unwrap(),
+            "Timestamp - Timestamp must produce Duration(Microsecond)"
+        );
+        assert_eq!(
+            crate::plan::extended_types::storage_dtype(dt),
+            DataType::Int64
         );
     }
 

@@ -426,7 +426,8 @@ fn column_as_f64_no_nulls(col_io: &ColumnIO, batch: &RecordBatch) -> BoltResult<
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => Err(BoltError::Type(format!(
             "VAR_POP/VAR_SAMP over dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -877,6 +878,9 @@ fn reduce_column_from_batch(
                 col_io.dtype, col_io.name
             )))
         }
+        DataType::Extended(t) => Err(BoltError::Type(format!(
+            "{t}: extended types run on their storage type, not here"
+        ))),
     }
 }
 
@@ -1048,7 +1052,8 @@ fn fused_avg_from_batch(
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => Err(BoltError::Type(format!(
             "AVG over dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -1517,7 +1522,8 @@ fn welford_state_from_batch(
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => {
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "STDDEV over dtype {:?} not supported (column '{}')",
                 col_io.dtype, col_io.name

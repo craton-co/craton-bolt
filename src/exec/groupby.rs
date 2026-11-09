@@ -2373,6 +2373,9 @@ fn run_typed_agg(
             "aggregate input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
+        DataType::Extended(t) => Err(BoltError::Type(format!(
+            "{t}: extended types run on their storage type, not here"
+        ))),
     }
 }
 
@@ -2623,6 +2626,9 @@ fn run_typed_agg_native_validity(
             "native-validity dispatch reached unsupported dtype {:?} (column '{}')",
             col_io.dtype, col_io.name
         ))),
+        DataType::Extended(t) => Err(BoltError::Type(format!(
+            "{t}: extended types run on their storage type, not here"
+        ))),
     }
 }
 
@@ -2703,7 +2709,8 @@ fn load_input_column_as_f64_filtered(
         | DataType::Utf8
         | DataType::Decimal128(_, _)
         | DataType::Date32
-        | DataType::Timestamp(_, _) => Err(BoltError::Type(format!(
+        | DataType::Timestamp(_, _)
+        | DataType::Extended(_) => Err(BoltError::Type(format!(
             "AVG input dtype {:?} not supported (column '{}')",
             col_io.dtype, col_io.name
         ))),
@@ -2771,7 +2778,8 @@ fn build_key_arrays(
             | DataType::Utf8
             | DataType::Decimal128(_, _)
             | DataType::Date32
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype

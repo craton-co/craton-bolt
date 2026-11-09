@@ -89,6 +89,7 @@ pub mod string_project;
 // constants before physical lowering. See the module docs.
 pub mod expr_agg;
 pub mod extended_agg;
+pub(crate) mod extended_store;
 pub mod gpu_compact_multipass;
 pub mod gpu_table;
 pub mod groupby_shmem_avg_exec;

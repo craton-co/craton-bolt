@@ -1119,6 +1119,10 @@ pub struct Engine {
     /// while the entry still holds exactly the pinned chunks. The next
     /// `register_batch` adopts it as the table's head chunk.
     pub(crate) coalesced_reads: RefCell<HashMap<String, CoalescedRead>>,
+    /// The registered types and kept opaque values of every table with an
+    /// extended column (`crate::plan::extended_types`); `tables` holds
+    /// their storage form.
+    pub(crate) extended: RefCell<crate::exec::extended_store::ExtendedStore>,
     /// Lazily-registered streaming table sources, keyed by name.
     ///
     /// Tables registered through [`Engine::register_table_stream_lazy`] are
@@ -1706,6 +1710,7 @@ impl EngineBuilder {
         let engine = Engine {
             tables: HashMap::new(),
             coalesced_reads: RefCell::new(HashMap::new()),
+            extended: RefCell::default(),
             streaming_sources: RefCell::new(HashMap::new()),
             provider: {
                 let mut p = MemTableProvider::new();
@@ -2102,6 +2107,8 @@ impl Engine {
             )));
         }
         self.touch_table(&name);
+        // Extended columns are stored in the form the executors run on.
+        let (batch, staged) = self.extended.get_mut().ingest(&name, &batch, false)?;
         // Stage 6: the historical flatten step (`flatten_dictionary_utf8_columns`)
         // is gone from the hot path. `DictRegistry::register_table` matches
         // `DictionaryArray<Int32, Utf8>` directly and re-uses the input
@@ -2116,10 +2123,11 @@ impl Engine {
             .get_mut()
             .register_table(name.clone(), &batch)?;
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
-        let extended = self
-            .dict_registry
-            .get_mut()
-            .extended_schema(&name, &base_schema);
+        let extended = staged.logical_schema(
+            self.dict_registry
+                .get_mut()
+                .extended_schema(&name, &base_schema),
+        );
         self.provider.register(name.clone(), extended);
         // Stage 6: surface per-column runtime nullability so the engine's
         // null-aware paths can short-circuit the validity bitmap upload
@@ -2147,6 +2155,7 @@ impl Engine {
             .borrow_mut()
             .insert(name.clone(), Some(gpu_table));
         self.tables.insert(name, vec![batch]);
+        self.extended.get_mut().commit(staged);
         Ok(())
     }
 
@@ -2262,10 +2271,14 @@ impl Engine {
     ///
     /// # Errors
     /// - A table named `name` is already registered (eager or lazy).
+    /// - `schema` has a column of an extended type ([`DataType::Extended`]
+    ///   — use [`Engine::register_table_stream`] for those tables).
     /// - Schema validation and the empty-stream check happen at the first
     ///   referencing query (when the producer is actually drained) and fail
     ///   that query — and every later one, deterministically, until the
     ///   producer yields conforming batches.
+    ///
+    /// [`DataType::Extended`]: crate::plan::DataType::Extended
     pub fn register_table_stream_lazy(
         &mut self,
         name: impl Into<String>,
@@ -2278,6 +2291,17 @@ impl Engine {
             return Err(BoltError::Plan(format!(
                 "table '{name}' is already registered — register_table_stream_lazy \
                  cannot append to an existing table"
+            )));
+        }
+        if let Some(f) = schema
+            .fields
+            .iter()
+            .find(|f| matches!(f.dtype, crate::plan::DataType::Extended(_)))
+        {
+            return Err(BoltError::Plan(format!(
+                "register_table_stream_lazy: column '{}' has type {:?}; tables with \
+                 extended-type columns must be registered eagerly (register_table_stream)",
+                f.name, f.dtype
             )));
         }
         // Register the declared schema with the SQL frontend so planning can
@@ -2475,6 +2499,8 @@ impl Engine {
         // hot path. Dict ingest is native through `DictRegistry::register_table`
         // and `GpuTable::from_record_batch::upload_dict_utf8`.
         //
+        // Extended columns are stored in the form the executors run on.
+        let (batch, staged) = self.extended.get_mut().ingest(&name, &batch, false)?;
         // Build the new GPU table first (upload may fail).
         let mut new_gpu_table = crate::exec::gpu_table::GpuTable::from_record_batch(&batch)?;
         let base_schema = arrow_schema_to_plan_schema(batch.schema().as_ref())?;
@@ -2498,10 +2524,11 @@ impl Engine {
         // dicts. It is computed here (still before the engine-state mutations
         // below) but cannot fail, so it does not affect the transactional
         // guarantee.
-        let extended = self
-            .dict_registry
-            .get_mut()
-            .extended_schema(&name, &base_schema);
+        let extended = staged.logical_schema(
+            self.dict_registry
+                .get_mut()
+                .extended_schema(&name, &base_schema),
+        );
 
         // ---- SWAP (infallible): from here on nothing can fail, so the
         // remaining engine fields are mutated only after every fallible step
@@ -2545,6 +2572,7 @@ impl Engine {
             .insert(name.clone(), Some(new_gpu_table));
         self.coalesced_reads.get_mut().remove(&name);
         self.tables.insert(name, vec![batch]);
+        self.extended.get_mut().commit(staged);
         Ok(())
     }
 
@@ -2579,6 +2607,9 @@ impl Engine {
             // dictionary + provider wiring happens exactly once.
             return self.register_table(name.to_string(), batch);
         };
+        // Extended columns are stored in the form the executors run on; the
+        // store also checks the batch against the registered (logical) types.
+        let (batch, staged) = self.extended.borrow().ingest(name, &batch, true)?;
         if let Some(first) = existing.first() {
             if first.schema() != batch.schema() {
                 return Err(BoltError::Plan(format!(
@@ -2613,10 +2644,11 @@ impl Engine {
             .map(|f| self.provider.has_nulls(name, f.name()))
             .collect();
         let base_schema = arrow_schema_to_plan_schema(schema.as_ref())?;
-        let extended = self
-            .dict_registry
-            .get_mut()
-            .extended_schema(name, &base_schema);
+        let extended = staged.logical_schema(
+            self.dict_registry
+                .get_mut()
+                .extended_schema(name, &base_schema),
+        );
         self.provider.register(name.to_string(), extended);
         for (idx, field) in schema.fields().iter().enumerate() {
             let has_nulls = had_nulls[idx] || column_has_nulls(field, batch.column(idx));
@@ -2625,6 +2657,7 @@ impl Engine {
         }
         let n_rows_total = chunks.iter().map(RecordBatch::num_rows).sum();
         self.tables.insert(name.to_string(), chunks);
+        self.extended.get_mut().commit(staged);
         // Batch 5: every column gained rows, so every column's revision and
         // the table revision bump. `gpu_tables[name]` is INTENTIONALLY left in
         // place: `ensure_gpu_table` extends it on the next query (or falls

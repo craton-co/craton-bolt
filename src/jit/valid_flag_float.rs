@@ -184,7 +184,8 @@ fn emit_agg_valid_float_kernel(
         | (_, DataType::Utf8)
         | (_, DataType::Decimal128(_, _))
         | (_, DataType::Date32)
-        | (_, DataType::Timestamp(_, _)) => {
+        | (_, DataType::Timestamp(_, _))
+        | (_, DataType::Extended(_)) => {
             return Err(BoltError::Other(format!(
                 "valid_flag_float: dtype {:?} is not a floating-point type; \
                  use valid_flag_kernels::compile_agg_valid_kernel for integer MIN/MAX",

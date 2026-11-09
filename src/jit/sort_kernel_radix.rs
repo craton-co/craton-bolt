@@ -264,7 +264,7 @@ impl RadixFlavour {
                     "sort_kernel_radix: Decimal128 not yet supported".into(),
                 ))
             }
-            DataType::Date32 | DataType::Timestamp(_, _) => {
+            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
                 return Err(BoltError::Other(
                     "sort_kernel_radix: Date/Timestamp not yet supported".into(),
                 ))
