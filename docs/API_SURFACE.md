@@ -42,8 +42,9 @@ count as breaking changes (major-version bump):
 - Renaming, removing, or relocating the symbol.
 - For **structs / enums**: adding a new public field or variant *without*
   `#[non_exhaustive]`. Today the attribute is carried by `BoltError`,
-  `Engine` and `EngineBuilder` (the snapshot lists every `#[non_exhaustive]`
-  item); per-row notes call out the types that still lack it. Changing an
+  `Engine`, `EngineBuilder` and `plan::DataType`, among others (the snapshot
+  lists every `#[non_exhaustive]` item); per-row notes call out the types
+  that still lack it. Changing an
   existing field's type or visibility is breaking.
 - For **functions / methods**: changing the signature (parameters, return
   type, generic bounds, `&self` vs `&mut self`).
@@ -115,7 +116,7 @@ behind opaque builders before 1.0. No decision is forced by this document.
 | `plan::parse_sql` | fn (`plan::sql_frontend::parse`) | `fn parse(sql: &str, provider: &dyn TableProvider) -> BoltResult<LogicalPlan>`. Re-exported at `plan::parse_sql`. Changing the signature or accepted SQL dialect compatibility envelope is breaking. |
 | `plan::Schema` | struct (`plan::logical_plan`) | Logical schema. Used in `TableProvider::schema`; changing field shape is breaking. |
 | `plan::Field` | struct (`plan::logical_plan`) | Named column with `DataType` + nullability. |
-| `plan::DataType` | enum (`plan::logical_plan`) | Engine-internal type enum. **Not** `#[non_exhaustive]` — see general caveat. (Also re-exported under `__test_only_logical_plan` for test-only consumers; the canonical path is `plan::DataType`.) |
+| `plan::DataType` | enum (`plan::logical_plan`) | Engine type enum, `Copy`. Carries `#[non_exhaustive]` since 0.10.1, when it gained `Extended(&'static arrow_schema::DataType)` for the types the engine stores and returns without computing on them natively (time, duration, binary, interval, `Decimal256`, `Null`, nested; see `docs/SQL_REFERENCE.md`), so downstream `match`es need a wildcard arm and later variants are non-breaking. `DataType::from_arrow(&arrow_schema::DataType) -> BoltResult<DataType>` maps an Arrow type the way table registration does (interning an extended type). Removing or renaming a variant, or changing `from_arrow`'s signature, is breaking. (Also re-exported under `__test_only_logical_plan` for test-only consumers; the canonical path is `plan::DataType`.) |
 | `plan::Literal` | enum (`plan::logical_plan`) | Scalar literal in logical expressions. |
 | `plan::BinaryOp` | enum (`plan::logical_plan`) | Binary operator enum. |
 | `plan::UnaryOp` | enum (`plan::logical_plan`) | Unary operator enum. |

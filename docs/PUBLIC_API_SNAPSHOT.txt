@@ -1865,10 +1865,11 @@ pub craton_bolt::plan::logical_plan::BinaryOp::Or
 pub craton_bolt::plan::logical_plan::BinaryOp::Shl
 pub craton_bolt::plan::logical_plan::BinaryOp::Shr
 pub craton_bolt::plan::logical_plan::BinaryOp::Sub
-pub enum craton_bolt::plan::logical_plan::DataType
+#[non_exhaustive] pub enum craton_bolt::plan::logical_plan::DataType
 pub craton_bolt::plan::logical_plan::DataType::Bool
 pub craton_bolt::plan::logical_plan::DataType::Date32
 pub craton_bolt::plan::logical_plan::DataType::Decimal128(u8, i8)
+pub craton_bolt::plan::logical_plan::DataType::Extended(&'static arrow_schema::datatype::DataType)
 pub craton_bolt::plan::logical_plan::DataType::Float32
 pub craton_bolt::plan::logical_plan::DataType::Float64
 pub craton_bolt::plan::logical_plan::DataType::Int32
@@ -1877,6 +1878,7 @@ pub craton_bolt::plan::logical_plan::DataType::Timestamp(craton_bolt::plan::logi
 pub craton_bolt::plan::logical_plan::DataType::Utf8
 impl craton_bolt::plan::logical_plan::DataType
 pub fn craton_bolt::plan::logical_plan::DataType::byte_width(self) -> core::option::Option<usize>
+pub fn craton_bolt::plan::logical_plan::DataType::from_arrow(&arrow_schema::datatype::DataType) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::DataType>
 pub fn craton_bolt::plan::logical_plan::DataType::is_decimal(self) -> bool
 pub enum craton_bolt::plan::logical_plan::DateField
 pub craton_bolt::plan::logical_plan::DateField::Day
@@ -2651,10 +2653,11 @@ pub craton_bolt::plan::BinaryOp::Or
 pub craton_bolt::plan::BinaryOp::Shl
 pub craton_bolt::plan::BinaryOp::Shr
 pub craton_bolt::plan::BinaryOp::Sub
-pub enum craton_bolt::plan::DataType
+#[non_exhaustive] pub enum craton_bolt::plan::DataType
 pub craton_bolt::plan::DataType::Bool
 pub craton_bolt::plan::DataType::Date32
 pub craton_bolt::plan::DataType::Decimal128(u8, i8)
+pub craton_bolt::plan::DataType::Extended(&'static arrow_schema::datatype::DataType)
 pub craton_bolt::plan::DataType::Float32
 pub craton_bolt::plan::DataType::Float64
 pub craton_bolt::plan::DataType::Int32
@@ -2663,6 +2666,7 @@ pub craton_bolt::plan::DataType::Timestamp(craton_bolt::plan::logical_plan::Time
 pub craton_bolt::plan::DataType::Utf8
 impl craton_bolt::plan::logical_plan::DataType
 pub fn craton_bolt::plan::logical_plan::DataType::byte_width(self) -> core::option::Option<usize>
+pub fn craton_bolt::plan::logical_plan::DataType::from_arrow(&arrow_schema::datatype::DataType) -> craton_bolt::BoltResult<craton_bolt::plan::logical_plan::DataType>
 pub fn craton_bolt::plan::logical_plan::DataType::is_decimal(self) -> bool
 pub enum craton_bolt::plan::ExecutionTier
 pub craton_bolt::plan::ExecutionTier::Gpu

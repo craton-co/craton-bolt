@@ -270,6 +270,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/exec/engine_views.rs` | Materialized views. |
 | `src/exec/expr_agg.rs` | Host-side expression evaluator for aggregate inputs. |
 | `src/exec/extended_agg.rs` | Host-side aggregate execution for the dtypes the GPU reduction kernels don't cover: `Bool` (any aggregate) and `Utf8` (COUNT/MIN/MAX only). |
+| `src/exec/extended_store.rs` | Storage form of extended columns (see [`crate::plan::extended_types`]). |
 | `src/exec/filter.rs` | Host-side post-aggregate filter executor. |
 | `src/exec/gpu_compact.rs` | GPU-side filter compaction: prefix-scan + gather, end-to-end. |
 | `src/exec/gpu_compact_multipass.rs` | Multi-pass prefix-scan compaction. |
@@ -383,6 +384,7 @@ Generated from each file's `//!` summary line by `tests/doc_consistency_test.rs`
 | `src/observability.rs` | Observability surface — pool-stats observer + tracing span catalogue. |
 | `src/plan/dataframe.rs` | Lazy DataFrame builder over [`LogicalPlan`]. |
 | `src/plan/explain.rs` | Plan introspection / `EXPLAIN`. |
+| `src/plan/extended_types.rs` | Extended column types ([`DataType::Extended`]): what each one is stored as, which operations it supports, and the plan rewrite that runs a query over them on the engine's native types. |
 | `src/plan/literal_coercion.rs` | Exact coercion of a constant compared with an operand of another type. |
 | `src/plan/logical_plan.rs` | Logical plan AST: schemas, expressions, and relational nodes. |
 | `src/plan/mod.rs` | Logical plan IR, DataFrame builder, SQL frontend, and physical plan. |

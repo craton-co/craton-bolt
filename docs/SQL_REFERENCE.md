@@ -81,7 +81,9 @@ Two queries can be combined with `UNION` / `UNION ALL` / `EXCEPT [ALL]` / `INTER
 
 ## Data types
 
-The plan's `DataType` enum is intentionally small.
+The plan's `DataType` enum is intentionally small. Types the engine stores
+and returns but does not compute on natively are carried by one variant,
+`DataType::Extended(<Arrow type>)` (see *Extended types* below).
 
 | Plan dtype | Arrow dtype     | Notes                                                    |
 |------------|-----------------|----------------------------------------------------------|
@@ -90,17 +92,41 @@ The plan's `DataType` enum is intentionally small.
 | `Int64`    | `Int64`         |                                                          |
 | `Float32`  | `Float32`       |                                                          |
 | `Float64`  | `Float64`       |                                                          |
-| `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices.      |
+| `Utf8`     | `Utf8`          | Dictionary-encoded on register; i32 or i64 indices. `LargeUtf8` and `Utf8View` columns are stored (and returned) as `Utf8`. Two string columns compare (`=`, `<>`, `<`, ...) on the GPU through a shared byte-order rank. |
 | `Decimal128(p, s)` | `Decimal128(p, s)` | `+`, `-`, and `*` lower to GPU (dual-register 128-bit IR), including **mixed Decimal/integer** arithmetic. Division is rejected by default because the legacy device implementation does not implement SQL NULL/error semantics; `BOLT_LEGACY_ARITHMETIC=1` explicitly restores that compatibility path. Comparisons are GPU and scale-aligned. Scalar and grouped `SUM`/`MIN`/`MAX`, supported casts, gather/upload, and `CASE` are wired. |
 | `Date32`   | `Date32`        | `DATE '…'` literals; `date - date` (→ `Int32` days) and `date ± integer` days (→ `Date32`) lower to the GPU, and computed dates (`CASE`, arithmetic, literals) are fused kernel outputs. GPU gather (filter/compaction) + upload are wired (i32 days-since-epoch layout). `COUNT(date_col)`, **`MIN(date_col)` and `MAX(date_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i32 storage and the result is rebuilt as a `Date32`); `SUM` over a date is rejected by design. CAST integer→Date32 lowers via the Decimal/i128 path; a constant `CAST('…' AS DATE)` folds to a literal; other CASTs to/from Date32 (string, etc.): parse; GPU lowering pending. A date column compares with `TIMESTAMP` constants (see Literals). |
-| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` and `TIMESTAMPTZ '…'` literals, compared with a column of any unit or zone (see Literals); Timestamp−Timestamp arithmetic lowers to GPU, and timestamps passed through or chosen by `CASE` are fused kernel outputs. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. A constant `CAST('…' AS TIMESTAMP[TZ])` folds to a literal; CAST of a non-constant to/from Timestamp is rejected at type-check. |
+| `Timestamp(unit, tz)` | `Timestamp(unit, tz)` | `TIMESTAMP '…'` and `TIMESTAMPTZ '…'` literals, compared with a column of any unit or zone (see Literals); `timestamp - timestamp` (matching unit and zone) is a `Duration(unit)` and `timestamp ± duration` (an `INTERVAL` or a `Duration` column, rescaled to the timestamp's unit, truncating) a timestamp, both lowered to GPU integer arithmetic; `timestamp ± integer` is rejected; and timestamps passed through or chosen by `CASE` are fused kernel outputs. Timezones are interned. GPU gather (filter/compaction) + upload are wired (i64 ticks-since-epoch layout, unit + tz preserved on download). `COUNT(ts_col)`, **`MIN(ts_col)` and `MAX(ts_col)`** all work end-to-end (the MIN/MAX reduction runs on the GPU over the i64 storage and the result is rebuilt preserving unit + timezone); `SUM` over a timestamp is rejected by design. A constant `CAST('…' AS TIMESTAMP[TZ])` folds to a literal; CAST of a non-constant to/from Timestamp is rejected at type-check. |
 
 `Decimal128`, `Date32`, and `Timestamp` parse, type-check and lower to the GPU
 as described in the per-type notes above (mixed Decimal/integer arithmetic,
 integer↔decimal and decimal-rescale CAST, scale-aligned Decimal comparison,
-and temporal `MIN`/`MAX`). `INTERVAL` values in expressions (they are
-accepted as window `RANGE` offsets), time-of-day, list, struct, and map are
-still not modelled.
+and temporal `MIN`/`MAX`).
+
+### Extended types
+
+Tables may hold the Arrow types below (`register_table`, `register_batch`,
+`replace_table`, `register_table_stream`, Parquet files and catalog tables).
+Each is `DataType::Extended(<its Arrow type>)` (`DataType::from_arrow` maps an
+Arrow type), comes back from a query as the same Arrow type, and runs on a
+native *storage* type on both tiers — the GPU never sees the original values:
+
+| Family | Arrow types | Stored as | Supported beyond passthrough |
+|---|---|---|---|
+| time | `Time32(s, ms)`, `Time64(us, ns)` | `Int32` / `Int64` ticks | `=`, `<>`, `<`, `<=`, `>`, `>=` (with each other in any unit, the coarser side rescaled, and with `TIME 'HH:MM:SS[.fffffffff]'` literals, also in `IN` / `BETWEEN`), `GROUP BY`, `ORDER BY`, `DISTINCT`, `INTERSECT` / `EXCEPT`, join keys (same type on both sides), `MIN` / `MAX`, window `PARTITION BY` / `ORDER BY` / `MIN` / `MAX`, `CASE` results of one type |
+| duration | `Duration(unit)` | `Int64` ticks | as time (literals: fixed-length `INTERVAL '<n> <unit>'` / `INTERVAL '<n>' <UNIT>` with units microsecond … week, a `Duration(Microsecond)`), plus `SUM` and `timestamp ± duration` |
+| binary | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary(n)` (UUIDs) | `Utf8`, lowercase hex | byte-order comparisons (with each other and with `X'0A0B'` literals), `GROUP BY`, `ORDER BY`, `DISTINCT`, set operations, join keys, `CASE` results — on the GPU like a string column |
+| opaque | `Interval`, `Decimal256`, `Null`, `List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`, `Union` | `Int64` row handle | none |
+
+Every extended column can be selected, carried through `WHERE` filters,
+`ORDER BY` / `GROUP BY` on other columns, `LIMIT`, `UNION ALL`, joins and
+windows, tested with `IS [NOT] NULL` and counted (`COUNT(col)`). Any other
+operation (arithmetic, functions, `LIKE`, `CAST`, `MIN(binary)`, `SUM(time)`,
+`AVG`, an opaque value in a comparison, key, `DISTINCT` or set operation, a
+subquery returning one) is a type error at plan time naming the operation and
+the type, for `sql`, `explain_sql` and `run_logical_plan` alike. A query
+shape the engine combines on the host (`DISTINCT ON`, `LATERAL`, `ASOF
+JOIN`, recursive CTEs, correlated `WHERE`, `VALUES`, `generate_series`,
+`COUNT(DISTINCT)` with `GROUP BY`) cannot return an extended column.
 
 ## Literals
 
@@ -110,6 +136,9 @@ still not modelled.
 - Boolean: `TRUE` / `FALSE`. Case-insensitive per `sqlparser`.
 - Null: `NULL`. Parsed as `Literal::Null`; semantics in expressions are limited (see Type checking).
 - Date: `DATE '2024-01-05'`. Parsed as `Date32`.
+- Time: `TIME '12:34:56[.fffffffff]'`. A `Time64(Nanosecond)` constant (see Extended types).
+- Interval: `INTERVAL '90 minutes'`, `INTERVAL '2' HOUR` — a non-negative whole or fractional number of microseconds, milliseconds, seconds, minutes, hours, days or weeks, as a `Duration(Microsecond)` constant. Months and years are rejected.
+- Binary: `X'0aFF'` (an even number of hex digits). A `Binary` constant.
 - Timestamp: `TIMESTAMP '2024-01-05[ 12:00:00[.fff]]'` (a date alone is midnight; `T` may separate date and time; up to 9 fractional digits). Parsed as a naive `Timestamp(Nanosecond)`; a UTC offset is an error.
 - Instant: `TIMESTAMPTZ '2024-01-05 02:00:00+02'` (also `TIMESTAMP WITH TIME ZONE '…'`). The optional offset is `Z`, `±hh`, `±hh:mm` or `±hhmm`; without one the text is UTC. Parsed as `Timestamp(Nanosecond, "UTC")`.
 - `CAST(<constant> AS DECIMAL(p, s) | DATE | TIMESTAMP[(p)] | TIMESTAMPTZ)` folds to a literal of that type from the constant's text: a number or numeric string to an exact `Decimal128(p, s)` (rounded half away from zero to `s` digits; an error if it does not fit `p`), a string to a date or timestamp as above. `DECIMAL` alone is `(38, 10)`, `DECIMAL(p)` is `(p, 0)`.

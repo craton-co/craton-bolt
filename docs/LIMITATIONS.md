@@ -232,10 +232,14 @@ Running anything beyond a type-check requires an NVIDIA GPU and CUDA toolkit:
 - **One writer per catalog.** `_bolt/LOCK` admits a single writing engine;
   a crashed writer leaves the lock file to remove by hand. Snapshots opened
   with `database_snapshot` are read-only.
-- **Parquet types.** Columns of nested, binary, unsigned-64 or other
+- **Parquet types.** Columns of unsigned-64, `Float16`, `Date64` or other
   non-engine types are skipped (`ParquetTable::skipped_columns`); narrow
   integers widen to `Int32` / `Int64`, large / view strings and string
-  dictionaries read as `Utf8`. External tables are read-only. Hive-style
+  dictionaries read as `Utf8`, and the extended types (time, binary,
+  `Decimal256`, nested, ...; see `SQL_REFERENCE.md`) are kept. The `parquet`
+  53 writer cannot store `Duration` or `Interval(MonthDayNano)` columns, so a
+  catalog `CREATE TABLE` / `COPY ... TO` of one fails with the writer's error;
+  zone maps do not prune on extended columns. External tables are read-only. Hive-style
   `key=value` directories become partition columns typed `Int64` or `Utf8`
   only (no date / decimal partition values), and every file must use the
   same partition keys.
@@ -352,13 +356,41 @@ These are real, code-level behaviors to be aware of:
   Utf8 ordering comparisons against a literal (`WHERE name < 'M'`) use
   **binary (UTF-8 byte) collation**, not locale-aware / ICU collation, so the
   ordering matches `memcmp` rather than any natural-language collation.
-  Ordering of *two* Utf8 columns (`a < b`) now folds to a **GPU** rank
+  Comparison of *two* Utf8 columns (`a < b`, and `a = b` / `a <> b`, whose
+  dictionary indices are not comparable) now folds to a **GPU** rank
   comparison (finding F12): both columns are ranked against the de-duplicated
   union of their dictionaries under binary collation, and the predicate becomes
   a NULL-safe integer compare over the materialised per-row rank columns. A NULL
   on either side fails the `>= 0` guard, so the row is dropped (correct SQL 3VL
   projection of NULL → no row passes). Shapes the rank path can't cover (a
   non-dict or protected column) still fall back to a host string comparison.
+- **Extended column types: stored, mostly not computed on.** `Time32` /
+  `Time64`, `Duration`, the binary family (incl. UUIDs as
+  `FixedSizeBinary(16)`), `Interval`, `Decimal256`, `Null` and nested
+  (`List`, `Struct`, `Map`, ...) columns register, store and come back as
+  their Arrow type (`DataType::Extended`); the operations each family
+  supports are listed in `SQL_REFERENCE.md` (*Extended types*). Residual
+  gaps, all rejected with a type error naming the type at plan time:
+  arithmetic other than `timestamp ± duration` / `timestamp - timestamp`,
+  `CAST` to or from them (and `CAST(... AS TIME)`), `MIN` / `MAX` on binary,
+  comparisons between a time and a duration, join keys of two different
+  time / duration units, `CASE` / `COALESCE` mixing units, a scalar / `IN`
+  subquery returning one, any computation on an opaque value (`Interval`,
+  `Decimal256`, `Null`, nested). `INTERVAL` literals are fixed-length only
+  (no months / years) and are `Duration(Microsecond)`; there is no interval
+  arithmetic. `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `COPY ... FROM` on a
+  table with an extended column are rejected (replace its rows through the
+  registration API), `register_table_stream_lazy` refuses a schema with one
+  (use `register_table_stream`), and the host-orchestrated shapes
+  (`DISTINCT ON`, `LATERAL`, `ASOF JOIN`, recursive CTEs, correlated `WHERE`,
+  `VALUES`, `generate_series`, `COUNT(DISTINCT)` with `GROUP BY`) cannot
+  return one. Binary values are kept as hex strings (twice their size), and
+  an opaque column's original arrays stay in host memory beside an `Int64`
+  handle column for as long as the table is registered. `LargeUtf8` /
+  `Utf8View` columns come back as `Utf8`. `COUNT(binary_col)` next to
+  `COUNT(*)` in one scalar aggregate fails as it does for a `Utf8` column
+  (a pre-existing gap of the aggregate pre-kernel); count them in separate
+  statements.
 - **Temporal / decimal types: lowered, with residual gaps.** `Decimal128`,
   `Date32`, and `Timestamp` parse and lower to the GPU. GPU gather (filter /
   compaction) and column upload are wired for all three.
