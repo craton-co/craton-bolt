@@ -386,6 +386,10 @@ impl Engine {
             crate::exec::engine_support::concat_table_batches(name, &batches)?
         };
         drop(batches);
+        // Extended columns are installed in the form the executors run on;
+        // the scan replaces the table's previously kept values.
+        let (data, staged) = self.extended.borrow().ingest(name, &data, false)?;
+        self.extended.borrow_mut().commit(staged);
         // Same dictionary policy as a lazy drain: whole-table dictionaries
         // only without a memory budget (morsels would not match them).
         // The registry is free here: the top-level pass installs every scan

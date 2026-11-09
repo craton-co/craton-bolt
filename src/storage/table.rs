@@ -148,14 +148,23 @@ pub fn placeholder_array(dtype: &ArrowDataType, len: usize) -> BoltResult<ArrayR
         ArrowDataType::Boolean => ArrayData::builder(dtype.clone())
             .len(len)
             .add_buffer(zeroed(len.div_ceil(8))),
-        ArrowDataType::Utf8 => ArrayData::builder(dtype.clone())
+        ArrowDataType::Utf8 | ArrowDataType::Binary => ArrayData::builder(dtype.clone())
             .len(len)
             .add_buffer(zeroed((len + 1) * 4))
+            .add_buffer(zeroed(0)),
+        ArrowDataType::LargeBinary => ArrayData::builder(dtype.clone())
+            .len(len)
+            .add_buffer(zeroed((len + 1) * 8))
             .add_buffer(zeroed(0)),
         other => match other.primitive_width() {
             Some(w) => ArrayData::builder(other.clone())
                 .len(len)
                 .add_buffer(zeroed(len * w)),
+            // The other extended types (nested, views, ...) have no zero
+            // value; an unread column of one is all NULL.
+            None if crate::plan::extended_types::is_extended_arrow(other) => {
+                return Ok(arrow_array::new_null_array(other, len))
+            }
             None => {
                 return Err(BoltError::Type(format!(
                     "no scan placeholder for Arrow type {other:?}"

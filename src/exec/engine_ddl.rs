@@ -728,19 +728,22 @@ impl Engine {
     /// extended-type column (`crate::plan::extended_types`); its rows are
     /// replaced through the registration API instead.
     pub(crate) fn reject_extended_write(&self, name: &str) -> BoltResult<()> {
-        if !self.extended.borrow().has_extended(name) {
+        let Ok(schema) = crate::plan::TableProvider::schema(&self.provider, name) else {
             return Ok(());
-        }
-        let schema = crate::plan::TableProvider::schema(&self.provider, name)?;
-        let f = schema
+        };
+        match schema
             .fields
             .iter()
-            .find(|f| matches!(f.dtype, crate::plan::DataType::Extended(_)));
-        Err(BoltError::Plan(format!(
-            "table '{name}' has a column of an extended type ({}); INSERT, UPDATE, DELETE, \
-             MERGE and COPY FROM are not supported on it — use register_batch / replace_table",
-            f.map_or_else(String::new, |f| format!("'{}' {:?}", f.name, f.dtype))
-        )))
+            .find(|f| matches!(f.dtype, crate::plan::DataType::Extended(_)))
+        {
+            None => Ok(()),
+            Some(f) => Err(BoltError::Plan(format!(
+                "table '{name}' has a column of an extended type ('{}' {:?}); INSERT, \
+                 UPDATE, DELETE, MERGE and COPY FROM are not supported on it — use \
+                 register_batch / replace_table",
+                f.name, f.dtype
+            ))),
+        }
     }
 
     /// Arrow schema rows must have to be stored in table `name`.

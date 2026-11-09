@@ -171,6 +171,9 @@ fn normalize_type(dt: &ArrowDataType) -> Option<ArrowDataType> {
         | ArrowDataType::UInt8
         | ArrowDataType::UInt16 => Some(ArrowDataType::Int32),
         ArrowDataType::UInt32 => Some(ArrowDataType::Int64),
+        // Extended types are stored and returned as they are (see
+        // `crate::plan::extended_types`).
+        t if crate::plan::extended_types::is_extended_arrow(t) => Some(t.clone()),
         _ => None,
     }
 }
@@ -591,7 +594,14 @@ impl ParquetTable {
             (Physical::INT32, Literal::Int64(v)) => {
                 i32::try_from(*v).is_ok_and(|v| bloom.check(&v))
             }
-            (Physical::BYTE_ARRAY, Literal::Utf8(s)) => bloom.check(&s.as_str()),
+            // A string constant tests a string column only: one compared
+            // with a binary column is the column's hex storage form, not its
+            // bytes.
+            (Physical::BYTE_ARRAY, Literal::Utf8(s))
+                if self.arrow_schema.field(column).data_type() == &ArrowDataType::Utf8 =>
+            {
+                bloom.check(&s.as_str())
+            }
             _ => true,
         }
     }
@@ -949,8 +959,9 @@ mod tests {
         write_parquet(&dir.join("a.parquet"), &[batch(0, 3000)], &opts).unwrap();
         write_parquet(&dir.join("b.parquet"), &[batch(3000, 2000)], &opts).unwrap();
         let t = ParquetTable::open(&dir).unwrap();
-        assert_eq!(t.skipped_columns(), ["blob".to_string()]);
-        assert_eq!(t.schema().fields.len(), 3);
+        // Binary is an extended type: kept, not skipped.
+        assert!(t.skipped_columns().is_empty());
+        assert_eq!(t.schema().fields.len(), 4);
         assert_eq!(t.chunk_count(), 5);
         let s = t.statistics();
         assert_eq!(s.row_count, 5000);

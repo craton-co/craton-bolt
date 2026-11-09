@@ -296,6 +296,18 @@ pub(crate) fn binary_literal(bytes: &[u8]) -> Expr {
     }
 }
 
+/// The bytes of a hex string (either case); `None` when it is not hex.
+pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| match p {
+            [h, l] => Some(digit(*h)? << 4 | digit(*l)?),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Lowercase hex: the storage form of a binary value.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";

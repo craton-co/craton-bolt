@@ -1063,7 +1063,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> BoltResult<()> {
 }
 
 /// Catalog text form of a plan type (`int64`, `decimal128(10,2)`,
-/// `timestamp(us,UTC)`, …).
+/// `timestamp(us,UTC)`, …). An extended type is `extended:<hex>`, the hex
+/// of its Arrow IPC schema encoding (one field), which keeps nested types
+/// exact.
 pub fn dtype_to_text(d: DataType) -> BoltResult<String> {
     Ok(match d {
         DataType::Bool => "bool".into(),
@@ -1086,6 +1088,15 @@ pub fn dtype_to_text(d: DataType) -> BoltResult<String> {
                 None => format!("timestamp({u})"),
             }
         }
+        DataType::Extended(t) => {
+            let schema =
+                arrow_schema::Schema::new(vec![arrow_schema::Field::new("t", t.clone(), true)]);
+            let fb = arrow::ipc::convert::IpcSchemaEncoder::new().schema_to_fb(&schema);
+            format!(
+                "{EXTENDED_PREFIX}{}",
+                crate::plan::extended_types::hex(fb.finished_data())
+            )
+        }
         #[allow(unreachable_patterns)]
         other => {
             return Err(BoltError::Type(format!(
@@ -1095,9 +1106,19 @@ pub fn dtype_to_text(d: DataType) -> BoltResult<String> {
     })
 }
 
+/// Prefix of an extended type's catalog text form.
+const EXTENDED_PREFIX: &str = "extended:";
+
 /// Inverse of [`dtype_to_text`].
 pub fn dtype_from_text(s: &str) -> BoltResult<DataType> {
     let bad = || BoltError::Other(format!("catalog: unknown column type '{s}'"));
+    if let Some(hex) = s.strip_prefix(EXTENDED_PREFIX) {
+        let bytes = crate::plan::extended_types::unhex(hex).ok_or_else(bad)?;
+        let fb = arrow::ipc::root_as_schema(&bytes).map_err(|_| bad())?;
+        let schema = arrow::ipc::convert::fb_to_schema(fb);
+        let field = schema.fields().first().ok_or_else(bad)?;
+        return DataType::from_arrow(field.data_type());
+    }
     Ok(match s {
         "bool" => DataType::Bool,
         "int32" => DataType::Int32,
@@ -1304,5 +1325,38 @@ mod tests {
             assert_eq!(dtype_from_text(&dtype_to_text(d).unwrap()).unwrap(), d);
         }
         assert!(dtype_from_text("blob").is_err());
+        let nested = arrow_schema::DataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("key", ArrowDataType::Utf8, false),
+                        ArrowField::new(
+                            "value",
+                            ArrowDataType::List(Arc::new(ArrowField::new(
+                                "item",
+                                ArrowDataType::Time64(arrow_schema::TimeUnit::Nanosecond),
+                                true,
+                            ))),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        for t in [
+            nested,
+            ArrowDataType::FixedSizeBinary(16),
+            ArrowDataType::Decimal256(40, 2),
+        ] {
+            let d = DataType::from_arrow(&t).unwrap();
+            let text = dtype_to_text(d).unwrap();
+            assert!(text.starts_with(EXTENDED_PREFIX), "{text}");
+            assert_eq!(dtype_from_text(&text).unwrap(), d);
+        }
+        assert!(dtype_from_text("extended:zz").is_err());
     }
 }

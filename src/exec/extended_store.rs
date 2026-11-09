@@ -235,12 +235,6 @@ impl ExtendedStore {
         }
     }
 
-    /// `true` when table `table` has a column whose storage differs from
-    /// its registered type.
-    pub(crate) fn has_extended(&self, table: &str) -> bool {
-        self.tables.contains_key(table)
-    }
-
     /// `batch`'s storage columns as the types of `logical` (the query's
     /// output schema; columns match by position).
     pub(crate) fn restore(&self, batch: RecordBatch, logical: &Schema) -> BoltResult<RecordBatch> {
@@ -353,21 +347,8 @@ fn to_hex(col: &dyn Array) -> BoltResult<StringArray> {
 }
 
 fn unhex(s: &str) -> BoltResult<Vec<u8>> {
-    let digit = |c: u8| -> BoltResult<u8> {
-        (c as char)
-            .to_digit(16)
-            .map(|d| d as u8)
-            .ok_or_else(|| BoltError::Other(format!("extended types: '{s}' is not hex")))
-    };
-    s.as_bytes()
-        .chunks(2)
-        .map(|p| match p {
-            [h, l] => Ok(digit(*h)? << 4 | digit(*l)?),
-            _ => Err(BoltError::Other(format!(
-                "extended types: '{s}' is not hex"
-            ))),
-        })
-        .collect()
+    crate::plan::extended_types::unhex(s)
+        .ok_or_else(|| BoltError::Other(format!("extended types: '{s}' is not hex")))
 }
 
 fn from_hex(col: &StringArray, t: &A) -> BoltResult<ArrayRef> {
@@ -443,7 +424,7 @@ mod tests {
         assert_eq!(stored.column(3).data_type(), &A::Int64);
         assert_eq!(stored.column(3).null_count(), 1);
         store.commit(staged);
-        assert!(store.has_extended("t"));
+        assert!(store.tables.contains_key("t"));
         let back = store.restore(stored, &logical(&input)).unwrap();
         for c in 0..input.num_columns() {
             assert_eq!(

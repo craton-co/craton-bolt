@@ -731,3 +731,108 @@ fn unsupported_operations_fail_with_a_clear_error() {
     assert_eq!(s.value(0), 45);
     let _ = OPAQUE;
 }
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "bolt-extended-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// The fixture without the columns the Parquet writer cannot store
+/// (`Interval(MonthDayNano)`, `Duration`).
+fn parquet_fixture(lo: usize, hi: usize) -> RecordBatch {
+    let b = normalized(&fixture(lo, hi));
+    let keep: Vec<usize> = (0..b.num_columns())
+        .filter(|&i| !matches!(b.schema().field(i).name().as_str(), "iv" | "d"))
+        .collect();
+    b.project(&keep).unwrap()
+}
+
+#[test]
+#[ignore = "gpu:e2e — extended columns in Parquet storage and catalog tables"]
+fn parquet_and_catalog_tables_store_extended_columns() {
+    use craton_bolt::storage::{write_parquet, ParquetWriteOptions};
+    let dir = temp_dir("parquet");
+    let path = dir.join("t.parquet");
+    let opts = ParquetWriteOptions {
+        row_group_rows: 25,
+        ..Default::default()
+    };
+    write_parquet(&path, &[parquet_fixture(0, N)], &opts).unwrap();
+    let want = parquet_fixture(0, N);
+    let cols: Vec<String> = want
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let cols: Vec<&str> = cols.iter().map(String::as_str).collect();
+    {
+        let mut e = Engine::new().expect("CUDA context");
+        e.register_parquet("p", &path).unwrap();
+        for p in POLICIES {
+            let got = run(&mut e, p, "SELECT * FROM p ORDER BY k");
+            assert_same(&got, &want, &format!("{p:?} parquet SELECT *"));
+            let got = run(
+                &mut e,
+                p,
+                "SELECT k, l, b FROM p WHERE k >= 60 AND k < 70 ORDER BY k",
+            );
+            let r = rows(|i| (60..70).contains(&i));
+            assert_same(
+                &got,
+                &select(&want, &["k", "l", "b"], &r),
+                &format!("{p:?} pruned"),
+            );
+            let got = run(&mut e, p, "SELECT k FROM p WHERE b = X'02FF01' ORDER BY k");
+            let r = rows(|i| b_valid(i) && b_bytes(i) == [2, 0xff, 1]);
+            assert_same(
+                &got,
+                &select(&want, &["k"], &r),
+                &format!("{p:?} parquet b = literal"),
+            );
+            let got = run(
+                &mut e,
+                p,
+                "SELECT k FROM p WHERE tm = TIME '00:00:00' ORDER BY k",
+            );
+            assert_same(
+                &got,
+                &select(&want, &["k"], &[0]),
+                &format!("{p:?} parquet tm = literal"),
+            );
+        }
+    }
+    let db = dir.join("db");
+    let mut e = Engine::builder()
+        .database(&db)
+        .build()
+        .expect("CUDA context");
+    e.register_table("t", parquet_fixture(0, N)).unwrap();
+    e.execute_sql("CREATE TABLE c AS SELECT * FROM t").unwrap();
+    for p in POLICIES {
+        let got = run(&mut e, p, "SELECT * FROM c ORDER BY k");
+        assert_same(&got, &want, &format!("{p:?} catalog SELECT *"));
+        let got = run(&mut e, p, "SELECT st, k FROM c WHERE k < 5 ORDER BY k");
+        assert_same(
+            &got,
+            &select(&want, &["st", "k"], &rows(|i| i < 5)),
+            &format!("{p:?} catalog filter"),
+        );
+    }
+    let err = e
+        .execute_sql("DELETE FROM c WHERE k < 3")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("extended type"), "{err}");
+    let _ = cols;
+    drop(e);
+    std::fs::remove_dir_all(dir).ok();
+}
