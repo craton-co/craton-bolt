@@ -836,3 +836,70 @@ fn parquet_and_catalog_tables_store_extended_columns() {
     drop(e);
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+#[ignore = "gpu:e2e — DISTINCT, set operations, IN / BETWEEN, windows and SUM(duration)"]
+fn extended_columns_in_distinct_windows_and_set_operations() {
+    let want = normalized(&fixture(0, N));
+    let mut e = engine_with(fixture(0, N));
+    let mut distinct_b: Vec<Vec<u8>> = rows(b_valid).into_iter().map(b_bytes).collect();
+    distinct_b.sort();
+    distinct_b.dedup();
+    for p in POLICIES {
+        let got = run(&mut e, p, "SELECT DISTINCT b FROM t");
+        assert_eq!(got.num_rows(), distinct_b.len() + 1, "{p:?} DISTINCT b");
+        let got = run(
+            &mut e,
+            p,
+            "SELECT tm FROM t INTERSECT SELECT tm FROM t WHERE k < 50",
+        );
+        let r = rows(|i| i < 50 && tm_valid(i)).len() + 1;
+        assert_eq!(got.num_rows(), r, "{p:?} INTERSECT tm");
+        let got = run(
+            &mut e,
+            p,
+            "SELECT k FROM t WHERE tm BETWEEN TIME '00:00:00' AND TIME '00:10:00' ORDER BY k",
+        );
+        let r = rows(|i| tm_valid(i) && tm_us(i) <= 600_000_000);
+        assert_same(&got, &select(&want, &["k"], &r), &format!("{p:?} BETWEEN"));
+        let got = run(
+            &mut e,
+            p,
+            "SELECT k FROM t WHERE b IN (X'00FF00', X'01FF01') ORDER BY k",
+        );
+        let r =
+            rows(|i| b_valid(i) && matches!(b_bytes(i).as_slice(), [0, 0xff, 0] | [1, 0xff, 1]));
+        assert_same(&got, &select(&want, &["k"], &r), &format!("{p:?} IN"));
+        let got = run(
+            &mut e,
+            p,
+            "SELECT k, l, ROW_NUMBER() OVER (PARTITION BY b ORDER BY tm) AS r FROM t              ORDER BY k LIMIT 7",
+        );
+        let part = got.project(&[0, 1]).unwrap();
+        assert_same(
+            &part,
+            &select(&want, &["k", "l"], &(0..7).collect::<Vec<_>>()),
+            &format!("{p:?} window"),
+        );
+        let got = run(&mut e, p, "SELECT SUM(d) AS s FROM t");
+        let s: i64 = rows(d_valid)
+            .iter()
+            .map(|&i| i as i64 * 1_000_000 - 30_000_000)
+            .sum();
+        let d = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<DurationMicrosecondArray>()
+            .unwrap();
+        assert_eq!(d.value(0), s, "{p:?} SUM(d)");
+    }
+    // Query shapes that combine component results on the host refuse an
+    // extended output column.
+    for q in [
+        "SELECT DISTINCT ON (k) k, l FROM t ORDER BY k",
+        "SELECT k, COUNT(DISTINCT b) AS c FROM t GROUP BY k",
+    ] {
+        let err = e.sql(q).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("List") || err.contains("Binary"), "{q}: {err}");
+    }
+}

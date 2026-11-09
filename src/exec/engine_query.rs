@@ -801,7 +801,24 @@ impl Engine {
     /// `QueriesTotal` / `QueriesFailed`: the top-level `sql()` call already
     /// counts the statement once, and a failure here surfaces as that
     /// statement's failure.
+    ///
+    /// A component that returns an extended-type column
+    /// (`crate::plan::extended_types`) is refused: the shapes combine their
+    /// components' results on the host, and re-scan them, in the engine's
+    /// native types only.
     pub(crate) fn run_subplan(&self, plan: LogicalPlan) -> BoltResult<RecordBatch> {
+        if let Some(schema) = crate::plan::extended_types::lower_plan(&plan)?.restore {
+            if let Some(f) = schema
+                .fields
+                .iter()
+                .find(|f| matches!(f.dtype, crate::plan::DataType::Extended(_)))
+            {
+                return Err(BoltError::Plan(format!(
+                    "column '{}' has type {:?}, which this query shape (DISTINCT ON,                      LATERAL, ASOF JOIN, recursive CTE, correlated WHERE, VALUES,                      generate_series or COUNT(DISTINCT) with GROUP BY) cannot return",
+                    f.name, f.dtype
+                )));
+            }
+        }
         self.execute_logical(&plan, true, false)
             .map(QueryHandle::into_record_batch)
     }
