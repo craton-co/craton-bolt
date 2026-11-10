@@ -1085,6 +1085,28 @@ fn rewrite_expr_with<R: LiteralResolver>(expr: &Expr, r: &R, depth: usize) -> Bo
             })
         }
         Expr::Unary { op, operand } => {
+            // NOT (expr LIKE pat) is expr NOT LIKE pat. Preserving it as
+            // Expr::Like { negated: true } keeps the host-side fallback with
+            // full SQL 3-valued NULL logic (W2-A-001) instead of rewriting into
+            // an OR-of-equalities whose NOT would turn NULL rows (slot 0) into true.
+            if matches!(op, UnaryOp::Not) {
+                if let Expr::Like {
+                    expr,
+                    pattern,
+                    escape,
+                    negated,
+                    case_insensitive,
+                } = operand.as_ref()
+                {
+                    return Ok(Expr::Like {
+                        expr: Box::new(rewrite_expr_with(expr, r, depth + 1)?),
+                        pattern: pattern.clone(),
+                        escape: *escape,
+                        negated: !*negated,
+                        case_insensitive: *case_insensitive,
+                    });
+                }
+            }
             // `col IS [NOT] NULL` over a dict-encoded Utf8 column is a test
             // of the NULL slot: a NULL row's index is 0 (craton-bolt-006; the
             // GPU has no Utf8 register class, so the Utf8 operand itself

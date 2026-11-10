@@ -59,6 +59,24 @@ impl<'a> EngineProvider<'a> {
 
 impl<'a> crate::plan::TableProvider for EngineProvider<'a> {
     fn schema(&self, name: &str) -> BoltResult<Schema> {
+        if let Ok(s) = self.base.schema(name) {
+            return Ok(s);
+        }
+        if let Some(batches) = self.batches_for(name) {
+            if let Some(first) = batches.first() {
+                let arrow_schema = first.schema();
+                let mut fields = Vec::with_capacity(arrow_schema.fields().len());
+                for f in arrow_schema.fields() {
+                    let dt = crate::plan::logical_plan::DataType::from_arrow(f.data_type())?;
+                    fields.push(crate::plan::logical_plan::Field::new(
+                        f.name(),
+                        dt,
+                        f.is_nullable(),
+                    ));
+                }
+                return Ok(Schema::new(fields));
+            }
+        }
         self.base.schema(name)
     }
 

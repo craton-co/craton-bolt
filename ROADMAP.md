@@ -5,7 +5,7 @@ planned beyond it. For day-to-day progress, see `CHANGELOG.md`. For supported
 SQL today, see `docs/SQL_REFERENCE.md`. For the full 1.0 plan, see
 `docs/PATH_TO_1.0.md`. To install and build, see `docs/INSTALL.md`.
 
-## 0.10.0 (current — pre-production, API stabilising)
+## 0.11.0 (current — pre-production, API stabilising)
 
 0.9 makes SQL semantics the default and hardens the runtime contract (see
 `CHANGELOG.md` for the full list): SQL NULL semantics for integer / decimal

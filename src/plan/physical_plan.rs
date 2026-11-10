@@ -4414,10 +4414,7 @@ fn lower_aggregate(
     // row count. Any GROUP BY or extra aggregates over a non-scan-chain input
     // are out of scope and rejected cleanly here.
     if !is_scan_chain(input) {
-        if group_by.is_empty()
-            && aggregates.len() == 1
-            && matches!(aggregates[0], AggregateExpr::Count(_))
-        {
+        if group_by.is_empty() && aggregates.len() == 1 && is_count_star(&aggregates[0]) {
             let child = lower_depth(input, depth + 1)?;
             // `plan.schema()` is the Aggregate node's schema: a single Int64
             // count column (named per `aggregate_output_name`, honouring any

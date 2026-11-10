@@ -12,6 +12,12 @@ reproduction runs in `tests/issue_reports_regression_test.rs` under both
 tier policies.
 
 ### Fixed
+- **Host-side `NOT LIKE` evaluation**: preserve negated `Expr::Like` expressions
+  during string literal rewrite to ensure full SQL 3-valued NULL logic.
+- **Engine provider schema resolution**: fallback to inferring table schema
+  from registered batches when not defined in base table provider.
+- **`COUNT(*)` over non-scan-chain input**: accurately recognize `COUNT(*)` in
+  single-aggregate expressions to allow lower depth execution.
 - **Ungrouped `SUM` / `MIN` / `MAX` / `STDDEV_*` over an empty or all-NULL
   filtered or computed input returned the reduction identity** (`0`,
   `i64::MAX`, `-inf`, `0.0`) instead of NULL (craton-bolt-003).

@@ -273,10 +273,10 @@ enum KeySource {
 ///     `cvt.s64.s32` to unsigned `mul.wide.u32` in `ptx_gen.rs`; this
 ///     changes emitted PTX text for validity-carrying kernels, so the
 ///     disk key MUST rotate to avoid serving the old (mis-addressing) PTX.
-///   - v3: 0.10.1 — `I128ToF64` converts the magnitude and re-applies the
+///   - v3: 0.11.0 — `I128ToF64` converts the magnitude and re-applies the
 ///     sign (negative Decimal128 -> DOUBLE), predicate kernels emit only the
 ///     ops the predicate reads, and the float MIN reduction identity is NaN.
-///   - v4: 0.10.1 — the scalar `SUM(Float32)` reduction kernel widens each
+///   - v4: 0.11.0 — the scalar `SUM(Float32)` reduction kernel widens each
 ///     load with `cvt.f64.f32` and reduces in f64 (W8-B-007); its partials
 ///     are now 8 bytes wide, so an old f32-partials entry must not be reused.
 ///
@@ -1374,7 +1374,7 @@ pub(crate) fn valid_key(key: &str) -> bool {
 /// Header-line prefix written ahead of the PTX body in every cache file
 /// (V-7 / W2-D-003 keyed content integrity).
 ///
-/// Format of a 0.10.1-and-later cache file:
+/// Format of a 0.11.0-and-later cache file:
 /// ```text
 /// #bolt-ptx-cache v2 hmac-sha256 <64-hex-char tag>\n
 /// <ptx body bytes...>

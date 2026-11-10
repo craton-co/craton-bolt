@@ -19,6 +19,7 @@ version jumps in Craton Bolt's history so far:
 - **0.8.0 -> 0.9.0** — SQL semantics become the default; one live `Engine`
   per process is enforced.
 - **0.9.0 -> 0.10.0** — storage layer, persistent catalog, transactions, out-of-core execution, and SQL completeness.
+- **0.10.0 -> 0.11.0** — embedder-report fixes, opt-in SQL semantics, cancellation, extended column types, keyed PTX cache.
 
 ## Public API diffs from the snapshot
 
@@ -686,6 +687,20 @@ was hardened. Every item below is listed under `[0.9.0]` in `CHANGELOG.md`.
 | `storage::ParquetWriteOptions` gains `bloom_filters` (default `true`); `catalog::ViewMeta` gains `refreshed_at_ms` / `base_files`; `RefreshPolicy` / `RefreshMode` gain `Scheduled` | Breaking for struct literals / exhaustive matches | Use `..Default::default()`; add a match arm |
 | A query that plans like a fresh materialized view's defining query is answered from the view | Behavioural | `EngineBuilder::view_rewrite(false)` to opt out |
 | Grouped `SUM` / `MIN` / `MAX` of an all-NULL group return NULL | Behavioural (bug fix) | — |
+
+## 0.10.0 -> 0.11.0 migration
+
+| Change | Classification | Action |
+|---|---|---|
+| `plan::DataType` is `#[non_exhaustive]` and gains `Extended(&'static arrow_schema::DataType)` | Breaking for exhaustive `match` (one time; later additions are non-breaking) | Add a `_` arm |
+| `BoltError::Cancelled(CancelReason)` | Additive (`#[non_exhaustive]`) | — |
+| `TIMESTAMP - TIMESTAMP` returns `Duration(unit)` instead of an integer tick count | Behavioural (bug fix) | Cast or `EXTRACT` where an integer was expected |
+| Constants compared with Decimal128 / Timestamp / Date32 columns are coerced to the column type | Behavioural (previously a type error) | — |
+| Utf8 `!=` / `NOT (s = ...)` exclude NULL rows; empty-input `SUM` / `MIN` / `MAX` / `STDDEV_*` return NULL | Behavioural (bug fix) | Results that relied on the old rows / identities change |
+| `SUM(Float32)` accumulates in f64 | Behavioural (precision) | — |
+| The 64-value `IN` list cap is removed | Additive | — |
+| `EngineBuilder::sql_semantics`, `CancellationToken` and the `*_with_cancel` entry points, `EngineBuilder::persistent_cache_key`, `DataType::from_arrow` | Additive | — |
+| Disk PTX cache entries are HMAC-tagged; existing v1 entries miss once and are rewritten | Behavioural (one recompile per kernel) | Optionally pass `persistent_cache_key` or set `BOLT_PTX_CACHE_KEY_FILE` |
 
 ## Quick upgrade checklist
 
