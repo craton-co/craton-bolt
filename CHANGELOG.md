@@ -4,6 +4,115 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-30
+
+Closes the engine reports filed by an embedder (`docs/issues/`,
+craton-bolt-003 .. 010 and the extension pages that reference them). Every
+reproduction runs in `tests/issue_reports_regression_test.rs` under both
+tier policies.
+
+### Fixed
+- **Ungrouped `SUM` / `MIN` / `MAX` / `STDDEV_*` over an empty or all-NULL
+  filtered or computed input returned the reduction identity** (`0`,
+  `i64::MAX`, `-inf`, `0.0`) instead of NULL (craton-bolt-003).
+- **`dec IS [NOT] NULL` on a nullable `Decimal128` column returned the
+  wrong rows**: the kernels read one validity byte per row while Decimal128
+  kept the packed bitmap (craton-bolt-004).
+- **Decimal128 could not be compared with a constant.** Numeric constants
+  compared with a Decimal128, Timestamp or Date32 operand are coerced
+  exactly to its type in one pass (`plan::literal_coercion`), in either
+  operand order; a constant with more fractional digits rounds toward the
+  correct side and `=` folds to never (craton-bolt-004).
+- **`CAST(<negative decimal> AS DOUBLE)` was wrong** (`-0.25` gave `0`): the
+  i128-to-f64 conversion added the signed high half to the unsigned low
+  half. `CAST(dec AS DOUBLE)` in a `WHERE` clause or a filtered projection
+  now runs (craton-bolt-004).
+- **A filtered plan failed on any table containing a Decimal128 column**,
+  referenced or not; the host Filter lifts only the columns its predicate
+  reads. `COUNT(*) ... WHERE dec IS NULL` runs through the pre-stage
+  (craton-bolt-004).
+- **`TIMESTAMP '...'` constants could only be compared with nanosecond
+  columns.** They are rescaled to the column's unit and adopt a zoned
+  column's time zone; `DATE` columns compare with TIMESTAMP constants
+  (craton-bolt-005).
+- **Utf8 `IS [NOT] NULL` and `IN` failed at execution, and `!=` / `NOT` on a
+  Utf8 column returned NULL rows** (wrong results). `IS NULL` folds to the
+  dictionary NULL slot, dictionary-folded predicates follow Kleene logic,
+  NULL items are folded out of `IN` lists, and host-evaluated expressions
+  over a dictionary column get its index column. EXPLAIN and execution now
+  agree on these plans (craton-bolt-006).
+- **Long `OR` / `AND` chains and dictionary-lowered string predicates
+  overflowed the thread stack and aborted the process** (300 terms on a
+  2 MiB stack). Every statement is rebalanced iteratively at the shared
+  parse entry; IN lists, conjunct folds and membership sets are built
+  balanced. The 64-value `IN` cap is gone (craton-bolt-007).
+- **`register_batch` cost O(table) per call, so N appends were O(N^2)**:
+  dictionaries are extended with the new batch only and chunks merge
+  geometrically (appends 127..147 of 2,048 rows: 3.54 s -> 30.7 ms;
+  craton-bolt-008).
+- **Float NaN handling, both semantics modes**: the host sort put `-NaN`
+  first, scalar float `MAX` dropped NaN on the GPU, `MIN` over all-NaN input
+  returned `+inf`, and the host evaluator disagreed with the GPU on
+  `NaN != x`.
+- **`SUM` of a `FLOAT` column accumulated in single precision** (grouped
+  GPU paths used f32 atomics, off by up to 11,478 ulps on 1M rows). Every
+  path now accumulates in f64 and rounds once; the output type is still
+  `Float32`.
+- **Untrusted Parquet files could make the reader reserve up to 2 GiB**
+  (a page header claiming `compressed_page_size = i32::MAX`, oversized
+  footer lists or bloom filters) and abort on hosts without overcommit.
+  Footer lengths, page headers and bloom-filter headers are bounds-checked
+  before `parquet` allocates (W7-A-001).
+- **Column-vs-column Utf8 `=` / `<>` failed in PTX codegen**; it uses the
+  shared-rank comparison.
+- **`COUNT(*)` next to `COUNT(<Utf8 / Binary / temporal / decimal column>)`
+  failed**: the `COUNT(*)` literal forced a pre-aggregation kernel that
+  cannot output those columns; it now counts through a row column, as the
+  GROUP BY path already did.
+- **Disk-cached PTX from before these codegen changes could be reused**:
+  `CODEGEN_VERSION` is 4.
+
+### Added
+- **`EngineBuilder::sql_semantics(SqlSemantics::Standard)`**: SQL-compatible
+  semantics on every tier: total-order floats (NaN = NaN, NaN greatest, also
+  for join keys and `IN`), checked integer `+ - *` and float-to-integer
+  `CAST` ("Out of Range Error" instead of wrapping), NULLS LAST by default.
+  The default (`SqlSemantics::Ieee`) is unchanged and now documented
+  (craton-bolt-010).
+- **Query cancellation and timeouts**: `CancellationToken` (flag plus
+  optional deadline), `Engine::sql_with_cancel`, `execute_sql_with_cancel`,
+  `sql_stream_with_cancel`, `DataFrame::collect_with_cancel`,
+  `Session::sql_with_cancel` / `submit_with_cancel`, and
+  `BoltError::Cancelled(CancelReason)`. Checks run at operator, morsel,
+  partition, chunk, radix-pass and worker-thread boundaries, never inside a
+  kernel; DML stops only before its commit point (W2-E-005).
+- **Extended column types**: Time32 / Time64, Duration, Interval, Binary /
+  LargeBinary / FixedSizeBinary, Decimal256, Null and nested List / Struct /
+  Map columns can be registered, stored (Parquet, catalog), filtered on other
+  columns and returned (`plan::DataType::Extended`, capability table
+  `plan::extended_types`). Time, Duration and Binary support comparisons,
+  `GROUP BY`, `ORDER BY`, `MIN` / `MAX` and `TIME '...'` / `X'..'` /
+  `INTERVAL` literals; `INSERT` / `UPDATE` / `DELETE` / `MERGE` / `COPY FROM`
+  work on such tables; unsupported operations fail at plan time (W1-D-007).
+- **SQL**: `CAST(... AS DECIMAL(p,s) | DATE | TIMESTAMP | TIMESTAMPTZ)`,
+  date-only `TIMESTAMP 'YYYY-MM-DD'`, `TIMESTAMPTZ '... +hh[:mm]'` literals.
+- **Keyed integrity for the disk PTX cache**: entries carry an HMAC-SHA-256
+  tag under a key kept outside the cache directory
+  (`EngineBuilder::persistent_cache_key`, `BOLT_PTX_CACHE_KEY_FILE`, or a
+  per-user key file created owner-only); unkeyed, v1 or tampered entries are
+  never launched (W2-D-003 item 5). New dependencies: `hmac`, `sha2`,
+  `getrandom`.
+
+### Changed
+- `TIMESTAMP - TIMESTAMP` returns a `Duration` of the operand unit instead
+  of raw ticks typed as an integer.
+- `plan::DataType` is `#[non_exhaustive]` and gains `Extended`; a downstream
+  exhaustive `match` needs a wildcard arm (see `docs/MIGRATION_GUIDE.md`).
+  Later type additions are non-breaking.
+- `Engine::deregister_table` / `drop_table` are pinned by tests to release
+  the resident device copy, dictionaries, statistics and cached plans of one
+  table (W1-B-006).
+
 ## [0.10.0] - 2026-10-26
 
 ### Fixed
