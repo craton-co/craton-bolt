@@ -732,6 +732,7 @@ fn unsupported_operations_fail_with_a_clear_error() {
     let _ = OPAQUE;
 }
 
+#[cfg(feature = "storage")]
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!(
         "bolt-extended-{tag}-{}-{}",
@@ -745,6 +746,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
+#[cfg(feature = "storage")]
 /// The fixture without the columns the Parquet writer cannot store
 /// (`Interval(MonthDayNano)`, `Duration`).
 fn parquet_fixture(lo: usize, hi: usize) -> RecordBatch {
@@ -755,6 +757,7 @@ fn parquet_fixture(lo: usize, hi: usize) -> RecordBatch {
     b.project(&keep).unwrap()
 }
 
+#[cfg(feature = "storage")]
 #[test]
 #[ignore = "gpu:e2e — extended columns in Parquet storage and catalog tables"]
 fn parquet_and_catalog_tables_store_extended_columns() {
@@ -984,6 +987,7 @@ fn count_of_a_string_or_binary_column_next_to_count_star() {
     }
 }
 
+#[cfg(feature = "storage")]
 /// INSERT ... SELECT / VALUES, DELETE, UPDATE, MERGE and COPY FROM on a table
 /// with extended columns, in memory (`db = false`) and in a catalog.
 fn dml_round_trip(db: bool) {
@@ -1134,16 +1138,19 @@ fn dml_round_trip(db: bool) {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[cfg(feature = "storage")]
 const ALL_PQ: &[&str] = &[
     "k", "tm", "ts32", "b", "lb", "fb", "lu", "dec", "nul", "l", "st", "m",
 ];
 
+#[cfg(feature = "storage")]
 #[test]
 #[ignore = "gpu:e2e — DML on in-memory tables with extended columns"]
 fn dml_on_in_memory_tables_with_extended_columns() {
     dml_round_trip(false);
 }
 
+#[cfg(feature = "storage")]
 #[test]
 #[ignore = "gpu:e2e — DML on catalog tables with extended columns"]
 fn dml_on_catalog_tables_with_extended_columns() {
