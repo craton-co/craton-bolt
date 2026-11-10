@@ -226,6 +226,12 @@ impl ExtendedStore {
         }
     }
 
+    /// The registered (logical) Arrow schema of `table`, when it has an
+    /// extended column.
+    pub(crate) fn logical_schema(&self, table: &str) -> Option<SchemaRef> {
+        self.tables.get(table).map(|e| Arc::clone(&e.schema))
+    }
+
     /// Drop table `table`'s entry and kept arrays.
     pub(crate) fn forget(&mut self, table: &str) {
         if let Some(entry) = self.tables.remove(table) {
@@ -274,16 +280,12 @@ impl ExtendedStore {
     }
 
     fn restore_column(&self, col: &ArrayRef, dt: DataType, t: &'static A) -> BoltResult<ArrayRef> {
-        let storage = storage_arrow(dt);
-        let col = if col.data_type() == &storage {
-            Arc::clone(col)
-        } else {
-            arrow::compute::cast(col, &storage).map_err(arrow_err)?
-        };
         match family(t) {
-            Family::Time(_) | Family::Duration(_) => reinterpret(col.as_ref(), t.clone()),
-            Family::Binary => from_hex(col.as_string::<i32>(), t),
-            Family::Opaque => self.gather(col.as_primitive::<arrow_array::types::Int64Type>(), t),
+            Family::Opaque => {
+                let col = arrow::compute::cast(col, &A::Int64).map_err(arrow_err)?;
+                self.gather(col.as_primitive::<arrow_array::types::Int64Type>(), t)
+            }
+            _ => from_storage(col, dt),
         }
     }
 
@@ -320,6 +322,27 @@ impl ExtendedStore {
             }
         }
         arrow::compute::interleave(&arrays, &indices).map_err(arrow_err)
+    }
+}
+
+/// A time, duration or binary column of type `dt` from its storage form
+/// (ticks, hex). Opaque values have no storage form outside a table.
+pub(crate) fn from_storage(col: &ArrayRef, dt: DataType) -> BoltResult<ArrayRef> {
+    let DataType::Extended(t) = dt else {
+        return Ok(Arc::clone(col));
+    };
+    let storage = storage_arrow(dt);
+    let col = if col.data_type() == &storage {
+        Arc::clone(col)
+    } else {
+        arrow::compute::cast(col, &storage).map_err(arrow_err)?
+    };
+    match family(t) {
+        Family::Time(_) | Family::Duration(_) => reinterpret(col.as_ref(), t.clone()),
+        Family::Binary => from_hex(col.as_string::<i32>(), t),
+        Family::Opaque => Err(BoltError::Type(format!(
+            "{t} values cannot be built from constants"
+        ))),
     }
 }
 

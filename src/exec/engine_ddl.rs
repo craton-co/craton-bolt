@@ -723,31 +723,19 @@ impl Engine {
         }
     }
 
-    /// SQL statements that change rows (`INSERT`, `UPDATE`, `DELETE`,
-    /// `MERGE`, `COPY ... FROM`) are not supported on a table with an
-    /// extended-type column (`crate::plan::extended_types`); its rows are
-    /// replaced through the registration API instead.
-    pub(crate) fn reject_extended_write(&self, name: &str) -> BoltResult<()> {
-        let Ok(schema) = crate::plan::TableProvider::schema(&self.provider, name) else {
-            return Ok(());
-        };
-        match schema
-            .fields
-            .iter()
-            .find(|f| matches!(f.dtype, crate::plan::DataType::Extended(_)))
-        {
-            None => Ok(()),
-            Some(f) => Err(BoltError::Plan(format!(
-                "table '{name}' has a column of an extended type ('{}' {:?}); INSERT, \
-                 UPDATE, DELETE, MERGE and COPY FROM are not supported on it — use \
-                 register_batch / replace_table",
-                f.name, f.dtype
-            ))),
+    /// Arrow schema rows must have to be stored in table `name`: its
+    /// registered types (an extended column has its own Arrow type; see
+    /// [`Self::storage_arrow_schema`] for the form the executors hold).
+    pub(crate) fn table_arrow_schema(&self, name: &str) -> BoltResult<SchemaRef> {
+        if let Some(s) = self.extended.borrow().logical_schema(name) {
+            return Ok(s);
         }
+        self.storage_arrow_schema(name)
     }
 
-    /// Arrow schema rows must have to be stored in table `name`.
-    pub(crate) fn table_arrow_schema(&self, name: &str) -> BoltResult<SchemaRef> {
+    /// Arrow schema of the batches `tables` holds for `name` (extended
+    /// columns in their storage form), as the out-of-core paths read them.
+    pub(crate) fn storage_arrow_schema(&self, name: &str) -> BoltResult<SchemaRef> {
         if let Some(b) = self.tables.get(name).and_then(|b| b.first()) {
             return Ok(b.schema());
         }
@@ -813,7 +801,6 @@ impl Engine {
                 "'{name}' is a materialized view; it changes only by REFRESH"
             )));
         }
-        self.reject_extended_write(name)?;
         let target = self.table_arrow_schema(name)?;
         let aligned = align_batch(rows, &target, columns)?;
         let n = aligned.num_rows() as u64;

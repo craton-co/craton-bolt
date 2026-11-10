@@ -2110,6 +2110,8 @@ fn coerce_values_literal(lit: Literal, target: DataType) -> BoltResult<Literal> 
     use DataType as D;
     Ok(match (&lit, target) {
         (Literal::Null, _) => Literal::Null,
+        // A typed extended constant keeps its storage literal.
+        (_, D::Extended(_)) => lit,
         // Exact-type fast paths.
         (Literal::Int32(_), D::Int32)
         | (Literal::Int64(_), D::Int64)
@@ -2168,6 +2170,9 @@ fn lower_values_relation(
     // Fold every cell to a literal; reject ragged rows.
     let empty = NameResolver::empty();
     let mut lits: Vec<Vec<Literal>> = Vec::with_capacity(values.rows.len());
+    // Per column: the extended type of its typed constants, and how many.
+    let mut ext_types: Vec<Option<DataType>> = vec![None; n_cols];
+    let mut ext_cells: Vec<usize> = vec![0; n_cols];
     for (ri, row) in values.rows.iter().enumerate() {
         if row.len() != n_cols {
             return Err(BoltError::Sql(format!(
@@ -2181,6 +2186,27 @@ fn lower_values_relation(
             let lowered = lower_expr(cell, &empty, 0)?;
             match lowered {
                 Expr::Literal(l) => row_lits.push(l),
+                // A `TIME` / `INTERVAL` / `X'..'` constant: its storage
+                // literal, with the column typed by the constant's type.
+                Expr::Cast { expr, target, .. }
+                    if matches!(target, DataType::Extended(_))
+                        && matches!(expr.as_ref(), Expr::Literal(_)) =>
+                {
+                    let Expr::Literal(l) = *expr else {
+                        unreachable!("matched a literal")
+                    };
+                    match ext_types[ci] {
+                        Some(t) if t != target => {
+                            return Err(BoltError::Sql(format!(
+                                "VALUES column {} mixes incompatible types {t:?} and {target:?}",
+                                ci + 1
+                            )))
+                        }
+                        _ => ext_types[ci] = Some(target),
+                    }
+                    ext_cells[ci] += 1;
+                    row_lits.push(l)
+                }
                 _ => {
                     return Err(BoltError::Sql(format!(
                         "VALUES cell (row {}, column {}) is not a constant expression; \
@@ -2222,6 +2248,24 @@ fn lower_values_relation(
                 names.len(),
                 n_cols
             )));
+        }
+    }
+
+    // A column of typed extended constants takes their type; mixing them with
+    // other (non-NULL) constants is an error.
+    for ci in 0..n_cols {
+        if let Some(t) = ext_types[ci] {
+            let non_null = lits
+                .iter()
+                .filter(|r| !matches!(r[ci], Literal::Null))
+                .count();
+            if non_null != ext_cells[ci] {
+                return Err(BoltError::Sql(format!(
+                    "VALUES column {} mixes {t:?} constants with constants of another type",
+                    ci + 1
+                )));
+            }
+            col_types[ci] = Some(t);
         }
     }
 

@@ -170,7 +170,6 @@ impl Engine {
 
     /// Schema of table `name` if statements may change its rows.
     pub(crate) fn writable_schema(&self, name: &str) -> BoltResult<SchemaRef> {
-        self.reject_extended_write(name)?;
         if self.view_exists(name) {
             return Err(BoltError::Plan(format!(
                 "'{name}' is a materialized view; it changes only by REFRESH"
@@ -368,7 +367,15 @@ impl Engine {
                 return concat(schema, &batches);
             }
         }
-        concat(schema, self.tables.get(name).map_or(&[][..], Vec::as_slice))
+        // Extended columns are held in their storage form: convert back.
+        let storage = self.storage_arrow_schema(name)?;
+        let rows = concat(
+            &storage,
+            self.tables.get(name).map_or(&[][..], Vec::as_slice),
+        )?;
+        let logical = crate::exec::engine_support::arrow_schema_to_plan_schema(schema.as_ref())?;
+        let rows = self.extended.borrow().restore(rows, &logical)?;
+        align_batch(&rows, schema, &[])
     }
 
     /// `ALTER TABLE`.

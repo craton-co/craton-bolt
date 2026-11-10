@@ -1571,7 +1571,8 @@ fn unify_case_dtypes(a: DataType, b: DataType) -> Option<DataType> {
     if a.is_numeric() && b.is_numeric() {
         unify_numeric(a, b).ok()
     } else {
-        None
+        // Two time (or two duration) units: the finer one.
+        crate::plan::extended_types::finer_ticks(a, b)
     }
 }
 

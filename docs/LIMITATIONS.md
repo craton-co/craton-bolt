@@ -374,17 +374,19 @@ These are real, code-level behaviors to be aware of:
   arithmetic other than `timestamp ± duration` / `timestamp - timestamp`,
   `CAST` to or from them (and `CAST(... AS TIME)`), `MIN` / `MAX` on binary,
   comparisons between a time and a duration, join keys of two different
-  time / duration units, `CASE` / `COALESCE` mixing units, a scalar / `IN`
-  subquery returning one, any computation on an opaque value (`Interval`,
-  `Decimal256`, `Null`, nested). `INTERVAL` literals are fixed-length only
+  time / duration units, a scalar / `IN` subquery returning one, any
+  computation on an opaque value (`Interval`, `Decimal256`, `Null`, nested)
+  beyond choosing it in a `CASE`. `INTERVAL` literals are fixed-length only
   (no months / years) and are `Duration(Microsecond)`; there is no interval
-  arithmetic. `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `COPY ... FROM` on a
-  table with an extended column are rejected (replace its rows through the
-  registration API), `register_table_stream_lazy` refuses a schema with one
-  (use `register_table_stream`), and the host-orchestrated shapes
-  (`DISTINCT ON`, `LATERAL`, `ASOF JOIN`, recursive CTEs, correlated `WHERE`,
-  `VALUES`, `generate_series`, `COUNT(DISTINCT)` with `GROUP BY`) cannot
-  return one. Binary values are kept as hex strings (twice their size), and
+  arithmetic. `INSERT ... SELECT`, `INSERT ... VALUES` (typed constants:
+  `TIME`, `INTERVAL`, `X'..'`, or `NULL`), `UPDATE` (a column set to an
+  expression of its type, so an opaque column only from another column or
+  `NULL`), `DELETE`, `MERGE` and `COPY ... FROM` work on tables with extended
+  columns, in memory and in a catalog. `register_table_stream_lazy` refuses
+  a schema with one (use `register_table_stream`), and the host-orchestrated
+  shapes (`DISTINCT ON`, `LATERAL`, `ASOF JOIN`, recursive CTEs, correlated
+  `WHERE`, `SELECT ... FROM (VALUES ...)`, `generate_series`,
+  `COUNT(DISTINCT)` with `GROUP BY`) cannot return one. Binary values are kept as hex strings (twice their size), and
   an opaque column's original arrays stay in host memory beside an `Int64`
   handle column for as long as the table is registered. `LargeUtf8` /
   `Utf8View` columns come back as `Utf8`.

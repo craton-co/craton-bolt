@@ -112,10 +112,10 @@ native *storage* type on both tiers — the GPU never sees the original values:
 
 | Family | Arrow types | Stored as | Supported beyond passthrough |
 |---|---|---|---|
-| time | `Time32(s, ms)`, `Time64(us, ns)` | `Int32` / `Int64` ticks | `=`, `<>`, `<`, `<=`, `>`, `>=` (with each other in any unit, the coarser side rescaled, and with `TIME 'HH:MM:SS[.fffffffff]'` literals, also in `IN` / `BETWEEN`), `GROUP BY`, `ORDER BY`, `DISTINCT`, `INTERSECT` / `EXCEPT`, join keys (same type on both sides), `MIN` / `MAX`, window `PARTITION BY` / `ORDER BY` / `MIN` / `MAX`, `CASE` results of one type |
+| time | `Time32(s, ms)`, `Time64(us, ns)` | `Int32` / `Int64` ticks | `=`, `<>`, `<`, `<=`, `>`, `>=` (with each other in any unit, the coarser side rescaled, and with `TIME 'HH:MM:SS[.fffffffff]'` literals, also in `IN` / `BETWEEN`), `GROUP BY`, `ORDER BY`, `DISTINCT`, `INTERSECT` / `EXCEPT`, join keys (same type on both sides), `MIN` / `MAX`, window `PARTITION BY` / `ORDER BY` / `MIN` / `MAX`, `CASE` / `COALESCE` results (arms of several units take the finest) |
 | duration | `Duration(unit)` | `Int64` ticks | as time (literals: fixed-length `INTERVAL '<n> <unit>'` / `INTERVAL '<n>' <UNIT>` with units microsecond … week, a `Duration(Microsecond)`), plus `SUM` and `timestamp ± duration` |
 | binary | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary(n)` (UUIDs) | `Utf8`, lowercase hex | byte-order comparisons (with each other and with `X'0A0B'` literals), `GROUP BY`, `ORDER BY`, `DISTINCT`, set operations, join keys, `CASE` results — on the GPU like a string column |
-| opaque | `Interval`, `Decimal256`, `Null`, `List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`, `Union` | `Int64` row handle | none |
+| opaque | `Interval`, `Decimal256`, `Null`, `List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`, `Union` | `Int64` row handle | `CASE` / `COALESCE` results (of one type) |
 
 Every extended column can be selected, carried through `WHERE` filters,
 `ORDER BY` / `GROUP BY` on other columns, `LIMIT`, `UNION ALL`, joins and
@@ -125,8 +125,11 @@ operation (arithmetic, functions, `LIKE`, `CAST`, `MIN(binary)`, `SUM(time)`,
 subquery returning one) is a type error at plan time naming the operation and
 the type, for `sql`, `explain_sql` and `run_logical_plan` alike. A query
 shape the engine combines on the host (`DISTINCT ON`, `LATERAL`, `ASOF
-JOIN`, recursive CTEs, correlated `WHERE`, `VALUES`, `generate_series`,
-`COUNT(DISTINCT)` with `GROUP BY`) cannot return an extended column.
+JOIN`, recursive CTEs, correlated `WHERE`, `SELECT ... FROM (VALUES ...)`,
+`generate_series`, `COUNT(DISTINCT)` with `GROUP BY`) cannot return an
+extended column. `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `COPY ... FROM`
+work on tables with extended columns; a `VALUES` row may hold `TIME`,
+`INTERVAL` and `X'..'` constants.
 
 ## Literals
 

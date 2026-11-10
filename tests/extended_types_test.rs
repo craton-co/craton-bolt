@@ -827,11 +827,6 @@ fn parquet_and_catalog_tables_store_extended_columns() {
             &format!("{p:?} catalog filter"),
         );
     }
-    let err = e
-        .execute_sql("DELETE FROM c WHERE k < 3")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("extended type"), "{err}");
     let _ = cols;
     drop(e);
     std::fs::remove_dir_all(dir).ok();
@@ -987,4 +982,170 @@ fn count_of_a_string_or_binary_column_next_to_count_star() {
             }
         }
     }
+}
+
+/// INSERT ... SELECT / VALUES, DELETE, UPDATE, MERGE and COPY FROM on a table
+/// with extended columns, in memory (`db = false`) and in a catalog.
+fn dml_round_trip(db: bool) {
+    use craton_bolt::storage::{write_parquet, ParquetWriteOptions};
+    let dir = temp_dir(if db { "dml-db" } else { "dml-mem" });
+    let mut e = if db {
+        Engine::builder()
+            .database(dir.join("db"))
+            .build()
+            .expect("CUDA context")
+    } else {
+        Engine::new().expect("CUDA context")
+    };
+    let base = parquet_fixture(0, 20);
+    e.register_table("src", parquet_fixture(0, 20)).unwrap();
+    e.execute_sql("CREATE TABLE t AS SELECT * FROM src")
+        .unwrap();
+    let all = |e: &mut Engine| run(e, TierPolicy::GpuFirst, "SELECT * FROM t ORDER BY k");
+    // INSERT ... SELECT copies extended values exactly.
+    e.execute_sql("INSERT INTO t SELECT * FROM src WHERE k < 3")
+        .unwrap();
+    let mut idx: Vec<usize> = (0..20).collect();
+    idx.extend(0..3);
+    idx.sort();
+    assert_same(
+        &all(&mut e),
+        &select(&base, ALL_PQ, &idx),
+        &format!("db={db} INSERT SELECT"),
+    );
+    // DELETE keeps the other rows' values.
+    e.execute_sql("DELETE FROM t WHERE k < 3 OR k >= 18")
+        .unwrap();
+    let kept: Vec<usize> = (3..18).collect();
+    assert_same(
+        &all(&mut e),
+        &select(&base, ALL_PQ, &kept),
+        &format!("db={db} DELETE"),
+    );
+    // UPDATE of a native column carries the extended ones; of extended ones
+    // with literals of their type.
+    e.execute_sql("UPDATE t SET k = k + 100 WHERE k < 6")
+        .unwrap();
+    e.execute_sql("UPDATE t SET tm = TIME '01:02:03', b = X'0A0B' WHERE k = 10")
+        .unwrap();
+    for p in POLICIES {
+        let got = run(
+            &mut e,
+            p,
+            "SELECT k, l, st FROM t WHERE k >= 100 ORDER BY k",
+        );
+        let want = select(&base, &["l", "st"], &[3, 4, 5]);
+        assert_eq!(got.num_rows(), 3, "db={db} {p:?} UPDATE k");
+        for c in 0..2 {
+            assert_eq!(
+                got.column(c + 1).as_ref(),
+                want.column(c).as_ref(),
+                "db={db} {p:?} UPDATE"
+            );
+        }
+        let got = run(&mut e, p, "SELECT tm, b, l FROM t WHERE k = 10");
+        let tm = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .unwrap();
+        assert_eq!(tm.value(0), 3_723_000_000, "db={db} {p:?} UPDATE tm");
+        let b = got
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(b.value(0), &[0x0a, 0x0b], "db={db} {p:?} UPDATE b");
+        assert_eq!(
+            got.column(2).as_ref(),
+            select(&base, &["l"], &[10]).column(0).as_ref()
+        );
+    }
+    // INSERT ... VALUES: typed literals, NULL for the rest.
+    e.execute_sql("INSERT INTO t (k, tm, b) VALUES (500, TIME '00:00:05', X'FF00')")
+        .unwrap();
+    let got = run(
+        &mut e,
+        TierPolicy::GpuFirst,
+        "SELECT tm, b, l, st FROM t WHERE k = 500",
+    );
+    let tm = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Time64MicrosecondArray>()
+        .unwrap();
+    assert_eq!(tm.value(0), 5_000_000, "db={db} VALUES tm");
+    let b = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(b.value(0), &[0xff, 0x00], "db={db} VALUES b");
+    assert!(
+        got.column(2).is_null(0) && got.column(3).is_null(0),
+        "db={db} VALUES nulls"
+    );
+    // MERGE: update matched rows, insert the rest.
+    e.execute_sql(
+        "MERGE INTO t USING src ON t.k = src.k \
+         WHEN MATCHED THEN UPDATE SET fb = src.fb, tm = TIME '00:00:07' \
+         WHEN NOT MATCHED THEN INSERT VALUES (src.k, src.tm, src.ts32, src.b, src.lb, \
+         src.fb, src.lu, src.dec, src.nul, src.l, src.st, src.m)",
+    )
+    .unwrap();
+    let got = run(
+        &mut e,
+        TierPolicy::GpuFirst,
+        "SELECT k, l FROM t WHERE k < 20 ORDER BY k",
+    );
+    assert_same(
+        &got,
+        &select(&base, &["k", "l"], &(0..20).collect::<Vec<_>>()),
+        &format!("db={db} MERGE"),
+    );
+    let got = run(
+        &mut e,
+        TierPolicy::GpuFirst,
+        "SELECT COUNT(*) AS n FROM t WHERE tm = TIME '00:00:07'",
+    );
+    // Matched: k 6..17 (k 3..5 moved to 103..105, 0..2 and 18..19 inserted).
+    assert_eq!(i64_col(&got, 0)[0], 12, "db={db} MERGE matched");
+    // COPY FROM a Parquet file.
+    let path = dir.join("more.parquet");
+    write_parquet(
+        &path,
+        &[parquet_fixture(40, 45)],
+        &ParquetWriteOptions::default(),
+    )
+    .unwrap();
+    e.execute_sql(&format!("COPY t FROM '{}'", path.display()))
+        .unwrap();
+    let got = run(
+        &mut e,
+        TierPolicy::CostBased,
+        "SELECT * FROM t WHERE k >= 40 AND k < 45 ORDER BY k",
+    );
+    assert_same(
+        &got,
+        &parquet_fixture(40, 45),
+        &format!("db={db} COPY FROM"),
+    );
+    drop(e);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+const ALL_PQ: &[&str] = &[
+    "k", "tm", "ts32", "b", "lb", "fb", "lu", "dec", "nul", "l", "st", "m",
+];
+
+#[test]
+#[ignore = "gpu:e2e — DML on in-memory tables with extended columns"]
+fn dml_on_in_memory_tables_with_extended_columns() {
+    dml_round_trip(false);
+}
+
+#[test]
+#[ignore = "gpu:e2e — DML on catalog tables with extended columns"]
+fn dml_on_catalog_tables_with_extended_columns() {
+    dml_round_trip(true);
 }

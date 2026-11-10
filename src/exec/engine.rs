@@ -382,6 +382,39 @@ pub(crate) fn materialize_values_relation(
                     .collect::<BoltResult<Vec<_>>>()?;
                 Arc::new(StringArray::from(vals))
             }
+            // `TIME` / `INTERVAL` / `X'..'` cells: their storage constants
+            // (ticks, hex) converted to the column type.
+            DataType::Extended(_) => {
+                let storage: ArrayRef = match crate::plan::extended_types::storage_dtype(dtype) {
+                    DataType::Utf8 => Arc::new(StringArray::from(
+                        relation
+                            .rows
+                            .iter()
+                            .map(|r| match &r[ci] {
+                                Literal::Null => Ok(None),
+                                Literal::Utf8(s) => Ok(Some(s.clone())),
+                                other => Err(BoltError::Plan(format!(
+                                    "VALUES {dtype:?} column got {other:?}"
+                                ))),
+                            })
+                            .collect::<BoltResult<Vec<_>>>()?,
+                    )),
+                    _ => Arc::new(Int64Array::from(
+                        relation
+                            .rows
+                            .iter()
+                            .map(|r| match &r[ci] {
+                                Literal::Null => Ok(None),
+                                Literal::Int64(v) => Ok(Some(*v)),
+                                other => Err(BoltError::Plan(format!(
+                                    "VALUES {dtype:?} column got {other:?}"
+                                ))),
+                            })
+                            .collect::<BoltResult<Vec<_>>>()?,
+                    )),
+                };
+                crate::exec::extended_store::from_storage(&storage, dtype)?
+            }
             other => {
                 return Err(BoltError::Type(format!(
                     "VALUES: unsupported inferred column dtype {other:?}"

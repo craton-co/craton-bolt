@@ -600,7 +600,10 @@ impl Engine {
         else {
             return Ok(None);
         };
-        let (sa, sb) = (self.table_arrow_schema(&a)?, self.table_arrow_schema(&b)?);
+        let (sa, sb) = (
+            self.storage_arrow_schema(&a)?,
+            self.storage_arrow_schema(&b)?,
+        );
         let parts = partitions_for(est, budget);
         let seed = 0x9a7e + depth as u64;
         let files_a = self.partition_table(left, &a, &keys_a, parts, seed)?;
@@ -1267,7 +1270,10 @@ impl Engine {
             keys_a.push(pair.0);
             keys_b.push(pair.1);
         }
-        let (sa, sb) = (self.table_arrow_schema(&a)?, self.table_arrow_schema(&b)?);
+        let (sa, sb) = (
+            self.storage_arrow_schema(&a)?,
+            self.storage_arrow_schema(&b)?,
+        );
         for (ka, kb) in keys_a.iter().zip(&keys_b) {
             let fa = key_family(
                 sa.field_with_name(ka)
@@ -1451,7 +1457,7 @@ impl Engine {
         if let Some(t) = self.storage_table(table) {
             return Ok(t.schema().clone());
         }
-        let arrow = self.table_arrow_schema(table)?;
+        let arrow = self.storage_arrow_schema(table)?;
         crate::exec::engine_support::arrow_schema_to_plan_schema(arrow.as_ref())
     }
 

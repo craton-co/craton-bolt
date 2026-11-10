@@ -214,14 +214,15 @@ fn is_comparison(op: BinaryOp) -> bool {
 pub(crate) fn supports(f: Family, u: Use) -> bool {
     use Family::*;
     match u {
-        Use::IsNull | Use::Count => true,
+        // A `CASE` only chooses between values: an opaque one is its row
+        // handle, which carries its source, so the choice restores exactly.
+        Use::IsNull | Use::Count | Use::Case => true,
         Use::Compare(_)
         | Use::GroupBy
         | Use::OrderBy
         | Use::JoinKey
         | Use::Distinct
-        | Use::SetOp
-        | Use::Case => f != Opaque,
+        | Use::SetOp => f != Opaque,
         Use::MinMax => matches!(f, Time(_) | Duration(_)),
         Use::Sum => matches!(f, Duration(_)),
         Use::Operator(_) | Use::Aggregate(_) | Use::Cast | Use::Function(_) | Use::Subquery => {
@@ -240,6 +241,25 @@ pub(crate) fn check(dt: DataType, u: Use) -> BoltResult<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+/// Of two time (or two duration) types, the one with the finer unit (the
+/// common type of `CASE` arms); `None` for any other pair.
+pub(crate) fn finer_ticks(a: DataType, b: DataType) -> Option<DataType> {
+    let unit = |d: DataType| match family_of(d) {
+        Some(Family::Time(u)) => Some((true, u)),
+        Some(Family::Duration(u)) => Some((false, u)),
+        _ => None,
+    };
+    let ((ta, ua), (tb, ub)) = (unit(a)?, unit(b)?);
+    if ta != tb {
+        return None;
+    }
+    Some(if ticks_per_second(ua) >= ticks_per_second(ub) {
+        a
+    } else {
+        b
+    })
 }
 
 /// `true` when two comparison operands of these types type-check: the same
@@ -888,6 +908,34 @@ fn lower_expr(e: &Expr, s: &Schema, changed: &Cell<bool>) -> BoltResult<Expr> {
                 _ => binary(*op, l, r),
             }
         }
+        // A time / duration `CASE` over arms of several units: every arm in
+        // the result's (finest) unit.
+        Expr::Case {
+            branches,
+            else_branch,
+        } if tick_unit(Some(e.dtype(s)?)).is_some() => {
+            let unit = tick_unit(Some(e.dtype(s)?)).expect("checked");
+            let arm = |x: &Expr| -> BoltResult<Expr> {
+                let lowered = low(x)?;
+                Ok(match tick_unit(dtype_of(x, s)?) {
+                    Some(u) if u != unit => {
+                        changed.set(true);
+                        rescale(lowered, u, unit)
+                    }
+                    _ => lowered,
+                })
+            };
+            Expr::Case {
+                branches: branches
+                    .iter()
+                    .map(|(w, t)| Ok((low(w)?, arm(t)?)))
+                    .collect::<BoltResult<_>>()?,
+                else_branch: match else_branch {
+                    Some(x) => Some(Box::new(arm(x)?)),
+                    None => None,
+                },
+            }
+        }
         Expr::ScalarSubquery(p) => Expr::ScalarSubquery(Box::new(lower_node(p, changed)?)),
         Expr::InSubquery {
             expr,
@@ -990,6 +1038,19 @@ mod tests {
             err.contains("ORDER BY") && err.contains("Decimal256"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn case_arms_of_two_units_take_the_finer() {
+        let (ms, us) = (
+            ext(A::Time32(AU::Millisecond)),
+            ext(A::Time64(AU::Microsecond)),
+        );
+        assert_eq!(finer_ticks(ms, us), Some(us));
+        assert_eq!(finer_ticks(us, ms), Some(us));
+        assert_eq!(finer_ticks(ms, ext(A::Duration(AU::Second))), None);
+        assert_eq!(finer_ticks(ms, DataType::Int64), None);
+        assert!(supports(Family::Opaque, Use::Case));
     }
 
     #[test]
