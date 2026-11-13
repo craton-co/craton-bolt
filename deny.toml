@@ -1,0 +1,145 @@
+# deny.toml — cargo-deny configuration for craton-bolt
+#
+# Run locally:
+#     cargo install --locked cargo-deny
+#     cargo deny check
+#
+# CI wires this in via .github/workflows/ — see RELEASING.md.
+#
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# SCAN SCOPE — read this before relying on the advisory/license gates below.
+#
+# This file's own graph setting covers the DEFAULT feature graph
+# (all-features = false, no-default-features = false), which is what the
+# shipped library actually pulls in.
+#
+# CI runs the checks TWICE and BOTH runs are blocking:
+#   1. `cargo deny check licenses bans` + `cargo deny check advisories`
+#      — the default graph.
+#   2. `cargo deny --all-features check advisories licenses bans`
+#      — the complete graph, which adds the optional `flight` / `substrait`
+#        frontends and the `reference-tests` / `reference-benches` engines
+#        (DuckDB, Polars). Those are test- and benchmark-only, never part of
+#        a downstream build of this crate, but they are held to the same
+#        policy rather than being waved through.
+#
+# The old carve-out for the `rust-cuda` build-toolchain tree is gone: that
+# feature and its dependency/build-script graph were removed, so there is no
+# longer an off-default tree to scan non-blockingly. Anything still tolerated
+# is an explicit, justified `ignore` entry below and is tracked in SECURITY.md
+# as security debt.
+all-features = false
+no-default-features = false
+# Only check the host build. The nvptx64 kernels crate has its own
+# (much smaller) dep tree and a different toolchain; lint it separately
+# if/when we re-include it in workspace.
+exclude = []
+
+[licenses]
+# Apache-2.0 + MIT is the standard Rust-ecosystem permissive set. We add
+# BSD-2-Clause, BSD-3-Clause, ISC, Unicode-DFS-2016 because common transitive
+# deps (e.g., regex's `unicode-ident`) ship under them.
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    # Apache-2.0 plus the LLVM linking exception — the license the Rust
+    # project itself uses for compiler-adjacent crates. Reaches the graph via
+    # `ar_archive_writer` under the `reference-*` engines. Strictly more
+    # permissive than the bare Apache-2.0 already allowed above.
+    "Apache-2.0 WITH LLVM-exception",
+    # Boost Software License 1.0 — OSI-approved, FSF Free/Libre, no
+    # attribution requirement for binary distribution. Reaches the graph via
+    # `xxhash-rust` under Polars (`reference-benches`).
+    "BSL-1.0",
+]
+# Confidence threshold for LICENSE-file inference. The default 0.8 is fine.
+confidence-threshold = 0.8
+
+[bans]
+# Allow multiple versions of common transitive deps for now (the Rust
+# ecosystem is mid-flight on syn 1 → 2, etc.). Tighten over time.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Deny known-bad deps. Empty for now — add entries as advisories surface.
+deny = []
+skip = []
+skip-tree = []
+
+[advisories]
+version = 2
+# Vulnerability and unsound advisories are ALWAYS denied by cargo-deny v2 (the
+# old per-severity toggles are gone from the schema). `unmaintained` selects
+# WHICH part of the graph is scanned for unmaintained crates; "all" is the
+# strictest setting and scans every dependency.
+#
+# Both CI runs of this policy — the default graph and `--all-features` — are
+# blocking. The `rust-cuda` build-toolchain tree that used to justify a
+# non-blocking all-features lane no longer exists in this repository.
+unmaintained = "all"
+yanked = "warn"
+ignore = [
+    # POLICY: an id may be listed here only with (a) the exact advisory id,
+    # (b) which feature graph reaches it, (c) why no upgrade is available, and
+    # (d) an entry in SECURITY.md's security-debt section. Upstream-pinned
+    # transitive advisories must be proven non-impacting to Craton Bolt.
+    # Each entry must be re-checked whenever the upstream crate is bumped.
+    #
+    # RUSTSEC-2024-0436 — `paste 1.0.15` is unmaintained (no vulnerability).
+    # Reached only via `arrow-flight 53` under the optional `flight` feature,
+    # as a compile-time proc-macro. arrow-flight 53 pins it and there is no
+    # maintained drop-in at this arrow major; it leaves the graph when the
+    # arrow/arrow-flight major is bumped.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2025-0003 — `fast-float 0.2.0` unchecked read on empty input.
+    # Reached only via `polars 0.42` under `reference-benches`, i.e. the
+    # benchmark harness's REFERENCE engine. It is never linked into the
+    # library, the integration tests, or a published artifact, and it only
+    # parses benchmark-local fixture data. Upstream has no patched release
+    # (the fix lives in the `fast-float2` fork, adopted by later Polars); it
+    # leaves the graph when the Polars reference engine is bumped.
+    "RUSTSEC-2025-0003",
+    # RUSTSEC-2026-0249 — `smartstring 1.0.1` is unmaintained (repository archived).
+    # Reached only via `polars 0.42` under `reference-benches`. It is never linked into
+    # the library, integration tests, or published artifacts. Upstream has no patched
+    # release; it leaves the graph when the Polars reference engine is bumped.
+    "RUSTSEC-2026-0249",
+    # RUSTSEC-2024-0449 — `unsafe-libyaml 0.2.11` is unmaintained (repository archived).
+    # Reached only via `substrait 0.55` build dependency `serde_yaml` under the optional
+    # `substrait` feature. It is a build-time dependency, never linked into runtime artifacts.
+    # No upstream patch is available until `substrait` replaces `serde_yaml`.
+    "RUSTSEC-2024-0449",
+    # RUSTSEC-2026-0391 — `zstd 0.13.3` reused context stream leak.
+    # Reached via `parquet 53.4.1` under the `storage` feature. Parquet manages its own
+    # compression buffers without reusing abandoned `with_context` stream handles across
+    # tenant boundaries. Upstream `parquet 53.4.1` pins `zstd 0.13` (0.14+ is a breaking
+    # bump); it leaves the graph when the Arrow major is bumped.
+    "RUSTSEC-2026-0391",
+    # RUSTSEC-2026-0403 — `zstd-safe 7.2.1` legacy frame decompression uninit memory.
+    # Reached via `zstd 0.13.3` <- `parquet 53.4.1`. Parquet uses modern zstd frames, not
+    # corrupt v0.4-v0.7 legacy frames. Pinned by `parquet 53.4.1`; leaves on Arrow major bump.
+    "RUSTSEC-2026-0403",
+    # RUSTSEC-2026-0410 — `zstd-sys 2.0.13+zstd.1.5.6` wasm32 allocator shim.
+    # Affects wasm32 only; Craton Bolt is native CUDA (x86_64/aarch64) and never builds for
+    # wasm32. Pinned by `zstd 0.13.3` <- `parquet 53.4.1`; leaves on Arrow major bump.
+    "RUSTSEC-2026-0410",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

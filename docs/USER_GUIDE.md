@@ -1,0 +1,730 @@
+<!--
+applies-to: main
+owner: maintainers
+version-neutral: the crate version and MSRV live in Cargo.toml
+-->
+
+# User Guide
+
+A narrative walk through Craton Bolt from `cargo add` to a working `GROUP BY`.
+If you read this end-to-end you should reach a successful query in under ten
+minutes; if you don't, that's a bug — please file an issue.
+
+> **Pre-1.0 execution contract.** Craton Bolt is not production-ready.
+> “Supported SQL” does not imply device-only execution: inspect
+> `QueryHandle::planned_execution_tier()` for `Gpu`, `Host`, or `Hybrid`, and
+> review [`LIMITATIONS.md`](LIMITATIONS.md) before relying on a workload.
+
+For the exhaustive SQL surface see
+[`SQL_REFERENCE.md`](SQL_REFERENCE.md). For the architectural picture
+underneath the API see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the env
+vars referenced from this guide see [`ENV_VARS.md`](ENV_VARS.md).
+
+---
+
+## Quick start
+
+Add the crate:
+
+```toml
+[dependencies]
+craton-bolt = "0.11"
+arrow-array  = "53"
+arrow-schema = "53"
+```
+
+Or:
+
+```sh
+cargo add craton-bolt arrow-array arrow-schema
+```
+
+Craton Bolt is GPU-only at runtime. You need an NVIDIA card with compute
+capability >= 7.0 and a CUDA toolkit >= 12.0 on the linker path. Hosts
+without CUDA can still type-check the crate via
+`--features cuda-stub --no-default-features`, but cannot execute a query.
+
+The smallest end-to-end program builds an Arrow `RecordBatch`, registers
+it as a table, and runs a `SELECT`:
+
+```rust
+use std::sync::Arc;
+use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use craton_bolt::Engine;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id",    DataType::Int32, false),
+        Field::new("name",  DataType::Utf8,  false),
+        Field::new("score", DataType::Int32, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            Arc::new(StringArray::from(vec!["alice", "bob", "carol", "dave"])),
+            Arc::new(Int32Array::from(vec![95, 87, 92, 78])),
+        ],
+    )?;
+
+    let mut engine = Engine::new()?;
+    engine.register_table("users", batch)?;
+
+    let result = engine.sql(
+        "SELECT name, score FROM users WHERE score >= 90 ORDER BY score DESC",
+    )?;
+    println!("rows = {}", result.num_rows());
+    println!("{:?}", result.record_batch());
+    Ok(())
+}
+```
+
+That's the round-trip: parse the SQL → build a logical plan → lower to a
+physical plan → emit PTX → load the module on the GPU → run the kernel →
+download an Arrow `RecordBatch`. `Engine::new()` picks device 0; for a
+specific GPU use `Engine::new_with_device(idx)`.
+
+Now widen the example to a `GROUP BY` — the acceptance criterion for this
+guide:
+
+```rust
+let result = engine.sql(
+    "SELECT id, SUM(score), COUNT(*) FROM users GROUP BY id",
+)?;
+```
+
+That's enough to be productive. The rest of the guide is breadth.
+
+---
+
+## Registering data
+
+Three entry points cover every shape of input data Craton Bolt accepts
+today. They live on `Engine` and all return `BoltResult<()>`.
+
+### Single batch — `register_table`
+
+The common case. Builds the table's Utf8 dictionaries, uploads every
+column to the GPU, and makes it queryable.
+
+```rust
+engine.register_table("sales", batch)?;
+```
+
+Re-registering an existing name errors. To swap contents, use
+`replace_table` (atomic rebuild — a failure mid-rebuild leaves the
+previous table intact):
+
+```rust
+engine.replace_table("sales", new_batch)?;
+```
+
+### Multi-batch — `register_batch`
+
+For tables whose rows arrive incrementally. The first call creates the
+table; subsequent calls append additional batches under the same name.
+
+```rust
+engine.register_batch("sales", batch_0)?;
+engine.register_batch("sales", batch_1)?;
+engine.register_batch("sales", batch_2)?;
+```
+
+All appended batches must share the schema of batch 0 (checked eagerly;
+a mismatch returns `BoltError::Plan` at append time, not at query time).
+The engine concatenates batches lazily at query time and keeps a per-
+column GPU cache, so a second append only re-uploads the new tail —
+the cached prefix never re-crosses PCIe.
+
+Dictionaries are **unioned across all registered batches**: a string
+literal that appears only in batch 2 still resolves correctly in
+`WHERE col = 'literal'`.
+
+Each append costs time proportional to the new batch, not the table: the
+Utf8 dictionaries are extended with the batch's values only, and the
+stored chunks are merged geometrically rather than on every call.
+
+### Removing one table — `deregister_table` / `drop_table`
+
+`engine.deregister_table("sales")?` removes one table without touching the
+others or rebuilding the engine: its host batches, resident GPU copy,
+Utf8 dictionaries, statistics and cached plans are released, and the name
+can be registered again with any schema. `drop_table` does the same and
+also drops the table from an attached catalog; SQL `DROP TABLE [IF EXISTS]`
+goes through `drop_table`. Both return `BoltError::Plan` when the table is
+not registered; check `table_names()` first for drop-if-exists semantics.
+
+### Streaming — `register_table_stream` / `register_table_stream_lazy`
+
+`Engine::register_table_stream(name, schema, iter)` drains a `RecordBatch`
+iterator **eagerly**: every batch is validated against `schema`, the batches
+are coalesced into one, and the table is installed atomically (nothing is
+installed if a batch fails). Prefer it over many `register_batch` calls for
+bulk loads — each append rebuilds the table's string dictionaries.
+
+`Engine::register_table_stream_lazy(name, schema, producer)` registers in
+O(1) and stores a replayable producer. The producer runs only when a query
+first references the table (unrelated lazy tables are never drained, and
+`explain_sql` never drains); its batches are validated against `schema` — a
+mismatch fails every query on the table — and coalesced. Under
+`EngineBuilder::memory_budget`, row-wise scans and aggregates (including `AVG` / variance / stddev)
+over such a table run in bounded morsels. Without a budget the drain also
+builds the table's string dictionaries, so string predicates fold to GPU
+index comparisons as for an eager table; under a budget they are evaluated
+on the host. See
+[`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
+
+### Parquet and other storage tables
+
+`Engine::register_parquet(name, path)` registers a Parquet file, or every
+`*.parquet` file of a directory, without reading data. Each statement then
+reads only the row groups whose footer statistics (min / max / null count)
+may match its filters, and only the columns it uses:
+
+```rust
+engine.register_parquet("events", "/data/events/")?;
+let n = engine.sql("SELECT COUNT(*) FROM events WHERE day >= DATE '2026-01-01'")?;
+let r = engine.last_scan("events").unwrap();   // chunks_total / chunks_read / rows_read
+```
+
+A later statement whose needs are covered by what is already loaded reuses
+it (GPU copy included). A Hive-style directory (`region=eu/day=3/part.parquet`)
+adds `region` / `day` partition columns, and filters on them skip whole
+partitions without opening their files. `explain_sql` shows what a statement
+would read (`Storage scans:`). Any type implementing `storage::StorageTable` —
+chunks plus per-chunk `TableStatistics` — registers the same way via
+`register_storage_table`; `storage::MemoryTable` is an in-memory example.
+`Engine::table_statistics(name)` returns row count, size and per-column
+bounds / null counts / distinct estimates for any table.
+
+---
+
+## SQL statements and the persistent catalog
+
+`Engine::sql` runs queries. `Engine::execute_sql(&mut self, sql)` runs one or
+more `;`-separated statements of any kind and returns the last result
+(statements return a one-row `rows_affected` batch):
+
+```rust
+engine.execute_sql("CREATE TABLE sales (id BIGINT NOT NULL, region VARCHAR, amount DOUBLE)")?;
+engine.execute_sql("INSERT INTO sales VALUES (1, 'eu', 9.5), (2, 'us', 3.0)")?;
+engine.execute_sql("CREATE TABLE eu AS SELECT * FROM sales WHERE region = 'eu'")?;
+engine.execute_sql("COPY sales TO '/tmp/sales.parquet'")?;
+engine.execute_sql("CREATE EXTERNAL TABLE raw STORED AS PARQUET LOCATION '/data/raw/'")?;
+engine.execute_sql("ANALYZE sales")?;   // per-column statistics, one row per column
+```
+
+The full statement list is in [`SQL_REFERENCE.md`](SQL_REFERENCE.md#statements).
+
+Without a catalog, tables created this way are in-memory. Attach a catalog
+directory to make them durable:
+
+```rust
+let mut engine = Engine::builder().database("/var/lib/bolt/warehouse").build()?;
+engine.execute_sql("CREATE TABLE IF NOT EXISTS t (k BIGINT, v DOUBLE)")?;
+engine.execute_sql("INSERT INTO t SELECT k, v FROM staging")?;   // a new immutable file + snapshot
+// ... restart: the tables (and materialized views) are still there.
+let v = engine.catalog().unwrap().version();
+let old = Engine::builder().database_snapshot("/var/lib/bolt/warehouse", v - 1).build()?; // read-only
+```
+
+`DELETE`, `UPDATE` and `ALTER TABLE` rewrite the affected data (a catalog
+table only the files whose zone maps may match), and transactions group
+statements into one snapshot:
+
+```rust
+engine.execute_sql("UPDATE t SET v = v * 1.1 WHERE k BETWEEN 100 AND 200")?;
+engine.execute_sql("DELETE FROM t WHERE v IS NULL")?;
+engine.execute_sql("ALTER TABLE t ADD COLUMN tag VARCHAR DEFAULT 'none'")?;
+engine.execute_sql("BEGIN; INSERT INTO t SELECT * FROM staging; DELETE FROM staging; COMMIT")?;
+```
+
+Outside a transaction each statement commits on its own; inside one, a
+failure aborts it until `ROLLBACK`.
+`COMPACT TABLE t` merges a table's files — `COMPACT TABLE t ORDER BY (day,
+region)` also sorts it on a clustering key, so each row group covers a narrow
+key range and range filters prune most of it; `VACUUM [KEEP n]` deletes old
+snapshots and unreferenced files. `ANALYZE t` records exact column
+statistics that the optimizer uses for join ordering.
+
+From Rust, `engine.insert_batch("t", batch)` appends one batch (positional,
+cast to the column types), and `engine.ingest_stream("t", batches, 100_000)`
+buffers a batch stream into one data file per 100 000 rows — the
+streaming-ingest path. `Engine::builder().auto_compact(16)` compacts a table
+automatically once appends leave it with more than 16 files. `CREATE TEMP TABLE` stays in memory even
+with a catalog attached. One engine writes a catalog at a time.
+
+**Materialized views.**
+
+```rust
+engine.execute_sql("CREATE MATERIALIZED VIEW by_region AS SELECT region, SUM(amount) AS total FROM sales GROUP BY region")?;
+engine.execute_sql("CREATE MATERIALIZED VIEW live WITH (refresh = 'on_commit') AS SELECT COUNT(*) AS n FROM sales")?;
+assert!(!engine.view_status("by_region")?.fresh);   // after a change to `sales`
+engine.execute_sql("REFRESH MATERIALIZED VIEW by_region")?;
+```
+
+Views are read like tables. `on_commit` views refresh after any statement
+that changes a base table (and before the next `execute_sql` statement if a
+base table changed through the Rust API); `WITH (refresh = 'every 10
+minutes')` views refresh when stale, at most once per interval. A view of
+`SUM` / `COUNT` / `MIN` / `MAX` [`GROUP BY`] over one catalog table refreshes
+**incrementally** while the table only grows — only the new data files are
+read and their partial aggregates merged — and in full after any other
+change. A query that plans exactly like a fresh view's defining query is
+answered from the view (`Engine::builder().view_rewrite(false)` turns that
+off). In a catalog, view definitions and freshness persist.
+
+---
+
+## Memory budgets and out-of-core execution
+
+```rust
+let engine = Engine::builder()
+    .memory_budget(4 << 30)          // device bytes
+    .host_memory_budget(16 << 30)    // host bytes the engine holds for itself
+    .spill_dir("/fast/scratch")
+    .build()?;
+println!("{:?}", engine.memory_stats());   // reserved / peak, spills, evictions
+```
+
+Under a budget, idle GPU table copies and loaded storage scans are evicted
+(least recently used) to make room, and a statement whose input table is
+larger than the budget runs **out of core**: the table is hash-partitioned
+into spill files and the normal GPU operators run on one partition at a
+time — `GROUP BY` / `DISTINCT` (exact for every aggregate), equi-joins
+(grace hash join, all join types), and `ORDER BY [LIMIT]` (sorted runs,
+k-way merge). An over-budget partition (key skew) is split again with a new
+hash seed. A filter / projection over a storage table larger than the host
+budget runs over bounded chunk groups, and `COUNT` / `SUM` / `MIN` / `MAX` /
+`AVG` without `GROUP BY` merge per-chunk partials. Simple aggregates over
+lazily-held tables keep using the single-pass morsel path.
+
+`Engine::sql` returns one host batch. To consume a large row-wise result
+without holding it at once, stream it:
+
+```rust
+for batch in engine.sql_stream("SELECT id, amount FROM sales WHERE amount > 100")? {
+    write_out(&batch?)?;            // one chunk group's rows at a time
+}
+```
+
+See [`LIMITATIONS.md`](LIMITATIONS.md#streaming-and-data-size).
+
+**CPU or GPU.** By default every statement the GPU path supports runs
+there. With `Engine::builder().tier_policy(TierPolicy::CostBased)`, a
+`CostModel` estimates each row-wise statement or scalar aggregate on both
+tiers — transfers, launches, compilation, per-row throughput — and small or
+non-resident inputs run on the host when that is cheaper.
+`engine.calibrate_cost_model()` measures the model's constants on the
+device; `EXPLAIN` shows the estimate (`Tier: ...`).
+
+---
+
+## Sharing an engine: `Database` and sessions
+
+One process has one active `Engine`. To serve many clients, wrap it in a
+`Database`, which owns the engine on a runtime thread; `Session`s are cheap
+handles usable from any thread:
+
+```rust
+use craton_bolt::{Database, Engine};
+
+let db = Database::open(Engine::builder().database("/var/lib/bolt/warehouse"))?;
+let s = db.session();
+s.sql("INSERT INTO t VALUES (1, 2.0)")?;
+let pending = db.session().submit("SELECT COUNT(*) FROM t");  // returns at once
+let batch = pending.wait()?;                                   // or `.await` it
+let ro = db.session();
+ro.set_read_only(true);                                        // queries only
+db.with_engine(|e| e.table_names())?;                          // non-SQL engine access
+```
+
+Statements run one at a time in arrival order on the shared GPU runtime;
+dropping a `PendingResult` before its statement starts cancels it, and a
+panic fails only its own statement. `Database::stats()` reports queue waits.
+A `BEGIN` ... `COMMIT` belongs to its session, and sessions' transactions
+run concurrently under snapshot isolation: each sees the data as of its
+`BEGIN` plus its own changes, and a commit that changed a table another
+transaction committed first fails and rolls back (retry it). With
+`db.set_isolation(IsolationLevel::Serializable)` other sessions' statements
+wait for an open transaction instead (failing after
+`Database::set_transaction_wait`, 30 s by default). Dropping a session rolls
+its transaction back.
+
+With the `flight` feature, `FlightSqlServer::from_database(&db)` serves the
+same database over Arrow Flight SQL: client queries go through a read-only
+session and are awaited, so concurrent clients queue on the runtime instead
+of blocking server threads, while other sessions keep writing.
+
+---
+
+## Cancelling a query and timeouts
+
+Every statement entry point has a `_with_cancel` twin that takes a
+`CancellationToken`: `Engine::sql_with_cancel`, `execute_sql_with_cancel`,
+`sql_stream_with_cancel`, `DataFrame::collect_with_cancel`, and
+`Session::sql_with_cancel` / `submit_with_cancel`. Cancel the token from any
+thread (a Ctrl-C handler, a watchdog) and the statement stops with
+`BoltError::Cancelled(CancelReason::Cancelled)`. A statement timeout is a
+token with a deadline, which stops with `CancelReason::DeadlineExceeded`:
+
+```rust
+use std::time::Duration;
+use craton_bolt::{BoltError, CancelReason, CancellationToken};
+
+let token = CancellationToken::new();
+let stop = token.clone();
+std::thread::spawn(move || { wait_for_ctrl_c(); stop.cancel(); });
+
+let timed = token.with_timeout(Duration::from_secs(30)); // shares the flag
+match engine.sql_with_cancel("SELECT ...", &timed) {
+    Err(BoltError::Cancelled(CancelReason::DeadlineExceeded)) => { /* timed out */ }
+    Err(BoltError::Cancelled(_)) => { /* cancelled */ }
+    other => { /* ran to completion */ }
+}
+```
+
+The engine polls the token (an atomic load) before every operator, for
+every morsel, partition and chunk group, and between the passes of
+multi-kernel operators; a kernel that is already running finishes first, so
+a stop takes at most about one operator step. A stopped statement frees its
+device memory and spill files, and the engine runs the next statement
+normally. `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE TABLE ... AS`,
+`ALTER TABLE`, `COPY` and view refreshes poll the token for the last time
+just before they apply their change, then complete: a cancelled statement
+leaves the data unchanged. Inside a transaction it does not abort the
+transaction, and `BEGIN` / `COMMIT` / `ROLLBACK` are never interrupted (a
+cancelled token can still `ROLLBACK`). A cancelled incremental
+`ResultStream` yields one `Err(Cancelled)` and ends. A session statement
+waiting for another session's transaction stops waiting (without running)
+once its token is cancelled or its deadline passes. `Database::with_engine`
+closures take no token; use the engine's `_with_cancel` methods inside one.
+
+---
+
+## Supported SQL
+
+Craton Bolt's frontend is built on
+[`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) and
+accepts a precisely-bounded subset of SQL. The authoritative list lives
+in [`SQL_REFERENCE.md`](SQL_REFERENCE.md); the short version is:
+
+- `[WITH ...] SELECT [DISTINCT] ... FROM <table> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`.
+- Aggregates: `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (GPU), plus host-side
+  `STDDEV` / `VAR` (scalar and grouped). `SUM` / `MIN` / `MAX` over
+  `Decimal128` run on the **GPU** in both the scalar path (i128 block-reduce
+  kernels) and the grouped path (a per-slot-locked 128-bit accumulator).
+  `SUM(Int32)` widens to `Int64`
+  to prevent silent wraparound. `COUNT(DISTINCT col)` is supported as the sole
+  SELECT item — also with a surrounding `SELECT DISTINCT` and a `HAVING`
+  over the count (no `GROUP BY`) — and combined with `GROUP BY`, including
+  several `COUNT(DISTINCT ...)` and a mix with `COUNT` / `SUM` / `MIN` /
+  `MAX` / `AVG`. Aggregates over joins are supported too. `COUNT`, **`MIN`, and `MAX`** over a
+  `Date32` / `Timestamp` column all work end-to-end now (GPU reduction;
+  the date type / timestamp unit + timezone is preserved), in both the
+  scalar and `GROUP BY` paths; `SUM` over a temporal column is rejected by
+  design (see `SQL_REFERENCE.md`).
+- Scalar expressions: arithmetic and comparisons, including
+  `Decimal128` `+` / `-` / `*` and mixed Decimal/integer arithmetic
+  (GPU; scale-aligned comparisons too), `IN` / `BETWEEN` (desugar to GPU
+  comparison chains), `CASE` / `CAST` / `COALESCE` / `NULLIF` (GPU for
+  numeric / `Bool` / `Date32` / `Timestamp` **and `Decimal128`** results — the
+  Decimal case folds via `Op::Select128`; a `Utf8`-result `CASE` over a bare
+  scan is **host-realized** with SQL 3VL), `CAST` (GPU for numeric/`Bool`
+  pairs, integer↔`Decimal128`, `Decimal128` rescale, integer→`Date32`, and
+  **plain Float↔`Decimal128`**; CAST to/from `Timestamp` / `String` rejected at
+  GPU lowering), `TRY_CAST` / `SAFE_CAST` (NULL-on-failure, host-evaluated;
+  Float↔`Decimal128` rejected at type-check) and `CAST(... FORMAT '<pattern>')`
+  (host-evaluated temporal⇄string, bounded pattern vocab),
+  `LIKE` (GPU over dictionary inputs and validated non-dictionary shapes),
+  `||` (host-side), `NOT` (host-side). String functions: `LENGTH` (GPU
+  integer output); ASCII `UPPER` / `LOWER` use their validated device path,
+  while Unicode case mapping, `SUBSTRING` (literal args), and single-arg
+  `TRIM` over a bare `Utf8` scan run on the host (custom-chars `TRIM` and
+  computed `SUBSTRING` args fall back to the host `Project`); `CONCAT` is
+  host-side and NULL-if-any-arg-NULL. `BOLT_GPU_STRING=0` forces validated
+  device string shapes to their host mirrors for differential diagnosis.
+- Joins: one or more `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS`
+  JOINs per `SELECT`, with `ON` / `USING (...)` / `NATURAL` constraints
+  (equi-keys only). Each shape has a gated GPU fast path that falls back
+  to a host executor on a gate miss.
+- Set ops: `UNION` (dedups), `UNION ALL` (concatenates),
+  `EXCEPT [ALL]` / `INTERSECT [ALL]` (host-side).
+- Query composition: non-recursive CTEs (`WITH`) and **`WITH RECURSIVE`**
+  (linear, non-linear, and mutual recursion, host-orchestrated with an
+  iteration cap); uncorrelated scalar and `[NOT] IN` subqueries in
+  `SELECT` / `WHERE` (and an uncorrelated scalar subquery in `ORDER BY`);
+  **derived tables** in `FROM` (`(SELECT ...) AS alias`, alias required),
+  including **`LATERAL`** derived tables (correlated, run as a host
+  nested-loop apply); a **single correlated scalar / `EXISTS` / `NOT EXISTS`
+  subquery in a top-level `WHERE` conjunct** (also a host nested-loop apply);
+  `VALUES` as a row source; `DISTINCT ON (...)`; the
+  `generate_series(start, stop[, step])` table-valued function in `FROM`; and a
+  multi-table comma `FROM a, b` (desugars to `CROSS JOIN`). (A correlated
+  subquery in `SELECT` / `ORDER BY`, more than one correlated subquery in
+  `WHERE`, correlation inside `OR`, correlated `IN (SELECT ...)`, and
+  non-recursive-CTE column-list aliases `AS d(x, y)` are rejected.)
+- GROUP BY super-aggregates: `ROLLUP` / `CUBE` / `GROUPING SETS` /
+  `GROUP BY ALL`, the `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE` trailing
+  modifiers, and `GROUPING()` / `GROUPING_ID()` (host-expanded to a
+  UNION-ALL of per-set plans; max 12 grouping columns).
+- Window functions: `ROW_NUMBER` / `RANK` / `DENSE_RANK` /
+  `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` `OVER (PARTITION BY ... ORDER
+  BY ...)` (host-side, default frame only), including a named `WINDOW w AS
+  (...)` clause with `OVER w`, and `QUALIFY` to filter on a window result.
+- `ORDER BY`: single-key `Int32`/`Int64` orderings (and multi-key /
+  `DESC`) run on the GPU radix sort; other shapes sort host-side.
+- Types: `Bool`, `Int32`, `Int64`, `Float32`, `Float64`, dictionary-
+  encoded `Utf8`, plus `Decimal128`, `Date32`, and `Timestamp` (with the
+  per-type GPU-lowering caveats in `SQL_REFERENCE.md`). `Decimal128`,
+  `Date32`, and `Timestamp` columns have GPU gather (filter / compaction)
+  and upload wired, so they survive a filtered query end-to-end.
+  `Decimal128` arithmetic (`+` / `-` / `*`, mixed with integers),
+  scale-aligned comparisons, and integer↔decimal / decimal-rescale CAST now
+  run on the GPU; temporal `MIN` / `MAX` run on the GPU and preserve the date
+  type / timestamp unit + timezone.
+- Utf8 predicates: equality / inequality against string literals (folded
+  to integer comparisons on the dictionary index at plan time, GPU),
+  `LIKE` (dictionary columns fold to GPU integer membership; supported
+  non-dictionary shapes use the hardware-validated device matcher by default,
+  with `BOLT_GPU_STRING=0` as force-host), and
+  **ordering comparisons against a string literal** (`WHERE name < 'M'`,
+  GPU via byte/binary collation; not locale/ICU), and **ordering of two Utf8
+  columns** (`a < b`, GPU via a cross-dictionary rank compare — a NULL on
+  either side drops the row). `IN` against a Utf8 column is still rejected
+  (rewrite as an `OR` chain of literal equalities).
+- Qualified column refs (`t.col`) and case-insensitive identifiers are
+  supported; `JOIN ... ON` also accepts the schema-qualified
+  `schema.table.col` form (leading catalog segment dropped).
+
+A representative query that exercises most of the working surface:
+
+```rust
+let result = engine.sql(
+    "SELECT region_id, SUM(price), COUNT(*) AS n \
+       FROM sales \
+      WHERE region = 'US' AND active \
+      GROUP BY region_id \
+     HAVING COUNT(*) > 10 \
+      ORDER BY region_id \
+      LIMIT 100",
+)?;
+```
+
+Anything outside the supported surface returns a structured
+`BoltError::Sql(...)` or `BoltError::Plan(...)` with the unsupported
+construct quoted in the message. Some *supported* constructs execute on
+a host-side code path rather than the GPU — the `||` concat operator,
+`SUBSTRING` / `TRIM` / `CONCAT`, a `Utf8`-result `CASE`, `STDDEV` / `VAR`,
+`TRY_CAST` / `CAST(... FORMAT ...)`, set operations
+(`EXCEPT` / `INTERSECT`), `WITH RECURSIVE` orchestration, the correlated-`WHERE`
+nested-loop apply, `DISTINCT ON`, `VALUES` / `generate_series` row sources,
+GROUP BY
+super-aggregate expansion, window functions, and host-side join / sort
+fallbacks — and a few constructs parse and type-check but are rejected at
+the GPU lowering boundary with a clear `"… not yet lowered to GPU"` message
+(e.g. `CAST` to/from Timestamp/String). `SQL_REFERENCE.md` tags every feature
+with its execution tier (GPU / host-side / GPU lowering pending).
+
+---
+
+## When something fails
+
+Every fallible entry point returns
+`BoltResult<T> = Result<T, BoltError>`. `BoltError` is a `thiserror`
+enum (`src/error.rs`); the variants you'll see in normal use are:
+
+| Variant            | Phase            | Typical cause                                                |
+| ------------------ | ---------------- | ------------------------------------------------------------ |
+| `Sql(String)`      | Parse            | Unrecognised keyword, unsupported construct, syntax error.   |
+| `Plan(String)`     | Plan / lower     | Unknown column, schema mismatch, unsupported expression.     |
+| `Type(String)`     | Plan / lower     | Operands won't unify (e.g. `Utf8 + Int32`).                  |
+| `Memory(String)`   | Runtime          | Host-side allocator failure, pool eviction edge case.        |
+| `GpuCapacity(...)` | Runtime          | GPU hash-join overshoot — caller should retry on host.       |
+| `Cuda(String)`     | Runtime          | CUDA driver error without an associated `CUresult`.          |
+| `CudaWithCode { code, message }` | Runtime | Driver error with a numeric `CUresult`. Pattern-match `code` to recognise specific errors (e.g. `code == 2` is `CUDA_ERROR_OUT_OF_MEMORY`). |
+| `Io(io::Error)`    | Runtime          | Wraps `std::io::Error` via `#[from]`.                        |
+| `Cancelled(CancelReason)` | Runtime   | The statement's `CancellationToken` was cancelled or its deadline passed (see [Cancelling a query and timeouts](#cancelling-a-query-and-timeouts)). |
+
+Use the `Display` impl to render an error, or pattern-match on the
+variant to dispatch retry logic:
+
+```rust
+use craton_bolt::BoltError;
+
+match engine.sql("SELECT FOO(x) FROM t") {
+    Ok(handle) => process(handle),
+    Err(BoltError::Sql(msg))    => eprintln!("query rejected: {msg}"),
+    Err(BoltError::Plan(msg))   => eprintln!("plan error: {msg}"),
+    Err(BoltError::CudaWithCode { code: 2, .. }) => {
+        // CUDA_ERROR_OUT_OF_MEMORY — drop caches and retry once.
+    }
+    Err(other) => eprintln!("engine error: {other}"),
+}
+```
+
+A few common error shapes and what they actually mean:
+
+- **`SQL parse error: ...`** — the query didn't make it past
+  `sqlparser`. Re-read the keyword the parser flagged; the error
+  message includes a column number.
+- **`plan error: unknown column 'foo' on table 'sales'`** — typo or
+  case mismatch. Identifiers are matched case-insensitively
+  (`SELECT Score` resolves to a column named `score`), but they have
+  to exist.
+- **`plan error: table 'sales' is already registered`** — you called
+  `register_table` twice. Use `register_batch` to append, or
+  `replace_table` to swap.
+- **`CUDA driver error 2: out of memory`** — the device-memory pool
+  couldn't satisfy an allocation. See *Performance tuning* below for
+  the pool knobs; the pool watcher (under the `pool-watcher` feature)
+  proactively evicts on low-water hits.
+
+For observability, the engine emits periodic pool-stats lines via
+the [`log`](https://crates.io/crates/log) crate's `info!` macro. Wire
+up any `log` backend (`env_logger`, `tracing-log`, `fern`, …) and the
+lines appear automatically:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    // ... your engine code ...
+    Ok(())
+}
+```
+
+Run with `RUST_LOG=info` to see them. For structured access (Prometheus,
+OpenTelemetry, a custom dashboard) install an observer:
+
+```rust
+use craton_bolt::{install_pool_stats_observer, PoolStats};
+
+install_pool_stats_observer(Box::new(|s: PoolStats| {
+    println!(
+        "pool: {} bytes / {} buckets ({} OOM rescues)",
+        s.total_pooled_bytes, s.bucket_count, s.oom_recovery_count,
+    );
+}));
+```
+
+Structured per-phase tracing spans (parse / plan / lower / codegen /
+ptx_load / launch / transfer / materialize) are emitted via the
+[`tracing`](https://crates.io/crates/tracing) crate. They are off by
+default and opt-in: install a `tracing_subscriber` in your binary and
+the spans appear automatically (span names are catalogued in
+`src/observability.rs`). The `log`-level diagnostics and the pool-stats
+observer remain available alongside the spans.
+
+Pre-aggregated latency histograms (`craton_bolt::metrics_snapshot()` /
+`render_prometheus`) cover the `parse`, `plan`, `lower`, `codegen`,
+`ptx_load`, `execute` and `materialize` phases, so cold-JIT cost (`codegen` +
+`ptx_load`) is separable from steady-state execution without a subscriber.
+
+---
+
+## Performance tuning
+
+Most workloads need no tuning. The defaults are conservative
+production-safe choices. When you do need to dial something, here are
+the knobs that actually exist today.
+
+### Env vars
+
+[`ENV_VARS.md`](ENV_VARS.md) is the **authoritative** list — every runtime /
+build var the crate reads, with full per-var notes and source call sites. The
+handful below are the ones you're most likely to touch:
+
+| Var                                 | Default     | What                                                  |
+| ----------------------------------- | ----------- | ----------------------------------------------------- |
+| `CRATON_BOLT_POOL_MAX_BYTES`        | 512 MiB     | Soft cap on total pooled GPU memory.                  |
+| `CRATON_BOLT_PTX_CACHE_CAP`         | 256         | In-process JIT PTX module-cache size (FIFO eviction). |
+| `CRATON_BOLT_PTX_CACHE_MAX_BYTES`   | 64 MiB      | Disk PTX-cache total-bytes cap (`0` disables).        |
+| `CRATON_BOLT_PTX_CACHE_MAX_ENTRIES` | 4096        | Disk PTX-cache entry-count cap (`0` disables).        |
+| `BOLT_POOL_STATS_INTERVAL_SECS`     | 60          | Pool-stats log cadence. Set to `0` to silence.        |
+| `BOLT_POOL_WATCH_INTERVAL_SECS`     | 5           | `pool-watcher` poll cadence (only with that feature). |
+| `BOLT_GPU_JOIN_TABLE_CAP_MB`        | driver-detected | Override the GPU hash-join byte cap, 64..=4096 MiB. |
+
+Example — bound the engine's resident footprint on a shared GPU:
+
+```sh
+CRATON_BOLT_POOL_MAX_BYTES=$((256 * 1024 * 1024)) \
+    cargo run --release
+```
+
+Most env vars are read once on first use and frozen for the process
+lifetime; setting them mid-run has no effect.
+
+### Cargo features
+
+```toml
+[dependencies]
+craton-bolt = { version = "0.11", features = ["pool-sharded"] }
+```
+
+| Feature        | Default | What it does                                                            |
+| -------------- | ------- | ----------------------------------------------------------------------- |
+| `cuda-stub`    | off     | Build without linking CUDA. Every FFI entry returns `CUDA_ERROR_STUB`. Useful for `cargo check` on a CUDA-less host or docs.rs. Cannot execute queries. |
+| `cudarc`       | on      | Supported default primary-context and CUDA driver adapter; see `docs/CUDARC_ADOPTION.md`. |
+| `pool-sharded` | off     | Swap the memory-pool bucket map from a `DashMap` to a fixed 32-way mutex-array shard. Turn on only if profiling shows DashMap contention. |
+| `pool-watcher` | off     | Spawn a background thread that polls device memory and proactively evicts when free / total drops below `BOLT_POOL_WATCH_LOW_WATER_FRAC` (default 10%). Off by default — adds a permanently-resident thread. |
+| `storage`      | on      | Parquet tables (`register_parquet`, `CREATE EXTERNAL TABLE`, `COPY` to / from Parquet), the persistent catalog (`EngineBuilder::database`) and durable materialized views. Pulls in `parquet` / `serde_json`. Without it, `execute_sql` still runs in-memory DDL / DML and CSV `COPY`. |
+
+### The PTX module cache
+
+Every distinct `KernelSpec` Craton Bolt emits is JIT-compiled exactly
+once per process: the emitted PTX text is hashed and the loaded
+`CudaModule` is reused on subsequent queries with the same kernel
+shape. The cache is in-process, LRU, capped at
+`CRATON_BOLT_PTX_CACHE_CAP` entries (default 256). On a long-running
+workload that cycles through a bounded set of query shapes, every
+query after the first warm-up issues zero PTX compiles.
+
+A **disk-backed** persistent PTX cache (so cold-start is fast after the
+first run of a process) is opt-in via the
+`BOLT_PTX_CACHE_DIR=/path` env var (or the
+`Engine::Builder::persistent_cache(path)` hook); on a miss in the
+in-process cache the engine reads a `.ptx` entry from disk before
+re-running codegen, and writes freshly-generated PTX back atomically
+(tempfile + rename) for the next process. Set it on benchmark harnesses,
+CLI tools, and per-request workers that never benefit from the
+in-process cache alone. See [`ENV_VARS.md`](ENV_VARS.md) for the path
+conventions. The in-process cache still covers the steady-state case.
+
+Cached PTX is launched, so each entry is authenticated with HMAC-SHA-256
+under a secret key that is not stored in the cache directory. By default
+the key lives in a per-user file (`ptx-cache.key`, created on first use
+with owner-only permissions); point `BOLT_PTX_CACHE_KEY_FILE` at another
+file, or pass the key directly with
+`Engine::builder().persistent_cache_key(key)`. Processes that share a cache
+directory must share the key. If the key cannot be trusted the disk cache
+is turned off with a warning; queries still run.
+
+### Multi-GPU
+
+One CUDA context per `Engine`, one `Engine` per GPU. To use multiple
+cards, construct one engine per device and dispatch queries to the
+appropriate one:
+
+```rust
+let gpu_0 = Engine::new_with_device(0)?;
+let gpu_1 = Engine::new_with_device(1)?;
+```
+
+There is no automatic cross-GPU query planning. That's a 2.0 concern
+(see [`PATH_TO_1.0.md`](PATH_TO_1.0.md) §7).
+
+---
+
+## See also
+
+- [`SQL_REFERENCE.md`](SQL_REFERENCE.md) — every accepted query shape,
+  every rejection reason.
+- [`ENV_VARS.md`](ENV_VARS.md) — exhaustive env-var reference.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — what the engine actually does
+  with your query under the hood.
+- [`FAQ.md`](FAQ.md) — common questions about the design choices.
+- [`PATH_TO_1.0.md`](PATH_TO_1.0.md) — what's coming, in what order,
+  with what acceptance criteria.
+- [`CHANGELOG.md`](../CHANGELOG.md) — what landed when.

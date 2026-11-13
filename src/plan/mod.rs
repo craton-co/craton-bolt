@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Logical plan IR, DataFrame builder, SQL frontend, and physical plan.
+
+pub mod dataframe;
+pub mod explain;
+pub(crate) mod extended_types;
+pub(crate) mod literal_coercion;
+pub mod logical_plan;
+pub(crate) mod null_semantics;
+pub mod optimizer;
+pub mod physical_plan;
+pub mod rewrite;
+pub mod sql_frontend;
+pub mod sql_semantics;
+pub mod statistics;
+pub mod string_literal_rewrite;
+pub mod subquery;
+/// Substrait plan ingestion (optional, `--features substrait`).
+#[cfg(feature = "substrait")]
+pub mod substrait;
+pub mod suggest;
+
+pub use dataframe::{
+    avg, count, max, min, stddev_pop, stddev_samp, sum, var_pop, var_samp, DataFrame,
+    GroupedDataFrame,
+};
+pub use explain::{format_logical, format_physical};
+pub use logical_plan::{
+    col, lit, AggregateExpr, BinaryOp, DataType, Expr, Field, Literal, LogicalPlan, ScalarFnKind,
+    Schema, SetOpKind, TimeUnit, UnaryOp,
+};
+pub use optimizer::{default_passes, default_passes_with_estimator, RowEstimator, StatsEstimator};
+pub use physical_plan::{
+    lower as lower_physical, ColumnIO, ExecutionTier, KernelSpec, MemoryBehavior, Op, PhysicalPlan,
+    Reg, StringLengthOutput, StringProjectOutput, Value,
+};
+pub use rewrite::PlanRewrite;
+pub use sql_frontend::{parse as parse_sql, MemTableProvider, TableProvider};
+pub use sql_semantics::SqlSemantics;

@@ -1,0 +1,169 @@
+---
+source: tests/ptx_golden_tests.rs
+---
+.version 7.5
+.target sm_70
+.address_size 64
+
+.shared .align 4 .b8 sdata[2048];
+
+.visible .entry bolt_prefix_scan(
+	.param .u64 bolt_prefix_scan_param_0,
+	.param .u64 bolt_prefix_scan_param_1,
+	.param .u64 bolt_prefix_scan_param_2,
+	.param .u32 bolt_prefix_scan_param_3
+)
+{
+	.reg .pred  %p<8>;
+	.reg .b16   %rs<4>;
+	.reg .b32   %r<32>;
+	.reg .b64   %rd<32>;
+
+	mov.u32 %r{0}, %ctaid.x;
+	mov.u32 %r{1}, %ntid.x;
+	mov.u32 %r{2}, %tid.x;
+	mad.lo.s32 %r{3}, %r{0}, %r{1}, %r{2};
+	ld.param.u32 %r{4}, [bolt_prefix_scan_param_3];
+	ld.param.u64 %rd{0}, [bolt_prefix_scan_param_0];
+	cvta.to.global.u64 %rd{0}, %rd{0};
+	ld.param.u64 %rd{1}, [bolt_prefix_scan_param_1];
+	cvta.to.global.u64 %rd{1}, %rd{1};
+	ld.param.u64 %rd{2}, [bolt_prefix_scan_param_2];
+	cvta.to.global.u64 %rd{2}, %rd{2};
+	setp.ge.u32 %p{0}, %r{3}, %r{4};
+	mov.u32 %r{5}, 0;
+	@%p{0} bra AFTER_LOAD;
+	mul.wide.u32 %rd{3}, %r{3}, 1;
+	add.s64 %rd{4}, %rd{0}, %rd{3};
+	ld.global.nc.u8 %rs0, [%rd{4}];
+	cvt.u32.u16 %r{6}, %rs0;
+	setp.ne.s32 %p{1}, %r{6}, 0;
+	selp.s32 %r{5}, 1, 0, %p{1};
+AFTER_LOAD:
+	mov.u64 %rd{5}, sdata;
+	add.s64 %rd{6}, %rd{5}, 1024;
+	mul.wide.u32 %rd{7}, %r{2}, 4;
+	add.s64 %rd{8}, %rd{5}, %rd{7};
+	add.s64 %rd{9}, %rd{6}, %rd{7};
+	st.shared.u32 [%rd{8}], %r{5};
+	bar.sync 0;
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{2}, %r{2}, 1;
+	mov.u32 %r{8}, 0;
+	@%p{2} bra SKIP_LOAD_0;
+	sub.s64 %rd{10}, %rd{8}, 4;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_0:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{3}, %r{2}, 2;
+	mov.u32 %r{8}, 0;
+	@%p{3} bra SKIP_LOAD_1;
+	sub.s64 %rd{10}, %rd{8}, 8;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_1:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{4}, %r{2}, 4;
+	mov.u32 %r{8}, 0;
+	@%p{4} bra SKIP_LOAD_2;
+	sub.s64 %rd{10}, %rd{8}, 16;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_2:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{5}, %r{2}, 8;
+	mov.u32 %r{8}, 0;
+	@%p{5} bra SKIP_LOAD_3;
+	sub.s64 %rd{10}, %rd{8}, 32;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_3:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{2}, %r{2}, 16;
+	mov.u32 %r{8}, 0;
+	@%p{2} bra SKIP_LOAD_4;
+	sub.s64 %rd{10}, %rd{8}, 64;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_4:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{3}, %r{2}, 32;
+	mov.u32 %r{8}, 0;
+	@%p{3} bra SKIP_LOAD_5;
+	sub.s64 %rd{10}, %rd{8}, 128;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_5:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{4}, %r{2}, 64;
+	mov.u32 %r{8}, 0;
+	@%p{4} bra SKIP_LOAD_6;
+	sub.s64 %rd{10}, %rd{8}, 256;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_6:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{7}, [%rd{8}];
+	setp.lt.s32 %p{5}, %r{2}, 128;
+	mov.u32 %r{8}, 0;
+	@%p{5} bra SKIP_LOAD_7;
+	sub.s64 %rd{10}, %rd{8}, 512;
+	ld.shared.u32 %r{8}, [%rd{10}];
+SKIP_LOAD_7:
+	add.s32 %r{9}, %r{7}, %r{8};
+	st.shared.u32 [%rd{9}], %r{9};
+	bar.sync 0;
+	mov.u64 %rd{11}, %rd{8};
+	mov.u64 %rd{8}, %rd{9};
+	mov.u64 %rd{9}, %rd{11};
+	ld.shared.u32 %r{10}, [%rd{8}];
+	sub.s32 %r{11}, %r{10}, %r{5};
+	setp.ge.u32 %p{5}, %r{3}, %r{4};
+	@%p{5} bra AFTER_LOCAL_STORE;
+	mul.wide.u32 %rd{12}, %r{3}, 4;
+	add.s64 %rd{13}, %rd{1}, %rd{12};
+	st.global.u32 [%rd{13}], %r{11};
+AFTER_LOCAL_STORE:
+	setp.ne.s32 %p{6}, %r{2}, 255;
+	@%p{6} bra DONE;
+	mul.wide.u32 %rd{14}, %r{0}, 4;
+	add.s64 %rd{15}, %rd{2}, %rd{14};
+	st.global.u32 [%rd{15}], %r{10};
+DONE:
+	ret;
+}

@@ -1,0 +1,36 @@
+Craton Bolt — JIT-compiled GPU SQL engine
+Copyright 2026 Craton Software Company
+
+This product includes software developed at:
+  - The Apache Arrow project (https://arrow.apache.org)
+    Licensed under Apache License 2.0.
+      - arrow - Apache-2.0
+      - arrow-array - Apache-2.0
+      - arrow-buffer - Apache-2.0
+      - arrow-schema - Apache-2.0
+  - The Apache DataFusion sqlparser-rs project
+    (https://github.com/apache/datafusion-sqlparser-rs)
+    Licensed under Apache License 2.0.
+      - sqlparser - Apache-2.0
+
+This product depends on, but does not redistribute, the following projects
+in its development setup. Their licenses apply where applicable:
+  - bytemuck, libc, parking_lot, once_cell, thiserror — Apache-2.0 or MIT.
+  - log - MIT/Apache-2.0.
+  - dashmap (https://github.com/xacrimon/dashmap) — Apache-2.0 or MIT.
+  - cudarc (https://github.com/coreylowman/cudarc) — Apache-2.0 or MIT
+    (optional, enabled with --features cudarc).
+  - criterion — Apache-2.0 or MIT (dev-dependency only).
+  - polars — MIT (dev-dependency only, used for benchmark comparison).
+  - duckdb (https://github.com/duckdb/duckdb-rs) — MIT
+    (dev-dependency only, used for differential benchmarking).
+  - proptest (https://github.com/proptest-rs/proptest) — Apache-2.0 or MIT
+    (dev-dependency only).
+  - insta (https://github.com/mitsuhiko/insta) — Apache-2.0
+    (dev-dependency only).
+  - cuda_builder (https://github.com/Rust-GPU/Rust-CUDA) — Apache-2.0 or MIT
+    (build-dependency only, enabled with --features rust-cuda).
+
+The CUDA driver API, headers, and runtime libraries are © NVIDIA Corporation
+and are not redistributed with this project. See the EULA accompanying your
+CUDA Toolkit installation.

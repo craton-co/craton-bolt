@@ -1,0 +1,9 @@
+﻿# Craton Bolt code owners
+#
+# These owners are requested for review on every pull request automatically.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+#
+# The repository's current maintainer account is a real, write-capable owner.
+# Branch protection on dev/main must require code-owner approval.
+
+* @victor-craton

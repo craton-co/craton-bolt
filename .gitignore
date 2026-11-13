@@ -1,0 +1,33 @@
+# Rust build artifacts. The glob also covers the side target directories a
+# secondary toolchain needs (e.g. an MSRV or coverage run pointed at
+# `target-msrv/` via CARGO_TARGET_DIR), which are build output just the same.
+/target/
+/target-*/
+lcov.info
+
+# Claude Code worktrees and session state
+.claude/
+
+# Editor / IDE
+.idea
+.vscode/
+
+# OS
+.DS_Store
+
+# JetBrains: default ignored files
+/shelf/
+/workspace.xml
+# Ignored default folder with query files
+/queries/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+# Editor-based HTTP Client requests
+/httpRequests/
+
+# Internal AI scratch — must not ship
+bolt_continue_prompt.md
+
+# Internal review notes — kept local, not published
+reviews/

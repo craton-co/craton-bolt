@@ -1,0 +1,43 @@
+---
+source: tests/ptx_golden_tests.rs
+---
+.version 7.5
+.target sm_70
+.address_size 64
+
+.visible .entry bolt_test_kernel(
+	.param .u64 .ptr .global .align 16 bolt_test_kernel_param_0,
+	.param .u64 .ptr .global .align 16 bolt_test_kernel_param_1,
+	.param .u32 bolt_test_kernel_param_2_n_rows
+)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<7>;
+	.reg .b64 %rl<2>;
+	.reg .b64 %rd<6>;
+	mov.u32 %r{0}, %ctaid.x;
+	mov.u32 %r{1}, %ntid.x;
+	mov.u32 %r{2}, %tid.x;
+	mad.lo.s32 %r{3}, %r{0}, %r{1}, %r{2};
+	ld.param.u32 %r{4}, [bolt_test_kernel_param_2_n_rows];
+	setp.ge.u32 %p{0}, %r{3}, %r{4};
+	@%p{0} bra DONE;
+	ld.param.u64 %rd{0}, [bolt_test_kernel_param_0];
+	cvta.to.global.u64 %rd{0}, %rd{0};
+	ld.param.u64 %rd{1}, [bolt_test_kernel_param_1];
+	cvta.to.global.u64 %rd{1}, %rd{1};
+	mul.wide.u32 %rd{2}, %r{3}, 4;
+	add.s64 %rd{3}, %rd{0}, %rd{2};
+	ld.global.nc.s32 %r{5}, [%rd{3}];
+	mov.s64 %rl{0}, 0x0000000000000005;
+	cvt.s64.s32 %rl{1}, %r{5};
+	setp.eq.s64 %p{1}, %rl{1}, %rl{0};
+	selp.s32 %r{6}, 1, 0, %p{1};
+	setp.eq.s32 %p{2}, %r{6}, 0;
+	@%p{2} bra DONE;
+	mul.wide.u32 %rd{4}, %r{3}, 4;
+	add.s64 %rd{5}, %rd{1}, %rd{4};
+	st.global.s32 [%rd{5}], %r{5};
+DONE:
+	ret;
+}

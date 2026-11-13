@@ -1,0 +1,59 @@
+name: bench-history
+
+# Scheduled GPU benchmark history.
+#
+# Hosted CI builds with `cuda-stub`, so it cannot observe GPU performance and
+# must not be used to infer regressions. This workflow runs the cost-model
+# response-surface suite and the h2o.ai GROUP BY subset on the self-hosted
+# NVIDIA runner and archives Criterion's estimates together with the
+# reproducibility manifest each bench writes (target/bench-manifests/), so a
+# per-commit history exists to judge regressions against. It is informational:
+# it never gates merges. See docs/BENCHMARKS.md ("Scheduled benchmark history").
+
+on:
+  schedule:
+    # Weekly, offset from the CI schedule so the GPU runner is not shared.
+    - cron: "17 9 * * 3"
+  workflow_dispatch: {}
+
+# Third-party actions are pinned to immutable commits (same pins as ci.yml).
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gpu-bench:
+    name: gpu benchmark history (self-hosted NVIDIA GPU)
+    # Never run fork code on the self-hosted hardware.
+    if: ${{ github.repository == 'craton-co/craton-bolt' }}
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Record device
+        run: nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.free,driver_version,power.limit --format=csv
+
+      - name: Cost-model response surfaces
+        env:
+          BOLT_BENCH_GPU: "1"
+        run: cargo bench --bench cost_model --no-default-features --features cudarc
+
+      - name: h2o.ai GROUP BY subset (DuckDB / Polars verified)
+        env:
+          BOLT_BENCH_GPU: "1"
+        run: cargo bench --bench olap_benchmarks --no-default-features --features cudarc,reference-benches
+
+      - name: Archive estimates + manifests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-history-${{ github.sha }}
+          path: |
+            target/bench-manifests/
+            target/criterion/**/new/estimates.json
+          if-no-files-found: error
+          retention-days: 400

@@ -1,0 +1,1347 @@
+# Changelog
+
+All notable changes to this project will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project tries to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it leaves `0.x`.
+
+## [Unreleased]
+
+## [0.12.0] - 2026-11-12
+
+### Changed
+
+- Relicensed the project from Apache-2.0 to AGPL-3.0-only.
+
+## [0.11.0] - 2026-10-30
+
+Closes the engine reports filed by an embedder (`docs/issues/`,
+craton-bolt-003 .. 010 and the extension pages that reference them). Every
+reproduction runs in `tests/issue_reports_regression_test.rs` under both
+tier policies.
+
+### Fixed
+- **Host-side `NOT LIKE` evaluation**: preserve negated `Expr::Like` expressions
+  during string literal rewrite to ensure full SQL 3-valued NULL logic.
+- **Engine provider schema resolution**: fallback to inferring table schema
+  from registered batches when not defined in base table provider.
+- **`COUNT(*)` over non-scan-chain input**: accurately recognize `COUNT(*)` in
+  single-aggregate expressions to allow lower depth execution.
+- **Ungrouped `SUM` / `MIN` / `MAX` / `STDDEV_*` over an empty or all-NULL
+  filtered or computed input returned the reduction identity** (`0`,
+  `i64::MAX`, `-inf`, `0.0`) instead of NULL (craton-bolt-003).
+- **`dec IS [NOT] NULL` on a nullable `Decimal128` column returned the
+  wrong rows**: the kernels read one validity byte per row while Decimal128
+  kept the packed bitmap (craton-bolt-004).
+- **Decimal128 could not be compared with a constant.** Numeric constants
+  compared with a Decimal128, Timestamp or Date32 operand are coerced
+  exactly to its type in one pass (`plan::literal_coercion`), in either
+  operand order; a constant with more fractional digits rounds toward the
+  correct side and `=` folds to never (craton-bolt-004).
+- **`CAST(<negative decimal> AS DOUBLE)` was wrong** (`-0.25` gave `0`): the
+  i128-to-f64 conversion added the signed high half to the unsigned low
+  half. `CAST(dec AS DOUBLE)` in a `WHERE` clause or a filtered projection
+  now runs (craton-bolt-004).
+- **A filtered plan failed on any table containing a Decimal128 column**,
+  referenced or not; the host Filter lifts only the columns its predicate
+  reads. `COUNT(*) ... WHERE dec IS NULL` runs through the pre-stage
+  (craton-bolt-004).
+- **`TIMESTAMP '...'` constants could only be compared with nanosecond
+  columns.** They are rescaled to the column's unit and adopt a zoned
+  column's time zone; `DATE` columns compare with TIMESTAMP constants
+  (craton-bolt-005).
+- **Utf8 `IS [NOT] NULL` and `IN` failed at execution, and `!=` / `NOT` on a
+  Utf8 column returned NULL rows** (wrong results). `IS NULL` folds to the
+  dictionary NULL slot, dictionary-folded predicates follow Kleene logic,
+  NULL items are folded out of `IN` lists, and host-evaluated expressions
+  over a dictionary column get its index column. EXPLAIN and execution now
+  agree on these plans (craton-bolt-006).
+- **Long `OR` / `AND` chains and dictionary-lowered string predicates
+  overflowed the thread stack and aborted the process** (300 terms on a
+  2 MiB stack). Every statement is rebalanced iteratively at the shared
+  parse entry; IN lists, conjunct folds and membership sets are built
+  balanced. The 64-value `IN` cap is gone (craton-bolt-007).
+- **`register_batch` cost O(table) per call, so N appends were O(N^2)**:
+  dictionaries are extended with the new batch only and chunks merge
+  geometrically (appends 127..147 of 2,048 rows: 3.54 s -> 30.7 ms;
+  craton-bolt-008).
+- **Float NaN handling, both semantics modes**: the host sort put `-NaN`
+  first, scalar float `MAX` dropped NaN on the GPU, `MIN` over all-NaN input
+  returned `+inf`, and the host evaluator disagreed with the GPU on
+  `NaN != x`.
+- **`SUM` of a `FLOAT` column accumulated in single precision** (grouped
+  GPU paths used f32 atomics, off by up to 11,478 ulps on 1M rows). Every
+  path now accumulates in f64 and rounds once; the output type is still
+  `Float32`.
+- **Untrusted Parquet files could make the reader reserve up to 2 GiB**
+  (a page header claiming `compressed_page_size = i32::MAX`, oversized
+  footer lists or bloom filters) and abort on hosts without overcommit.
+  Footer lengths, page headers and bloom-filter headers are bounds-checked
+  before `parquet` allocates (W7-A-001).
+- **Column-vs-column Utf8 `=` / `<>` failed in PTX codegen**; it uses the
+  shared-rank comparison.
+- **`COUNT(*)` next to `COUNT(<Utf8 / Binary / temporal / decimal column>)`
+  failed**: the `COUNT(*)` literal forced a pre-aggregation kernel that
+  cannot output those columns; it now counts through a row column, as the
+  GROUP BY path already did.
+- **Disk-cached PTX from before these codegen changes could be reused**:
+  `CODEGEN_VERSION` is 4.
+
+### Added
+- **`EngineBuilder::sql_semantics(SqlSemantics::Standard)`**: SQL-compatible
+  semantics on every tier: total-order floats (NaN = NaN, NaN greatest, also
+  for join keys and `IN`), checked integer `+ - *` and float-to-integer
+  `CAST` ("Out of Range Error" instead of wrapping), NULLS LAST by default.
+  The default (`SqlSemantics::Ieee`) is unchanged and now documented
+  (craton-bolt-010).
+- **Query cancellation and timeouts**: `CancellationToken` (flag plus
+  optional deadline), `Engine::sql_with_cancel`, `execute_sql_with_cancel`,
+  `sql_stream_with_cancel`, `DataFrame::collect_with_cancel`,
+  `Session::sql_with_cancel` / `submit_with_cancel`, and
+  `BoltError::Cancelled(CancelReason)`. Checks run at operator, morsel,
+  partition, chunk, radix-pass and worker-thread boundaries, never inside a
+  kernel; DML stops only before its commit point (W2-E-005).
+- **Extended column types**: Time32 / Time64, Duration, Interval, Binary /
+  LargeBinary / FixedSizeBinary, Decimal256, Null and nested List / Struct /
+  Map columns can be registered, stored (Parquet, catalog), filtered on other
+  columns and returned (`plan::DataType::Extended`, capability table
+  `plan::extended_types`). Time, Duration and Binary support comparisons,
+  `GROUP BY`, `ORDER BY`, `MIN` / `MAX` and `TIME '...'` / `X'..'` /
+  `INTERVAL` literals; `INSERT` / `UPDATE` / `DELETE` / `MERGE` / `COPY FROM`
+  work on such tables; unsupported operations fail at plan time (W1-D-007).
+- **SQL**: `CAST(... AS DECIMAL(p,s) | DATE | TIMESTAMP | TIMESTAMPTZ)`,
+  date-only `TIMESTAMP 'YYYY-MM-DD'`, `TIMESTAMPTZ '... +hh[:mm]'` literals.
+- **Keyed integrity for the disk PTX cache**: entries carry an HMAC-SHA-256
+  tag under a key kept outside the cache directory
+  (`EngineBuilder::persistent_cache_key`, `BOLT_PTX_CACHE_KEY_FILE`, or a
+  per-user key file created owner-only); unkeyed, v1 or tampered entries are
+  never launched (W2-D-003 item 5). New dependencies: `hmac`, `sha2`,
+  `getrandom`.
+
+### Changed
+- `TIMESTAMP - TIMESTAMP` returns a `Duration` of the operand unit instead
+  of raw ticks typed as an integer.
+- `plan::DataType` is `#[non_exhaustive]` and gains `Extended`; a downstream
+  exhaustive `match` needs a wildcard arm (see `docs/MIGRATION_GUIDE.md`).
+  Later type additions are non-breaking.
+- `Engine::deregister_table` / `drop_table` are pinned by tests to release
+  the resident device copy, dictionaries, statistics and cached plans of one
+  table (W1-B-006).
+
+## [0.10.0] - 2026-10-26
+
+### Fixed
+- **An inner join with equi keys and a residual predicate returned a filtered
+  cross product** when the key columns shared a name (`... JOIN s ON t.k =
+  s.k WHERE s.x = 1`, or `ON t.k = s.k AND <non-equi>`): the residual path
+  folded the keys back in as `k = k`, comparing the left column with itself.
+  Such joins now hash-join on the keys and filter the result (checked against
+  DuckDB).
+- **Projection pruning dropped right-side columns read only by a join's
+  residual predicate** under a colliding name (`right.s`), so storage scans
+  skipped them and the predicate compared placeholders.
+- **GPU kernels ignored SQL NULLs of nullable primitive columns.** A NULL
+  read as `0`: `WHERE i < 5` kept the rows where `i` is NULL, computed outputs
+  (`i + 1`, `CASE WHEN i < 10 ...`) and filtered projections returned values
+  where NULL was due, and `NOT` / `OR` / `CASE` gave non-Kleene answers.
+  Predicates and outputs over nullable columns are now rewritten into
+  explicit validity checks before codegen (`plan::null_semantics`): a
+  predicate compiles as "is TRUE", each output gets a hidden validity output
+  the executor applies, and aggregate feeds that are not NULL-strict are
+  computed as columns first. `CASE` without `ELSE` (and NULL arms) now runs
+  on the GPU too.
+- **`SUM(Int32)` through the aggregate pre-stage wrote its `i64` block
+  partials into an `i32` buffer**: only the first 256 rows were summed and
+  the rest was an out-of-bounds device write (e.g. `SELECT COUNT(*), SUM(i)
+  FROM t`). The input is widened before the reduction, and the reduction
+  refuses an accumulator wider than its buffer.
+- **`COUNT(col)` / `AVG(col)` through the aggregate pre-stage counted NULL
+  rows** of a nullable `col` (e.g. `COUNT(f) ... WHERE k > 3`).
+- **`ORDER BY` a column the SELECT list does not output failed in LATERAL
+  and correlated-`WHERE` queries** ("column not found"); their outer
+  templates now carry hidden sort columns like ordinary queries.
+- **A `DATE` / `TIMESTAMP` column passed through a fused projection kernel
+  failed** ("Date/Timestamp output column lowering pending") — e.g. a bare
+  scan feeding a host-orchestrated query. Temporal kernel outputs now
+  download as their `i32` / `i64` storage and get their logical type back, so
+  passthrough, `CASE` and arithmetic outputs stay in the fused kernel.
+- **A grouped aggregate with a string key and a computed input over a
+  table without dictionaries failed** ("build_projection_kernel returned
+  non-Projection"); the inputs are now computed as columns first.
+- **Grouped `SUM` / `MIN` / `MAX` of a group with only NULL values
+  returned the accumulator's identity** (`0`, `i64::MAX`, `inf`, `NaN`)
+  instead of NULL. When an aggregate's input holds NULLs, a companion
+  `COUNT(input)` of the same plan now marks the empty groups.
+- **Several aggregates of one column under a predicate failed** (`SUM(v),
+  MIN(v) ... WHERE ...` → "duplicate pre output name"), and **grouped float
+  `MIN` / `MAX` under a predicate** failed ("MIN/MAX over float not yet
+  supported"; now folded on the host).
+- **Aggregates filtered by `IS [NOT] NULL` read garbage validity pointers**
+  in the fused pre-stage predicate kernel (CUDA "invalid argument" or an
+  access violation): the predicate kernel now receives the validity
+  parameters it is compiled for.
+- **`ORDER BY` a column the SELECT list does not output failed** (`SELECT v
+  FROM t ORDER BY k` → "Unable to get field named k"): the projection now
+  carries the sort columns as hidden outputs and a final projection restores
+  the SELECT list.
+- **String functions outside their dedicated shapes failed** (`SELECT
+  UPPER(s), v * 2 FROM t`, `LENGTH(s)` under an `ORDER BY` on another column,
+  … → "not yet lowered to GPU"): `UPPER` / `LOWER` / `LENGTH` / `CONCAT` now
+  evaluate on the host there, with the GPU producers' semantics.
+- **`GROUP BY` over a join of a dictionary-encoded table, under an `ORDER
+  BY`, bound a non-existent `__idx_<col>` column**; synthetic dictionary
+  columns are now bound only when the aggregate reads them.
+- **DuckDB differential lane**: the `OCTET_LENGTH` oracle query uses DuckDB's
+  `strlen` (DuckDB 1.2 has no `OCTET_LENGTH(VARCHAR)`), DECIMAL results are
+  decoded, and the property test's floor is measured over the queries DuckDB
+  accepts (96 cases), so random seeds that draw mostly oracle-invalid SQL no
+  longer fail it.
+- **`COUNT(*)` grouped by a string (or temporal / decimal / boolean) key
+  failed** with "Bool/Utf8 in pre outputs not yet supported": the literal
+  feed forced the aggregate pre-kernel, which cannot carry such a key. It now
+  counts through a non-nullable column, or binds the input with a synthetic
+  row column.
+- **A `Utf8` column projected next to a computed column failed** (`SELECT
+  name, price * 2 FROM t` → "Utf8 not supported in PTX codegen yet"); such
+  projections now evaluate on the host over a passthrough of the columns
+  they read, as predicated ones already did.
+- **Lazy and storage tables re-uploaded to the GPU on every query.** Overlay
+  tables carry no host revisions, so `ensure_gpu_table` never took its cache
+  hit for them; the cached copy is now reused while the overlay holds the
+  very batch that was uploaded.
+- **Lazy streams drain only the tables a query references.**
+  `register_table_stream_lazy` promised that a producer runs on the first query
+  that *references* its table, but every generic query drained every pending
+  lazy source. The compile pipeline now collects the plan's scans and
+  materialises exactly those (subqueries and host-orchestrated subplans drain
+  their own scans as they are compiled); `explain_sql` never drains.
+- **Lazy streams enforce the declared schema.** Batches drained from a lazy
+  producer are validated with the same check the eager `register_table_stream`
+  path uses (column count, names, plan dtypes); a mismatch fails every query
+  that references the table deterministically instead of letting planning see
+  one type while execution receives another.
+- **`run_logical_plan` / `DataFrame::collect` run user `PlanRewrite`s**, as
+  `sql()` always did.
+- **`explain_sql` renders the plan that executes.** It now runs the built-in
+  optimizer (constant folding, pushdown, join reorder, pruning) like `sql()`;
+  when a plan carries uncorrelated subqueries — which EXPLAIN does not execute —
+  the physical section is headed `Physical plan (pre-subquery-resolution ...)`
+  instead of silently differing from the executed plan.
+- **The dictionary plan rewrite runs once per plan**, not twice back-to-back.
+- **`QueriesFailed` counts every failure** of a top-level `sql()` /
+  `run_logical_plan` call — parse, rewrite, optimize, subquery resolution,
+  lowering — not only execution failures.
+- **`SELECT <utf8 col>, ... WHERE <non-string predicate>` executes.** A
+  projection of a `Utf8` column under a numeric or dictionary-folded
+  predicate fell into the fused GPU kernel, which has no `Utf8` register class
+  (`Utf8 not supported in PTX codegen yet`) — including the published
+  `examples/quickstart.rs` query. It now lowers to a host passthrough → filter
+  → project, with rewriter-synthesised `__idx_` / `__rank_` columns
+  materialised for the filter.
+- **Aggregates filtered by a string predicate execute.** `COUNT(*) / SUM(..)
+  ... WHERE s = 'lit'` failed (`pre kernel input column '__idx_s' not present`):
+  the host pre-stage fallback now materialises the dictionary-index columns,
+  and the resident on-device path reads them straight from the registry (and
+  accepts `COUNT(*)`), so the common case stays on the GPU.
+- **An absent string literal folds to a constant.** Engine dictionaries are
+  built from the full table, so they are now marked complete: `s = 'absent'`
+  folds to `FALSE` (and `<>` to `TRUE`) instead of surviving as a raw string
+  comparison the fused kernels cannot evaluate.
+- **Duplicate Arrow dictionary values no longer drop rows.** A
+  `Dictionary<Int32, Utf8>` column whose values array repeats a string gave
+  the string two device indices, so `s = 'x'` matched only one of them; each
+  distinct string now owns exactly one index.
+- **Aggregates over string predicates on lazy (dictionary-less) tables**, and
+  `GROUP BY <utf8 key>` under a predicate, execute (see `AggregateOverInput`).
+
+### Added
+- **`GROUPS` window frames and `RANGE` frames with value offsets**
+  (`RANGE BETWEEN 5 PRECEDING AND 2.5 FOLLOWING`, `INTERVAL '2 days'
+  PRECEDING` over `DATE` / `TIMESTAMP` keys), checked against DuckDB with
+  duplicate and NULL keys in both directions. Window keys may be timestamps
+  of any unit.
+- **`memory_pressure` and `concurrent_queries` benchmark groups** in
+  `benches/cost_model.rs`: out-of-core latency and spill / repartition /
+  eviction counts as the host budget shrinks, and throughput, p50 / p95
+  latency and fairness with 1–8 sessions on one `Database`.
+- **Device-resident operator pipelines** (`exec::device_pipeline`,
+  `Engine::execute_device`): an inner equi-join on one integer key over
+  fused projections or scans runs its hash build / probe on the device key
+  columns and gathers every output column on the device by the matched
+  indices, then hands the device table to the consumer — an aggregate over
+  the join reads it in place, `COUNT(*)` reads its row count, and a join
+  returned to the caller downloads only its output. Duplicate keys on
+  either side are supported. On an RTX 2060: join → `COUNT(*)` 10–22×,
+  joined rows 2×, join → aggregate 1.1–1.9× faster than the host-batch
+  path. `BOLT_DEVICE_PIPELINE=0` turns it off; `Counter::DevicePipelines`
+  counts it.
+- **`MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED [BY SOURCE | BY
+  TARGET] [AND p] THEN UPDATE | DELETE | INSERT`**, over in-memory and
+  catalog tables (one snapshot), with the cardinality check for target rows
+  matched more than once.
+- **Savepoints**: `SAVEPOINT`, `ROLLBACK TO [SAVEPOINT]` (also ends an aborted
+  state), `RELEASE [SAVEPOINT]` (`Engine::savepoint` /
+  `rollback_to_savepoint` / `release_savepoint`).
+- **Concurrent transactions.** Through a `Database` every session may hold a
+  transaction; they run concurrently under snapshot isolation (each on a
+  private snapshot installed per statement, merged at `COMMIT`; a write
+  conflict at table granularity fails the later commit). `IsolationLevel`
+  and `Database::set_isolation` (`Serializable` restores waiting);
+  `Engine::open_transactions`.
+- **`DATE ± integer`** (`d + 7`, `30 + d`, `d - n`) → `DATE`, on the GPU and
+  the host evaluator, and **computed `DATE` / `TIMESTAMP` outputs of fused
+  projection kernels** (`CASE WHEN ... THEN d1 ELSE d2 END`, temporal
+  literals, passthrough under predicates) instead of a host detour.
+- **`ASOF JOIN` without table aliases**: `FROM trades ASOF JOIN quotes
+  MATCH_CONDITION (tt >= qt)` used to fail to parse (sqlparser read `ASOF` /
+  `MATCH_CONDITION` as aliases).
+- **`DELETE`, `UPDATE`, `ALTER TABLE`.** `DELETE FROM t [WHERE ...]` and
+  `UPDATE t SET c = expr, ... [WHERE ...]` (subqueries see the table as it
+  was) rewrite only the catalog files whose zone maps may match, in one
+  snapshot; in-memory tables are rebuilt. `ALTER TABLE` supports `ADD
+  [COLUMN] [IF NOT EXISTS] c type [NOT NULL] [DEFAULT e]`, `DROP [COLUMN]`,
+  `RENAME [COLUMN] a TO b`, `ALTER [COLUMN] c [SET DATA] TYPE t | SET NOT
+  NULL | DROP NOT NULL` and `RENAME TO`. `Catalog::rewrite_files`,
+  `replace_table`, `rename_table`.
+- **Transactions.** `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`,
+  `ROLLBACK` (`Engine::begin_transaction` / `commit_transaction` /
+  `rollback_transaction` / `in_transaction`): a catalog publishes the
+  transaction's changes as one snapshot; `ROLLBACK` restores catalog and
+  in-memory tables, views and registrations. A failing statement aborts the
+  transaction. Through a `Database` a transaction belongs to its session:
+  other sessions' statements wait for it (`Database::set_transaction_wait`,
+  default 30 s), and a dropped session rolls back. `Catalog::begin` /
+  `commit_transaction` / `rollback_transaction`.
+- **Out of core, more shapes.** Over-budget partitions (key skew) are split
+  again with a new hash seed, up to three levels
+  (`MemoryStats::repartitions`). A row-wise scan of a storage table larger
+  than the host budget runs over bounded chunk groups (stopping at a
+  `LIMIT`), and `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` without `GROUP BY`
+  merge per-chunk partials — both used to fail with a memory error.
+  `Engine::sql_stream` / `ResultStream` yield such a query's result chunk
+  group by chunk group, so a large result is never held at once.
+- **`MemoryBehavior`** (crate root): `PhysicalPlan::memory_behavior` /
+  `memory_profile` / `children` classify each operator as streaming,
+  bounded-state, spillable, partitionable or fully materializing — the
+  classification the out-of-core executor acts on; `EXPLAIN` prints the
+  plan's profile (`Memory: ...`).
+- **`ASOF JOIN`** (`FROM l ASOF JOIN r MATCH_CONDITION (l.t >= r.t) [ON l.k
+  = r.k ...]`): each left row with the closest right row by time within
+  equal keys, NULL-padded when none (Snowflake semantics); `>=` / `>` /
+  `<=` / `<`, integer / float / date / timestamp times. Host matching in
+  `O((L + R) log R)`; `EXPLAIN` renders the `AsOfJoin` step.
+- **Window frames.** `ROWS BETWEEN <bound> AND <bound>` (`UNBOUNDED` /
+  `n PRECEDING` / `CURRENT ROW` / `n FOLLOWING`) and `RANGE BETWEEN` with
+  `UNBOUNDED` / `CURRENT ROW` bounds for `SUM` / `AVG` / `MIN` / `MAX` /
+  `COUNT` windows (`WindowExpr::frame`, `WindowFrame`, `FrameBound`,
+  `FrameUnits`); checked against DuckDB in the differential lane. `GROUPS`
+  and value-offset `RANGE` frames are still rejected.
+- **Bloom-filter pruning.** `write_parquet` (and so every catalog data
+  file) writes Parquet bloom filters for integer, date and string columns
+  with at least 1024 distinct values (`ParquetWriteOptions::bloom_filters`,
+  on by default); `ParquetTable::plan_scan` tests them for `=` / `IN`
+  predicates, skipping row groups whose zone maps cannot rule the value out.
+  `IN` lists (the frontend's three-valued `CASE` form) now prune by zone map
+  too.
+- **Materialized views: incremental and scheduled refresh, query
+  rewrite.** A durable view `SELECT keys, SUM / COUNT / MIN / MAX(...) FROM
+  t [WHERE ...] GROUP BY keys` over a catalog table that only gained files
+  refreshes from the new files, merging partial aggregates
+  (`ViewStatus::incremental` / `last_refresh_incremental`;
+  `ViewMeta::base_files`). `WITH (refresh = 'every 5 minutes')`
+  (`RefreshMode::Scheduled`, `RefreshPolicy::Scheduled`) refreshes a stale
+  view at most once per interval — before `execute_sql` statements, in
+  `Engine::refresh_due_views`, and on the `Database` runtime. A query whose
+  plan equals a fresh view's defining query is answered from the view
+  (`EngineBuilder::view_rewrite`, `Counter::ViewRewrites`; `EXPLAIN` says
+  so).
+- **Cost-based CPU / GPU tier selection** (`exec::cost`). `CostModel`
+  (`estimate(&CostInputs) -> OperatorCost`: host and device time, H2D / D2H
+  bytes, peak device bytes, compile time), the linear `DefaultCostModel`,
+  `Engine::calibrate_cost_model` (measures it on the device),
+  `EngineBuilder::tier_policy` / `cost_model`, `Engine::set_tier_policy`.
+  Under `TierPolicy::CostBased` row-wise statements and scalar aggregates the
+  host evaluator supports run on the host when cheaper (small or
+  non-resident inputs); `EXPLAIN` prints the estimate and the chosen tier;
+  `Counter::HostTierQueries`. The default stays `TierPolicy::GpuFirst`.
+- **Storage layer (`storage` feature, on by default).** `storage::StorageTable`
+  — chunked data with per-chunk `TableStatistics` — is scanned per
+  statement: a `ScanRequest` derived from the optimized plan (read columns +
+  prunable filter conjuncts) lets the table skip chunks by zone map, and a
+  covering installed scan is reused. `ParquetTable` (row groups as chunks,
+  footer statistics, projection, type normalisation) and `MemoryTable`
+  implement it; `write_parquet` writes atomically. `Engine::register_parquet`,
+  `register_storage_table`, `last_scan`, `table_statistics`, `table_names`,
+  `deregister_table`.
+- **SQL statements.** `Engine::execute_sql(&mut self)` runs `CREATE [TEMP |
+  EXTERNAL] TABLE [AS]`, `INSERT`, `DROP`, `TRUNCATE`, `COPY` to / from
+  Parquet and CSV, `ANALYZE`, `SHOW TABLES`, `DESCRIBE`, `COMPACT TABLE`,
+  `VACUUM`, and multi-statement scripts.
+- **Persistent catalog.** `EngineBuilder::database(dir)`: immutable Parquet
+  data files plus atomically committed JSON manifests; every manifest is a
+  snapshot (`database_snapshot(dir, version)`, read-only time travel);
+  writer lock; compaction; vacuum.
+- **Materialized views.** `CREATE / REFRESH / DROP MATERIALIZED VIEW`,
+  dependency and per-table data-version tracking, `Engine::view_status`,
+  manual or `on_commit` refresh; durable in a catalog.
+- **Memory governor.** `MemoryGovernor` with host / device budgets,
+  `MemoryReservation`, `MemoryConsumer`, `MemoryStats`;
+  `EngineBuilder::host_memory_budget` / `spill_dir`; `Engine::memory_stats`.
+  Loaded storage scans and idle GPU table copies are evicted LRU to fit.
+- **Out-of-core execution.** Over-budget `GROUP BY` / `DISTINCT` (any
+  aggregate), equi-joins of every type (grace hash join) and `ORDER BY
+  [LIMIT]` run on spilled hash partitions / sorted runs with the ordinary GPU
+  operators. `Counter::SpillFilesWritten` / `SpillBytesWritten` /
+  `StorageChunksRead` / `StorageChunksPruned`.
+- **Hive partitioning, clustering, statistics-driven selectivity.**
+  `ParquetTable::open` on a `key=value` directory tree adds partition columns
+  pruned like any zone map; `COMPACT TABLE t ORDER BY (cols)` /
+  `Engine::compact_table(name, Some(cols))` sorts a catalog table on a
+  recorded clustering key; storage statistics and `ANALYZE` results refine
+  the optimizer's filter / join selectivity.
+- **Streaming ingestion and a compaction policy.** `Engine::insert_batch`
+  (positional, cast, catalog-aware) and `Engine::ingest_stream` (buffers a
+  batch stream into one immutable file per flush); `EngineBuilder::auto_compact
+  (max_files)` compacts a catalog table once appends exceed the threshold.
+- **Flight SQL over a shared `Database`.** `FlightSqlServer::from_database`
+  answers through a read-only session and awaits results, so concurrent
+  clients no longer block tonic worker threads on an engine mutex.
+- **`APPROX_COUNT_DISTINCT(x)` / `APPROX_DISTINCT(x)`**, answered exactly
+  through the `COUNT(DISTINCT)` paths (parse-time rewrite).
+- **`EXPLAIN` shows data access and memory decisions**: a `Storage scans:`
+  section (chunks / columns each storage table would read) and the
+  out-of-core strategy a statement would use.
+- **Sessions.** `Database` owns the engine on a runtime thread; cloneable
+  `Session`s submit from any thread (`sql`, `submit` → `PendingResult` with
+  `wait` / `Future` / cancel-on-drop, `try_submit`), read-only sessions,
+  `with_engine`, `DatabaseStats`.
+- **Typed Tier-1 shared-memory GROUP BY SUM.** The resident on-device path
+  now covers `Int64` keys and `SUM(Int64)` / `SUM(Int32)` values (≤ 1024
+  groups), not only `Int32` keys × `SUM(Float64)`. Integer sums stay exact:
+  `SUM(Int32)` cannot overflow there, and `SUM(Int64)` takes the path only when
+  a device-computed `max|v| × n_rows` fits `i64` (otherwise the guarded path
+  still reports `SUM(integer) overflow`). Measured 40–70× faster for those
+  shapes at 4 M rows on an RTX 2060 (145–280 ms → 3.6–5.3 ms).
+- **Algebraic aggregates stream.** `AVG`, `VAR_*` and `STDDEV_*` (scalar and
+  grouped, mixed with distributive aggregates) run morsel-by-morsel under a
+  memory budget: each is decomposed into `SUM` / `COUNT` / `VAR_POP` partials
+  and recombined exactly (two-pass parallel variance), instead of draining the
+  whole table.
+- **Lazy tables get string dictionaries.** Without a memory budget, a lazy
+  table's dictionaries are built when it is drained — before the statement is
+  compiled — so its string predicates fold to GPU index comparisons like an
+  eager table's.
+- **Compiled-plan cache.** Repeated top-level SQL reuses the prepared physical
+  plan (skipping classification, rewrite, optimizer, subquery execution and
+  lowering), keyed by `(SQL, schema version, data epoch)`; every registration,
+  append, replace and lazy drain bumps the epoch, and the cache is bypassed
+  while `PlanRewrite` hooks are registered. 1.5–2.1× on small repeated queries.
+- **`GROUP BY` / aggregates over a non-fusable input.** Aggregates over a
+  join, union, distinct, or a filter the fused GPU kernel cannot evaluate
+  used to be rejected at lowering (`unsupported aggregate over non-scan-chain
+  input`). The new `PhysicalPlan::AggregateOverInput` runs the input, binds its
+  rows as an ephemeral table and aggregates that through the ordinary
+  (GPU where possible) aggregate path.
+- **Cost-model benchmark suite** (`benches/cost_model.rs`): one independent
+  variable per group — plan-pipeline stages, dictionary rewrite, batch
+  fragmentation, ingest, filter selectivity, GROUP BY cardinality / skew,
+  NULL density, JIT cold/warm, residency, join shape, string width, morsel
+  size, recursion depth. Configure with `BOLT_COST_ROWS`.
+- **Reproducibility manifests.** Every bench writes
+  `target/bench-manifests/<bench>-<unix>.json` (commit, dirty flag, crate
+  version, rustc, profile, features, GPU model / CC / VRAM, driver, power
+  limit, CUDA toolkit, experimental axes).
+- **Scheduled GPU benchmark history** (`.github/workflows/bench-history.yml`,
+  self-hosted, informational) archiving estimates + manifests per commit.
+- **Example gates.** CI compiles every example and runs the quickstart
+  (host: graceful no-GPU exit; GPU lane: real execution of `quickstart` and
+  `groupby`).
+- **Generated documentation.** `docs/ARCHITECTURE.md` carries a module
+  inventory generated from each file's `//!` summary, `docs/DEVELOPMENT.md` a
+  CI workflow/job matrix generated from `.github/workflows/`; both are
+  verified by `tests/doc_consistency_test.rs` (`BOLT_REGENERATE_DOCS=1`
+  refreshes). A new guard rejects version applicability markers, retired MSRV
+  claims and stale `craton-bolt = "x.y"` snippets in living docs.
+- **Engine-level regression suites** `tests/query_pipeline_parity_test.rs`
+  (incl. a sequential-engine context-lifetime soak, `BOLT_SEQUENTIAL_ENGINE_ITERS`)
+  and `tests/string_eq_aggregate_test.rs`.
+
+### Changed
+- **`Counter` is `#[non_exhaustive]`** (it gained storage and spill
+  counters); match it with a wildcard arm.
+- **Hosted CI covers the storage layer** (`--features cuda-stub,storage`,
+  GPU lane `cudarc,storage`), with a separate storage-less clippy gate; the
+  public-API snapshot is generated with `storage` on.
+- **`Engine::sql` names `execute_sql`** when given a statement (`CREATE`,
+  `INSERT`, …) instead of failing in the parser.
+- **Per-phase latency histograms for JIT and execution.** `metrics::Phase`
+  gains `Codegen` (PTX generation on a module-cache miss), `PtxLoad` (driver
+  module load on a PTX-cache miss) and `Execute` (post-planning execution of a
+  top-level statement), so cold-JIT cost is separable from steady-state
+  execution in `metrics_snapshot()` / `render_prometheus`. `Phase` is now
+  `#[non_exhaustive]`; an exhaustive `match` on it needs a wildcard arm.
+- **Low-cardinality GROUP BY no longer serialises on one shared atomic.** The
+  Tier-1 SUM and COUNT kernels pre-aggregate per-thread runs of equal keys in
+  registers (and warp-reduce the final runs) before touching shared memory:
+  a single-key `SUM ... GROUP BY` went from 23.8 ms to 3.8 ms (4 M rows).
+- **Obsolete milestone labels removed from source comments** (`v0.5` … `v0.7`
+  tags and stale "rejected in v0.5" claims about per-group variance).
+- **Multi-batch tables are coalesced at ingest.** `register_batch` stores the
+  coalesced batch it already built for the dictionary union,
+  `register_table_stream` validates and coalesces once before a single atomic
+  install (no per-batch dictionary rebuild, no partial install on a late
+  error), and a drained lazy stream is coalesced once. Queries over a
+  fragmented table no longer concatenate it per query — measured 7–10 ms per
+  query on a 2 M-row table in 2–1024 batches, now an Arc clone.
+- **Documentation is version-neutral.** README status/compatibility block,
+  `LIMITATIONS.md` (new query-pipeline and streaming sections),
+  `ARCHITECTURE.md` (pipeline, optimizer, streaming — it claimed there was no
+  optimizer), `SQL_REFERENCE.md` (per-feature tier / complexity / limits
+  matrix; corrected `COUNT(DISTINCT)`+`GROUP BY` and correlated-subquery
+  claims), `API_SURFACE.md` (snapshot is authoritative; corrected
+  `#[non_exhaustive]` claims), `BENCHMARKS.md` (provenance, manifest,
+  cost-model matrix, publication template), `MIGRATION_GUIDE.md` (0.8 → 0.9,
+  unreleased deltas, snapshot API-diff links), `CONTRIBUTING.md` (test
+  matrix, CI commands), and the extension points (`PlanRewrite`,
+  `TableProvider`, `RowEstimator`, `BatchProducer`, pool-stats observer)
+  document stability, execution semantics, threading, errors and
+  compatibility.
+- **One compile pipeline for every entry point.** `sql`, `explain_sql`,
+  `run_logical_plan` and the component subplans of host-orchestrated SQL shapes
+  (recursive CTE, LATERAL, correlated `WHERE`, `VALUES`, `generate_series`,
+  `DISTINCT ON`, `COUNT(DISTINCT)` + `GROUP BY`) share a single
+  dictionary-rewrite → optimizer → `PlanRewrite` → subquery-resolution →
+  lowering sequence (`exec::engine_query`). Behavioural consequence: user
+  `PlanRewrite`s now also see the component subplans of those host-orchestrated
+  shapes (once per compilation — e.g. per recursive iteration); an extracted
+  uncorrelated subquery is still only rewritten as part of its enclosing plan.
+  The full contract is documented on `PlanRewrite`.
+- **SQL is classified once.** A single frontend classifier replaces eight
+  independent detector calls that each re-parsed the statement; a statement
+  proven ordinary is memoised per schema version, so a repeated query skips
+  shape detection and hits the plan cache directly.
+
+## [0.9.0] - 2026-10-02
+
+### Changed
+- **BREAKING: integer and `Decimal128` arithmetic now follows SQL semantics by
+  default.** Integer division / remainder by zero and `MIN / -1` produce `NULL`
+  instead of `0` / a wrapped value, and `Decimal128` division by zero is
+  rejected instead of returning `0`. The historical behavior is still reachable
+  with `BOLT_LEGACY_ARITHMETIC=1`, which defaults off.
+- **BREAKING: grouped `AVG` over an empty or all-NULL group returns `NULL`**,
+  not `0.0`. Every grouped finalizer (standard, pre-aggregation, wide, and
+  validity-aware) now emits a nullable `Float64`.
+- **BREAKING: literal-list `IN` / `NOT IN` follows SQL three-valued logic.**
+  Literal lists lower to an explicit `CASE` chain, so scalar, filtered, and
+  `HAVING` uses share the same NULL semantics the subquery path already had.
+- **BREAKING: constructing a second concurrent `Engine` is now an error.**
+  `Engine::build` takes a process-wide permit before CUDA initialization and
+  releases it on failure or `Drop` (after context teardown). The documented
+  one-engine-per-process model is enforced instead of silently allowing
+  cross-context contamination of the process-global pools and caches.
+- **BREAKING: the `rust-cuda` feature was removed** (see Security).
+- **BREAKING: DuckDB and Polars moved behind `reference-tests` /
+  `reference-benches`.** Ordinary `cargo test` / `cargo check` loops no longer
+  compile a bundled DuckDB into ~39 integration binaries; the cross-engine
+  parity targets declare the features they need.
+- **BREAKING: the MSRV is now 1.85.** The previously declared 1.74 could not
+  build the committed `Cargo.lock` at all — a locked dependency declares
+  `edition = "2024"`, which older Cargo cannot parse — so the 1.74 CI matrix leg
+  was dead. 1.85 is verified by its own matrix leg and pinned by a
+  document-consistency test against the CI matrix, `ci_local.sh`, and every doc
+  that quotes it.
+- **`cudarc` is the supported CUDA adapter**, not a partial spike alongside a
+  hand-rolled FFI backend; `cuda-stub` remains the host-only validation adapter.
+- **GPU paths are planner-selected, not env-gated.** Radix GPU sort is chosen by
+  supported key shape and size, and single primitive-key `DISTINCT` uses GPU
+  dedup (which `UNION` inherits); supported non-dictionary string operations
+  select their GPU implementation by default. The `BOLT_GPU_*=0` overrides
+  remain for diagnosis.
+
+### Added
+- **Public `ExecutionTier` contract.** `ExecutionTier::{Gpu, Host, Hybrid}` is
+  re-exported at the crate root; `PhysicalPlan::planned_execution_tier()` and
+  `QueryHandle::planned_execution_tier()` report the deterministic placement
+  decision *before* results are collected, so "supported SQL" is no longer
+  conflated with "ran on the GPU". The SQL and execution docs are
+  machine-checked against the contract.
+- **Streaming grouped integer `SUM` overflow is detected.** Streaming
+  aggregation retains the checked source values overflow validation needs, so
+  detection no longer depends on a host replay that streaming inputs cannot
+  reproduce. Covered by a multi-morsel end-to-end regression.
+- **Committed public-API snapshot.** `docs/PUBLIC_API_SNAPSHOT.txt` plus
+  `scripts/check_public_api.sh` reject `pub` surface drift in CI using a
+  date-pinned nightly and `cargo-public-api`, replacing manual enumeration.
+- **Scaling and VRAM-pressure benchmark** (`benches/scaling_benchmarks.rs`):
+  a real-device row sweep (`BOLT_SCALING_ROWS`) plus one near-capacity point
+  (`BOLT_VRAM_PRESSURE_ROWS`).
+- **End-to-end fixtures for the optional subsystems.** `tests/flight_e2e.rs`
+  drives the Flight wire round-trip through the stock arrow-flight client
+  decoder and, on a GPU host, a live gRPC `get_flight_info` + `do_get`
+  round-trip plus the bearer-token gate. `tests/substrait_e2e.rs` converts
+  producer-shaped Substrait plans and executes them through
+  `Engine::run_logical_plan`. Both feature lanes now run these instead of
+  merely compiling the features.
+- **Targeted regressions for the documented semantic exceptions** — invalid
+  integer arithmetic, Decimal division rejection, grouped all-NULL `AVG`,
+  literal `NULL` membership, streaming `SUM` overflow, GPU-path defaults,
+  execution-tier reporting, engine isolation, and Decimal GPU overflow.
+
+### Docs
+- Retired the external `deep-research-bolt.md` review into
+  `docs/internal/audits/`, and archived the historical portions of
+  `PATH_TO_1.0.md` and `GROUPBY_PERF.md` under `docs/internal/history/` so the
+  top-level documents carry only current direction.
+- `README.md` lists `kernels/` in the project layout and indexes
+  `CUDARC_ADOPTION.md` / `CONTRIBUTING_KERNEL.md` under an explicit
+  advanced/developer section; the index is link-checked by a test.
+- `DEVELOPMENT.md` gained a CI truth table covering hosted and local gates;
+  `RELEASING.md`, `ROADMAP.md`, `SECURITY.md`, `USER_GUIDE.md`, and
+  `MAINTAINERS.md` / `CODEOWNERS` were corrected to match the repository
+  (tag behavior, Codecov status, persistent-cache wiring, real code owners).
+
+## [0.8.0] - 2026-09-15
+
+### Performance
+- **Tier-2 group-by host slot-walk** (`exec::groupby_tier2_common::collect_populated_slots_sorted`):
+  the post-reduce collection over the fixed `NUM_PARTITIONS × BLOCK_GROUPS`
+  (~4.2M-entry) slot buffer now uses a fused single-pass serial scan (pre-sized
+  output `Vec`, hoisted bounds) and, above a 256K-slot threshold, a
+  `std::thread::scope` parallel scan (no new dependency). Output is byte-identical
+  to the previous serial implementation (ordered chunk concatenation followed by the
+  same stable sort), proven by a 1M-slot parity test; the collector's generic bound
+  widened to `T: Copy + Send + Sync`.
+
+### Security
+- **Substrait ingestion now honours-or-rejects dropped plan fields** instead of
+  silently ignoring them — an unrecognised / unsupported field in a
+  `substrait::proto::Plan` is now an explicit error rather than being dropped,
+  so a converted plan can never silently diverge from the caller's intent.
+- **Flight SQL frontend hardened** (`--features flight`): the server now binds
+  to **loopback by default**, requires **bearer-token auth**, enforces
+  **result-size caps**, uses a **non-poisoning lock** so one failed query can't
+  wedge the service, and **redacts error detail** returned to clients so
+  internal messages don't leak over the wire.
+- **`LPAD` / `RPAD` output length is now capped** (default 1,048,576 chars,
+  overridable via `CRATON_MAX_PAD_LEN`) so an adversarial `len` can't drive an
+  unbounded host allocation; an over-cap request is a clean error. See
+  `docs/ENV_VARS.md`.
+
+### Fixed
+- **Strict three-valued-logic `IN` / `NOT IN` folds no longer reach the GPU.**
+  `(k <> 2) AND NULL` and `NOT ((k = 1) OR NULL)` failed to assemble
+  (`Arguments mismatch for instruction 'and'` — an untyped `Literal::Null`
+  materialises in the b64 register class while `Bool` lives in b32), and
+  widening the register would still have answered wrongly, because the
+  kernel's AND-of-input-validity fold is not 3VL (`FALSE AND NULL` is `FALSE`,
+  not NULL). These expressions now lower to the host evaluator, which
+  implements exact 3VL, and the plan reports a `Host` / `Hybrid` tier. The host
+  evaluator also learned to read an all-NULL untyped operand of a logical
+  operator as a Bool NULL.
+- **Non-linear `WITH RECURSIVE` no longer aborts the process.** A recursive
+  term with `k` self-references is a `k`-way self-join, and its `n^k`
+  intermediate is built inside the recursive subplan where neither the
+  working-set nor the accumulated-result row cap can see it. Over a cyclic
+  graph the working set squared each iteration and requested a 64 GiB host
+  allocation — killing the process — while still sitting under the 10M-row cap
+  and several iterations short of the iteration cap. The driver now rejects an
+  iteration whose worst-case fan-out cannot fit under `CRATON_MAX_RECURSIVE_ROWS`
+  and returns a `BoltError` instead.
+- **Shared-memory GROUP BY negative-key out-of-bounds guard** — the Tier-1
+  shmem group-by path now bounds-checks negative / out-of-range keys before
+  indexing the slot buffer, closing an OOB access.
+- **Context-epoch the stream / graph / PTX caches** — the per-context stream
+  pool, CUDA-graph cache, and PTX module cache are now invalidated by a
+  `CONTEXT_EPOCH` bump on `CudaContext` drop, fixing a multi-engine teardown
+  use-after-free where a second engine reused handles minted in a
+  torn-down context.
+- **`GpuView` / `GpuViewMut` `Send` soundness** — the cross-thread handle types
+  now carry a `Mutex` so the `Send` impl is sound rather than relying on an
+  unsynchronised raw pointer.
+- **`IN (subquery)` stack overflow + three-valued-logic fold** — deeply nested
+  / large `IN (SELECT ...)` lists no longer overflow the stack during folding,
+  and the fold now follows SQL three-valued logic (NULL handling) correctly.
+- **Float-atomics bounded probe + signed-zero determinism** — the float
+  MIN/MAX CAS loop now uses a bounded probe (no unbounded spin) and canonicalises
+  `-0.0` / `+0.0` so results are deterministic across runs.
+- **Spill-counter null-gate** — the GROUP BY spill counter is no longer bumped
+  on a null/empty path, fixing a spurious spill-metric increment.
+- **Join-reorder schema-rename guard** — the join reorder optimization now
+  guards against the collision-safe right-side column renames so a reorder can't
+  resolve a column against the wrong (pre-rename) schema.
+- **Transactional `replace_table`** — replacing a registered table is now
+  atomic: a failure mid-replace leaves the previously-registered table intact
+  rather than dropping it.
+- **Disk PTX-cache stable hashing** — the on-disk cache key now uses a stable
+  (process-independent) hash so cache entries are reusable across processes as
+  intended.
+- **PTX decimal / null literals** — codegen now emits `Decimal128` and NULL
+  literals correctly in the PTX literal path.
+- **Join match-counter `u64` widening** — the join match counter is widened to
+  `u64`, preventing overflow on very large match cardinalities.
+- **Optimizer union-duplicate-name guard** — the optimizer now guards against
+  duplicate output column names produced by a `UNION`, and uses stats-driven
+  selectivity where available (see Changed).
+- **`Dictionary(Utf8)` `ORDER BY` now sorts by string value** (lexicographic)
+  instead of by the raw dictionary index — fixes wrong ordering for unordered
+  dictionaries on the GPU sort path.
+- **Scalar `MIN` / `MAX` / `SUM` / `AVG` over an all-NULL or empty input now
+  return SQL `NULL`** (matching DuckDB / standard SQL) instead of a sentinel
+  value (`i64::MAX` / `±inf`) or `0`.
+- **`ILIKE` now uses Unicode-aware per-character case folding** — fixes
+  incorrect matches when case folding changes string length (e.g. the dotted-I
+  `İ`) around `_` and prefix / suffix / contains patterns.
+- **Predicate pushdown no longer pushes column-free (row-invariant) predicates
+  into a single side of an OUTER join**, removing a latent wrong-results hazard.
+
+### Changed
+- **De-duplicated `StreamSet`** — `cuda::async_copy` now consumes the canonical
+  `cuda::buffer::StreamSet` instead of carrying its own identical copy (~46 LOC
+  removed). Stream tracking, `Drop` fencing, and the event-based deferred-free path
+  are unchanged; `buffer::StreamSet` gained only additive `pub(crate)` accessors.
+- **Integer `SUM` overflow is now a hard error** (`BoltError::Type`) rather than
+  a silent wraparound; the behavior is documented in `docs/SQL_REFERENCE.md`.
+- **New typed `BoltError::Unsupported` variant** for the no-GPU / `cuda-stub`
+  case, which previously surfaced through the generic `BoltError::Other`.
+- **`GpuView` / `GpuViewMut::byte_len` use checked multiplication**
+  (overflow-safe), consistent with the other buffer types.
+- **PTX disk-cache key now incorporates an automatic codegen fingerprint**
+  emitted by `build.rs`, so the on-disk cache self-invalidates when the codegen
+  source changes.
+- **Hardened the module-cache key** with a `Debug`-injectivity guard test;
+  disk-cache write-through failures are now logged.
+- **Optimizer uses stats-driven selectivity** for filter / join cardinality
+  estimates where column statistics are available, falling back to the previous
+  heuristic constants otherwise.
+- **CI GPU lane exercises the real `cudarc` path** rather than the `cuda-stub`
+  shim, so the cudarc-backed driver calls get build/link coverage in CI.
+
+### Docs
+- Corrected `docs/JIT_PIPELINE.md` (LRU + 128-bit key, disk cache documented)
+  and `docs/SQL_REFERENCE.md` (fused `AVG`, integer `SUM` overflow error,
+  NULL / empty aggregate semantics, `ESCAPE` implemented, `ILIKE` documented).
+- Added a "Rejected SQL constructs" section to `docs/LIMITATIONS.md`, created
+  `docs/CUDARC_ADOPTION.md`, and refreshed the milestone framing in
+  `docs/COMPETITIVE_BENCHMARKING.md`.
+
+### Packaging
+- Removed internal scratch files from the published repo / tarball; cleaned up
+  `deny.toml` and the example declarations.
+
+### Internal
+- Documented the GPU-only performance items deliberately deferred pending on-hardware
+  benchmarking (AVG sum+count reduce fusion, device-side compaction before the 52 MiB
+  group-by D2H, adaptive spin back-off, pinned-memory pool) — see
+  `reviews/PERF_BACKLOG.md`. These change device behavior or emitted PTX and cannot be
+  validated under the `cuda-stub` + host-oracle CI used on this branch.
+
+## [0.7.0] - 2026-05-29
+
+v0.7 turns the v0.6 carry-overs into live code paths. The themes are
+the same three the v0.6 closing notes scheduled for "v0.7+": wiring the
+`KernelSpec` module cache into real call sites, lighting up the
+`Decimal128` / `Date` / `Timestamp` GPU lowering boundaries, and landing
+the GPU radix sort dispatch in the executor. It also widens the SQL
+surface itself — set operations (`EXCEPT` / `INTERSECT`), host-side
+window functions, non-recursive CTEs, uncorrelated subqueries,
+`JOIN ... USING` / `NATURAL`, `COUNT(DISTINCT)`, and GPU `LIKE` /
+`UPPER` / `LOWER` / `LENGTH`. Later feature waves in the same release
+widen it further — `LATERAL` and derived tables, `WITH RECURSIVE`,
+correlated `WHERE` subqueries, `VALUES` as a row source,
+`generate_series`, `DISTINCT ON`, named `WINDOW` / `QUALIFY`,
+super-aggregates (`ROLLUP` / `CUBE` / `GROUPING SETS`), grouped
+`Decimal128` GPU aggregation, and `FETCH` / `TOP` / `FOR UPDATE` /
+`PREWHERE` query-clause sugar. Items are grouped to mirror the v0.6
+milestone headings.
+
+### Added — Types (Decimal128 / Date / Timestamp)
+- **`Decimal128` GPU arithmetic** — dual-register IR (`Op::*128` +
+  `RegAlloc::assign_pair`), `GpuColumnData` ingest, and `Codegen` wiring
+  so `+`, `-`, `*` are reachable from lowering.
+- **`Decimal128` comparisons** (`=`, `!=`, `<`, `>`, `<=`, `>=`) lowered
+  to GPU and reachable from `WHERE` predicates.
+- **`SUM(Decimal128)`** via host-side reduction.
+- **`Date32` / `Timestamp` arithmetic** (Date−Date and
+  Timestamp−Timestamp; Day-INTERVAL only) lowered to GPU.
+
+### Added — Aggregates
+- **Grouped `STDDEV` / `VAR`** under `GROUP BY` via per-group host-side
+  Welford.
+
+### Added — Join + Sort
+- **GPU radix sort integration** in `src/exec/sort.rs` — single-key
+  `Int32` / `Int64` ASC, plus multi-key and `DESC` support. Fixes the
+  `DESC` pre-transform to use `!(val ^ MIN)` rather than a bare `!val`.
+
+### Changed — KernelSpec module cache wiring
+- **`KernelSpec` extended** to model aggregate / join / sort /
+  compaction kernel kinds (sibling spec types).
+- **Cache wired into call sites**: `ScalarAggSpec` (scalar reduction),
+  `HashJoinKernelSpec` (10 `gpu_join` call sites), `RadixSortKernelSpec`
+  (4 `gpu_sort` call sites), and `CompactionKernelSpec` (6 compaction
+  kernels: prefix-scan + gather). Cache hits skip both codegen and
+  PTXAS.
+- **Async memcpy** rolled out to the remaining `GROUP BY` variants
+  (tier2 / shmem / wide / valid) and async D2H for
+  `compact::download_mask` (the `WHERE` filter path).
+
+### Changed — Lowering / validation
+- **WHERE predicate type-checking** during SQL lowering (fixes `LIKE` on
+  a non-`Utf8` column).
+
+### Added — SQL surface (set ops, windows, CTEs, subqueries, joins)
+- **`EXCEPT [ALL]` / `INTERSECT [ALL]`** — lowered to a binary
+  `LogicalPlan::SetOp` node and executed **host-side** by
+  `src/exec/setops.rs`. Set forms return distinct left rows; multiset
+  (`ALL`) forms follow the SQL-standard `max(0, lc - rc)` /
+  `min(lc, rc)` multiplicities. Row equality reuses the `DISTINCT`
+  executor's row-key machinery (NULLs not distinct; `±0.0`
+  canonicalised). `UNION` / `EXCEPT` / `INTERSECT BY NAME` rejected.
+- **Window functions (`OVER`)** — host-side executor
+  (`src/exec/window.rs`) for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, and
+  `SUM` / `AVG` / `MIN` / `MAX` / `COUNT` aggregate windows. Default
+  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW` frame only; window
+  functions must be top-level SELECT items. Explicit / non-default
+  frames, named `WINDOW`, `QUALIFY`, and `COUNT(DISTINCT) OVER` rejected.
+- **Non-recursive CTEs (`WITH name AS (...)`)** — lowered against the
+  left-to-right CTE scope and type-checked at the definition site.
+  `WITH RECURSIVE`, CTE column-list aliases, and the materialization
+  hint rejected.
+- **Uncorrelated subqueries** — scalar `(SELECT ...)` and
+  `[NOT] IN (SELECT ...)` in `SELECT` / `WHERE`, resolved to constants
+  before physical lowering (`src/exec/subquery_resolve.rs`). Scalar
+  `>1` row errors; `IN` folds to an `OR`/`AND` chain. Correlated
+  subqueries, `EXISTS`, and derived tables in `FROM` rejected.
+- **`JOIN ... USING (...)` / `NATURAL JOIN`** — desugared to equi
+  `left.col = right.col` pairs and run through the existing join paths.
+  Missing / ambiguous / duplicate `USING` columns and a `NATURAL` join
+  with no common column are rejected.
+- **`COUNT(DISTINCT col)`** — supported as the sole SELECT item (no
+  `GROUP BY` / `HAVING` / `SELECT DISTINCT`), lowered to
+  `COUNT(*) ∘ Distinct ∘ Project([col]) ∘ Filter(col IS NOT NULL)` and
+  executed via the new `PhysicalPlan::CountRows` node.
+
+### Added — SQL surface (later 0.7 feature waves: LATERAL / recursive / VALUES / generate_series / super-aggregates)
+- **`LATERAL` derived tables** — `FROM left, LATERAL (SELECT ... WHERE x =
+  left.col) AS d` (and the `CROSS` / `INNER JOIN LATERAL ... ON true` and
+  `LEFT JOIN LATERAL ... ON true` forms). Correlated; executed as a host
+  nested-loop apply (dependent join), bounded by `CRATON_MAX_APPLY_ROWS`
+  (default 100k). Leading / multiple / `RIGHT` / `FULL` LATERAL, a
+  predicate other than `ON true`, and a column-list alias are rejected.
+- **Derived tables** — a subquery in `FROM` (`FROM (SELECT ...) AS alias`)
+  is planned recursively as a self-contained subtree and exposed under the
+  (required) alias. A column-list alias (`AS d(x, y)`) is rejected.
+- **`WITH RECURSIVE`** — host-orchestrated (`execute_recursive_cte` /
+  `execute_mutual_recursive_cte`); the body must be `<anchor> UNION [ALL]
+  <recursive term>`, evaluated to a fixpoint. Linear, non-linear, and
+  mutual recursion, plus an optional recursive-CTE column-list alias
+  (`WITH RECURSIVE c (a, b) AS ...`). Iteration cap
+  `CRATON_MAX_RECURSIVE_ITERATIONS`. A recursive anchor that seeds from a
+  recursive member, a self-reference buried in a subquery, and
+  `UNION BY NAME` are rejected.
+- **Correlated `WHERE` subqueries** — a single correlated subquery in a
+  top-level `WHERE` conjunct: a correlated scalar comparison, `EXISTS`
+  (semi-join), or `NOT EXISTS` (anti-join). Bounded by the same
+  `CRATON_MAX_APPLY_ROWS` cap as `LATERAL`. More than one correlated
+  subquery, a correlation inside an `OR`, and a correlated
+  `IN (SELECT ...)` are rejected.
+- **`VALUES` as a row source** (`plan_values_query` /
+  `execute_values_query`) — bare (`VALUES (...), (...) [ORDER BY] [LIMIT]`)
+  and in `FROM` (`SELECT ... FROM (VALUES (...)) AS t(a, b)`). Per-column
+  dtypes inferred by numeric widening; row count capped
+  (`CRATON_VALUES_MAX_ROWS`, default 1,000,000).
+- **`generate_series(start, stop[, step])`** — the one supported
+  table-valued function in `FROM` (`plan_generate_series_query` /
+  `execute_generate_series_query`); produces an inclusive non-nullable
+  `Int64` series. `step` defaults to `1`; negative `step` descends;
+  `step = 0` errors. Row count capped (`CRATON_GENERATE_SERIES_MAX_ROWS`).
+- **`DISTINCT ON (...)`** (Postgres extension) — host-orchestrated
+  (`plan_distinct_on` / `execute_distinct_on`): the base query runs with
+  the `DISTINCT ON` keys prepended and its `ORDER BY` applied, then the
+  engine keeps the first row per key (`LIMIT` applied after dedup). Keys
+  must be simple column refs; combined with `GROUP BY` / `HAVING` or a
+  computed-expression key, it is rejected.
+- **Named `WINDOW` clause and `QUALIFY`** — `WINDOW w AS (...)` referenced
+  via `OVER w` (including extension, `OVER (w ORDER BY ...)`), and
+  `QUALIFY <window-predicate>` lowered to a `Filter` over the window
+  projection. `QUALIFY` / named `WINDOW` combined with `GROUP BY` /
+  aggregates is rejected.
+- **Super-aggregates** — `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` /
+  `ALL`, the trailing `WITH TOTALS` / `WITH ROLLUP` / `WITH CUBE`
+  modifiers, and the `GROUPING()` / `GROUPING_ID()` indicators. Expanded
+  host-side at plan time into one grouping set per result row, rewritten
+  as a `UNION ALL` of the per-set sub-plans (max 12 grouping columns).
+- **Combined `COUNT(DISTINCT col)` forms** — two forms layered on the
+  sole-item distinct-count base plan are now accepted (e.g.
+  `SELECT DISTINCT COUNT(DISTINCT col)`).
+- **Grouped `Decimal128` GPU aggregation** — `SUM` / `MIN` / `MAX` over a
+  `Decimal128` column under `GROUP BY` lowered on-device (complements the
+  scalar `Decimal128` aggregation and arithmetic already in 0.7), and
+  `Decimal128` division added to the GPU arithmetic set.
+- **Query-clause sugar** — `FETCH` and T-SQL `TOP` fold into `LIMIT`,
+  `FOR UPDATE` / `FOR SHARE` are accepted as a no-op, and `PREWHERE`
+  (ClickHouse-ism) folds into `WHERE`. A bare `FROM a, b` comma list
+  desugars to a `CROSS JOIN` chain.
+
+### Added — GPU string functions
+- **GPU `LIKE` / `NOT LIKE`** over `Utf8` columns — dictionary columns
+  via dictionary-precompute → index membership; non-dictionary `Utf8`
+  via the new `PhysicalPlan::StringLikeFilter` device matcher
+  (`compile_like_match_kernel`, EXACT / PREFIX / SUFFIX / CONTAINS).
+  Host `host_like` fallback retained.
+- **GPU `UPPER` / `LOWER`** — two-pass variable-width device output via
+  `PhysicalPlan::StringProject`.
+- **GPU `LENGTH`** — `PhysicalPlan::StringLength` (dictionary-gather,
+  `Int64` output).
+- **Host-side `SUBSTRING` / `TRIM`** (`TRIM BOTH` / `LEADING` /
+  `TRAILING`) executed end-to-end through a host projection.
+- **GPU `NOT`** in a predicate lowered via `Op::Not`.
+
+### Internal
+- **Schema-converter consolidation** — the plan↔Arrow schema converters
+  are unified into `exec::schema_convert`.
+- **`ScalarAggSpec` dedup** (collision between two sibling-spec
+  additions); field references updated (`dtype` → `input_dtype`).
+- Radix dispatch gate tests serialized via an override hook to remove
+  env-var test contention; dead single-key wrapper / warning cleanup.
+
+## [0.6.0] - 2026-05-28
+
+This release covers milestones M1 (foundation), M3 (join + sort), M4
+(types), M5 (observability + ergonomics), M6 (performance), M7 (API
+stabilization), and M8 (freeze prep) from `docs/PATH_TO_1.0.md`. v0.5
+brought the SQL surface up to "table stakes"; v0.6 turns to the
+execution-layer plumbing, the type system, and the public-API shape
+that 1.0 will freeze. Many of the new code paths are present but
+intentionally not yet wired into the default execution hot path — see
+the closing paragraph for the explicit carry-overs.
+
+### Added — M1 (Foundation)
+- **`Engine::register_table_stream(name, schema, iter)`** in
+  `src/exec/engine.rs`. v0.6 ships an eager implementation that drains
+  the iterator into the existing in-memory table representation; the
+  signature is future-compatible with a truly-lazy streaming path so
+  callers won't need to rewrite their code when the lazy executor
+  lands.
+- **Async memcpy + pinned host buffers** piloted in the scalar
+  aggregate executor (`src/exec/aggregate.rs::upload_primitive_values_async`).
+  Per-shape rollout to the other executors is deferred to v0.7.
+- **`KernelSpec`-keyed module cache** in `src/exec/module_cache.rs`,
+  built and unit-tested. The cache skips both codegen and PTXAS on a
+  hit. Call-site wiring is deferred to v0.7.
+
+### Added — M3 (Join + Sort)
+- **GPU radix-sort kernel scaffold** for `Int32` and `Int64` in
+  `src/jit/sort_kernel_radix.rs`. Env-gated via `BOLT_GPU_SORT=1`; not
+  integrated into `src/exec/sort.rs` yet (that wiring is a v0.7 task).
+- **Non-equi join via nested-loop** in
+  `src/exec/join.rs::execute_nested_loop_join`. INNER only, capped at
+  `MAX_NESTED_LOOP_INNER_ROWS = 1024`. Closes the long-standing
+  non-equi gap for small-cardinality cases.
+
+### Added — M4 (Types)
+- **`DataType::Decimal128(p, s)`** plumbed end-to-end through the
+  logical plan + Arrow round-trip. `Literal::Decimal128` carried
+  through the parser and type-checker. `CAST(int AS DECIMAL(p, s))`
+  parses; GPU codegen rejects cleanly with `"Decimal128 not yet
+  lowered to GPU"` until the runtime path lands.
+- **`DataType::Date32`** and **`DataType::Timestamp(TimeUnit,
+  Option<&'static str>)`** with a `TimeUnit` enum. `Literal::Date32(i32)`
+  and `Literal::Timestamp(i64, unit, tz)`. `DATE '...'` and
+  `TIMESTAMP '...'` literals parse. Timezones are interned via
+  `crate::plan::logical_plan::intern_timezone` so `DataType` stays
+  `Copy`.
+
+### Added — M5 (Observability + ergonomics)
+- **`tracing` crate dependency** with spans on the full
+  parse / plan / lower / codegen / ptx_load / launch / transfer /
+  materialize pipeline. Span names catalogued in
+  `src/observability.rs`. Off by default; opt-in via the consumer's
+  `tracing_subscriber`.
+- **`BoltError` is now `#[non_exhaustive]`** and gains a
+  `SqlWithSpan { msg, span: Range<usize> }` variant plus a
+  `BoltError::span()` accessor. sqlparser parse errors are wrapped
+  via `parse_error_to_bolt_error` in `src/plan/sql_frontend.rs`.
+- **Did-you-mean suggestions** in `Schema::index_of`,
+  `NameResolver::resolve_compound`, and `try_aggregate`. Backed by a
+  shared Levenshtein helper in `src/plan/suggest.rs` (edit distance
+  capped at 2).
+
+### Added — M6 (Performance)
+- **Disk-backed PTX cache** in `src/jit/disk_cache.rs`. Opt-in via the
+  `BOLT_PTX_CACHE_DIR=/path` env var or a builder hook. Writes are
+  atomic (`tempfile` + rename) so a partially-written cache entry
+  can't poison subsequent runs.
+- **Criterion regression bench scaffold** in `benches/regression.rs`.
+  Three queries (scalar aggregate, GROUP BY, filter) measured at
+  parse / lower / ptx_gen. cuda-stub invocation is documented; a >5%
+  slowdown convention is established for the regression workflow.
+
+### Added — M7 (API stabilization)
+- **`Engine::Builder` (`EngineBuilder`)** with knobs for `device`,
+  `memory_budget`, `persistent_cache`, and `enable_tracing`.
+  `Engine::new` and `Engine::new_with_device` are preserved as thin
+  wrappers over the builder. `Engine` is now `#[non_exhaustive]` so
+  future fields don't break downstream destructuring.
+- **`DataFrame::collect(self, engine: &mut Engine) -> BoltResult<RecordBatch>`** —
+  the `#[doc(hidden)]` tombstone is gone; `collect` now materializes
+  through the new `Engine::run_logical_plan` entry point.
+- **`PlanRewrite` trait** in `src/plan/rewrite.rs`. `Engine` stores
+  `rewrites: Vec<Box<dyn PlanRewrite>>` and threads them through
+  `Engine::sql` immediately before `lower_physical`. Builder /
+  fluent hook: `Engine::with_rewrite(self, r) -> Self`.
+- **`docs/API_SURFACE.md`** enumerates the public surface by
+  stability tier, distinguishing the items 1.0 will freeze from the
+  ones still subject to change.
+
+### Added — M8 (Freeze prep)
+- **`docs/MIGRATION_GUIDE.md`** — covers `0.3 → 0.5 → 0.6` upgrade
+  paths.
+
+### Added — Docs
+- **`docs/USER_GUIDE.md`** — 10-minute-tutorial structure aimed at
+  first-time users.
+
+### Notes — intentionally NOT in v0.6 (carry-overs for v0.7+)
+
+The following items parse and type-check in v0.6 but reject at the
+GPU lowering boundary; the runtime paths are scheduled for v0.7+:
+
+- GPU lowering for `CASE`, `CAST`, scalar string funcs, `LIKE` with
+  `ESCAPE`, `||` in `WHERE` predicates, grouped `STDDEV` / `VAR`,
+  `Decimal128` arithmetic, and `Date` / `Timestamp` arithmetic.
+- Per-executor async-memcpy wiring beyond the scalar aggregate pilot.
+- `KernelSpec` cache integration into call sites (the cache is built
+  and unit-tested; wiring is deferred).
+- GPU radix sort integration in `src/exec/sort.rs` (the kernel
+  scaffold exists; the dispatch is gated behind an env var and not
+  yet selected by the planner).
+- Disk PTX cache wiring through `EngineBuilder::build` — the env-var
+  path works today, but the builder knob is not yet honored.
+
+## [0.5.0] - 2026-05-28
+
+This release covers the M2 milestone from `docs/PATH_TO_1.0.md`: SQL scalar
+completeness. Version 0.4 is skipped — the M1 foundation work (streaming
+tables, async Stage 2, KernelSpec cache) is deferred to a later release;
+this cut focuses on bringing the SQL surface up to "table stakes" while
+keeping the existing in-memory execution model.
+
+### Added — SQL scalar surface
+- **`NOT <bool-expr>`** — new `UnaryOp::Not` variant routed through the
+  host-side filter path (GPU lowering is a follow-up).
+- **`<expr> [NOT] IN (v1, v2, …)`** — desugared to an OR/AND chain of
+  element-wise comparisons. Capped at 64 values; a large-list hash probe
+  is a follow-up.
+- **`<expr> [NOT] BETWEEN low AND high`** — desugared to
+  `(expr >= low) AND (expr <= high)` (or the DeMorgan inverse).
+- **`CASE WHEN cond THEN val [WHEN…] [ELSE val] END`** — both plain and
+  simple (with-operand) forms. Type-check unifies numeric arms via
+  `unify_numeric` and requires exact match for non-numeric. Physical
+  lowering rejects cleanly with "CASE not yet lowered to GPU".
+- **`CAST(expr AS type)`** — primitive numeric and boolean pairs only.
+  Physical lowering rejects cleanly until the runtime conversion lands.
+- **`COALESCE(a, b, …)`** and **`NULLIF(a, b)`** — desugared to `CASE`.
+- **`<expr> [NOT] LIKE 'pattern'`** — constant-pattern LIKE with `%` and
+  `_` wildcards. Routes through the host-side `host_like` evaluator;
+  fast paths for prefix / suffix / contains / exact shapes.
+- **String concat `a || b`** — new `BinaryOp::Concat` operator, lowered
+  through the host-side `PhysicalPlan::Project` executor for SELECT
+  positions. WHERE-clause concat is rejected with a clear message.
+- **`STDDEV_POP`, `STDDEV_SAMP`, `STDDEV`** aggregates (Welford on host).
+  Scalar-aggregate only; GROUP BY support is a follow-up.
+- **`VAR_POP`, `VAR_SAMP`, `VARIANCE`** aggregates (shared Welford state).
+- **`UPPER`, `LOWER`, `LENGTH`, `SUBSTRING`, `CONCAT`** scalar functions
+  surfaced via `Expr::ScalarFn`. Parser + type-check only; physical
+  lowering rejects each with a "follow-up" message.
+
+### Added — SQL ergonomics
+- **Aggregate aliasing** (`SELECT SUM(x) AS total`) — the alias carries
+  through the post-Aggregate Project and is visible to HAVING / ORDER BY.
+- **Qualified column references** (`t.col`, `alias.col`) — resolved
+  against the FROM-tree, including JOIN aliases. Schema-qualified
+  three-part names are rejected with a dedicated message.
+- **Post-aggregate scalar expressions** (`SUM(x) + 1`, `AVG(qty) * 2`,
+  `(SUM(a) + SUM(b)) / 2`) — extracted as aggregate feeds + rewritten
+  surface expression in a post-Aggregate Project.
+- **Case-insensitive identifiers** — unquoted SQL idents fold to
+  lowercase at parse time; schema lookup falls back to case-insensitive
+  match when the lookup name is all-ASCII-lowercase. Quoted
+  (`"MyCol"`) identifiers preserve case and match verbatim.
+
+### Added — M1 foundation
+- **Validity propagation through primitive scalar aggregates** —
+  `COUNT(col)` now excludes NULLs via the bitmap; `SUM`/`MIN`/`MAX`/`AVG`
+  host-strip NULL positions before the GPU reduction. The zero-null
+  fast path (`null_count == 0`) remains a zero-copy `primitive_to_gpu`
+  upload.
+
+### Notes
+- The execution surface remains conservative: many of the items above
+  parse and type-check, but the physical layer rejects them with a clear
+  "not yet lowered to GPU" message until the corresponding kernel /
+  host-side runtime path lands in a follow-up. The intent is to unblock
+  third-party tooling (which can now generate the SQL it would naturally
+  write) without claiming false execution coverage.
+- This release also skips the original 0.4 milestone (streaming /
+  async-memcpy Stage 2 / KernelSpec cache) for the same reason 0.2.0 was
+  skipped: scope grew past what a single minor bump could carry, and
+  scalar completeness was the more user-visible delta.
+
+## [0.3.0] - 2026-05-26
+
+### Added
+- **`INNER JOIN ... ON <equi predicate>`** — host-side hash join.
+  Recursively executes both sides, builds a
+  `HashMap<JoinKey, Vec<row_idx>>` on the smaller input, probes the
+  larger, and materialises matches via `arrow::compute::take`. One join
+  per `SELECT`; LEFT / RIGHT / FULL / CROSS and non-equi predicates are
+  rejected at the parser. NULL keys never match (SQL
+  `NULL = NULL → UNKNOWN`).
+- **`DISTINCT`, `LIMIT [OFFSET]`, `ORDER BY [ASC|DESC]`, `HAVING`,
+  `UNION [ALL]`** — full plan + parser + standalone executors
+  (`src/exec/{distinct,sort,limit}.rs`). HAVING desugars to a `Filter`
+  over the `Aggregate`; plain `UNION` lowers to `Distinct(Union(..))`,
+  `UNION ALL` stays a flat `Union`. Executors are host-side for 0.3.x.
+- Multi-batch tables: the engine accepts more than one `RecordBatch` per
+  registered table and threads them through the new operators (was:
+  single-batch only).
+- Validity propagation through `compact` / `gpu_compact`: filter
+  selection masks now carry per-row validity for downstream consumers.
+- Warp-shuffle reduction path in `agg_kernels.rs` for the last 5 strides
+  of the agg-kernel tree (replaces the all-stride `__syncthreads` +
+  shared-memory reduction the TODO marker called out).
+- 13 new offline e2e tests in `tests/e2e_tests.rs` covering the new
+  operators: 9 for DISTINCT / LIMIT / ORDER BY / HAVING / UNION (plan
+  shapes, ASC/DESC defaults, `LIMIT -1` parse rejection) and 4 for
+  INNER JOIN (single-key, multi-key, schema disambiguation, combined
+  physical output schema).
+- `Engine::new_with_device(idx)` for selecting a specific GPU on
+  multi-GPU hosts. `Engine::new()` delegates to it with device 0.
+- `cuda-stub` feature is now real: the `#[link(name = "cuda")]` block is
+  gated and every FFI entry has a stub returning `CUDA_ERROR_STUB`, so
+  `cargo check --no-default-features --features cuda-stub` works without
+  the CUDA toolkit. `[package.metadata.docs.rs]` requests the feature so
+  `docs.rs` builds the crate.
+- Process-wide PTX cache in `jit_compiler` — FIFO at 256 entries, hashes
+  the emitted PTX text and reuses the loaded `CudaModule` on a hit,
+  skipping `cuModuleLoadDataEx` / PTXAS re-assembly.
+- `BoolNullable` variant in the device-column enums propagates Arrow
+  validity bitmaps for `BooleanArray` columns; the projection round-trip
+  reconstructs a nullable `BooleanArray` on download. Filter / aggregate
+  kernels still consume the values buffer only (TODO marker in
+  `engine.rs`).
+- New FFI bindings and safe wrappers for `cuMemAllocHost_v2`,
+  `cuMemFreeHost`, `cuMemcpyHtoDAsync_v2`, `cuMemcpyDtoHAsync_v2`,
+  `cuMemsetD8_v2`, `cuMemsetD8Async`.
+- New CI workflow `.github/workflows/ci.yml` (Ubuntu + Windows × stable
+  + 1.74) gated on `cuda-stub`, plus `dependabot.yml`, issue / PR
+  templates, `CODEOWNERS`, and `SECURITY.md`.
+- `tests/ptx_golden_tests.rs`: golden-snapshot smoke tests for emitted
+  PTX (substring assertions on `.target sm_70`, `atom.*`, predicate
+  gate, `.restrict`, sign-extension before atomic add, etc.).
+- `tests/parser_tests.rs`: 17 negative parser tests covering DISTINCT,
+  ORDER BY, LIMIT, HAVING, UNION, subqueries, JOIN, CTE, qualified
+  column refs, integer-literal overflow, plus one positive
+  bare-bool-predicate control.
+- 10 offline aggregate / GROUP BY tests in `tests/e2e_tests.rs` covering
+  SUM widening, COUNT(*), AVG, alias preservation, SELECT-order
+  preservation, and `i64::MIN` literal handling.
+- Host-only unit tests on `src/cuda/buffer.rs`, `dictionary.rs`,
+  `dictionary_any.rs`, `smart_ptrs.rs` (via test-only
+  `new_host_only` constructors). `dictionary_any` regains four
+  previously `#[ignore]`'d dispatch tests via host-only execution.
+- `DCO` file at repo root and DCO sign-off section in `CONTRIBUTING.md`.
+- `ROADMAP.md` and `docs/FAQ.md`.
+
+### Changed
+- `LogicalPlan::Join::schema()` and `PhysicalPlan::Join::output_schema()`
+  now return the *combined* (left + right) schema with collision-safe
+  naming: any right-side field whose name clashes with a left-side name
+  is prefixed `right.<col>`, with a `__2`, `__3`, … suffix as a final
+  uniqueness guard. Both methods share a single `join_combined_schema`
+  helper so they can't drift. Previously the logical version
+  concatenated without disambiguation (duplicate names) and the physical
+  version returned only the left input.
+- `SUM(Int32) -> Int64` widening end-to-end (plan output dtype, scalar
+  reducer, GROUP BY accumulator, kernel emits `atom.global.add.s64` with
+  `cvt.s64.s32` sign extension). SUM(Int64), SUM(Float*) unchanged.
+- Float-MIN/MAX GROUP BY launch in `groupby_valid` now passes 7 params
+  (kernel ABI) instead of 11; integer / float-SUM variants keep all 11.
+  `debug_assert_eq!` on arg count at each launch site.
+- `pub fn craton_bolt::sql()` convenience deleted (it constructed an Engine
+  with no tables — unusable).
+- `pub struct Reg(pub u32)` IR type: field demoted to `pub(crate)` with
+  a new `Reg::id() -> u32` accessor.
+- `BoltError::Cuda` is now a tuple variant `Cuda(String)` (was a
+  struct variant). Internal-only ergonomic; not part of the stable API.
+- `GpuBuffer::zeros` uses `cuMemsetD8` (no host alloc + memcpy).
+- IR types (`PhysicalPlan`, `KernelSpec`, `AggregateSpec`, `Op`, `Reg`,
+  `Value`, `ColumnIO`) and internal re-exports under `exec::*` / `jit::*`
+  are marked `#[doc(hidden)]` for 0.3.x.
+- `Cargo.toml` gains `authors`, `repository`, `homepage`,
+  `documentation`, `readme`, `keywords`, `categories`, `rust-version`,
+  `[package.metadata.docs.rs]`. `log = "0.4"` added as a runtime dep.
+- `LICENSE` and `NOTICE` updated to "Copyright 2026 Craton Software
+  Company"; `NOTICE` lists `arrow-array`, `arrow-buffer`, `arrow-schema`,
+  and `log` explicitly.
+- README gains badges (crates.io / docs.rs / CI / license / MSRV), a
+  Platform support subsection, and Security / Releases sections. The
+  string-subset claim is tightened to flag `UPPER`/`LOWER`/`LENGTH`/
+  `CONCAT` as host-only Rust API, not SQL.
+- `docs/SQL_REFERENCE.md`: explicit "Not yet supported (planned)"
+  section; documented `SUM(Int32) -> Int64` widening and all-NULL group
+  semantics. `docs/JIT_PIPELINE.md`: predicate-gate snippet now matches
+  the emitter byte-for-byte; per-instruction CC table.
+  `docs/ARCHITECTURE.md`: `GpuView` corrected to `Send`-only / `!Sync`
+  with rationale; IR-types stability disclaimer.
+- `build.rs`: skips CUDA discovery under `cuda-stub`; picks the
+  highest-version CUDA install on Windows; also searches
+  `lib64/stubs/` on Linux for driverless hosts (NVIDIA's CI shim).
+- `#[inline]` on leaf accessors of `GpuVec`/`GpuView`/`GpuViewMut`.
+- `.ptr .global .restrict .align 16` on emitted kernel column-pointer
+  params (enables PTXAS alias optimizations).
+
+### Fixed
+- **Aggregate output column order was silently rearranged**:
+  `SELECT SUM(x), key FROM t GROUP BY key` previously returned
+  `[key, sum_x]` because the `selected_keys` projection was built but
+  never wrapped around the `Aggregate`. SELECT order is now preserved
+  via a top-level `Project`; aliases on group keys are honored.
+- **Windows linkage**: dropped `kind = "static"` on the
+  `#[link(name = "cuda")]` attribute. `cuda.lib` is an import library
+  for `nvcuda.dll`, not a static archive.
+- **Soundness**: `GpuView` is now `!Sync` (was unsoundly `Sync`). A
+  concurrent writer kernel launched through `GpuViewMut` against the
+  parent `GpuVec` would have raced a `GpuView` reader.
+- **Soundness**: `static mut INIT_RESULT` in `cuda_sys` replaced with
+  `OnceLock<CUresult>` — the previous pattern was a data race and a hard
+  error under Rust 2024.
+- **32-bit hosts**: pointer-truncation bug in `GpuBuffer::with_capacity`
+  alignment check; the `idx`-to-`usize` narrowing in
+  `DictionaryColumnI64::to_string_array`.
+- **`n_rows as u32` silent truncation** across every executor launch
+  site, via a new `n_rows_to_u32(n_rows) -> BoltResult<u32>` helper.
+- **`pack_keys` UB shift**: bare `<<` replaced with `wrapping_shl` plus
+  `debug_assert!(shift + bit_width <= 64, ...)`.
+- **`BooleanArray` null/false conflation** — upload now distinguishes
+  null from false via the `BoolNullable` variant (round-trip works for
+  projection; filter / agg kernels still see values only).
+- **`__idx_<col>` device→host→device bounce** removed; the engine
+  borrows the dictionary's existing `GpuVec` directly.
+- **Integer literal overflow** in `parse_number`: a positive literal
+  whose magnitude exceeds `i64::MAX` is now rejected with a clear error
+  rather than silently demoted to `Float64`. The `i64::MIN`-magnitude
+  literal `-9223372036854775808` is preserved as `Literal::Int64(i64::MIN)`.
+- **AVG over all-NULL group** in `groupby_valid` now returns SQL `NULL`
+  instead of `0.0` (matches `SQL_REFERENCE.md`).
+- **Test memory_tests**: `shared_view_is_send_but_not_sync` assertion
+  updated to match the new `GpuView: !Sync` contract.
+- **DataFrame builder**: `select`/`filter`/`group_by`/`agg` now validate
+  column references at builder time, deferring the first error via a
+  `String`-typed `first_error` field surfaced through
+  `DataFrame::validation_error()` and `schema()`.
+- **`physical_plan::lower`** now folds arbitrary `Scan / Filter / Project`
+  chain shapes (was: only `Scan` or `Filter(Scan)`). DataFrame chains
+  like `scan().select().filter().select()` no longer produce
+  unlowerable plans.
+- **String literal rewriter**: peels `Alias` wrappers on either side of
+  `BinaryOp::Eq`; `LiteralResolver::index_dtype` lets i64-indexed dicts
+  emit `Int64` index columns rather than the hardcoded `Int32`.
+- **`hash_kernels` classic keys kernel**: bounded probe loop with
+  `MAX_PROBE_FACTOR = 2`; previously could spin forever on a full table.
+- **`jit_compiler::from_ptx`**: uses `cuModuleLoadDataEx` with PTXAS
+  info / error log buffers; failures now surface line numbers.
+- **build.rs Windows fallback** picks the highest CUDA version on disk
+  (was: first NTFS-ordered entry).
+
+### Removed
+- `BoltError::Nvrtc` variant (Craton Bolt uses `cuModuleLoadDataEx`, not
+  NVRTC). The 4 jit_compiler.rs call sites migrated to `Cuda`.
+- `pub fn craton_bolt::sql(query)` (broken — see Fixed).
+
+### Deprecated
+- `DataFrame::collect()` (use `into_plan()`; tombstone retained for 0.1
+  call-site compatibility).
+
+### Security
+- (none yet — see `SECURITY.md` for the disclosure address.)
+
+
+## Note on version 0.2.0
+
+There is no `0.2.0` release. The project jumped from `0.1.0` (2026-05-23) directly to `0.3.0` (2026-05-26) — a three-day span in which the scope grew well past what a single minor bump could honestly carry (multi-batch tables, INNER JOIN, DISTINCT / LIMIT / ORDER BY / HAVING / UNION, real `cuda-stub`, PTX cache, CI). Tagging an intermediate `0.2.0` would have been a paper milestone, so the version number was reserved and skipped.
+
+## [0.1.0] - 2026-05-23
+
+### Added
+
+#### CUDA layer (`src/cuda/`)
+- Raw CUDA driver FFI (`cuda_sys.rs`) — context init, device discovery, memory alloc / free / memcpy, module load, stream create / destroy / sync, `cuLaunchKernel`.
+- `GpuBuffer<T>` (`buffer.rs`) — owned device allocation with Arrow's 64-byte alignment.
+- `GpuVec<T>` / `GpuView<'a, T>` / `GpuViewMut<'a, T>` (`smart_ptrs.rs`) — borrow-checked GPU memory. Kernel launches require borrows; use-after-free, double-free, and shared/mutable aliasing across kernel boundaries are rejected at compile time.
+- `DictionaryColumn` (`dictionary.rs`) — i32-indexed string dictionary with NULL at slot 0.
+- `DictionaryColumnI64` (`dictionary_i64.rs`) — i64-indexed dictionary for columns with > i32::MAX unique strings.
+- `DictionaryColumnAny` (`dictionary_any.rs`) — unified enum picking i32/i64 by cardinality at construction.
+
+#### Plan layer (`src/plan/`)
+- `LogicalPlan` AST (`logical_plan.rs`) — Scan / Filter / Project / Aggregate. `Expr` covers Column / Literal / Binary / Alias. Numeric type promotion follows the standard SQL rules.
+- `DataFrame` builder (`dataframe.rs`) — Polars-style lazy API.
+- SQL frontend (`sql_frontend.rs`) — sqlparser-based; supports SELECT with WHERE, GROUP BY, scalar aggregates.
+- `PhysicalPlan` lowering (`physical_plan.rs`) — produces fused `KernelSpec` with SSA-shaped op IR.
+- `StringPredicateRewriter` (`string_literal_rewrite.rs`) — rewrites `col = 'literal'` to `__idx_col = i32/i64(idx)` against registered dictionaries.
+
+#### JIT layer (`src/jit/`)
+- PTX codegen for projection (`ptx_gen.rs`) — targets `sm_70` / `.version 7.5` / 64-bit addressing.
+- PTX codegen for predicate-only kernels (`scan_kernel.rs`) — materialises u8 keep-masks.
+- Scalar reduction kernels (`agg_kernels.rs`) — SUM / MIN / MAX / COUNT / AVG with per-block reduction + host-side cross-block finish.
+- Hash GROUP BY kernels (`hash_kernels.rs`) — single-pass open-addressing with `atom.cas.b64` on the keys table.
+- Float MIN/MAX via CAS loop (`float_atomics.rs`) — closes the sm_70 gap for `atom.global.{min,max}.f{32,64}`.
+- Sentinel-free GROUP BY kernels (`valid_flag_kernels.rs`) — parallel `slot_valid: u32[]` table eliminates `i64::MIN` collision risk (notably Float64 `-0.0`).
+- Sentinel-free float MIN/MAX (`valid_flag_float.rs`) — combines the CAS loop with the valid-flag probe.
+- Parallel prefix-scan + gather (`prefix_scan.rs`) — Hillis-Steele per-block scan, host-side block-base reduction, per-dtype gather.
+- Multi-pass prefix-scan (`prefix_scan_multipass.rs`) — recursive scan over block_sums; unbounded row counts.
+- CUDA module loader (`jit_compiler.rs`) — `cuModuleLoadData` wrapper; PTX-to-cubin assembly happens inside the driver.
+
+#### Execution layer (`src/exec/`)
+- `Engine` (`engine.rs`) — top-level entry point. Holds the CUDA context, registered tables, dictionary registry. `sql(query)` returns a `QueryHandle` wrapping an Arrow `RecordBatch`.
+- Scalar aggregate executor (`aggregate.rs`) — primitive SUM / MIN / MAX / COUNT / AVG.
+- Aggregate with pre kernel (`agg_with_pre.rs`) — handles aggregates over expressions / filtered inputs.
+- GROUP BY executor (`groupby.rs`) — packed-i64-key path with composite-tuple decode.
+- GROUP BY + pre (`groupby_with_pre.rs`) — fused pre kernel + GROUP BY.
+- Wide-key GROUP BY fallback (`groupby_wide.rs`) — host-side reduction for > 64-bit composite keys.
+- Sentinel-free GROUP BY (`groupby_valid.rs`) — float-key safe path with bounded spin + spill.
+- Stream + kernel launcher (`launch.rs`) — `CudaStream`, `KernelArgs`, 1D launch helper.
+- Host-side filter compaction (`compact.rs`) — downloads mask, applies via `arrow::compute::filter`.
+- GPU-side filter compaction (`gpu_compact.rs`) — prefix-scan + gather, end-to-end on the GPU.
+- GPU compaction multi-pass driver (`gpu_compact_multipass.rs`).
+- Dictionary registry (`dict_registry.rs`) — per-table dictionaries, drives the predicate rewrite at `Engine::sql` time.
+- Bool / Utf8 aggregate executor (`extended_agg.rs`) — host-side SUM(bool) / MIN(utf8) / etc.
+- Host-side expression evaluator (`expr_agg.rs`) — fallback when an aggregate input isn't a bare column ref.
+- Dictionary-aware string ops (`string_ops.rs`) — UPPER / LOWER / LENGTH / input_eq_literal.
+- Variable-width-free CONCAT / SUBSTRING (`string_ops_extended.rs`).
+- Bool / Utf8 device columns (`string_col.rs`).
+
+#### Tests & benches
+- Memory-safety tests (`tests/memory_tests.rs`) — type-level proofs, compile-fail doctests, ignored live-GPU round-trips.
+- End-to-end tests (`tests/e2e_tests.rs`) — parser → plan → PTX-shape assertions; ignored live-GPU query verification.
+- Criterion benchmarks (`benches/query_benchmarks.rs`) — plan / lower / ptx_gen, CPU reference, Polars head-to-head, GPU engine path (gated behind `BOLT_BENCH_GPU=1`).
+
+### Build status
+
+Compiles clean on Windows MSVC / Linux with CUDA Toolkit ≥ 12. `cargo check --lib --tests --benches` works on hosts without CUDA. `cargo test` requires `cuda.lib` on the linker path; `cargo test -- --ignored` requires an NVIDIA GPU with compute capability ≥ 7.0.
+
+### Known limitations
+
+- No JOIN support. Single-table queries only.
+- No NULL-aware GPU aggregates yet — COUNT counts every row, not just non-null. The host-side `extended_agg` path does honour nulls for Bool/Utf8.
+- Variable-width string outputs (CONCAT producing genuinely new strings) work via host-side dictionary cross-product, not on the GPU.
+- Polars head-to-head numbers are not yet published.
+
+[Unreleased]: https://github.com/craton-co/craton-bolt/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/craton-co/craton-bolt/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/craton-co/craton-bolt/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/craton-co/craton-bolt/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/craton-co/craton-bolt/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/craton-co/craton-bolt/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/craton-co/craton-bolt/compare/v0.3.0...v0.5.0
+[0.3.0]: https://github.com/craton-co/craton-bolt/compare/v0.1.0...v0.3.0
+[0.1.0]: https://github.com/craton-co/craton-bolt/releases/tag/v0.1.0

@@ -1,0 +1,2 @@
+# Ensure shell scripts always use LF line endings on checkout across all platforms
+*.sh text eol=lf
