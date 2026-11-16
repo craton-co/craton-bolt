@@ -628,9 +628,13 @@ mod tests {
 mod cache_tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use parking_lot::Mutex;
+
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn second_call_same_spec_is_cache_hit() {
+        let _g = CACHE_TEST_LOCK.lock();
         let m1 = match get_or_build_module(&KernelSpec::PartitionI64) {
             Ok(m) => m,
             Err(_) => return,
@@ -643,6 +647,7 @@ mod cache_tests {
 
     #[test]
     fn different_specs_miss_then_hit_independently() {
+        let _g = CACHE_TEST_LOCK.lock();
         let _ = match get_or_build_module(&KernelSpec::ScatterI64) {
             Ok(m) => m,
             Err(_) => return,

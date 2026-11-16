@@ -4,6 +4,18 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-26
+
+### Fixed
+
+- **GPU `DISTINCT` host fallback** (`src/exec/distinct.rs`): fall back to host execution on `BoltError::Cuda` / `BoltError::CudaWithCode` in addition to capacity and unsupported errors.
+- **Test isolation under live CUDA**: serialize `mod cache_tests` across `groupby_tier2*.rs` with `CACHE_TEST_LOCK` and skip the `cuda-stub`-only `stream_set_tests` test in `src/cuda/buffer.rs` when a CUDA driver is active.
+
+### Documentation
+
+- Updated `docs/USER_GUIDE.md` crate version examples from `0.11` to `0.12`.
+- Added NVIDIA L40S benchmark results (`benchmark.md`) and multi-column `GROUP BY` with pre-aggregation TODO (`TODO.md`).
+
 ## [0.12.0] - 2026-11-12
 
 ### Changed

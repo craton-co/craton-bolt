@@ -415,8 +415,13 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
         match try_gpu_distinct(&batch) {
             Ok(Some(out)) => return Ok(QueryHandle::from_record_batch(out)),
             Ok(None) => { /* fall through to host */ }
-            Err(BoltError::GpuCapacity(_) | BoltError::Unsupported(_)) => {
-                /* unavailable or declined -> host */
+            Err(
+                BoltError::GpuCapacity(_)
+                | BoltError::Unsupported(_)
+                | BoltError::Cuda(_)
+                | BoltError::CudaWithCode { .. },
+            ) => {
+                /* unavailable, declined, or driver error -> host fallback */
             }
             Err(e) => return Err(e),
         }

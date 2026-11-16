@@ -2485,6 +2485,10 @@ mod stream_set_tests {
         // Host CI has no CUDA driver / runs under cuda-stub: `event_create`
         // returns an error, so `record_defer_events` must yield `None`
         // (signalling the blanket-sync fallback) rather than a partial set.
+        if let Ok(ev) = cuda_sys::event_create() {
+            let _ = unsafe { cuda_sys::event_destroy(ev) };
+            return;
+        }
         let mut set = StreamSet::default();
         set.insert(fake_stream(0x1));
         set.insert(fake_stream(0x2));
