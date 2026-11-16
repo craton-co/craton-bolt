@@ -877,9 +877,13 @@ mod eligibility_tests {
 mod cache_tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use parking_lot::Mutex;
+
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn second_call_same_spec_is_cache_hit() {
+        let _g = CACHE_TEST_LOCK.lock();
         let m1 = match get_or_build_module(&KernelSpec::PartitionI64) {
             Ok(m) => m,
             Err(_) => return,
@@ -892,6 +896,7 @@ mod cache_tests {
 
     #[test]
     fn op_dtype_combinations_are_distinct_cache_keys() {
+        let _g = CACHE_TEST_LOCK.lock();
         let _ = match get_or_build_module(&KernelSpec::ReduceMinMaxI64(ReduceKey::MinI32)) {
             Ok(m) => m,
             Err(_) => return,
@@ -911,6 +916,7 @@ mod cache_tests {
     /// neither recompiles on a repeat lookup.
     #[test]
     fn typed_i64_to_i64_scatter_is_distinct_cache_key() {
+        let _g = CACHE_TEST_LOCK.lock();
         let _ = match get_or_build_module(&KernelSpec::ScatterI64) {
             Ok(m) => m,
             Err(_) => return,
