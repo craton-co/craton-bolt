@@ -4127,6 +4127,10 @@ fn aggregate_needs_materialized_input(
     // pre-kernel is required, so bind the filtered rows instead and let the
     // aggregate read the columns directly.
     let input_schema = input.schema()?;
+    let feeds_utf8 = group_by
+        .iter()
+        .chain(aggregates.iter().map(aggregate_input_expr))
+        .any(|e| matches!(e.dtype(&input_schema), Ok(DataType::Utf8)));
     let feeds_non_numeric = group_by
         .iter()
         .chain(aggregates.iter().map(aggregate_input_expr))
@@ -4136,7 +4140,8 @@ fn aggregate_needs_materialized_input(
                 Ok(DataType::Utf8) | Ok(DataType::Bool)
             )
         });
-    Ok(feeds_non_numeric && resolved.predicate.is_some())
+    Ok((feeds_non_numeric && resolved.predicate.is_some())
+        || (feeds_utf8 && resolved.projection.is_some()))
 }
 
 /// An aggregate's input plan with its group keys and aggregates.
@@ -4623,7 +4628,13 @@ fn lower_aggregate(
                 kernel,
                 output_schema,
                 ..
-            } => (kernel, output_schema),
+            } if !kernel
+                .outputs
+                .iter()
+                .any(|io| matches!(io.dtype, DataType::Utf8 | DataType::Extended(_))) =>
+            {
+                (kernel, output_schema)
+            }
             // The pre-kernel cannot carry these feeds (e.g. a `Utf8` key of
             // a dictionary-less table next to a computed input): compute the
             // feeds as columns of a materialised input instead.
