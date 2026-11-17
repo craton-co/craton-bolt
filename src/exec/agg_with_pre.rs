@@ -90,8 +90,12 @@ pub fn execute_aggregate_with_pre(
     plan: &PhysicalPlan,
     table_batch: &RecordBatch,
 ) -> BoltResult<RecordBatch> {
-    let (pre, aggregate) = match plan {
-        PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+    let (table, pre, aggregate) = match plan {
+        PhysicalPlan::Aggregate {
+            table,
+            pre,
+            aggregate,
+        } => (table, pre, aggregate),
         other => {
             return Err(BoltError::Other(format!(
                 "execute_aggregate_with_pre: expected Aggregate plan, got {:?}",
@@ -111,6 +115,32 @@ pub fn execute_aggregate_with_pre(
         return Err(BoltError::Other(
             "agg_with_pre: GROUP BY handled separately".into(),
         ));
+    }
+
+    // When the pre kernel reads or produces Bool, temporal, or Decimal128
+    // columns, materialise the post-filter pre-stage batch via the shared
+    // wider pre-stage runner and delegate to `aggregate::execute_aggregate`.
+    if pre_spec
+        .inputs
+        .iter()
+        .chain(pre_spec.outputs.iter())
+        .any(|io| {
+            matches!(
+                io.dtype,
+                DataType::Bool
+                    | DataType::Date32
+                    | DataType::Timestamp(_, _)
+                    | DataType::Decimal128(_, _)
+            )
+        })
+    {
+        let (rewritten_plan, pre_batch) = crate::exec::groupby_with_pre::materialize_pre_stage_batch(
+            table,
+            pre_spec,
+            aggregate,
+            table_batch,
+        )?;
+        return crate::exec::aggregate::execute_aggregate(&rewritten_plan, &pre_batch);
     }
 
     let n_rows = table_batch.num_rows();
