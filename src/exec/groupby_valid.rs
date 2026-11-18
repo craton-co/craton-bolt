@@ -87,7 +87,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
@@ -109,7 +111,7 @@ use crate::jit::valid_flag_kernels::{
 // through `valid_flag_float::compile_agg_valid_float_kernel_with_validity`.
 // The host-strip path remains as the correctness fallback for any
 // (op, dtype) outside that coverage.
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema, TimeUnit};
 use crate::plan::physical_plan::{ColumnIO, PhysicalPlan};
 
 /// Capacity (in rows) of each per-kernel spill buffer used by the
@@ -1558,6 +1560,10 @@ fn run_typed_agg(
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
             let host: Vec<i64> = collect_filtered_primitive(pa, key_valid, value_valid.as_deref());
             debug_assert_eq!(host.len(), n);
+            if matches!(op, ReduceOp::Sum) {
+                let keys_host: Vec<i64> = filtered.col().to_vec()?;
+                crate::exec::groupby::checked_group_sum(&host, &keys_host)?;
+            }
             let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
@@ -1832,6 +1838,13 @@ fn run_typed_agg_native_validity(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
             let host: Vec<i64> = pa.values().to_vec();
+            if matches!(op, ReduceOp::Sum) {
+                crate::exec::groupby::checked_group_sum_native_validity(
+                    &host,
+                    value_valid,
+                    group_col,
+                )?;
+            }
             let input_gpu = GpuVec::<i64>::from_slice_async(&host, stream.raw())?;
             let init: Vec<i64> = vec![identity_i64(op); k];
             let mut acc = GpuVec::<i64>::from_slice_async(&init, stream.raw())?;
@@ -2096,6 +2109,13 @@ fn build_key_arrays_from_entries(
         I64(Vec<i64>),
         F32(Vec<f32>),
         F64(Vec<f64>),
+        Bool(Vec<bool>),
+        Date32(Vec<i32>),
+        Timestamp {
+            vals: Vec<i64>,
+            unit: TimeUnit,
+            tz: Option<&'static str>,
+        },
     }
 
     let mut buffers: Vec<ColBuf> = Vec::with_capacity(m);
@@ -2105,12 +2125,14 @@ fn build_key_arrays_from_entries(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Timestamp(_, _)
-            | DataType::Extended(_) => {
+            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n))),
+            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n))),
+            DataType::Timestamp(unit, tz) => buffers.push(ColBuf::Timestamp {
+                vals: Vec::with_capacity(n),
+                unit,
+                tz,
+            }),
+            DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype
@@ -2127,6 +2149,9 @@ fn build_key_arrays_from_entries(
                 (ColBuf::I64(v), KeyValue::I64(x)) => v.push(*x),
                 (ColBuf::F32(v), KeyValue::F32(x)) => v.push(*x),
                 (ColBuf::F64(v), KeyValue::F64(x)) => v.push(*x),
+                (ColBuf::Bool(v), KeyValue::Bool(x)) => v.push(*x),
+                (ColBuf::Date32(v), KeyValue::Date32(x)) => v.push(*x),
+                (ColBuf::Timestamp { vals, .. }, KeyValue::Timestamp(x)) => vals.push(*x),
                 _ => {
                     return Err(BoltError::Other(
                         "internal: decode_key produced a KeyValue variant \
@@ -2145,6 +2170,26 @@ fn build_key_arrays_from_entries(
             ColBuf::I64(v) => out.push(Arc::new(Int64Array::from(v)) as ArrayRef),
             ColBuf::F32(v) => out.push(Arc::new(Float32Array::from(v)) as ArrayRef),
             ColBuf::F64(v) => out.push(Arc::new(Float64Array::from(v)) as ArrayRef),
+            ColBuf::Bool(v) => out.push(Arc::new(BooleanArray::from(v)) as ArrayRef),
+            ColBuf::Date32(v) => out.push(Arc::new(Date32Array::from(v)) as ArrayRef),
+            ColBuf::Timestamp { vals, unit, tz } => {
+                let tz_arc: Option<Arc<str>> = tz.map(Arc::from);
+                let arr: ArrayRef = match unit {
+                    TimeUnit::Second => {
+                        Arc::new(TimestampSecondArray::from(vals).with_timezone_opt(tz_arc))
+                    }
+                    TimeUnit::Millisecond => {
+                        Arc::new(TimestampMillisecondArray::from(vals).with_timezone_opt(tz_arc))
+                    }
+                    TimeUnit::Microsecond => {
+                        Arc::new(TimestampMicrosecondArray::from(vals).with_timezone_opt(tz_arc))
+                    }
+                    TimeUnit::Nanosecond => {
+                        Arc::new(TimestampNanosecondArray::from(vals).with_timezone_opt(tz_arc))
+                    }
+                };
+                out.push(arr);
+            }
         }
     }
     Ok(out)
@@ -2519,7 +2564,7 @@ fn apply_spill_i64(
             .get(&key)
             .copied()
             .ok_or_else(|| spill_lookup_err(key))?;
-        acc[idx] = combine_i64(op, acc[idx], val);
+        acc[idx] = combine_i64(op, acc[idx], val)?;
     }
     Ok(acc)
 }
@@ -2561,11 +2606,14 @@ fn combine_i32(op: ReduceOp, a: i32, b: i32) -> i32 {
         ReduceOp::Max => a.max(b),
     }
 }
-fn combine_i64(op: ReduceOp, a: i64, b: i64) -> i64 {
+fn combine_i64(op: ReduceOp, a: i64, b: i64) -> BoltResult<i64> {
     match op {
-        ReduceOp::Sum | ReduceOp::Count => a.wrapping_add(b),
-        ReduceOp::Min => a.min(b),
-        ReduceOp::Max => a.max(b),
+        ReduceOp::Sum => a.checked_add(b).ok_or_else(|| {
+            BoltError::Type("SUM(integer) overflow: accumulator exceeds i64 range".into())
+        }),
+        ReduceOp::Count => Ok(a.wrapping_add(b)),
+        ReduceOp::Min => Ok(a.min(b)),
+        ReduceOp::Max => Ok(a.max(b)),
     }
 }
 fn combine_f32(op: ReduceOp, a: f32, b: f32) -> f32 {
@@ -2661,6 +2709,24 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
         (Scalars::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
             v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
         )) as ArrayRef),
+        (Scalars::I32(v), DataType::Date32) => Ok(Arc::new(Date32Array::from(v)) as ArrayRef),
+        (Scalars::I64(v), DataType::Timestamp(unit, tz)) => {
+            let tz_arc: Option<Arc<str>> = tz.map(Arc::from);
+            match unit {
+                TimeUnit::Second => {
+                    Ok(Arc::new(TimestampSecondArray::from(v).with_timezone_opt(tz_arc)) as ArrayRef)
+                }
+                TimeUnit::Millisecond => Ok(Arc::new(
+                    TimestampMillisecondArray::from(v).with_timezone_opt(tz_arc),
+                ) as ArrayRef),
+                TimeUnit::Microsecond => Ok(Arc::new(
+                    TimestampMicrosecondArray::from(v).with_timezone_opt(tz_arc),
+                ) as ArrayRef),
+                TimeUnit::Nanosecond => Ok(Arc::new(
+                    TimestampNanosecondArray::from(v).with_timezone_opt(tz_arc),
+                ) as ArrayRef),
+            }
+        }
 
         (_, dt) => Err(BoltError::Type(format!(
             "GROUP BY (valid-flag): cannot pack scalars into output dtype {:?}",
@@ -2740,15 +2806,12 @@ fn downcast_err(name: &str, expected: &str) -> BoltError {
 
 /// Map Arrow `DataType` to our plan `DataType`.
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    crate::exec::schema_convert::arrow_dtype_to_plan_basic(d, "")
+    crate::exec::schema_convert::arrow_dtype_to_plan(d)
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
-        s,
-        "this aggregate output path",
-    )
+    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
 // ---------------------------------------------------------------------------

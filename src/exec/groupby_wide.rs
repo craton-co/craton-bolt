@@ -53,12 +53,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Schema};
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Literal, Schema, TimeUnit};
 use crate::plan::physical_plan::{AggregateSpec, PhysicalPlan};
 
 // ---------------------------------------------------------------------------
@@ -148,7 +150,9 @@ pub fn execute_groupby_wide(
     //     This keeps SUM/MIN/MAX out of NULL slots, and makes
     //     COUNT(col)/AVG denominator reflect the non-NULL count.
     let any_key_nullable = key_cols.iter().any(|kc| kc.arr.null_count() > 0);
-    let any_agg_nullable = agg_plan.iter().any(|p| p.arr.null_count() > 0);
+    let any_agg_nullable = agg_plan
+        .iter()
+        .any(|p| p.arr.is_some_and(|a| a.null_count() > 0));
     for row in 0..n_rows {
         // Drop the row entirely if ANY group-by column is NULL at this row.
         // We probe `is_null` on the Arrow array directly — `key_value_at`
@@ -179,7 +183,7 @@ pub fn execute_groupby_wide(
         //   - AVG:         skip update so the denominator is non-NULL count
         //                  and the numerator excludes NULL contributions.
         for (i, agg_in) in agg_plan.iter().enumerate() {
-            if any_agg_nullable && agg_in.arr.is_null(row) {
+            if any_agg_nullable && agg_in.arr.is_some_and(|a| a.is_null(row)) {
                 continue;
             }
             let value = agg_input_at(agg_in, row)?;
@@ -252,6 +256,14 @@ enum KeyValue {
     F32Bits(u32),
     /// 64-bit float as bit pattern.
     F64Bits(u64),
+    /// Boolean key.
+    Bool(bool),
+    /// Date32 days since epoch.
+    Date32(i32),
+    /// Timestamp ticks since epoch.
+    Timestamp(i64),
+    /// Fixed-point 128-bit integer value.
+    Decimal128(i128),
 }
 
 /// A composite key: the full per-row tuple across every group-by column, in
@@ -275,29 +287,23 @@ fn resolve_key_columns<'a>(
         })?;
         // Reject unsupported key dtypes up-front so we can fail fast.
         match io.dtype {
-            DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
+            DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Bool
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _) => {}
             DataType::Utf8 => {
                 return Err(BoltError::Type(format!(
                     "Utf8 keys in wide GROUP BY not yet supported (column '{}')",
                     io.name
                 )))
             }
-            DataType::Bool => {
+            DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
-                    "Bool keys not supported (column '{}')",
-                    io.name
-                )))
-            }
-            DataType::Decimal128(_, _) => {
-                return Err(BoltError::Plan(format!(
-                    "Decimal128 not yet lowered to GPU; coming in a follow-up \
-                     (column '{}' in GROUP BY)",
-                    io.name
-                )))
-            }
-            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
-                return Err(BoltError::Type(format!(
-                    "Date/Timestamp keys in wide GROUP BY not yet supported (column '{}')",
+                    "Extended keys in wide GROUP BY not yet supported (column '{}')",
                     io.name
                 )))
             }
@@ -365,12 +371,60 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
             // Review C12: same signed-zero canonicalisation as Float32.
             Ok(KeyValue::F64Bits(canonicalise_f64(pa.value(row)).to_bits()))
         }
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Decimal128(_, _)
-        | DataType::Date32
-        | DataType::Timestamp(_, _)
-        | DataType::Extended(_) => Err(BoltError::Type(format!(
+        DataType::Bool => {
+            let ba = kc
+                .arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&kc.name, "Bool"))?;
+            Ok(KeyValue::Bool(ba.value(row)))
+        }
+        DataType::Date32 => {
+            let pa = kc
+                .arr
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| downcast_err(&kc.name, "Date32"))?;
+            Ok(KeyValue::Date32(pa.value(row)))
+        }
+        DataType::Timestamp(unit, _) => {
+            let ticks = match unit {
+                TimeUnit::Second => kc
+                    .arr
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .ok_or_else(|| downcast_err(&kc.name, "TimestampSecond"))?
+                    .value(row),
+                TimeUnit::Millisecond => kc
+                    .arr
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| downcast_err(&kc.name, "TimestampMillisecond"))?
+                    .value(row),
+                TimeUnit::Microsecond => kc
+                    .arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| downcast_err(&kc.name, "TimestampMicrosecond"))?
+                    .value(row),
+                TimeUnit::Nanosecond => kc
+                    .arr
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(|| downcast_err(&kc.name, "TimestampNanosecond"))?
+                    .value(row),
+            };
+            Ok(KeyValue::Timestamp(ticks))
+        }
+        DataType::Decimal128(_, _) => {
+            let da = kc
+                .arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| downcast_err(&kc.name, "Decimal128"))?;
+            Ok(KeyValue::Decimal128(da.value(row)))
+        }
+        DataType::Utf8 | DataType::Extended(_) => Err(BoltError::Type(format!(
             "wide GROUP BY: key dtype {:?} not supported",
             kc.dtype
         ))),
@@ -430,6 +484,10 @@ fn cmp_key_value(a: &KeyValue, b: &KeyValue) -> std::cmp::Ordering {
         (I64(x), I64(y)) => x.cmp(y),
         (F32Bits(x), F32Bits(y)) => x.cmp(y),
         (F64Bits(x), F64Bits(y)) => x.cmp(y),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (Date32(x), Date32(y)) => x.cmp(y),
+        (Timestamp(x), Timestamp(y)) => x.cmp(y),
+        (Decimal128(x), Decimal128(y)) => x.cmp(y),
         // Mixed variants: fall back to discriminant order. In a well-formed
         // input every row produces the same variant at each position, so we
         // never reach this branch.
@@ -443,6 +501,10 @@ fn variant_rank(v: &KeyValue) -> u8 {
         KeyValue::I64(_) => 1,
         KeyValue::F32Bits(_) => 2,
         KeyValue::F64Bits(_) => 3,
+        KeyValue::Bool(_) => 4,
+        KeyValue::Date32(_) => 5,
+        KeyValue::Timestamp(_) => 6,
+        KeyValue::Decimal128(_) => 7,
     }
 }
 
@@ -457,11 +519,10 @@ struct AggInputPlan<'a> {
     kind: AggKind,
     /// Input column name (for diagnostics).
     name: String,
-    /// Input column dtype (Int32/Int64/Float32/Float64 only — validated up
-    /// front).
+    /// Input column dtype.
     dtype: DataType,
-    /// The Arrow input array.
-    arr: &'a dyn Array,
+    /// The Arrow input array, or `None` for literal `COUNT(*)`.
+    arr: Option<&'a dyn Array>,
 }
 
 /// Discriminator that mirrors [`AggregateExpr`] but without carrying the
@@ -518,6 +579,17 @@ fn resolve_aggregates<'a>(
             // future code path.
             AggregateExpr::StddevPop(e) | AggregateExpr::StddevSamp(e) => e.as_ref(),
         };
+        if let AggregateExpr::Count(Expr::Literal(lit)) = agg {
+            if !matches!(lit, Literal::Null) {
+                out.push(AggInputPlan {
+                    kind: AggKind::Count,
+                    name: "*".into(),
+                    dtype: DataType::Int64,
+                    arr: None,
+                });
+                continue;
+            }
+        }
         let col_name = bare_column_name(expr)?;
         let io = aggregate
             .inputs
@@ -529,17 +601,19 @@ fn resolve_aggregates<'a>(
                     col_name
                 ))
             })?;
-        // Reject Bool/Utf8 inputs.
         match io.dtype {
-            DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 => {}
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
+            DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Bool
             | DataType::Date32
             | DataType::Timestamp(_, _)
-            | DataType::Extended(_) => {
+            | DataType::Decimal128(_, _) => {}
+            DataType::Utf8 if matches!(agg, AggregateExpr::Count(_)) => {}
+            DataType::Utf8 | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
-                    "wide GROUP BY: Bool/Utf8 aggregate inputs not supported (column '{}')",
+                    "wide GROUP BY: Utf8/Extended aggregate inputs not supported (column '{}')",
                     io.name
                 )))
             }
@@ -562,7 +636,7 @@ fn resolve_aggregates<'a>(
             kind: AggKind::from_expr(agg)?,
             name: io.name.clone(),
             dtype: io.dtype,
-            arr,
+            arr: Some(arr),
         });
     }
     Ok(out)
@@ -570,45 +644,91 @@ fn resolve_aggregates<'a>(
 
 /// Extract one [`AggInputValue`] from an [`AggInputPlan`] at `row`.
 fn agg_input_at(plan: &AggInputPlan<'_>, row: usize) -> BoltResult<AggInputValue> {
+    let Some(arr) = plan.arr else {
+        return Ok(AggInputValue::CountRow);
+    };
+    if matches!(plan.kind, AggKind::Count) {
+        return Ok(AggInputValue::CountRow);
+    }
     match plan.dtype {
         DataType::Int32 => {
-            let pa = plan
-                .arr
+            let pa = arr
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(&plan.name, "Int32"))?;
             Ok(AggInputValue::I32(pa.value(row)))
         }
         DataType::Int64 => {
-            let pa = plan
-                .arr
+            let pa = arr
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(&plan.name, "Int64"))?;
             Ok(AggInputValue::I64(pa.value(row)))
         }
         DataType::Float32 => {
-            let pa = plan
-                .arr
+            let pa = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(&plan.name, "Float32"))?;
             Ok(AggInputValue::F32(pa.value(row)))
         }
         DataType::Float64 => {
-            let pa = plan
-                .arr
+            let pa = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(&plan.name, "Float64"))?;
             Ok(AggInputValue::F64(pa.value(row)))
         }
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Decimal128(_, _)
-        | DataType::Date32
-        | DataType::Timestamp(_, _)
-        | DataType::Extended(_) => Err(BoltError::Type(format!(
+        DataType::Bool => {
+            let ba = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&plan.name, "Bool"))?;
+            Ok(AggInputValue::Bool(ba.value(row)))
+        }
+        DataType::Date32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| downcast_err(&plan.name, "Date32"))?;
+            Ok(AggInputValue::I32(pa.value(row)))
+        }
+        DataType::Timestamp(unit, _) => {
+            let ticks = match unit {
+                TimeUnit::Second => arr
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .ok_or_else(|| downcast_err(&plan.name, "TimestampSecond"))?
+                    .value(row),
+                TimeUnit::Millisecond => arr
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| downcast_err(&plan.name, "TimestampMillisecond"))?
+                    .value(row),
+                TimeUnit::Microsecond => arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| downcast_err(&plan.name, "TimestampMicrosecond"))?
+                    .value(row),
+                TimeUnit::Nanosecond => arr
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(|| downcast_err(&plan.name, "TimestampNanosecond"))?
+                    .value(row),
+            };
+            Ok(AggInputValue::I64(ticks))
+        }
+        DataType::Decimal128(_, scale) => {
+            let da = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| downcast_err(&plan.name, "Decimal128"))?;
+            Ok(AggInputValue::Decimal128 {
+                raw: da.value(row),
+                scale,
+            })
+        }
+        DataType::Utf8 | DataType::Extended(_) => Err(BoltError::Type(format!(
             "wide GROUP BY: aggregate input dtype {:?} not supported (column '{}')",
             plan.dtype, plan.name
         ))),
@@ -622,6 +742,9 @@ enum AggInputValue {
     I64(i64),
     F32(f32),
     F64(f64),
+    Bool(bool),
+    Decimal128 { raw: i128, scale: i8 },
+    CountRow,
 }
 
 impl AggInputValue {
@@ -632,6 +755,17 @@ impl AggInputValue {
             AggInputValue::I64(v) => v as f64,
             AggInputValue::F32(v) => v as f64,
             AggInputValue::F64(v) => v,
+            AggInputValue::Bool(b) => {
+                if b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            AggInputValue::Decimal128 { raw, scale } => {
+                (raw as f64) / 10f64.powi(scale as i32)
+            }
+            AggInputValue::CountRow => 1.0,
         }
     }
 
@@ -640,8 +774,8 @@ impl AggInputValue {
         match self {
             AggInputValue::I32(v) => Ok(v as i64),
             AggInputValue::I64(v) => Ok(v),
-            AggInputValue::F32(_) | AggInputValue::F64(_) => Err(BoltError::Type(
-                "wide GROUP BY: internal — tried to widen float to i64".into(),
+            _ => Err(BoltError::Type(
+                "wide GROUP BY: internal — tried to widen non-integer to i64".into(),
             )),
         }
     }
@@ -656,36 +790,42 @@ impl AggInputValue {
 /// group exists, every row's update must match the same variant.
 #[derive(Clone, Debug)]
 enum Accumulator {
-    /// `SUM` over an integer input. Widened to i64 internally to match the
-    /// narrow path's kernel behaviour.
+    /// `SUM` over an integer input. Widened to i64 internally, checked on overflow.
     SumI64 { total: i64 },
+    /// `SUM` over a Decimal128 input. Checked on i128 overflow.
+    SumDecimal128 { total: i128 },
     /// `SUM` over a float input. Widened to f64.
     SumF64 { total: f64 },
-    /// `MIN` over an Int32 input.
+    /// `MIN` over an Int32 / Date32 input.
     MinI32 { v: i32, seen: bool },
-    /// `MIN` over an Int64 input.
+    /// `MIN` over an Int64 / Timestamp input.
     MinI64 { v: i64, seen: bool },
     /// `MIN` over a Float32 input.
     MinF32 { v: f32, seen: bool },
     /// `MIN` over a Float64 input.
     MinF64 { v: f64, seen: bool },
-    /// `MAX` over an Int32 input.
+    /// `MIN` over a Bool input.
+    MinBool { v: bool, seen: bool },
+    /// `MIN` over a Decimal128 input.
+    MinDecimal128 { v: i128, seen: bool },
+    /// `MAX` over an Int32 / Date32 input.
     MaxI32 { v: i32, seen: bool },
-    /// `MAX` over an Int64 input.
+    /// `MAX` over an Int64 / Timestamp input.
     MaxI64 { v: i64, seen: bool },
     /// `MAX` over a Float32 input.
     MaxF32 { v: f32, seen: bool },
     /// `MAX` over a Float64 input.
     MaxF64 { v: f64, seen: bool },
-    /// `COUNT(expr)` — count of non-null rows. We don't track nulls in v1,
-    /// so this is row count per group (matches narrow-path behaviour).
+    /// `MAX` over a Bool input.
+    MaxBool { v: bool, seen: bool },
+    /// `MAX` over a Decimal128 input.
+    MaxDecimal128 { v: i128, seen: bool },
+    /// `COUNT(expr)` — count of non-null rows.
     Count { n: u64 },
     /// `AVG` — running sum + count.
     Avg { sum: f64, n: u64 },
     /// `VAR_POP` / `VAR_SAMP` / `STDDEV_POP` / `STDDEV_SAMP` — Welford
-    /// `(count, mean, M2)` state. The output finaliser
-    /// (`finalize_agg_column`) picks the right `var_*` / `stddev_*`
-    /// accessor on the state.
+    /// `(count, mean, M2)` state.
     Welford {
         state: crate::exec::welford::WelfordState,
     },
@@ -697,14 +837,21 @@ impl Accumulator {
         match self {
             Accumulator::SumI64 { total } => {
                 let v = value.as_i64()?;
-                // Wrap on i64 overflow to match the GPU narrow path, whose
-                // SUM kernel emits `atom.global.add.u64` (silently wraps on
-                // overflow). Since SUM(Int32) widens to an i64 accumulator
-                // AND the plan-declared output dtype is Int64 (see
-                // `crate::plan::logical_plan::sum_output_dtype`), the wrap
-                // semantics matter only for SUM(Int64), where they match the
-                // GPU and scalar reducer.
-                *total = total.wrapping_add(v);
+                *total = total.checked_add(v).ok_or_else(|| {
+                    BoltError::Type("SUM(integer) overflow: accumulator exceeds i64 range".into())
+                })?;
+            }
+            Accumulator::SumDecimal128 { total } => {
+                if let AggInputValue::Decimal128 { raw, .. } = value {
+                    *total = total.checked_add(raw).ok_or_else(|| {
+                        BoltError::Type(
+                            "SUM(Decimal128) precision overflow: accumulator exceeds i128 range"
+                                .into(),
+                        )
+                    })?;
+                } else {
+                    return Err(variant_mismatch_err("SumDecimal128"));
+                }
             }
             Accumulator::SumF64 { total } => {
                 *total += value.as_f64();
@@ -731,8 +878,6 @@ impl Accumulator {
             }
             Accumulator::MinF32 { v, seen } => {
                 if let AggInputValue::F32(x) = value {
-                    // `<` propagates NaN: NaN < anything is false, so NaN
-                    // never replaces a real value. Matches scalar reducer.
                     if !*seen || x < *v {
                         *v = x;
                     }
@@ -749,6 +894,26 @@ impl Accumulator {
                     *seen = true;
                 } else {
                     return Err(variant_mismatch_err("MinF64"));
+                }
+            }
+            Accumulator::MinBool { v, seen } => {
+                if let AggInputValue::Bool(x) = value {
+                    if !*seen || (!x && *v) {
+                        *v = x;
+                    }
+                    *seen = true;
+                } else {
+                    return Err(variant_mismatch_err("MinBool"));
+                }
+            }
+            Accumulator::MinDecimal128 { v, seen } => {
+                if let AggInputValue::Decimal128 { raw, .. } = value {
+                    if !*seen || raw < *v {
+                        *v = raw;
+                    }
+                    *seen = true;
+                } else {
+                    return Err(variant_mismatch_err("MinDecimal128"));
                 }
             }
             Accumulator::MaxI32 { v, seen } => {
@@ -791,6 +956,26 @@ impl Accumulator {
                     return Err(variant_mismatch_err("MaxF64"));
                 }
             }
+            Accumulator::MaxBool { v, seen } => {
+                if let AggInputValue::Bool(x) = value {
+                    if !*seen || (x && !*v) {
+                        *v = x;
+                    }
+                    *seen = true;
+                } else {
+                    return Err(variant_mismatch_err("MaxBool"));
+                }
+            }
+            Accumulator::MaxDecimal128 { v, seen } => {
+                if let AggInputValue::Decimal128 { raw, .. } = value {
+                    if !*seen || raw > *v {
+                        *v = raw;
+                    }
+                    *seen = true;
+                } else {
+                    return Err(variant_mismatch_err("MaxDecimal128"));
+                }
+            }
             Accumulator::Count { n } => {
                 let _ = value;
                 *n += 1;
@@ -823,17 +1008,22 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
             (AggKind::Sum, DataType::Int32) | (AggKind::Sum, DataType::Int64) => {
                 Accumulator::SumI64 { total: 0 }
             }
+            (AggKind::Sum, DataType::Decimal128(_, _)) => Accumulator::SumDecimal128 { total: 0 },
             (AggKind::Sum, DataType::Float32) | (AggKind::Sum, DataType::Float64) => {
                 Accumulator::SumF64 { total: 0.0 }
             }
-            (AggKind::Min, DataType::Int32) => Accumulator::MinI32 {
-                v: i32::MAX,
-                seen: false,
-            },
-            (AggKind::Min, DataType::Int64) => Accumulator::MinI64 {
-                v: i64::MAX,
-                seen: false,
-            },
+            (AggKind::Min, DataType::Int32) | (AggKind::Min, DataType::Date32) => {
+                Accumulator::MinI32 {
+                    v: i32::MAX,
+                    seen: false,
+                }
+            }
+            (AggKind::Min, DataType::Int64) | (AggKind::Min, DataType::Timestamp(_, _)) => {
+                Accumulator::MinI64 {
+                    v: i64::MAX,
+                    seen: false,
+                }
+            }
             (AggKind::Min, DataType::Float32) => Accumulator::MinF32 {
                 v: f32::INFINITY,
                 seen: false,
@@ -842,14 +1032,26 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
                 v: f64::INFINITY,
                 seen: false,
             },
-            (AggKind::Max, DataType::Int32) => Accumulator::MaxI32 {
-                v: i32::MIN,
+            (AggKind::Min, DataType::Bool) => Accumulator::MinBool {
+                v: true,
                 seen: false,
             },
-            (AggKind::Max, DataType::Int64) => Accumulator::MaxI64 {
-                v: i64::MIN,
+            (AggKind::Min, DataType::Decimal128(_, _)) => Accumulator::MinDecimal128 {
+                v: i128::MAX,
                 seen: false,
             },
+            (AggKind::Max, DataType::Int32) | (AggKind::Max, DataType::Date32) => {
+                Accumulator::MaxI32 {
+                    v: i32::MIN,
+                    seen: false,
+                }
+            }
+            (AggKind::Max, DataType::Int64) | (AggKind::Max, DataType::Timestamp(_, _)) => {
+                Accumulator::MaxI64 {
+                    v: i64::MIN,
+                    seen: false,
+                }
+            }
             (AggKind::Max, DataType::Float32) => Accumulator::MaxF32 {
                 v: f32::NEG_INFINITY,
                 seen: false,
@@ -858,20 +1060,35 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
                 v: f64::NEG_INFINITY,
                 seen: false,
             },
+            (AggKind::Max, DataType::Bool) => Accumulator::MaxBool {
+                v: false,
+                seen: false,
+            },
+            (AggKind::Max, DataType::Decimal128(_, _)) => Accumulator::MaxDecimal128 {
+                v: i128::MIN,
+                seen: false,
+            },
             (AggKind::Count, _) => Accumulator::Count { n: 0 },
-            (AggKind::Avg, _) => Accumulator::Avg { sum: 0.0, n: 0 },
+            (
+                AggKind::Avg,
+                DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Bool
+                | DataType::Decimal128(_, _),
+            ) => Accumulator::Avg { sum: 0.0, n: 0 },
             (
                 AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp,
-                DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64,
+                DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _),
             ) => Accumulator::Welford {
                 state: crate::exec::welford::WelfordState::empty(),
             },
-            (_, DataType::Bool)
-            | (_, DataType::Utf8)
-            | (_, DataType::Decimal128(_, _))
-            | (_, DataType::Date32)
-            | (_, DataType::Timestamp(_, _))
-            | (_, DataType::Extended(_)) => {
+            _ => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: cannot make accumulator for ({:?}, {:?}) on column '{}'",
                     p.kind, p.dtype, p.name
@@ -902,6 +1119,18 @@ fn build_key_arrays(
         I64(Vec<i64>),
         F32(Vec<f32>),
         F64(Vec<f64>),
+        Bool(Vec<bool>),
+        Date32(Vec<i32>),
+        Timestamp {
+            vals: Vec<i64>,
+            unit: TimeUnit,
+            tz: Option<&'static str>,
+        },
+        Decimal128 {
+            vals: Vec<i128>,
+            precision: u8,
+            scale: i8,
+        },
     }
 
     let mut buffers: Vec<ColBuf> = Vec::with_capacity(m);
@@ -911,12 +1140,19 @@ fn build_key_arrays(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Timestamp(_, _)
-            | DataType::Extended(_) => {
+            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n))),
+            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n))),
+            DataType::Timestamp(unit, tz) => buffers.push(ColBuf::Timestamp {
+                vals: Vec::with_capacity(n),
+                unit,
+                tz,
+            }),
+            DataType::Decimal128(precision, scale) => buffers.push(ColBuf::Decimal128 {
+                vals: Vec::with_capacity(n),
+                precision,
+                scale,
+            }),
+            DataType::Utf8 | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "wide GROUP BY: key dtype {:?} not supported on output",
                     kc.dtype
@@ -939,6 +1175,10 @@ fn build_key_arrays(
                 (ColBuf::I64(v), KeyValue::I64(x)) => v.push(*x),
                 (ColBuf::F32(v), KeyValue::F32Bits(bits)) => v.push(f32::from_bits(*bits)),
                 (ColBuf::F64(v), KeyValue::F64Bits(bits)) => v.push(f64::from_bits(*bits)),
+                (ColBuf::Bool(v), KeyValue::Bool(x)) => v.push(*x),
+                (ColBuf::Date32(v), KeyValue::Date32(x)) => v.push(*x),
+                (ColBuf::Timestamp { vals, .. }, KeyValue::Timestamp(x)) => vals.push(*x),
+                (ColBuf::Decimal128 { vals, .. }, KeyValue::Decimal128(x)) => vals.push(*x),
                 _ => {
                     return Err(BoltError::Other(
                         "wide GROUP BY: internal — tuple variant mismatched key column dtype"
@@ -956,6 +1196,25 @@ fn build_key_arrays(
             ColBuf::I64(v) => out.push(Arc::new(Int64Array::from(v)) as ArrayRef),
             ColBuf::F32(v) => out.push(Arc::new(Float32Array::from(v)) as ArrayRef),
             ColBuf::F64(v) => out.push(Arc::new(Float64Array::from(v)) as ArrayRef),
+            ColBuf::Bool(v) => out.push(Arc::new(BooleanArray::from(v)) as ArrayRef),
+            ColBuf::Date32(v) => out.push(Arc::new(Date32Array::from(v)) as ArrayRef),
+            ColBuf::Timestamp { vals, unit, tz } => {
+                out.push(timestamp_array_from_i64(vals, unit, tz))
+            }
+            ColBuf::Decimal128 {
+                vals,
+                precision,
+                scale,
+            } => {
+                let da = Decimal128Array::from(vals)
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| {
+                        BoltError::Type(format!(
+                            "wide GROUP BY: Decimal128 key precision/scale ({precision}, {scale}) invalid: {e}"
+                        ))
+                    })?;
+                out.push(Arc::new(da) as ArrayRef);
+            }
         }
     }
     Ok(out)
@@ -1103,16 +1362,13 @@ fn collect_sum_min_max(
         return pack_typed_array(
             out_dtype,
             match out_dtype {
-                DataType::Int32 => TypedColumn::I32(Vec::new()),
-                DataType::Int64 => TypedColumn::I64(Vec::new()),
+                DataType::Int32 | DataType::Date32 => TypedColumn::I32(Vec::new()),
+                DataType::Int64 | DataType::Timestamp(_, _) => TypedColumn::I64(Vec::new()),
                 DataType::Float32 => TypedColumn::F32(Vec::new()),
                 DataType::Float64 => TypedColumn::F64(Vec::new()),
-                DataType::Bool
-                | DataType::Utf8
-                | DataType::Decimal128(_, _)
-                | DataType::Date32
-                | DataType::Timestamp(_, _)
-                | DataType::Extended(_) => {
+                DataType::Bool => TypedColumn::Bool(Vec::new()),
+                DataType::Decimal128(_, _) => TypedColumn::Decimal128(Vec::new()),
+                DataType::Utf8 | DataType::Extended(_) => {
                     return Err(BoltError::Type(format!(
                         "wide GROUP BY: cannot emit empty {:?} aggregate column",
                         out_dtype
@@ -1140,6 +1396,16 @@ fn collect_sum_min_max(
                     }
                 }
                 TypedColumn::I64(out)
+            }
+            Accumulator::SumDecimal128 { .. } => {
+                let mut out: Vec<i128> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::SumDecimal128 { total }) => out.push(*total),
+                        _ => return Err(variant_mismatch_err("SumDecimal128")),
+                    }
+                }
+                TypedColumn::Decimal128(out)
             }
             Accumulator::SumF64 { .. } => {
                 let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
@@ -1195,6 +1461,30 @@ fn collect_sum_min_max(
                 }
                 TypedColumn::F64(out)
             }
+            Accumulator::MinBool { .. } | Accumulator::MaxBool { .. } => {
+                let mut out: Vec<Option<bool>> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::MinBool { v, seen })
+                        | Some(Accumulator::MaxBool { v, seen }) => {
+                            out.push(if *seen { Some(*v) } else { None });
+                        }
+                        _ => return Err(variant_mismatch_err("MinBool/MaxBool")),
+                    }
+                }
+                return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
+            }
+            Accumulator::MinDecimal128 { .. } | Accumulator::MaxDecimal128 { .. } => {
+                let mut out: Vec<i128> = Vec::with_capacity(sorted.len());
+                for (_, accs) in sorted {
+                    match accs.get(i) {
+                        Some(Accumulator::MinDecimal128 { v, .. })
+                        | Some(Accumulator::MaxDecimal128 { v, .. }) => out.push(*v),
+                        _ => return Err(variant_mismatch_err("MinDecimal128/MaxDecimal128")),
+                    }
+                }
+                TypedColumn::Decimal128(out)
+            }
             Accumulator::Count { .. } | Accumulator::Avg { .. } => {
                 return Err(BoltError::Other(
                     "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
@@ -1215,15 +1505,11 @@ enum TypedColumn {
     I64(Vec<i64>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+    Bool(Vec<bool>),
+    Decimal128(Vec<i128>),
 }
 
-/// Cast a typed column into an Arrow array of `out_dtype`. Mirrors the
-/// cross-dtype matrix in `groupby.rs::pack_array`, plus a Float64→Float32
-/// narrowing path needed because SUM(Float32) accumulates in `f64` while
-/// the plan-declared output dtype is `Float32`. There is no analogous
-/// Int64→Int32 narrowing: SUM(Int32) declares an `Int64` output dtype
-/// (see [`crate::plan::logical_plan::sum_output_dtype`]), so the widened
-/// accumulator is preserved end-to-end.
+/// Cast a typed column into an Arrow array of `out_dtype`.
 fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRef> {
     match (col, out_dtype) {
         // Exact-match paths.
@@ -1231,6 +1517,21 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRe
         (TypedColumn::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
         (TypedColumn::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
         (TypedColumn::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
+        (TypedColumn::Bool(v), DataType::Bool) => Ok(Arc::new(BooleanArray::from(v)) as ArrayRef),
+        (TypedColumn::I32(v), DataType::Date32) => Ok(Arc::new(Date32Array::from(v)) as ArrayRef),
+        (TypedColumn::I64(v), DataType::Timestamp(unit, tz)) => {
+            Ok(timestamp_array_from_i64(v, unit, tz))
+        }
+        (TypedColumn::Decimal128(v), DataType::Decimal128(precision, scale)) => {
+            let da = Decimal128Array::from(v)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "wide GROUP BY: Decimal128 output precision/scale ({precision}, {scale}) invalid: {e}"
+                    ))
+                })?;
+            Ok(Arc::new(da) as ArrayRef)
+        }
 
         // Widening (matches groupby.rs::pack_array).
         (TypedColumn::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
@@ -1248,15 +1549,6 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRe
         (TypedColumn::F32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
             v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
         )) as ArrayRef),
-
-        // Narrowing path for SUM(Float32): we accumulate in f64 to track
-        // partial-sum precision but the plan-declared output dtype remains
-        // Float32. Mirrors the scalar reducer and narrow GROUP BY path.
-        //
-        // Note there is intentionally NO `(I64, Int32)` narrowing path: SUM
-        // over `Int32` now declares an `Int64` output (see
-        // `crate::plan::logical_plan::sum_output_dtype`); the wider
-        // accumulator is preserved end-to-end.
         (TypedColumn::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
             v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
         )) as ArrayRef),
@@ -1265,6 +1557,24 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRe
             "wide GROUP BY: cannot pack scalars into output dtype {:?}",
             dt
         ))),
+    }
+}
+
+fn timestamp_array_from_i64(host: Vec<i64>, unit: TimeUnit, tz: Option<&'static str>) -> ArrayRef {
+    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
+    match unit {
+        TimeUnit::Second => {
+            Arc::new(TimestampSecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+        TimeUnit::Millisecond => {
+            Arc::new(TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+        TimeUnit::Microsecond => {
+            Arc::new(TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+        TimeUnit::Nanosecond => {
+            Arc::new(TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
     }
 }
 
@@ -1294,15 +1604,12 @@ fn downcast_err(name: &str, expected: &str) -> BoltError {
 
 /// Map Arrow `DataType` to our plan `DataType` (mirrors `groupby.rs`).
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    crate::exec::schema_convert::arrow_dtype_to_plan_basic(d, "wide GROUP BY: ")
+    crate::exec::schema_convert::arrow_dtype_to_plan(d)
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_no_temporal(
-        s,
-        "this aggregate output path",
-    )
+    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
 // ---------------------------------------------------------------------------
