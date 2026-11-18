@@ -87,8 +87,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use bytemuck::Pod;
@@ -174,6 +175,18 @@ fn key_array_contains_sentinel(arr: &dyn Array) -> BoltResult<bool> {
             }
         }
         return Ok(false);
+    }
+    if let Some(ts) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Ok(ts.iter().flatten().any(|v| v == I64_EMPTY_SENTINEL));
+    }
+    if let Some(ts) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Ok(ts.iter().flatten().any(|v| v == I64_EMPTY_SENTINEL));
+    }
+    if let Some(ts) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Ok(ts.iter().flatten().any(|v| v == I64_EMPTY_SENTINEL));
+    }
+    if let Some(ts) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Ok(ts.iter().flatten().any(|v| v == I64_EMPTY_SENTINEL));
     }
     // Int32 → i64 widens via sign-extension. i32::MIN as i64 is
     // -2147483648, nowhere near i64::MIN, so no value in an Int32Array can
@@ -1769,7 +1782,7 @@ impl<'a> FilteredKeys<'a> {
 // u64 group SUM atomic (e.g. a per-launch device "overflow" flag set on signed
 // carry) so overflow is caught on-device for that future streaming case and the
 // host re-fold can be dropped.
-fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
+pub(crate) fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
     debug_assert_eq!(
         values.len(),
         host_keys.len(),
@@ -1810,7 +1823,7 @@ fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
 /// The single D2H of the key column here is the cost of restoring the
 /// invariant on this path; see the `// TODO(overflow-kernel)` on
 /// `checked_group_sum` for the on-device follow-up that would remove it.
-fn checked_group_sum_native_validity(
+pub(crate) fn checked_group_sum_native_validity(
     values: &[i64],
     value_valid: &[bool],
     group_col: &GpuVec<i64>,
@@ -2705,15 +2718,38 @@ fn load_input_column_as_f64_filtered(
                 .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
             Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
         }
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Decimal128(_, _)
-        | DataType::Date32
-        | DataType::Timestamp(_, _)
-        | DataType::Extended(_) => Err(BoltError::Type(format!(
-            "AVG input dtype {:?} not supported (column '{}')",
-            col_io.dtype, col_io.name
-        ))),
+        DataType::Bool => {
+            let ba = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Bool"))?;
+            let n = ba.len();
+            let mut out: Vec<f64> = Vec::with_capacity(n);
+            for i in 0..n {
+                let kv = key_valid.map(|m| m[i]).unwrap_or(true);
+                let vv = value_valid.map(|m| m[i]).unwrap_or(true);
+                if kv && vv {
+                    out.push(if ba.value(i) { 1.0 } else { 0.0 });
+                }
+            }
+            Ok(out)
+        }
+        DataType::Decimal128(_, scale) => {
+            let da = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
+            let pow = 10f64.powi(scale as i32);
+            Ok(filter_iter_to_f64(da, key_valid, value_valid, |v| {
+                (v as f64) / pow
+            }))
+        }
+        DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
+            Err(BoltError::Type(format!(
+                "AVG input dtype {:?} not supported (column '{}')",
+                col_io.dtype, col_io.name
+            )))
+        }
     }
 }
 
@@ -2765,6 +2801,13 @@ fn build_key_arrays(
         I64(Vec<i64>),
         F32(Vec<f32>),
         F64(Vec<f64>),
+        Bool(Vec<bool>),
+        Date32(Vec<i32>),
+        Timestamp {
+            vals: Vec<i64>,
+            unit: TimeUnit,
+            tz: Option<&'static str>,
+        },
     }
 
     let mut buffers: Vec<ColBuf> = Vec::with_capacity(m);
@@ -2774,12 +2817,14 @@ fn build_key_arrays(
             DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
             DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
             DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Timestamp(_, _)
-            | DataType::Extended(_) => {
+            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n))),
+            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n))),
+            DataType::Timestamp(unit, tz) => buffers.push(ColBuf::Timestamp {
+                vals: Vec::with_capacity(n),
+                unit,
+                tz,
+            }),
+            DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => {
                 return Err(BoltError::Type(format!(
                     "GROUP BY key dtype {:?} not supported on output",
                     comp.original_dtype
@@ -2803,7 +2848,7 @@ fn build_key_arrays(
         row_valid.push(!is_null_group);
         if is_null_group {
             any_null_group = true;
-            // Push a placeholder (zero / 0.0) into each typed buffer; it is
+            // Push a placeholder (zero / 0.0 / false) into each typed buffer; it is
             // never observed because the validity mask marks this row NULL.
             for buf in buffers.iter_mut() {
                 match buf {
@@ -2811,6 +2856,9 @@ fn build_key_arrays(
                     ColBuf::I64(v) => v.push(0),
                     ColBuf::F32(v) => v.push(0.0),
                     ColBuf::F64(v) => v.push(0.0),
+                    ColBuf::Bool(v) => v.push(false),
+                    ColBuf::Date32(v) => v.push(0),
+                    ColBuf::Timestamp { vals, .. } => vals.push(0),
                 }
             }
             continue;
@@ -2822,6 +2870,9 @@ fn build_key_arrays(
                 (ColBuf::I64(v), KeyValue::I64(x)) => v.push(*x),
                 (ColBuf::F32(v), KeyValue::F32(x)) => v.push(*x),
                 (ColBuf::F64(v), KeyValue::F64(x)) => v.push(*x),
+                (ColBuf::Bool(v), KeyValue::Bool(x)) => v.push(*x),
+                (ColBuf::Date32(v), KeyValue::Date32(x)) => v.push(*x),
+                (ColBuf::Timestamp { vals, .. }, KeyValue::Timestamp(x)) => vals.push(*x),
                 _ => {
                     return Err(BoltError::Other(
                         "internal: decode_key produced a KeyValue variant \
@@ -2866,6 +2917,42 @@ fn build_key_arrays(
                         .map(|(x, &ok)| if ok { Some(x) } else { None })
                         .collect::<Vec<Option<f64>>>(),
                 )) as ArrayRef,
+                ColBuf::Bool(v) => Arc::new(BooleanArray::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect::<Vec<Option<bool>>>(),
+                )) as ArrayRef,
+                ColBuf::Date32(v) => Arc::new(Date32Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect::<Vec<Option<i32>>>(),
+                )) as ArrayRef,
+                ColBuf::Timestamp { vals, unit, tz } => {
+                    let tz_arc: Option<Arc<str>> = tz.map(Arc::from);
+                    let opts: Vec<Option<i64>> = vals
+                        .into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| if ok { Some(x) } else { None })
+                        .collect();
+                    match unit {
+                        TimeUnit::Second => {
+                            Arc::new(TimestampSecondArray::from(opts).with_timezone_opt(tz_arc))
+                                as ArrayRef
+                        }
+                        TimeUnit::Millisecond => Arc::new(
+                            TimestampMillisecondArray::from(opts).with_timezone_opt(tz_arc),
+                        ) as ArrayRef,
+                        TimeUnit::Microsecond => Arc::new(
+                            TimestampMicrosecondArray::from(opts).with_timezone_opt(tz_arc),
+                        ) as ArrayRef,
+                        TimeUnit::Nanosecond => {
+                            Arc::new(TimestampNanosecondArray::from(opts).with_timezone_opt(tz_arc))
+                                as ArrayRef
+                        }
+                    }
+                }
             }
         } else {
             match buf {
@@ -2873,6 +2960,9 @@ fn build_key_arrays(
                 ColBuf::I64(v) => Arc::new(Int64Array::from(v)) as ArrayRef,
                 ColBuf::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
                 ColBuf::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
+                ColBuf::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
+                ColBuf::Date32(v) => Arc::new(Date32Array::from(v)) as ArrayRef,
+                ColBuf::Timestamp { vals, unit, tz } => timestamp_array_from_i64(vals, unit, tz),
             }
         };
         out.push(arr);
@@ -3276,7 +3366,7 @@ fn downcast_err(name: &str, expected: &str) -> BoltError {
 
 /// Map Arrow `DataType` to our plan `DataType` (mirrors `aggregate.rs`).
 fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    crate::exec::schema_convert::arrow_dtype_to_plan_basic(d, "")
+    crate::exec::schema_convert::arrow_dtype_to_plan(d)
 }
 
 /// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
@@ -3289,7 +3379,7 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 /// dtype dispatch — so the only temporal output fields that reach here are the
 /// supported aggregate reductions.
 fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema_minmax_temporal(s)
+    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
 // ---------------------------------------------------------------------------

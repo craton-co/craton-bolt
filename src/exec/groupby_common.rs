@@ -45,12 +45,16 @@
 
 use std::collections::HashSet;
 
-use arrow_array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
-use crate::plan::logical_plan::DataType;
+use crate::plan::logical_plan::{DataType, TimeUnit};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
 // ---------------------------------------------------------------------------
@@ -116,14 +120,13 @@ pub(crate) fn download_pinned_f64(v: &GpuVec<f64>, stream: &CudaStream) -> BoltR
 /// (the two copies were byte-identical).
 pub(crate) fn key_bit_width(dtype: DataType) -> BoltResult<u32> {
     match dtype {
-        DataType::Int32 | DataType::Float32 => Ok(32),
-        DataType::Int64 | DataType::Float64 => Ok(64),
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Decimal128(_, _)
-        | DataType::Date32
-        | DataType::Timestamp(_, _)
-        | DataType::Extended(_) => Err(BoltError::Type(format!(
+        DataType::Int32 | DataType::Float32 | DataType::Bool | DataType::Date32 => Ok(32),
+        DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => Ok(64),
+        // 128-bit keys exceed the 64-bit packed slot budget, so `pack_keys`
+        // triggers its `> 64 bits` branch and `execute_groupby` delegates to
+        // `groupby_wide`.
+        DataType::Decimal128(_, _) => Ok(128),
+        DataType::Utf8 | DataType::Extended(_) => Err(BoltError::Type(format!(
             "GROUP BY key dtype {:?} not supported in v1",
             dtype
         ))),
@@ -178,6 +181,9 @@ pub(crate) enum KeyValue {
     I64(i64),
     F32(f32),
     F64(f64),
+    Bool(bool),
+    Date32(i32),
+    Timestamp(i64),
 }
 
 /// Read the per-row value of one group-by column out of `batch` and return a
@@ -268,12 +274,57 @@ pub(crate) fn load_key_column_bits(
                 .map(|&v| canonicalise_f64(v).to_bits())
                 .collect()
         }
-        DataType::Bool
-        | DataType::Utf8
-        | DataType::Decimal128(_, _)
-        | DataType::Date32
-        | DataType::Timestamp(_, _)
-        | DataType::Extended(_) => {
+        DataType::Bool => {
+            let ba = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&key_io.name, "Bool"))?;
+            (0..ba.len())
+                .map(|i| if !ba.is_null(i) && ba.value(i) { 1u64 } else { 0u64 })
+                .collect()
+        }
+        DataType::Date32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| downcast_err(&key_io.name, "Date32"))?;
+            pa.values().iter().map(|&v| v as u32 as u64).collect()
+        }
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => arr
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| downcast_err(&key_io.name, "TimestampSecond"))?
+                .values()
+                .iter()
+                .map(|&v| v as u64)
+                .collect(),
+            TimeUnit::Millisecond => arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| downcast_err(&key_io.name, "TimestampMillisecond"))?
+                .values()
+                .iter()
+                .map(|&v| v as u64)
+                .collect(),
+            TimeUnit::Microsecond => arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| downcast_err(&key_io.name, "TimestampMicrosecond"))?
+                .values()
+                .iter()
+                .map(|&v| v as u64)
+                .collect(),
+            TimeUnit::Nanosecond => arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| downcast_err(&key_io.name, "TimestampNanosecond"))?
+                .values()
+                .iter()
+                .map(|&v| v as u64)
+                .collect(),
+        },
+        DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => {
             return Err(BoltError::Type(format!(
                 "GROUP BY key dtype {:?} not supported in v1",
                 key_io.dtype
@@ -518,38 +569,26 @@ pub(crate) fn decode_key(packed: i64, components: &[KeyComponent]) -> Vec<KeyVal
     let u = packed as u64;
     for comp in components {
         let raw = match comp.original_dtype {
-            DataType::Int32 | DataType::Float32 => {
+            DataType::Int32 | DataType::Float32 | DataType::Bool | DataType::Date32 => {
                 // 32-bit field at `bit_offset`. Mask to u32.
                 (u >> comp.bit_offset) & 0xFFFF_FFFFu64
             }
-            DataType::Int64 | DataType::Float64 => {
+            DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => {
                 // 64-bit field: there can be at most one component and
                 // bit_offset is always 0.
                 u
             }
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Timestamp(_, _)
-            | DataType::Extended(_) => {
-                // pack_keys would have already rejected these dtypes — we
-                // can't reach this branch from the executors, but keep the
-                // match exhaustive and return a 0 placeholder.
-                0
-            }
+            DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => 0,
         };
         let val = match comp.original_dtype {
             DataType::Int32 => KeyValue::I32(raw as u32 as i32),
             DataType::Int64 => KeyValue::I64(raw as i64),
             DataType::Float32 => KeyValue::F32(f32::from_bits(raw as u32)),
             DataType::Float64 => KeyValue::F64(f64::from_bits(raw)),
-            DataType::Bool
-            | DataType::Utf8
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Timestamp(_, _)
-            | DataType::Extended(_) => KeyValue::I64(0),
+            DataType::Bool => KeyValue::Bool(raw != 0),
+            DataType::Date32 => KeyValue::Date32(raw as u32 as i32),
+            DataType::Timestamp(_, _) => KeyValue::Timestamp(raw as i64),
+            DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => KeyValue::I64(0),
         };
         out.push(val);
     }
@@ -605,7 +644,7 @@ fn downcast_err(name: &str, expected: &str) -> BoltError {
 /// shared `schema_convert` helper exactly as the executors' local
 /// `arrow_dtype_to_plan` aliases did.
 fn arrow_dtype_to_plan(d: &arrow_schema::DataType) -> BoltResult<DataType> {
-    crate::exec::schema_convert::arrow_dtype_to_plan_basic(d, "")
+    crate::exec::schema_convert::arrow_dtype_to_plan(d)
 }
 
 // ---------------------------------------------------------------------------
