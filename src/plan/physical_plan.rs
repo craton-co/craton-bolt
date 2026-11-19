@@ -4150,6 +4150,29 @@ type AggregateParts = (LogicalPlan, Vec<Expr>, Vec<AggregateExpr>);
 /// Name of the `k`-th feed column [`materialize_nonstrict_feeds`] adds.
 const FEED_COLUMN_PREFIX: &str = "__bolt_feed_";
 
+/// Walk through any nested [`PhysicalPlan::AggregateOverInput`] wrappers to
+/// rename the leaf [`AggregateSpec::output_schema`] fields to `want`.
+fn rename_aggregate_output_fields(mut phys: &mut PhysicalPlan, want: &Schema) {
+    loop {
+        match phys {
+            PhysicalPlan::AggregateOverInput { aggregate, .. } => {
+                phys = aggregate.as_mut();
+            }
+            PhysicalPlan::Aggregate {
+                aggregate: spec, ..
+            } => {
+                if spec.output_schema.fields.len() == want.fields.len() {
+                    for (f, w) in spec.output_schema.fields.iter_mut().zip(&want.fields) {
+                        f.name = w.name.clone();
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+}
+
 /// Lower the aggregate `plan` over [`AggregateParts`] from
 /// [`materialize_feeds`], keeping `plan`'s output column names.
 fn lower_materialized_feeds(
@@ -4159,18 +4182,7 @@ fn lower_materialized_feeds(
 ) -> BoltResult<PhysicalPlan> {
     let mut lowered = lower_aggregate_over_input(&with_feeds, &keys, &aggs, depth)?;
     let want = plan.schema()?;
-    if let PhysicalPlan::AggregateOverInput { aggregate, .. } = &mut lowered {
-        if let PhysicalPlan::Aggregate {
-            aggregate: spec, ..
-        } = aggregate.as_mut()
-        {
-            if spec.output_schema.fields.len() == want.fields.len() {
-                for (f, w) in spec.output_schema.fields.iter_mut().zip(&want.fields) {
-                    f.name = w.name.clone();
-                }
-            }
-        }
-    }
+    rename_aggregate_output_fields(&mut lowered, &want);
     Ok(lowered)
 }
 
@@ -4377,22 +4389,11 @@ fn lower_aggregate_over_input(
     };
     let mut aggregate = lower_aggregate(&over_scan, &scan, group_by, &aggregates, depth + 1)?;
     // Keep the output column names the enclosing plan references (the
-    // `COUNT(*)` → `COUNT(c)` substitution would otherwise rename them).
-    if let PhysicalPlan::Aggregate {
-        aggregate: spec, ..
-    } = &mut aggregate
-    {
-        if spec.output_schema.fields.len() == original_schema.fields.len() {
-            for (f, want) in spec
-                .output_schema
-                .fields
-                .iter_mut()
-                .zip(&original_schema.fields)
-            {
-                f.name = want.name.clone();
-            }
-        }
-    }
+    // `COUNT(*)` → `COUNT(c)` substitution would otherwise rename them),
+    // even when `lower_aggregate` wrapped the result in another
+    // `AggregateOverInput` (e.g. `materialize_feeds` for a computed input
+    // alongside a `Utf8` key).
+    rename_aggregate_output_fields(&mut aggregate, &original_schema);
     Ok(PhysicalPlan::AggregateOverInput {
         input: Box::new(child),
         table,
