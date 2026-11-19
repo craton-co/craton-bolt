@@ -824,15 +824,8 @@ fn diff_groupby_multi_sum() {
 //   * DISTINCT on a Utf8 column (host-side dedup with `RowKeyValue::Utf8`).
 //   * Compound predicate that mixes string equality with a numeric range
 //     — exercises the rewriter recursing through `AND`.
-//
-// NOT covered here: `GROUP BY <Utf8 column>`. The executor currently
-// rejects with `"Utf8 GROUP BY keys not yet supported"` (see
-// `src/exec/groupby_with_pre.rs` and `src/exec/groupby.rs`), so a diff
-// test would panic on the Bolt side rather than exercise the comparison
-// path. The H8 review's "GROUP BY string" slot is substituted with the
-// `s <> 'lit'` (inequality) case below — same rewriter, opposite
-// constant-fold branch — so the dictionary path still gets two-shape
-// coverage. Promote the GROUP BY case here the moment that error lifts.
+//   * `GROUP BY <Utf8 column>` with `COUNT(*)`, `SUM(expr)`, and optional
+//     `WHERE` filter.
 //
 // Gating: `#[ignore = "gpu:string"]` per the H8 review ask. Run on
 // a GPU host with:
@@ -1038,6 +1031,93 @@ fn diff_window_frames_and_null_semantics() {
                 name: "t",
                 ddl_cols: "k INTEGER NOT NULL, v DOUBLE",
                 batch: t_with_nulls(256),
+            }],
+        );
+    }
+}
+
+/// `GROUP BY <Utf8>` and multi-column `GROUP BY` with `WHERE` + computed
+/// pre-projection expressions against DuckDB (including `q2_region_category_rev`).
+#[test]
+#[ignore = "gpu:e2e"]
+fn diff_multicol_and_utf8_groupby_with_pre() {
+    let s_batch = t_strings(512);
+    for (i, sql) in [
+        "SELECT s, COUNT(*) AS c, SUM(v * 2) AS sv FROM t GROUP BY s ORDER BY s",
+        "SELECT s, COUNT(*) AS c, SUM(v + 5) AS sv FROM t WHERE v > 10 GROUP BY s ORDER BY s",
+    ]
+    .iter()
+    .enumerate()
+    {
+        diff_query(
+            &format!("diff_utf8_groupby_with_pre[{i}]"),
+            sql,
+            &[TableSpec {
+                name: "t",
+                ddl_cols: "s VARCHAR NOT NULL, v BIGINT NOT NULL",
+                batch: s_batch.clone(),
+            }],
+        );
+    }
+
+    let n = 1024usize;
+    let region_id: Vec<i32> = (0..n).map(|i| (i % 5) as i32).collect();
+    let category_id: Vec<i32> = (0..n).map(|i| ((i / 3) % 7) as i32).collect();
+    let tier_id: Vec<i32> = (0..n).map(|i| (i % 3) as i32).collect();
+    let order_day: Vec<i32> = (0..n).map(|i| ((i * 37) % 1800) as i32).collect();
+    let quantity: Vec<i32> = (0..n).map(|i| ((i % 9) + 1) as i32).collect();
+    let price: Vec<f64> = (0..n).map(|i| 10.0 + ((i % 19) as f64) * 1.5).collect();
+    let discount: Vec<f64> = (0..n).map(|i| ((i * 5) % 25) as f64).collect();
+    let q2_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("region_id", ArrowDataType::Int32, false),
+        ArrowField::new("category_id", ArrowDataType::Int32, false),
+        ArrowField::new("tier_id", ArrowDataType::Int32, false),
+        ArrowField::new("order_day", ArrowDataType::Int32, false),
+        ArrowField::new("quantity", ArrowDataType::Int32, false),
+        ArrowField::new("price", ArrowDataType::Float64, false),
+        ArrowField::new("discount", ArrowDataType::Float64, false),
+    ]));
+    let q2_batch = RecordBatch::try_new(
+        q2_schema,
+        vec![
+            Arc::new(Int32Array::from(region_id)),
+            Arc::new(Int32Array::from(category_id)),
+            Arc::new(Int32Array::from(tier_id)),
+            Arc::new(Int32Array::from(order_day)),
+            Arc::new(Int32Array::from(quantity)),
+            Arc::new(Float64Array::from(price)),
+            Arc::new(Float64Array::from(discount)),
+        ],
+    )
+    .unwrap();
+
+    for (i, sql) in [
+        "SELECT region_id, category_id, \
+                SUM(quantity * price * (1.0 - discount / 100.0)) AS gross_revenue, \
+                AVG(price) AS avg_price, \
+                COUNT(*) AS order_lines \
+         FROM sales \
+         WHERE order_day >= 365 AND order_day < 1460 \
+         GROUP BY region_id, category_id \
+         ORDER BY region_id, category_id",
+        "SELECT region_id, category_id, tier_id, \
+                SUM(quantity * price) AS rev, \
+                COUNT(*) AS cnt \
+         FROM sales \
+         WHERE order_day >= 500 \
+         GROUP BY region_id, category_id, tier_id \
+         ORDER BY region_id, category_id, tier_id",
+    ]
+    .iter()
+    .enumerate()
+    {
+        diff_query(
+            &format!("diff_q2_multicol_groupby[{i}]"),
+            sql,
+            &[TableSpec {
+                name: "sales",
+                ddl_cols: "region_id INTEGER NOT NULL, category_id INTEGER NOT NULL, tier_id INTEGER NOT NULL, order_day INTEGER NOT NULL, quantity INTEGER NOT NULL, price DOUBLE NOT NULL, discount DOUBLE NOT NULL",
+                batch: q2_batch.clone(),
             }],
         );
     }

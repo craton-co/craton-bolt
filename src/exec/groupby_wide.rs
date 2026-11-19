@@ -2397,4 +2397,89 @@ mod tests {
         assert_eq!(out.num_rows(), 0);
         assert_eq!(out.num_columns(), 7);
     }
+
+    #[test]
+    fn sum_int64_overflow_errors_and_decimal_date_count_star_work() {
+        let ov_batch = build_two_key_batch(&[(1, 2, i64::MAX), (1, 2, 1)]);
+        let ov_plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO {
+                        name: "a".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColumnIO {
+                        name: "b".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColumnIO {
+                        name: "v".into(),
+                        dtype: DataType::Int64,
+                    },
+                ],
+                group_by: vec![0, 1],
+                aggregates: vec![AggregateExpr::Sum(Expr::Column("v".into()))],
+                output_schema: Schema::new(vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("b", DataType::Int64, false),
+                    Field::new("sum_v", DataType::Int64, true),
+                ]),
+                input_has_validity: Vec::new(),
+            },
+        };
+        match execute_groupby_wide(&ov_plan, &ov_batch) {
+            Err(BoltError::Type(msg)) => assert!(msg.contains("SUM(integer) overflow")),
+            other => panic!("expected SUM(integer) overflow, got {other:?}"),
+        }
+
+        // Decimal128 + Date32 composite key with COUNT(*) literal and SUM(Decimal128).
+        let dec = Decimal128Array::from(vec![1025i128, 1025, 2050])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let d = Date32Array::from(vec![19_700, 19_700, 19_701]);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("dec", ArrowDataType::Decimal128(10, 2), false),
+                ArrowField::new("d", ArrowDataType::Date32, false),
+            ])),
+            vec![Arc::new(dec) as ArrayRef, Arc::new(d) as ArrayRef],
+        )
+        .unwrap();
+        let plan = PhysicalPlan::Aggregate {
+            table: "t".into(),
+            pre: None,
+            aggregate: AggregateSpec {
+                inputs: vec![
+                    ColumnIO {
+                        name: "dec".into(),
+                        dtype: DataType::Decimal128(10, 2),
+                    },
+                    ColumnIO {
+                        name: "d".into(),
+                        dtype: DataType::Date32,
+                    },
+                ],
+                group_by: vec![0, 1],
+                aggregates: vec![
+                    AggregateExpr::Sum(Expr::Column("dec".into())),
+                    AggregateExpr::Count(Expr::Literal(Literal::Int64(1))),
+                ],
+                output_schema: Schema::new(vec![
+                    Field::new("dec", DataType::Decimal128(10, 2), false),
+                    Field::new("d", DataType::Date32, false),
+                    Field::new("sum_dec", DataType::Decimal128(38, 2), true),
+                    Field::new("cnt", DataType::Int64, false),
+                ]),
+                input_has_validity: Vec::new(),
+            },
+        };
+        let out = execute_groupby_wide(&plan, &batch).expect("decimal+date wide groupby");
+        assert_eq!(out.num_rows(), 2);
+        let sums = out.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(sums.value(0), 2050);
+        assert_eq!(sums.value(1), 2050);
+        assert_eq!(col_i64(&out, 3), vec![2, 1]);
+    }
 }

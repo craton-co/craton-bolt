@@ -1087,4 +1087,57 @@ mod tests {
         assert_eq!(unique_count(&[1, 1, 1]), 1);
         assert_eq!(unique_count(&[1, 2, 3, 2, 1]), 3);
     }
+
+    #[test]
+    fn pack_keys_bool_date32_timestamp_and_decimal128_routing() {
+        let two = spec(
+            vec![("flag", DataType::Bool), ("day", DataType::Date32)],
+            vec![0, 1],
+        );
+        let b_batch = two_col_batch(
+            "flag",
+            Arc::new(BooleanArray::from(vec![true, false, true])) as ArrayRef,
+            "day",
+            Arc::new(Date32Array::from(vec![19_700, -5, 0])) as ArrayRef,
+        );
+        let packed = pack_keys(&two, &b_batch).expect("pack (Bool, Date32)");
+        assert_eq!(
+            decode_key(packed.keys_i64[0], &packed.components),
+            vec![KeyValue::Bool(true), KeyValue::Date32(19_700)]
+        );
+        assert_eq!(
+            decode_key(packed.keys_i64[1], &packed.components),
+            vec![KeyValue::Bool(false), KeyValue::Date32(-5)]
+        );
+
+        let ts_spec = spec(
+            vec![("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC")))],
+            vec![0],
+        );
+        let ts_batch = one_col_batch(
+            "ts",
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_700_000_000_000_000i64, -42])
+                    .with_timezone("UTC"),
+            ) as ArrayRef,
+        );
+        let ts_packed = pack_keys(&ts_spec, &ts_batch).expect("pack Timestamp");
+        assert_eq!(
+            decode_key(ts_packed.keys_i64[1], &ts_packed.components),
+            vec![KeyValue::Timestamp(-42)]
+        );
+
+        // Decimal128 exceeds 64 bits so `pack_keys` signals `> 64 bits` for wide-key routing.
+        let dec_spec = spec(vec![("d", DataType::Decimal128(10, 2))], vec![0]);
+        let dec_batch = one_col_batch(
+            "d",
+            Arc::new(
+                arrow_array::Decimal128Array::from(vec![100i128])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ) as ArrayRef,
+        );
+        let err = pack_keys(&dec_spec, &dec_batch).expect_err("Decimal128 routes to wide");
+        assert!(format!("{err}").contains("> 64 bits"));
+    }
 }

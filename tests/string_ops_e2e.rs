@@ -454,7 +454,33 @@ fn select_concat_column_with_literal_returns_suffixed_strings() {
 //                 — `SELECT s FROM t WHERE s LIKE 'foo%'`.
 // TODO(post-0.3): where_like_with_escape
 //                 — `WHERE s LIKE 'a\_b' ESCAPE '\'`.
-// TODO(post-0.3): group_by_string_column_execute
-//                 — `SELECT s, COUNT(*) FROM t GROUP BY s` (parse is asserted
-//                 above; execution will land once `Utf8 GROUP BY keys not
-//                 yet supported` lifts in `groupby_with_pre.rs`).
+
+#[test]
+#[ignore = "gpu:string"]
+fn group_by_string_column_execute() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use craton_bolt::Engine;
+
+    let mut engine = Engine::new().expect("ctx");
+    let s = StringArray::from(vec!["beta", "alpha", "beta", "gamma", "alpha", "beta"]);
+    let v = Int64Array::from(vec![10, 20, 30, 40, 50, 60]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", ArrowDataType::Utf8, false),
+        ArrowField::new("v", ArrowDataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(s), Arc::new(v)]).unwrap();
+    engine.register_table("t", batch).expect("register");
+
+    let out = engine
+        .sql("SELECT s, COUNT(*) AS cnt, SUM(v * 2) AS total FROM t GROUP BY s ORDER BY s")
+        .expect("execute GROUP BY Utf8 with computed SUM and COUNT(*)")
+        .into_record_batch();
+    let out_s = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let out_c = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let out_tot = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    let got_s: Vec<&str> = (0..out.num_rows()).map(|i| out_s.value(i)).collect();
+    assert_eq!(got_s, vec!["alpha", "beta", "gamma"]);
+    assert_eq!(out_c.values(), &[2, 3, 1]);
+    assert_eq!(out_tot.values(), &[140, 200, 80]);
+}
