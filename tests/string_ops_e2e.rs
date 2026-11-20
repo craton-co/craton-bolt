@@ -476,7 +476,11 @@ fn group_by_string_column_execute() {
         .sql("SELECT s, COUNT(*) AS cnt, SUM(v * 2) AS total FROM t GROUP BY s ORDER BY s")
         .expect("execute GROUP BY Utf8 with computed SUM and COUNT(*)")
         .into_record_batch();
-    let out_s = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let out_s = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     let out_c = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
     let out_tot = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
     let got_s: Vec<&str> = (0..out.num_rows()).map(|i| out_s.value(i)).collect();

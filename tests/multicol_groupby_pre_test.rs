@@ -11,7 +11,9 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
+};
 use craton_bolt::plan::{
     lower_physical, parse_sql, DataType, Field, MemTableProvider, PhysicalPlan, Schema,
 };
@@ -138,12 +140,36 @@ fn e2e_q2_region_category_rev_exact_benchmark_query() {
     use craton_bolt::Engine;
 
     let batch = build_q2_sales_batch(4_096);
-    let r_col = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let c_col = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-    let d_col = batch.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-    let q_col = batch.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
-    let p_col = batch.column(4).as_any().downcast_ref::<Float64Array>().unwrap();
-    let disc_col = batch.column(5).as_any().downcast_ref::<Float64Array>().unwrap();
+    let r_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let c_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let d_col = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let q_col = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let p_col = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let disc_col = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
 
     let mut expected: HashMap<(i32, i32), (f64, f64, i64)> = HashMap::new();
     for i in 0..batch.num_rows() {
@@ -180,8 +206,16 @@ fn e2e_q2_region_category_rev_exact_benchmark_query() {
 
     let out_r = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
     let out_c = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-    let out_rev = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let out_avg = out.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
+    let out_rev = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let out_avg = out
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     let out_cnt = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
 
     for (row, &key) in want_keys.iter().enumerate() {
@@ -222,7 +256,9 @@ fn e2e_multicol_count_star_without_where_and_pg_bolt_int32_float64_key() {
         vec![
             Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2, 2])) as ArrayRef,
             Arc::new(Float64Array::from(vec![0.05, 0.05, 0.10, 0.05, 0.10, -0.0])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![100.0, 200.0, 50.0, 80.0, 120.0, 40.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                100.0, 200.0, 50.0, 80.0, 120.0, 40.0,
+            ])) as ArrayRef,
             Arc::new(Int32Array::from(vec![1, 1, 0, 1, 1, 1])) as ArrayRef,
         ],
     )
@@ -236,7 +272,11 @@ fn e2e_multicol_count_star_without_where_and_pg_bolt_int32_float64_key() {
         .expect("bare multicol COUNT(*)");
     let b_out = bare.record_batch();
     assert_eq!(b_out.num_rows(), 3);
-    let cnts = b_out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    let cnts = b_out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(cnts.values(), &[1, 2, 3]);
 
     let wide_float = engine
@@ -248,10 +288,26 @@ fn e2e_multicol_count_star_without_where_and_pg_bolt_int32_float64_key() {
     let wf_out = wide_float.record_batch();
     // Surviving rows for active=1: (1, 0.05)x2, (2, 0.0), (2, 0.05), (2, 0.10) -> 4 groups.
     assert_eq!(wf_out.num_rows(), 4);
-    let wf_r = wf_out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let wf_tax = wf_out.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-    let wf_net = wf_out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let wf_n = wf_out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+    let wf_r = wf_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let wf_tax = wf_out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let wf_net = wf_out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let wf_n = wf_out
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(wf_r.values(), &[1, 2, 2, 2]);
     assert!((wf_tax.value(0) - 0.05).abs() < 1e-12);
     assert!((wf_net.value(0) - 285.0).abs() < 1e-9);
@@ -281,7 +337,9 @@ fn e2e_mixed_keys_three_cols_high_card_and_sentinel_collision() {
             Arc::new(Int32Array::from(vec![i32::MIN, i32::MIN, 1, 1, 2])) as ArrayRef,
             Arc::new(Int64Array::from(vec![100, 100, 200, 300, 200])) as ArrayRef,
             Arc::new(Int32Array::from(vec![0, 0, 5, 5, 6])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["east", "east", "west", "west", "east"])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                "east", "east", "west", "west", "east",
+            ])) as ArrayRef,
             Arc::new(Float64Array::from(vec![10.0, 15.0, 20.0, 99.0, 30.0])) as ArrayRef,
             Arc::new(Int32Array::from(vec![1, 1, 1, 0, 1])) as ArrayRef,
         ],
@@ -296,14 +354,28 @@ fn e2e_mixed_keys_three_cols_high_card_and_sentinel_collision() {
     let s_out = sent.record_batch();
     assert_eq!(s_out.num_rows(), 3);
     assert_eq!(
-        s_out.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values(),
+        s_out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
         &[i32::MIN, 1, 2]
     );
     assert_eq!(
-        s_out.column(1).as_any().downcast_ref::<Int32Array>().unwrap().values(),
+        s_out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
         &[0, 5, 6]
     );
-    let s_sums = s_out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let s_sums = s_out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert!((s_sums.value(0) - 50.0).abs() < 1e-9);
     assert!((s_sums.value(1) - 40.0).abs() < 1e-9);
     assert!((s_sums.value(2) - 60.0).abs() < 1e-9);
@@ -314,9 +386,21 @@ fn e2e_mixed_keys_three_cols_high_card_and_sentinel_collision() {
         .expect("(Int64, Utf8) with pre");
     let u_out = i64_utf8.record_batch();
     assert_eq!(u_out.num_rows(), 3);
-    let u_b64 = u_out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let u_lbl = u_out.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    let u_sum = u_out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let u_b64 = u_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let u_lbl = u_out
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let u_sum = u_out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert_eq!(u_b64.values(), &[100, 200, 200]);
     assert_eq!(u_lbl.value(0), "east");
     assert_eq!(u_lbl.value(1), "east");
@@ -372,9 +456,21 @@ fn e2e_mixed_keys_three_cols_high_card_and_sentinel_collision() {
         .expect("high-card 2-key Tier-2 with pre")
         .into_record_batch();
     assert_eq!(hc_out.num_rows(), hc_expected.len());
-    let ok1 = hc_out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let ok2 = hc_out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-    let osum = hc_out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let ok1 = hc_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let ok2 = hc_out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let osum = hc_out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     for i in 0..hc_out.num_rows() {
         let want = hc_expected[&(ok1.value(i), ok2.value(i))];
         assert!((osum.value(i) - want).abs() < 1e-6);
@@ -430,7 +526,11 @@ fn e2e_temporal_bool_decimal_groupby_and_scalar_pre() {
     let bd = by_date.record_batch();
     assert_eq!(bd.num_rows(), 2);
     let bd_d = bd.column(1).as_any().downcast_ref::<Date32Array>().unwrap();
-    let bd_s = bd.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let bd_s = bd
+        .column(2)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
     assert_eq!(bd_d.values(), &[19_723, 19_724]);
     // (1, 19723): (10.50 + 20.25) * 2 = 61.50 -> 6150; (2, 19724): 30.00 * 2 = 60.00 -> 6000.
     assert_eq!(bd_s.value(0), 6150);
@@ -454,19 +554,35 @@ fn e2e_temporal_bool_decimal_groupby_and_scalar_pre() {
     let sc = scalar.record_batch();
     assert_eq!(sc.num_rows(), 1);
     assert_eq!(
-        sc.column(0).as_any().downcast_ref::<Decimal128Array>().unwrap().value(0),
+        sc.column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .value(0),
         12150
     );
     assert_eq!(
-        sc.column(1).as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+        sc.column(1)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap()
+            .value(0),
         19_723
     );
     assert_eq!(
-        sc.column(2).as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+        sc.column(2)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap()
+            .value(0),
         19_724
     );
     assert_eq!(
-        sc.column(3).as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+        sc.column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
         3
     );
 }
@@ -491,8 +607,13 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(vec![Some(1), Some(1), Some(1), Some(1), Some(1)]))
-                as ArrayRef,
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+            ])) as ArrayRef,
             Arc::new(Int32Array::from(vec![
                 Some(10),
                 Some(10),
@@ -500,8 +621,13 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
                 Some(20),
                 None,
             ])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![Some(10.0), None, None, None, Some(999.0)]))
-                as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(10.0),
+                None,
+                None,
+                None,
+                Some(999.0),
+            ])) as ArrayRef,
             Arc::new(Int32Array::from(vec![1, 1, 1, 1, 1])) as ArrayRef,
         ],
     )
@@ -516,14 +642,28 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
         .expect("nulls multicol with pre")
         .into_record_batch();
     assert_eq!(out.num_rows(), 2);
-    let s_col = out.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let a_col = out.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
+    let s_col = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let a_col = out
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     let cv_col = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
     let cs_col = out.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(!s_col.is_null(0) && (s_col.value(0) - 20.0).abs() < 1e-9);
-    assert!(s_col.is_null(1), "all-NULL group must surface SQL NULL for SUM");
+    assert!(
+        s_col.is_null(1),
+        "all-NULL group must surface SQL NULL for SUM"
+    );
     assert!(!a_col.is_null(0) && (a_col.value(0) - 10.0).abs() < 1e-9);
-    assert!(a_col.is_null(1), "all-NULL group must surface SQL NULL for AVG");
+    assert!(
+        a_col.is_null(1),
+        "all-NULL group must surface SQL NULL for AVG"
+    );
     assert_eq!(cv_col.values(), &[1, 0]);
     assert_eq!(cs_col.values(), &[2, 2]);
 
@@ -569,7 +709,10 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
                     "unexpected overflow message for `{sql}`: {msg}"
                 );
             }
-            Ok(h) => panic!("expected SUM(integer) overflow for `{sql}`, got {:?}", h.record_batch()),
+            Ok(h) => panic!(
+                "expected SUM(integer) overflow for `{sql}`, got {:?}",
+                h.record_batch()
+            ),
             Err(other) => panic!("expected BoltError::Type for `{sql}`, got {other:?}"),
         }
     }

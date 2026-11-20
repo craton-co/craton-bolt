@@ -412,16 +412,16 @@ Still **rejected**: `COUNT(DISTINCT *)`, `COUNT(DISTINCT a, b)`, `COUNT(DISTINCT
 GROUP BY <expr_list>
 ```
 
-Supported key shapes:
+Supported key shapes (both bare-column scans and queries with a `WHERE` filter or computed pre-aggregation expressions):
 
-- **Single column**: any of `Int32`, `Int64`, `Float32`, `Float64`.
+- **Single column**: `Int32`, `Int64`, `Float32`, `Float64`, `Bool`, `Date32`, `Timestamp` (unit and timezone preserved), `Decimal128(p, s)`, and `Utf8`.
 - **Two columns** whose combined width fits in 64 bits:
-  - `(Int32, Int32)`, `(Int32, Float32)`, `(Float32, Float32)`. Packed into one i64 host-side.
-- **Three or more columns**, or pairs wider than 64 bits (e.g. `(Int64, Int64)`): host-side reduction fallback. Correct but doesn't use the GPU hash table.
+  - Any pair drawn from `{Int32, Float32, Bool, Date32}` (plus `Utf8` via lex-ranked `Int32` dictionary codes). Packed losslessly into one `i64` host-side and executed on the GPU (including the two-key Tier-2 hash-partitioned fast paths where applicable).
+- **Three or more columns**, pairs wider than 64 bits (e.g. `(Int64, Int64)`, `(Int32, Float64)`, `(Int64, Utf8)`), or `Decimal128` keys: host-side wide-tuple reduction fallback (`groupby_wide`).
 
-Float keys: bitwise grouping AFTER signed-zero canonicalisation (`canonicalise(f).to_bits() as i64`, where `canonicalise(x) = if x == 0.0 { 0.0 } else { x }`). `-0.0` and `+0.0` collapse to ONE group (matches SQL/IEEE and DuckDB — review C12). DISTINCT and JOIN apply the same canonicalisation so the three operators agree on float equivalence. NaN bit patterns are LEFT AS-IS (`NaN != NaN` per IEEE/SQL standard; DuckDB does the same), so different NaN payloads still group separately. The classic GPU path rejects keys that encode to `i64::MIN`; after canonicalisation `-0.0` packs to `+0.0` (bits `0`), removing the historical sentinel collision for the headline case. The sentinel-free `groupby_valid` path remains the safety net for any other dtype where the encoded bits happen to collide with `i64::MIN`.
+Float keys: bitwise grouping AFTER signed-zero and NaN canonicalisation (`canonicalise(f).to_bits()`), where `-0.0` folds to `+0.0` and all NaN payloads fold to a single canonical quiet NaN so all NaN keys collapse into one group (matching DuckDB). `DISTINCT` and `GROUP BY` share the same float equivalence relation. Any packed 64-bit key that collides with the classic kernel's `i64::MIN` empty-slot sentinel (for example `Int64` `i64::MIN` or packed `(i32::MIN, 0)`) or `i64::MAX` NULL-group sentinel routes automatically to the sentinel-free `groupby_valid` GPU executor.
 
-Utf8 keys: not yet supported. Would need a dictionary-aware GROUP BY codegen path.
+Utf8 keys: dictionary-encoded per query into lex-ranked `Int32` codes and executed through the integer `GROUP BY` pipeline (1-key, 2-key packed, or `3+`-key wide), then decoded back to `Utf8` on output; queries combining `Utf8` keys with `WHERE` filters or computed aggregate expressions materialise their pre-stage feeds first via `AggregateOverInput`.
 
 Output ordering: groups are sorted by encoded key for determinism. (Float bit-pattern order, which is NOT the same as numeric order — `-1.0` sorts after `+0.0` in output. Acceptable for a deterministic-but-not-ANSI v1; an explicit `ORDER BY` re-sorts the final result.)
 

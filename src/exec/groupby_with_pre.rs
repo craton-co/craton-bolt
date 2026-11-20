@@ -632,7 +632,13 @@ fn to_expr_host(c: &HostCol) -> expr_agg::HostColumn {
             let lifted = values
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| if valid_at(i) { Some((v as f64) / pow) } else { None })
+                .map(|(i, &v)| {
+                    if valid_at(i) {
+                        Some((v as f64) / pow)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             expr_agg::HostColumn::F64(lifted)
         }
@@ -1207,7 +1213,9 @@ fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
 #[cfg(test)]
 mod null_propagation_tests {
     use super::*;
-    use crate::exec::groupby_common::{download_pinned_f64, download_pinned_i32, download_pinned_i64};
+    use crate::exec::groupby_common::{
+        download_pinned_f64, download_pinned_i32, download_pinned_i64,
+    };
 
     #[test]
     fn host_col_compact_validity_alignment() {

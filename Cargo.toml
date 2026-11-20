@@ -18,7 +18,7 @@ categories   = ["database", "compilers"]
 # a dedicated CI matrix leg and pinned by the `msrv_is_consistent_across_repo`
 # document-consistency test, so this value cannot drift from the gate again.
 rust-version = "1.85"
-exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "bolt_continue_prompt.md", "reviews", "reviews/*"]
+exclude      = ["target/*", ".idea/*", ".github/*", ".cargo", ".cargo/*", "kernels/*", ".claude/*", "tests/snapshots/*", "benches/data/*", "bolt_continue_prompt.md", "reviews", "reviews/*", "docs/internal", "docs/internal/*"]
 
 # --- Workspace shim ---------------------------------------------------------
 #
