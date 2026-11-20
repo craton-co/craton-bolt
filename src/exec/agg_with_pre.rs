@@ -134,12 +134,13 @@ pub fn execute_aggregate_with_pre(
             )
         })
     {
-        let (rewritten_plan, pre_batch) = crate::exec::groupby_with_pre::materialize_pre_stage_batch(
-            table,
-            pre_spec,
-            aggregate,
-            table_batch,
-        )?;
+        let (rewritten_plan, pre_batch) =
+            crate::exec::groupby_with_pre::materialize_pre_stage_batch(
+                table,
+                pre_spec,
+                aggregate,
+                table_batch,
+            )?;
         return crate::exec::aggregate::execute_aggregate(&rewritten_plan, &pre_batch);
     }
 

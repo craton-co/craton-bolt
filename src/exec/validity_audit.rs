@@ -45,9 +45,9 @@
 //! |-----------------------------------------------|-----------------------------|-------------|----------------------------|------------------------|------------|------------------------------|
 //! | `aggregate.rs` (scalar, no GROUP BY)          | native (`bolt_reduce_with_validity`) | native      | native (tree-reduce, no atomics) | host-count            | row count  | host-strip values + GPU count |
 //! | `agg_with_pre.rs` (scalar w/ pre-kernel)      | host-strip                  | host-strip  | host-strip                 | host-count (`non_null_count`) | row count | host-strip + fused count     |
-//! | `groupby_valid.rs` (single-key, sentinel-free)| native (`*_valid_with_validity`) | native      | native (`valid_flag_float` `_with_validity`) | value-NULL mask + count | drop-key count | native SUM + value-NULL count |
-//! | `groupby_with_pre.rs` (single-key w/ pre)     | native (`*_with_validity`)  | native      | host-strip (no float MIN/MAX companion) | host-strip count | drop-key count | host-strip + count          |
-//! | `groupby.rs` (single-key, classic sentinel)   | native where companion exists; else host-strip | native | host-strip | value-NULL mask | drop-key count | mixed |
+//! | `groupby_valid.rs` (1/2-key, sentinel-free)   | native (`*_valid_with_validity`) | native      | native (`valid_flag_float` `_with_validity`) | value-NULL mask + count | drop-key count | native SUM + value-NULL count |
+//! | `groupby_with_pre.rs` (pre-kernel + GROUP BY) | materialises post-filter `RecordBatch` w/ per-column `NullBuffer`s, then delegates to `groupby.rs` ||||||
+//! | `groupby.rs` (1/2-key, classic sentinel)      | native where companion exists; else host-strip | native | host-strip | value-NULL mask | drop-key count | mixed |
 //! | `extended_agg.rs` (Bool / Utf8 scalar)        | n/a                         | n/a         | n/a                        | host-count            | row count  | n/a                          |
 //! | `filter.rs` (predicate / projection)          | validity AND-tree per output via `KernelSpec::{input,output}_has_validity` (see `ptx_gen`) ||||||
 //!

@@ -280,7 +280,13 @@ pub(crate) fn load_key_column_bits(
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| downcast_err(&key_io.name, "Bool"))?;
             (0..ba.len())
-                .map(|i| if !ba.is_null(i) && ba.value(i) { 1u64 } else { 0u64 })
+                .map(|i| {
+                    if !ba.is_null(i) && ba.value(i) {
+                        1u64
+                    } else {
+                        0u64
+                    }
+                })
                 .collect()
         }
         DataType::Date32 => {
@@ -1111,7 +1117,10 @@ mod tests {
         );
 
         let ts_spec = spec(
-            vec![("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC")))],
+            vec![(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+            )],
             vec![0],
         );
         let ts_batch = one_col_batch(

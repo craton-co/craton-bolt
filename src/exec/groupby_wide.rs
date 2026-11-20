@@ -762,9 +762,7 @@ impl AggInputValue {
                     0.0
                 }
             }
-            AggInputValue::Decimal128 { raw, scale } => {
-                (raw as f64) / 10f64.powi(scale as i32)
-            }
+            AggInputValue::Decimal128 { raw, scale } => (raw as f64) / 10f64.powi(scale as i32),
             AggInputValue::CountRow => 1.0,
         }
     }
@@ -2477,7 +2475,11 @@ mod tests {
         };
         let out = execute_groupby_wide(&plan, &batch).expect("decimal+date wide groupby");
         assert_eq!(out.num_rows(), 2);
-        let sums = out.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        let sums = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
         assert_eq!(sums.value(0), 2050);
         assert_eq!(sums.value(1), 2050);
         assert_eq!(col_i64(&out, 3), vec![2, 1]);

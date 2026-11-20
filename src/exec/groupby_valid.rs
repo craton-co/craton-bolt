@@ -2713,9 +2713,9 @@ fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
         (Scalars::I64(v), DataType::Timestamp(unit, tz)) => {
             let tz_arc: Option<Arc<str>> = tz.map(Arc::from);
             match unit {
-                TimeUnit::Second => {
-                    Ok(Arc::new(TimestampSecondArray::from(v).with_timezone_opt(tz_arc)) as ArrayRef)
-                }
+                TimeUnit::Second => Ok(Arc::new(
+                    TimestampSecondArray::from(v).with_timezone_opt(tz_arc),
+                ) as ArrayRef),
                 TimeUnit::Millisecond => Ok(Arc::new(
                     TimestampMillisecondArray::from(v).with_timezone_opt(tz_arc),
                 ) as ArrayRef),
