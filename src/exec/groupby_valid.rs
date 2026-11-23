@@ -256,6 +256,9 @@ pub fn execute_groupby_valid(
     // to distinct i64s. The KEY DIFFERENCE versus `execute_groupby` is that
     // we do NOT validate-out the `i64::MIN` value — any i64 is legal here.
     let packed = pack_keys(aggregate, table_batch)?;
+    if packed.key_valid.is_some() {
+        return crate::exec::groupby_wide::execute_groupby_wide(plan, table_batch);
+    }
     let key_components = packed.components;
     let key_valid = packed.key_valid;
 
