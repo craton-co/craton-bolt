@@ -1121,4 +1121,56 @@ fn diff_multicol_and_utf8_groupby_with_pre() {
             }],
         );
     }
+
+    // Nullable multi-column GROUP BY (Int32, VARCHAR) with NULL keys + WHERE + SUM/AVG/COUNT
+    // must match DuckDB's SQL-standard NULL-grouping row-for-row.
+    let nk_batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("g1", ArrowDataType::Int32, true),
+            ArrowField::new("g2", ArrowDataType::Utf8, true),
+            ArrowField::new("v", ArrowDataType::Float64, true),
+            ArrowField::new("keep", ArrowDataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                None,
+                None,
+                None,
+                Some(2),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("x"),
+                None,
+                None,
+                Some("x"),
+                None,
+                None,
+                Some("y"),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(10.0),
+                Some(20.0),
+                Some(30.0),
+                Some(40.0),
+                None,
+                None,
+                Some(99.0),
+            ])),
+            Arc::new(Int32Array::from(vec![1, 1, 1, 1, 1, 1, 0])),
+        ],
+    )
+    .unwrap();
+    diff_query(
+        "diff_multicol_null_group_keys_with_pre",
+        "SELECT g1, g2, SUM(v * 2.0) AS s, AVG(v) AS a, COUNT(v) AS cv, COUNT(*) AS cs \
+         FROM nk WHERE keep = 1 GROUP BY g1, g2",
+        &[TableSpec {
+            name: "nk",
+            ddl_cols: "g1 INTEGER, g2 VARCHAR, v DOUBLE, keep INTEGER NOT NULL",
+            batch: nk_batch,
+        }],
+    );
 }

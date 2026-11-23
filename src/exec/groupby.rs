@@ -488,13 +488,10 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
         ));
     }
 
-    // Review C7: pre-flight scan each GROUP BY key column for the classic
-    // kernel's empty-slot sentinel (`i64::MIN`). If any Int64 input
-    // legitimately contains that value the row would silently collide with
-    // the marker; route to the sentinel-free valid-flag executor before
-    // we waste time encoding + uploading. The post-encoding scan below
-    // remains as a safety net for the Float64 `-0.0` case (its bit pattern
-    // also encodes to `i64::MIN`).
+    // Pre-flight scan each GROUP BY key column for NULLs and the classic
+    // kernel's empty-slot sentinel (`i64::MIN`).
+    let mut any_key_has_nulls = false;
+    let mut sentinel_col: Option<&str> = None;
     for &ord in &aggregate.group_by {
         let io = aggregate.inputs.get(ord).ok_or_else(|| {
             BoltError::Plan(format!(
@@ -510,15 +507,27 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
             ))
         })?;
         let key_array: &dyn Array = table_batch.column(col_idx).as_ref();
-        if key_array_contains_sentinel(key_array)? {
-            log::warn!(
-                "execute_groupby: GROUP BY key '{}' contains i64::MIN \
-                 (classic-kernel empty-slot sentinel); routing to \
-                 sentinel-free valid-flag executor to preserve correctness",
-                io.name
-            );
-            return crate::exec::groupby_valid::execute_groupby_valid(plan, table_batch);
+        if key_array.null_count() > 0 {
+            any_key_has_nulls = true;
         }
+        if sentinel_col.is_none() && key_array_contains_sentinel(key_array)? {
+            sentinel_col = Some(io.name.as_str());
+        }
+    }
+    // Multi-column NULL keys (`(1, NULL)` vs `(NULL, 1)`) and sentinel+NULL
+    // combinations route to `groupby_wide`, which carries `Option<KeyValue>`
+    // per tuple slot and preserves SQL-standard NULL grouping.
+    if any_key_has_nulls && (aggregate.group_by.len() > 1 || sentinel_col.is_some()) {
+        return crate::exec::groupby_wide::execute_groupby_wide(plan, table_batch);
+    }
+    if let Some(col_name) = sentinel_col {
+        log::warn!(
+            "execute_groupby: GROUP BY key '{}' contains i64::MIN \
+             (classic-kernel empty-slot sentinel); routing to \
+             sentinel-free valid-flag executor to preserve correctness",
+            col_name
+        );
+        return crate::exec::groupby_valid::execute_groupby_valid(plan, table_batch);
     }
 
     // Encode all group-by columns into i64 keys (host-side packing). If the
@@ -583,12 +592,7 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
             .zip(mask.iter())
             .any(|(&k, &keep)| keep && k == NULL_GROUP_KEY);
         if genuine_hits_sentinel {
-            log::warn!(
-                "execute_groupby: a genuine GROUP BY key encodes to the reserved \
-                 NULL-group sentinel (i64::MAX); routing to valid-flag executor \
-                 (NULL group not synthesised on that path)"
-            );
-            return crate::exec::groupby_valid::execute_groupby_valid(plan, table_batch);
+            return crate::exec::groupby_wide::execute_groupby_wide(plan, table_batch);
         }
     }
 
@@ -838,8 +842,20 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
         arrays.push(arr);
     }
 
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
-    RecordBatch::try_new(arrow_schema, arrays)
+    let base_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let fields: Vec<arrow_schema::FieldRef> = base_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if !f.is_nullable() && arrays.get(i).is_some_and(|a| a.null_count() > 0) {
+                Arc::new(f.as_ref().clone().with_nullable(true))
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays)
         .map_err(|e| BoltError::Other(format!("failed to build GROUP BY RecordBatch: {e}")))
 }
 

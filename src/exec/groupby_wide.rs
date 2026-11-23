@@ -60,6 +60,7 @@ use arrow_array::{
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
+use crate::exec::groupby_common::{canonicalise_f32, canonicalise_f64};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Literal, Schema, TimeUnit};
 use crate::plan::physical_plan::{AggregateSpec, PhysicalPlan};
 
@@ -133,38 +134,29 @@ pub fn execute_groupby_wide(
     // insert per group rather than re-deriving the dtype matrix each time.
     let fresh_accs = make_initial_accumulators(&agg_plan)?;
     // Reusable scratch buffer for the per-row tuple build.
-    let mut buf_key: Vec<KeyValue> = Vec::with_capacity(key_cols.len());
+    let mut buf_key: Vec<Option<KeyValue>> = Vec::with_capacity(key_cols.len());
     // H1 NULL handling: precompute "any key column has nulls?" and "any
     // aggregate input has nulls?" once so the inner row loop stays
-    // branch-light when both are null-free (the common case). When either
-    // flag is set we fall back to per-row `is_null` probes on the relevant
-    // Arrow array via its validity bitmap.
+    // branch-light when both are null-free (the common case).
     //
-    // Lockstep semantics here:
-    //   - A row is DROPPED ENTIRELY when ANY group-by key column is NULL.
-    //     The narrow `groupby.rs` path does the same (`pack_keys`'s AND of
-    //     per-column key_valid masks); here we just short-circuit before
-    //     building the tuple key.
-    //   - Surviving rows feed each aggregate independently: an aggregate's
-    //     update is skipped only when that aggregate's own input is NULL.
-    //     This keeps SUM/MIN/MAX out of NULL slots, and makes
-    //     COUNT(col)/AVG denominator reflect the non-NULL count.
+    // SQL-standard NULL grouping:
+    //   - NULL in any group-by key column becomes `None` at that tuple slot,
+    //     so `(1, NULL)`, `(NULL, 1)`, and `(NULL, NULL)` each form their own
+    //     distinct group (`NULL IS NOT DISTINCT FROM NULL` per position).
+    //   - Rows feed each aggregate independently: an aggregate's update is
+    //     skipped only when that aggregate's own input is NULL.
     let any_key_nullable = key_cols.iter().any(|kc| kc.arr.null_count() > 0);
     let any_agg_nullable = agg_plan
         .iter()
         .any(|p| p.arr.is_some_and(|a| a.null_count() > 0));
     for row in 0..n_rows {
-        // Drop the row entirely if ANY group-by column is NULL at this row.
-        // We probe `is_null` on the Arrow array directly — `key_value_at`
-        // would otherwise read garbage at NULL slots via `pa.value(row)`,
-        // which ignores the validity bitmap.
-        if any_key_nullable && key_cols.iter().any(|kc| kc.arr.is_null(row)) {
-            continue;
-        }
-        // Build the tuple key for this row.
         buf_key.clear();
         for kc in &key_cols {
-            buf_key.push(key_value_at(kc, row)?);
+            if any_key_nullable && kc.arr.is_null(row) {
+                buf_key.push(None);
+            } else {
+                buf_key.push(Some(key_value_at(kc, row)?));
+            }
         }
         let tuple = TupleKey(buf_key.clone());
 
@@ -222,7 +214,7 @@ pub fn execute_groupby_wide(
         arrays.push(arr);
     }
 
-    let arrow_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+    let arrow_schema = build_output_arrow_schema(&aggregate.output_schema, &arrays)?;
     RecordBatch::try_new(arrow_schema, arrays)
         .map_err(|e| BoltError::Other(format!("failed to build wide GROUP BY RecordBatch: {e}")))
 }
@@ -267,9 +259,9 @@ enum KeyValue {
 }
 
 /// A composite key: the full per-row tuple across every group-by column, in
-/// `aggregate.group_by` order.
+/// `aggregate.group_by` order (`None` denotes SQL `NULL` at that key position).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TupleKey(Vec<KeyValue>);
+struct TupleKey(Vec<Option<KeyValue>>);
 
 /// Resolve each group-by ordinal to a [`KeyColumn`] borrowing into `batch`.
 fn resolve_key_columns<'a>(
@@ -431,42 +423,17 @@ fn key_value_at(kc: &KeyColumn<'_>, row: usize) -> BoltResult<KeyValue> {
     }
 }
 
-/// Canonicalise a float GROUP BY key: `-0.0 → +0.0` so signed-zero pairs key
-/// the same group (review C12), and every NaN bit pattern → a single canonical
-/// quiet NaN so all NaN keys collapse into one group, matching DuckDB (F3).
-/// Mirrors `groupby_common::canonicalise_f64` / `distinct.rs` so every GROUP
-/// BY / DISTINCT path agrees on the float equivalence relation.
-#[inline]
-fn canonicalise_f64(x: f64) -> f64 {
-    if x.is_nan() {
-        f64::NAN
-    } else if x == 0.0 {
-        0.0
-    } else {
-        x
-    }
-}
-
-/// `f32` analogue of [`canonicalise_f64`].
-#[inline]
-fn canonicalise_f32(x: f32) -> f32 {
-    if x.is_nan() {
-        f32::NAN
-    } else if x == 0.0 {
-        0.0
-    } else {
-        x
-    }
-}
-
-/// Total ordering over `TupleKey` for deterministic output. We compare
-/// position by position using a stable per-variant ordering; floats are
-/// ordered by their `u32`/`u64` bit pattern (consistent with how they hash).
+/// Total ordering over `TupleKey` for deterministic output (`NULLS LAST` per
+/// key position, matching `NULL_GROUP_KEY = i64::MAX` on the narrow path).
 fn cmp_tuple(a: &TupleKey, b: &TupleKey) -> std::cmp::Ordering {
-    // Tuples in the same group-by have identical length; debug-assert.
     debug_assert_eq!(a.0.len(), b.0.len());
     for (av, bv) in a.0.iter().zip(b.0.iter()) {
-        let ord = cmp_key_value(av, bv);
+        let ord = match (av, bv) {
+            (Some(x), Some(y)) => cmp_key_value(x, y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
@@ -789,11 +756,11 @@ impl AggInputValue {
 #[derive(Clone, Debug)]
 enum Accumulator {
     /// `SUM` over an integer input. Widened to i64 internally, checked on overflow.
-    SumI64 { total: i64 },
+    SumI64 { total: i64, seen: bool },
     /// `SUM` over a Decimal128 input. Checked on i128 overflow.
-    SumDecimal128 { total: i128 },
+    SumDecimal128 { total: i128, seen: bool },
     /// `SUM` over a float input. Widened to f64.
-    SumF64 { total: f64 },
+    SumF64 { total: f64, seen: bool },
     /// `MIN` over an Int32 / Date32 input.
     MinI32 { v: i32, seen: bool },
     /// `MIN` over an Int64 / Timestamp input.
@@ -833,13 +800,14 @@ impl Accumulator {
     /// Fold one row's value into the accumulator.
     fn update(&mut self, value: AggInputValue) -> BoltResult<()> {
         match self {
-            Accumulator::SumI64 { total } => {
+            Accumulator::SumI64 { total, seen } => {
                 let v = value.as_i64()?;
                 *total = total.checked_add(v).ok_or_else(|| {
                     BoltError::Type("SUM(integer) overflow: accumulator exceeds i64 range".into())
                 })?;
+                *seen = true;
             }
-            Accumulator::SumDecimal128 { total } => {
+            Accumulator::SumDecimal128 { total, seen } => {
                 if let AggInputValue::Decimal128 { raw, .. } = value {
                     *total = total.checked_add(raw).ok_or_else(|| {
                         BoltError::Type(
@@ -847,12 +815,14 @@ impl Accumulator {
                                 .into(),
                         )
                     })?;
+                    *seen = true;
                 } else {
                     return Err(variant_mismatch_err("SumDecimal128"));
                 }
             }
-            Accumulator::SumF64 { total } => {
+            Accumulator::SumF64 { total, seen } => {
                 *total += value.as_f64();
+                *seen = true;
             }
             Accumulator::MinI32 { v, seen } => {
                 if let AggInputValue::I32(x) = value {
@@ -1004,11 +974,20 @@ fn make_initial_accumulators(plan: &[AggInputPlan<'_>]) -> BoltResult<Vec<Accumu
     for p in plan {
         let acc = match (p.kind, p.dtype) {
             (AggKind::Sum, DataType::Int32) | (AggKind::Sum, DataType::Int64) => {
-                Accumulator::SumI64 { total: 0 }
+                Accumulator::SumI64 {
+                    total: 0,
+                    seen: false,
+                }
             }
-            (AggKind::Sum, DataType::Decimal128(_, _)) => Accumulator::SumDecimal128 { total: 0 },
+            (AggKind::Sum, DataType::Decimal128(_, _)) => Accumulator::SumDecimal128 {
+                total: 0,
+                seen: false,
+            },
             (AggKind::Sum, DataType::Float32) | (AggKind::Sum, DataType::Float64) => {
-                Accumulator::SumF64 { total: 0.0 }
+                Accumulator::SumF64 {
+                    total: 0.0,
+                    seen: false,
+                }
             }
             (AggKind::Min, DataType::Int32) | (AggKind::Min, DataType::Date32) => {
                 Accumulator::MinI32 {
@@ -1111,21 +1090,22 @@ fn build_key_arrays(
     let m = key_cols.len();
     let n = sorted.len();
 
-    // Per-column typed buffers.
     enum ColBuf {
-        I32(Vec<i32>),
-        I64(Vec<i64>),
-        F32(Vec<f32>),
-        F64(Vec<f64>),
-        Bool(Vec<bool>),
-        Date32(Vec<i32>),
+        I32(Vec<Option<i32>>, bool),
+        I64(Vec<Option<i64>>, bool),
+        F32(Vec<Option<f32>>, bool),
+        F64(Vec<Option<f64>>, bool),
+        Bool(Vec<Option<bool>>, bool),
+        Date32(Vec<Option<i32>>, bool),
         Timestamp {
-            vals: Vec<i64>,
+            vals: Vec<Option<i64>>,
+            has_null: bool,
             unit: TimeUnit,
             tz: Option<&'static str>,
         },
         Decimal128 {
-            vals: Vec<i128>,
+            vals: Vec<Option<i128>>,
+            has_null: bool,
             precision: u8,
             scale: i8,
         },
@@ -1134,19 +1114,21 @@ fn build_key_arrays(
     let mut buffers: Vec<ColBuf> = Vec::with_capacity(m);
     for kc in key_cols {
         match kc.dtype {
-            DataType::Int32 => buffers.push(ColBuf::I32(Vec::with_capacity(n))),
-            DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
-            DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
-            DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n))),
-            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n))),
+            DataType::Int32 => buffers.push(ColBuf::I32(Vec::with_capacity(n), false)),
+            DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n), false)),
+            DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n), false)),
+            DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n), false)),
+            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n), false)),
+            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n), false)),
             DataType::Timestamp(unit, tz) => buffers.push(ColBuf::Timestamp {
                 vals: Vec::with_capacity(n),
+                has_null: false,
                 unit,
                 tz,
             }),
             DataType::Decimal128(precision, scale) => buffers.push(ColBuf::Decimal128 {
                 vals: Vec::with_capacity(n),
+                has_null: false,
                 precision,
                 scale,
             }),
@@ -1169,14 +1151,54 @@ fn build_key_arrays(
         }
         for (buf, val) in buffers.iter_mut().zip(tuple.0.iter()) {
             match (buf, val) {
-                (ColBuf::I32(v), KeyValue::I32(x)) => v.push(*x),
-                (ColBuf::I64(v), KeyValue::I64(x)) => v.push(*x),
-                (ColBuf::F32(v), KeyValue::F32Bits(bits)) => v.push(f32::from_bits(*bits)),
-                (ColBuf::F64(v), KeyValue::F64Bits(bits)) => v.push(f64::from_bits(*bits)),
-                (ColBuf::Bool(v), KeyValue::Bool(x)) => v.push(*x),
-                (ColBuf::Date32(v), KeyValue::Date32(x)) => v.push(*x),
-                (ColBuf::Timestamp { vals, .. }, KeyValue::Timestamp(x)) => vals.push(*x),
-                (ColBuf::Decimal128 { vals, .. }, KeyValue::Decimal128(x)) => vals.push(*x),
+                (ColBuf::I32(v, _), Some(KeyValue::I32(x))) => v.push(Some(*x)),
+                (ColBuf::I32(v, hn), None) => {
+                    *hn = true;
+                    v.push(None);
+                }
+                (ColBuf::I64(v, _), Some(KeyValue::I64(x))) => v.push(Some(*x)),
+                (ColBuf::I64(v, hn), None) => {
+                    *hn = true;
+                    v.push(None);
+                }
+                (ColBuf::F32(v, _), Some(KeyValue::F32Bits(bits))) => {
+                    v.push(Some(f32::from_bits(*bits)))
+                }
+                (ColBuf::F32(v, hn), None) => {
+                    *hn = true;
+                    v.push(None);
+                }
+                (ColBuf::F64(v, _), Some(KeyValue::F64Bits(bits))) => {
+                    v.push(Some(f64::from_bits(*bits)))
+                }
+                (ColBuf::F64(v, hn), None) => {
+                    *hn = true;
+                    v.push(None);
+                }
+                (ColBuf::Bool(v, _), Some(KeyValue::Bool(x))) => v.push(Some(*x)),
+                (ColBuf::Bool(v, hn), None) => {
+                    *hn = true;
+                    v.push(None);
+                }
+                (ColBuf::Date32(v, _), Some(KeyValue::Date32(x))) => v.push(Some(*x)),
+                (ColBuf::Date32(v, hn), None) => {
+                    *hn = true;
+                    v.push(None);
+                }
+                (ColBuf::Timestamp { vals, .. }, Some(KeyValue::Timestamp(x))) => {
+                    vals.push(Some(*x))
+                }
+                (ColBuf::Timestamp { vals, has_null, .. }, None) => {
+                    *has_null = true;
+                    vals.push(None);
+                }
+                (ColBuf::Decimal128 { vals, .. }, Some(KeyValue::Decimal128(x))) => {
+                    vals.push(Some(*x))
+                }
+                (ColBuf::Decimal128 { vals, has_null, .. }, None) => {
+                    *has_null = true;
+                    vals.push(None);
+                }
                 _ => {
                     return Err(BoltError::Other(
                         "wide GROUP BY: internal — tuple variant mismatched key column dtype"
@@ -1190,27 +1212,67 @@ fn build_key_arrays(
     let mut out: Vec<ArrayRef> = Vec::with_capacity(m);
     for buf in buffers {
         match buf {
-            ColBuf::I32(v) => out.push(Arc::new(Int32Array::from(v)) as ArrayRef),
-            ColBuf::I64(v) => out.push(Arc::new(Int64Array::from(v)) as ArrayRef),
-            ColBuf::F32(v) => out.push(Arc::new(Float32Array::from(v)) as ArrayRef),
-            ColBuf::F64(v) => out.push(Arc::new(Float64Array::from(v)) as ArrayRef),
-            ColBuf::Bool(v) => out.push(Arc::new(BooleanArray::from(v)) as ArrayRef),
-            ColBuf::Date32(v) => out.push(Arc::new(Date32Array::from(v)) as ArrayRef),
-            ColBuf::Timestamp { vals, unit, tz } => {
-                out.push(timestamp_array_from_i64(vals, unit, tz))
-            }
+            ColBuf::I32(v, false) => out.push(Arc::new(Int32Array::from(
+                v.into_iter().map(|x| x.unwrap_or(0)).collect::<Vec<_>>(),
+            )) as ArrayRef),
+            ColBuf::I32(v, true) => out.push(Arc::new(Int32Array::from(v)) as ArrayRef),
+            ColBuf::I64(v, false) => out.push(Arc::new(Int64Array::from(
+                v.into_iter().map(|x| x.unwrap_or(0)).collect::<Vec<_>>(),
+            )) as ArrayRef),
+            ColBuf::I64(v, true) => out.push(Arc::new(Int64Array::from(v)) as ArrayRef),
+            ColBuf::F32(v, false) => out.push(Arc::new(Float32Array::from(
+                v.into_iter().map(|x| x.unwrap_or(0.0)).collect::<Vec<_>>(),
+            )) as ArrayRef),
+            ColBuf::F32(v, true) => out.push(Arc::new(Float32Array::from(v)) as ArrayRef),
+            ColBuf::F64(v, false) => out.push(Arc::new(Float64Array::from(
+                v.into_iter().map(|x| x.unwrap_or(0.0)).collect::<Vec<_>>(),
+            )) as ArrayRef),
+            ColBuf::F64(v, true) => out.push(Arc::new(Float64Array::from(v)) as ArrayRef),
+            ColBuf::Bool(v, false) => out.push(Arc::new(BooleanArray::from(
+                v.into_iter()
+                    .map(|x| x.unwrap_or(false))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef),
+            ColBuf::Bool(v, true) => out.push(Arc::new(BooleanArray::from(v)) as ArrayRef),
+            ColBuf::Date32(v, false) => out.push(Arc::new(Date32Array::from(
+                v.into_iter().map(|x| x.unwrap_or(0)).collect::<Vec<_>>(),
+            )) as ArrayRef),
+            ColBuf::Date32(v, true) => out.push(Arc::new(Date32Array::from(v)) as ArrayRef),
+            ColBuf::Timestamp {
+                vals,
+                has_null: false,
+                unit,
+                tz,
+            } => out.push(timestamp_array_from_i64(
+                vals.into_iter().map(|x| x.unwrap_or(0)).collect(),
+                unit,
+                tz,
+            )),
+            ColBuf::Timestamp {
+                vals,
+                has_null: true,
+                unit,
+                tz,
+            } => out.push(timestamp_opt_array_from_i64(vals, unit, tz)),
             ColBuf::Decimal128 {
                 vals,
+                has_null,
                 precision,
                 scale,
             } => {
-                let da = Decimal128Array::from(vals)
-                    .with_precision_and_scale(precision, scale)
-                    .map_err(|e| {
-                        BoltError::Type(format!(
-                            "wide GROUP BY: Decimal128 key precision/scale ({precision}, {scale}) invalid: {e}"
-                        ))
-                    })?;
+                let da = if has_null {
+                    Decimal128Array::from(vals)
+                } else {
+                    Decimal128Array::from(
+                        vals.into_iter().map(|x| x.unwrap_or(0)).collect::<Vec<_>>(),
+                    )
+                }
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "wide GROUP BY: Decimal128 key precision/scale ({precision}, {scale}) invalid: {e}"
+                    ))
+                })?;
                 out.push(Arc::new(da) as ArrayRef);
             }
         }
@@ -1383,117 +1445,212 @@ fn collect_sum_min_max(
             BoltError::Other("wide GROUP BY: internal — no groups when finalising aggregate".into())
         })?;
 
-    let collected: TypedColumn =
-        match first {
-            Accumulator::SumI64 { .. } => {
-                let mut out: Vec<i64> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::SumI64 { total }) => out.push(*total),
-                        _ => return Err(variant_mismatch_err("SumI64")),
-                    }
-                }
-                TypedColumn::I64(out)
-            }
-            Accumulator::SumDecimal128 { .. } => {
-                let mut out: Vec<i128> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::SumDecimal128 { total }) => out.push(*total),
-                        _ => return Err(variant_mismatch_err("SumDecimal128")),
-                    }
-                }
-                TypedColumn::Decimal128(out)
-            }
-            Accumulator::SumF64 { .. } => {
-                let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::SumF64 { total }) => out.push(*total),
-                        _ => return Err(variant_mismatch_err("SumF64")),
-                    }
-                }
-                TypedColumn::F64(out)
-            }
-            Accumulator::MinI32 { .. } | Accumulator::MaxI32 { .. } => {
-                let mut out: Vec<i32> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::MinI32 { v, .. })
-                        | Some(Accumulator::MaxI32 { v, .. }) => out.push(*v),
-                        _ => return Err(variant_mismatch_err("MinI32/MaxI32")),
-                    }
-                }
-                TypedColumn::I32(out)
-            }
-            Accumulator::MinI64 { .. } | Accumulator::MaxI64 { .. } => {
-                let mut out: Vec<i64> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::MinI64 { v, .. })
-                        | Some(Accumulator::MaxI64 { v, .. }) => out.push(*v),
-                        _ => return Err(variant_mismatch_err("MinI64/MaxI64")),
-                    }
-                }
-                TypedColumn::I64(out)
-            }
-            Accumulator::MinF32 { .. } | Accumulator::MaxF32 { .. } => {
-                let mut out: Vec<f32> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::MinF32 { v, .. })
-                        | Some(Accumulator::MaxF32 { v, .. }) => out.push(*v),
-                        _ => return Err(variant_mismatch_err("MinF32/MaxF32")),
-                    }
-                }
-                TypedColumn::F32(out)
-            }
-            Accumulator::MinF64 { .. } | Accumulator::MaxF64 { .. } => {
-                let mut out: Vec<f64> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::MinF64 { v, .. })
-                        | Some(Accumulator::MaxF64 { v, .. }) => out.push(*v),
-                        _ => return Err(variant_mismatch_err("MinF64/MaxF64")),
-                    }
-                }
-                TypedColumn::F64(out)
-            }
-            Accumulator::MinBool { .. } | Accumulator::MaxBool { .. } => {
-                let mut out: Vec<Option<bool>> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::MinBool { v, seen })
-                        | Some(Accumulator::MaxBool { v, seen }) => {
-                            out.push(if *seen { Some(*v) } else { None });
+    let collected: TypedColumn = match first {
+        Accumulator::SumI64 { .. } => {
+            let mut out: Vec<Option<i64>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::SumI64 { total, seen }) => {
+                        if *seen {
+                            out.push(Some(*total));
+                        } else {
+                            has_null = true;
+                            out.push(None);
                         }
-                        _ => return Err(variant_mismatch_err("MinBool/MaxBool")),
                     }
+                    _ => return Err(variant_mismatch_err("SumI64")),
                 }
-                return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
             }
-            Accumulator::MinDecimal128 { .. } | Accumulator::MaxDecimal128 { .. } => {
-                let mut out: Vec<i128> = Vec::with_capacity(sorted.len());
-                for (_, accs) in sorted {
-                    match accs.get(i) {
-                        Some(Accumulator::MinDecimal128 { v, .. })
-                        | Some(Accumulator::MaxDecimal128 { v, .. }) => out.push(*v),
-                        _ => return Err(variant_mismatch_err("MinDecimal128/MaxDecimal128")),
+            if has_null {
+                TypedColumn::OptI64(out)
+            } else {
+                TypedColumn::I64(out.into_iter().map(|x| x.unwrap_or(0)).collect())
+            }
+        }
+        Accumulator::SumDecimal128 { .. } => {
+            let mut out: Vec<Option<i128>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::SumDecimal128 { total, seen }) => {
+                        if *seen {
+                            out.push(Some(*total));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
                     }
+                    _ => return Err(variant_mismatch_err("SumDecimal128")),
                 }
-                TypedColumn::Decimal128(out)
             }
-            Accumulator::Count { .. } | Accumulator::Avg { .. } => {
-                return Err(BoltError::Other(
-                    "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
-                ))
+            if has_null {
+                TypedColumn::OptDecimal128(out)
+            } else {
+                TypedColumn::Decimal128(out.into_iter().map(|x| x.unwrap_or(0)).collect())
             }
-            Accumulator::Welford { .. } => {
-                return Err(BoltError::Other(
-                    "wide GROUP BY: internal — Welford variant in SUM/MIN/MAX path".into(),
-                ))
+        }
+        Accumulator::SumF64 { .. } => {
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::SumF64 { total, seen }) => {
+                        if *seen {
+                            out.push(Some(*total));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
+                    }
+                    _ => return Err(variant_mismatch_err("SumF64")),
+                }
             }
-        };
+            if has_null {
+                TypedColumn::OptF64(out)
+            } else {
+                TypedColumn::F64(out.into_iter().map(|x| x.unwrap_or(0.0)).collect())
+            }
+        }
+        Accumulator::MinI32 { .. } | Accumulator::MaxI32 { .. } => {
+            let mut out: Vec<Option<i32>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::MinI32 { v, seen })
+                    | Some(Accumulator::MaxI32 { v, seen }) => {
+                        if *seen {
+                            out.push(Some(*v));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
+                    }
+                    _ => return Err(variant_mismatch_err("MinI32/MaxI32")),
+                }
+            }
+            if has_null {
+                TypedColumn::OptI32(out)
+            } else {
+                TypedColumn::I32(out.into_iter().map(|x| x.unwrap_or(0)).collect())
+            }
+        }
+        Accumulator::MinI64 { .. } | Accumulator::MaxI64 { .. } => {
+            let mut out: Vec<Option<i64>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::MinI64 { v, seen })
+                    | Some(Accumulator::MaxI64 { v, seen }) => {
+                        if *seen {
+                            out.push(Some(*v));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
+                    }
+                    _ => return Err(variant_mismatch_err("MinI64/MaxI64")),
+                }
+            }
+            if has_null {
+                TypedColumn::OptI64(out)
+            } else {
+                TypedColumn::I64(out.into_iter().map(|x| x.unwrap_or(0)).collect())
+            }
+        }
+        Accumulator::MinF32 { .. } | Accumulator::MaxF32 { .. } => {
+            let mut out: Vec<Option<f32>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::MinF32 { v, seen })
+                    | Some(Accumulator::MaxF32 { v, seen }) => {
+                        if *seen {
+                            out.push(Some(*v));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
+                    }
+                    _ => return Err(variant_mismatch_err("MinF32/MaxF32")),
+                }
+            }
+            if has_null {
+                TypedColumn::OptF32(out)
+            } else {
+                TypedColumn::F32(out.into_iter().map(|x| x.unwrap_or(0.0)).collect())
+            }
+        }
+        Accumulator::MinF64 { .. } | Accumulator::MaxF64 { .. } => {
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::MinF64 { v, seen })
+                    | Some(Accumulator::MaxF64 { v, seen }) => {
+                        if *seen {
+                            out.push(Some(*v));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
+                    }
+                    _ => return Err(variant_mismatch_err("MinF64/MaxF64")),
+                }
+            }
+            if has_null {
+                TypedColumn::OptF64(out)
+            } else {
+                TypedColumn::F64(out.into_iter().map(|x| x.unwrap_or(0.0)).collect())
+            }
+        }
+        Accumulator::MinBool { .. } | Accumulator::MaxBool { .. } => {
+            let mut out: Vec<Option<bool>> = Vec::with_capacity(sorted.len());
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::MinBool { v, seen })
+                    | Some(Accumulator::MaxBool { v, seen }) => {
+                        out.push(if *seen { Some(*v) } else { None });
+                    }
+                    _ => return Err(variant_mismatch_err("MinBool/MaxBool")),
+                }
+            }
+            return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
+        }
+        Accumulator::MinDecimal128 { .. } | Accumulator::MaxDecimal128 { .. } => {
+            let mut out: Vec<Option<i128>> = Vec::with_capacity(sorted.len());
+            let mut has_null = false;
+            for (_, accs) in sorted {
+                match accs.get(i) {
+                    Some(Accumulator::MinDecimal128 { v, seen })
+                    | Some(Accumulator::MaxDecimal128 { v, seen }) => {
+                        if *seen {
+                            out.push(Some(*v));
+                        } else {
+                            has_null = true;
+                            out.push(None);
+                        }
+                    }
+                    _ => return Err(variant_mismatch_err("MinDecimal128/MaxDecimal128")),
+                }
+            }
+            if has_null {
+                TypedColumn::OptDecimal128(out)
+            } else {
+                TypedColumn::Decimal128(out.into_iter().map(|x| x.unwrap_or(0)).collect())
+            }
+        }
+        Accumulator::Count { .. } | Accumulator::Avg { .. } => {
+            return Err(BoltError::Other(
+                "wide GROUP BY: internal — COUNT/AVG variant in SUM/MIN/MAX path".into(),
+            ))
+        }
+        Accumulator::Welford { .. } => {
+            return Err(BoltError::Other(
+                "wide GROUP BY: internal — Welford variant in SUM/MIN/MAX path".into(),
+            ))
+        }
+    };
     pack_typed_array(out_dtype, collected)
 }
 
@@ -1505,6 +1662,11 @@ enum TypedColumn {
     F64(Vec<f64>),
     Bool(Vec<bool>),
     Decimal128(Vec<i128>),
+    OptI32(Vec<Option<i32>>),
+    OptI64(Vec<Option<i64>>),
+    OptF32(Vec<Option<f32>>),
+    OptF64(Vec<Option<f64>>),
+    OptDecimal128(Vec<Option<i128>>),
 }
 
 /// Cast a typed column into an Arrow array of `out_dtype`.
@@ -1521,6 +1683,30 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRe
             Ok(timestamp_array_from_i64(v, unit, tz))
         }
         (TypedColumn::Decimal128(v), DataType::Decimal128(precision, scale)) => {
+            let da = Decimal128Array::from(v)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    BoltError::Type(format!(
+                        "wide GROUP BY: Decimal128 output precision/scale ({precision}, {scale}) invalid: {e}"
+                    ))
+                })?;
+            Ok(Arc::new(da) as ArrayRef)
+        }
+        (TypedColumn::OptI32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
+        (TypedColumn::OptI64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
+        (TypedColumn::OptF32(v), DataType::Float32) => {
+            Ok(Arc::new(Float32Array::from(v)) as ArrayRef)
+        }
+        (TypedColumn::OptF64(v), DataType::Float64) => {
+            Ok(Arc::new(Float64Array::from(v)) as ArrayRef)
+        }
+        (TypedColumn::OptI32(v), DataType::Date32) => {
+            Ok(Arc::new(Date32Array::from(v)) as ArrayRef)
+        }
+        (TypedColumn::OptI64(v), DataType::Timestamp(unit, tz)) => {
+            Ok(timestamp_opt_array_from_i64(v, unit, tz))
+        }
+        (TypedColumn::OptDecimal128(v), DataType::Decimal128(precision, scale)) => {
             let da = Decimal128Array::from(v)
                 .with_precision_and_scale(precision, scale)
                 .map_err(|e| {
@@ -1550,6 +1736,36 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRe
         (TypedColumn::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
             v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
         )) as ArrayRef),
+        (TypedColumn::OptI32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
+            v.into_iter()
+                .map(|x| x.map(|n| n as i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef),
+        (TypedColumn::OptI32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter()
+                .map(|x| x.map(|n| n as f32))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef),
+        (TypedColumn::OptI32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
+            v.into_iter()
+                .map(|x| x.map(|n| n as f64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef),
+        (TypedColumn::OptI64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
+            v.into_iter()
+                .map(|x| x.map(|n| n as f64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef),
+        (TypedColumn::OptF32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
+            v.into_iter()
+                .map(|x| x.map(|n| n as f64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef),
+        (TypedColumn::OptF64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter()
+                .map(|x| x.map(|n| n as f32))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef),
 
         (_, dt) => Err(BoltError::Type(format!(
             "wide GROUP BY: cannot pack scalars into output dtype {:?}",
@@ -1574,6 +1790,45 @@ fn timestamp_array_from_i64(host: Vec<i64>, unit: TimeUnit, tz: Option<&'static 
             Arc::new(TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
         }
     }
+}
+
+fn timestamp_opt_array_from_i64(
+    host: Vec<Option<i64>>,
+    unit: TimeUnit,
+    tz: Option<&'static str>,
+) -> ArrayRef {
+    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
+    match unit {
+        TimeUnit::Second => {
+            Arc::new(TimestampSecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+        TimeUnit::Millisecond => {
+            Arc::new(TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+        TimeUnit::Microsecond => {
+            Arc::new(TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+        TimeUnit::Nanosecond => {
+            Arc::new(TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
+        }
+    }
+}
+
+fn build_output_arrow_schema(schema: &Schema, arrays: &[ArrayRef]) -> BoltResult<Arc<ArrowSchema>> {
+    let base = plan_schema_to_arrow_schema(schema)?;
+    let fields: Vec<arrow_schema::FieldRef> = base
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if !f.is_nullable() && arrays.get(i).is_some_and(|a| a.null_count() > 0) {
+                Arc::new(f.as_ref().clone().with_nullable(true))
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .collect();
+    Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2199,21 +2454,21 @@ mod tests {
         .expect("batch")
     }
 
-    /// H1: a row with a NULL in ANY key column is dropped from every group's
-    /// MIN/MAX/AVG/COUNT(col). The surviving rows must aggregate normally.
+    /// SQL-standard NULL group keys: a NULL in any key column forms a distinct
+    /// group (`NULL IS NOT DISTINCT FROM NULL` per position), so `(1, NULL)`,
+    /// `(NULL, 10)`, and `(NULL, NULL)` are distinct groups, and an all-NULL
+    /// value group emits SQL NULL for SUM/MIN/MAX/AVG and 0 for COUNT(col).
     #[test]
-    fn null_key_row_excluded_from_min_max_avg_count() {
-        // Layout — note row 2 has b=NULL so it must be dropped entirely.
-        // (a=1, b=10): v ∈ {100, 200}                → min 100, max 200,
-        //                                              avg 150, count 2, sum 300
-        // (a=1, b=NULL, v=999)                       → DROPPED (NULL key)
-        // (a=2, b=10): v ∈ {7, 8, 9}                 → min 7,   max 9,
-        //                                              avg 8,   count 3, sum 24
+    fn null_key_tuples_and_all_null_value_group_follow_sql_standard() {
         let rows: Vec<(Option<i64>, Option<i64>, Option<i64>)> = vec![
             (Some(1), Some(10), Some(100)),
             (Some(2), Some(10), Some(7)),
-            (Some(1), None, Some(999)), // NULL key → must drop
+            (Some(1), None, Some(400)),
             (Some(1), Some(10), Some(200)),
+            (Some(1), None, Some(599)),
+            (None, Some(10), Some(50)),
+            (None, None, None),
+            (None, None, None),
             (Some(2), Some(10), Some(8)),
             (Some(2), Some(10), Some(9)),
         ];
@@ -2261,26 +2516,61 @@ mod tests {
         };
         let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
 
-        // Only two groups must survive — the NULL-keyed row is gone.
+        // Sorted NULLS LAST per column:
+        // 0: (Some(1), Some(10)) -> sum 300, min 100, max 200, count 2, avg 150.0
+        // 1: (Some(1), None)     -> sum 999, min 400, max 599, count 2, avg 499.5
+        // 2: (Some(2), Some(10)) -> sum 24,  min 7,   max 9,   count 3, avg 8.0
+        // 3: (None,    Some(10)) -> sum 50,  min 50,  max 50,  count 1, avg 50.0
+        // 4: (None,    None)     -> all-NULL v: sum/min/max/avg = NULL, count = 0
+        assert_eq!(out.num_rows(), 5);
+        let a = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let b = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let s = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mn = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mx = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+        let c = out.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+        let avg = out
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        let keys: Vec<(Option<i64>, Option<i64>)> = (0..5)
+            .map(|r| {
+                (
+                    (!a.is_null(r)).then(|| a.value(r)),
+                    (!b.is_null(r)).then(|| b.value(r)),
+                )
+            })
+            .collect();
         assert_eq!(
-            out.num_rows(),
-            2,
-            "NULL-key row leaked into output as its own group"
+            keys,
+            vec![
+                (Some(1), Some(10)),
+                (Some(1), None),
+                (Some(2), Some(10)),
+                (None, Some(10)),
+                (None, None),
+            ]
         );
-        let a = col_i64(&out, 0);
-        let b = col_i64(&out, 1);
-        let s = col_i64(&out, 2);
-        let mn = col_i64(&out, 3);
-        let mx = col_i64(&out, 4);
-        let c = col_i64(&out, 5);
-        let avg = col_f64(&out, 6);
-        assert_eq!(a, vec![1, 2]);
-        assert_eq!(b, vec![10, 10]);
-        assert_eq!(s, vec![300, 24]);
-        assert_eq!(mn, vec![100, 7]);
-        assert_eq!(mx, vec![200, 9]);
-        assert_eq!(c, vec![2, 3]);
-        assert_eq!(avg, vec![150.0, 8.0]);
+        let sums: Vec<Option<i64>> = (0..5)
+            .map(|r| (!s.is_null(r)).then(|| s.value(r)))
+            .collect();
+        let mins: Vec<Option<i64>> = (0..5)
+            .map(|r| (!mn.is_null(r)).then(|| mn.value(r)))
+            .collect();
+        let maxs: Vec<Option<i64>> = (0..5)
+            .map(|r| (!mx.is_null(r)).then(|| mx.value(r)))
+            .collect();
+        assert_eq!(sums, vec![Some(300), Some(999), Some(24), Some(50), None]);
+        assert_eq!(mins, vec![Some(100), Some(400), Some(7), Some(50), None]);
+        assert_eq!(maxs, vec![Some(200), Some(599), Some(9), Some(50), None]);
+        assert_eq!(c.values(), &[2, 2, 3, 1, 0]);
+        assert!((avg.value(0) - 150.0).abs() < 1e-12);
+        assert!((avg.value(1) - 499.5).abs() < 1e-12);
+        assert!((avg.value(2) - 8.0).abs() < 1e-12);
+        assert!((avg.value(3) - 50.0).abs() < 1e-12);
+        assert!(avg.is_null(4));
     }
 
     /// H1: SUM excludes NULL value inputs (lockstep filter on the value
@@ -2338,19 +2628,18 @@ mod tests {
         assert_eq!(s, vec![300, 15]);
     }
 
-    /// H1: when EVERY row is filtered out (here: every row has a NULL key),
-    /// we still produce a clean empty output rather than panicking on the
-    /// "no groups when finalising aggregate" branch.
+    /// Empty input yields a clean 0-row output with the full output schema, and
+    /// an all-NULL-keyed batch groups identical NULL tuples together.
     #[test]
-    fn all_rows_filtered_yields_clean_empty_output() {
-        // All four rows have at least one NULL key → all four are dropped.
+    fn empty_input_and_all_null_keys_behave_cleanly() {
+        let empty_batch = build_two_key_batch_nullable(&[]);
         let rows: Vec<(Option<i64>, Option<i64>, Option<i64>)> = vec![
             (None, Some(10), Some(1)),
             (Some(1), None, Some(2)),
             (None, None, Some(3)),
-            (None, Some(20), Some(4)),
+            (None, Some(10), Some(4)),
         ];
-        let batch = build_two_key_batch_nullable(&rows);
+        let null_batch = build_two_key_batch_nullable(&rows);
 
         let plan = PhysicalPlan::Aggregate {
             table: "t".into(),
@@ -2390,10 +2679,14 @@ mod tests {
                 input_has_validity: Vec::new(),
             },
         };
-        let out = execute_groupby_wide(&plan, &batch).expect("groupby ok");
-        // Empty output, with the full output schema preserved.
-        assert_eq!(out.num_rows(), 0);
-        assert_eq!(out.num_columns(), 7);
+        let empty_out = execute_groupby_wide(&plan, &empty_batch).expect("empty groupby ok");
+        assert_eq!(empty_out.num_rows(), 0);
+        assert_eq!(empty_out.num_columns(), 7);
+
+        let null_out = execute_groupby_wide(&plan, &null_batch).expect("null-keys groupby ok");
+        // Groups sorted NULLS LAST: (1, NULL)->2, (NULL, 10)->5, (NULL, NULL)->3.
+        assert_eq!(null_out.num_rows(), 3);
+        assert_eq!(col_i64(&null_out, 2), vec![2, 5, 3]);
     }
 
     #[test]

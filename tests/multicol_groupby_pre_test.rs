@@ -594,10 +594,12 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
 
     let mut engine = Engine::new().expect("ctx");
 
-    // 1. Multi-column NULL keys + all-NULL value group with pre (`null_empty_groups`).
+    // 1. Multi-column SQL-standard NULL keys + all-NULL value group with pre (`null_empty_groups`).
     // Group (1, 10): v = [10.0, NULL] -> sum=20.0, avg=10.0, count(v)=1, count(*)=2
     // Group (1, 20): v = [NULL, NULL] -> sum=NULL, avg=NULL, count(v)=0, count(*)=2
-    // Row (1, NULL): dropped (multi-column NULL key)
+    // Group (1, NULL): v = [25.0, 75.0] -> sum=200.0, avg=50.0, count(v)=2, count(*)=2
+    // Group (NULL, 10): v = [5.0] -> sum=10.0, avg=5.0, count(v)=1, count(*)=1
+    // Group (NULL, NULL): v = [NULL] -> sum=NULL, avg=NULL, count(v)=0, count(*)=1
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("k1", ArrowDataType::Int32, true),
         ArrowField::new("k2", ArrowDataType::Int32, true),
@@ -613,6 +615,9 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
                 Some(1),
                 Some(1),
                 Some(1),
+                Some(1),
+                None,
+                None,
             ])) as ArrayRef,
             Arc::new(Int32Array::from(vec![
                 Some(10),
@@ -620,15 +625,21 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
                 Some(20),
                 Some(20),
                 None,
+                None,
+                Some(10),
+                None,
             ])) as ArrayRef,
             Arc::new(Float64Array::from(vec![
                 Some(10.0),
                 None,
                 None,
                 None,
-                Some(999.0),
+                Some(25.0),
+                Some(75.0),
+                Some(5.0),
+                None,
             ])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![1, 1, 1, 1, 1])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1; 8])) as ArrayRef,
         ],
     )
     .unwrap();
@@ -637,11 +648,13 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
     let out = engine
         .sql(
             "SELECT k1, k2, SUM(v * 2.0) AS s, AVG(v) AS a, COUNT(v) AS cv, COUNT(*) AS cstar \
-             FROM nulls WHERE keep = 1 GROUP BY k1, k2 ORDER BY k1, k2",
+             FROM nulls WHERE keep = 1 GROUP BY k1, k2 ORDER BY k1 NULLS LAST, k2 NULLS LAST",
         )
         .expect("nulls multicol with pre")
         .into_record_batch();
-    assert_eq!(out.num_rows(), 2);
+    assert_eq!(out.num_rows(), 5);
+    let k1_col = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let k2_col = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
     let s_col = out
         .column(2)
         .as_any()
@@ -654,18 +667,87 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
         .unwrap();
     let cv_col = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
     let cs_col = out.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+    let keys: Vec<(Option<i32>, Option<i32>)> = (0..5)
+        .map(|r| {
+            (
+                (!k1_col.is_null(r)).then(|| k1_col.value(r)),
+                (!k2_col.is_null(r)).then(|| k2_col.value(r)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (Some(1), Some(10)),
+            (Some(1), Some(20)),
+            (Some(1), None),
+            (None, Some(10)),
+            (None, None),
+        ]
+    );
     assert!(!s_col.is_null(0) && (s_col.value(0) - 20.0).abs() < 1e-9);
     assert!(
         s_col.is_null(1),
         "all-NULL group must surface SQL NULL for SUM"
     );
+    assert!(!s_col.is_null(2) && (s_col.value(2) - 200.0).abs() < 1e-9);
+    assert!(!s_col.is_null(3) && (s_col.value(3) - 10.0).abs() < 1e-9);
+    assert!(s_col.is_null(4));
     assert!(!a_col.is_null(0) && (a_col.value(0) - 10.0).abs() < 1e-9);
     assert!(
         a_col.is_null(1),
         "all-NULL group must surface SQL NULL for AVG"
     );
-    assert_eq!(cv_col.values(), &[1, 0]);
-    assert_eq!(cs_col.values(), &[2, 2]);
+    assert!(!a_col.is_null(2) && (a_col.value(2) - 50.0).abs() < 1e-9);
+    assert!(!a_col.is_null(3) && (a_col.value(3) - 5.0).abs() < 1e-9);
+    assert!(a_col.is_null(4));
+    assert_eq!(cv_col.values(), &[1, 0, 2, 1, 0]);
+    assert_eq!(cs_col.values(), &[2, 2, 2, 1, 1]);
+
+    // Sentinel collisions (`i64::MIN` and `i64::MAX`) combined with NULL group keys.
+    let sent_batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("k", ArrowDataType::Int64, true),
+            ArrowField::new("v", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                Some(i64::MAX),
+                None,
+                None,
+                Some(i64::MIN),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 20, 3, 4, 5])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    engine.register_table("sent_null", sent_batch).unwrap();
+    let sent_out = engine
+        .sql("SELECT k, SUM(v) AS s, COUNT(*) AS n FROM sent_null GROUP BY k ORDER BY k NULLS LAST")
+        .expect("sentinel + NULL key groupby")
+        .into_record_batch();
+    assert_eq!(sent_out.num_rows(), 3);
+    let sk = sent_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ss = sent_out
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sn = sent_out
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(sk.value(0), i64::MIN);
+    assert_eq!(sk.value(1), i64::MAX);
+    assert!(sk.is_null(2));
+    assert_eq!(ss.values(), &[15, 20, 7]);
+    assert_eq!(sn.values(), &[2, 1, 2]);
 
     // 2. ROLLUP over multi-column GROUP BY with WHERE + computed SUM.
     let rollup = engine

@@ -75,8 +75,9 @@
 //! 2. **SUM/MIN/MAX skip NULL rows** — whether by host-strip or by the
 //!    kernel folding a NULL row to the reduction identity (0 for SUM,
 //!    `+inf`/`INT_MAX` for MIN, `-inf`/`INT_MIN` for MAX).
-//! 3. **NULL GROUP BY keys are dropped** before the keys kernel runs, so a
-//!    garbage key bit pattern never forms a spurious group.
+//! 3. **NULL GROUP BY keys form distinct SQL-standard groups** (`NULL` equals
+//!    `NULL` per key position; raw unmasked buffer bytes at NULL slots never
+//!    reach a GPU keys kernel without an explicit sentinel or tuple tag).
 
 use arrow_array::Array;
 
