@@ -87,11 +87,13 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
-use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow_schema::DataType as ArrowDataType;
+#[cfg(test)]
+use arrow_schema::Schema as ArrowSchema;
 use bytemuck::Pod;
 
 use crate::cuda::cuda_sys::{self, CUdeviceptr};
@@ -116,9 +118,9 @@ use crate::jit::hash_kernels::{
     GroupedDecimalOp, AGG_DECIMAL_KERNEL_ENTRY, AGG_KERNEL_ENTRY, I64_EMPTY_SENTINEL,
     KEYS_KERNEL_ENTRY,
 };
-use crate::plan::logical_plan::{
-    sum_output_dtype, AggregateExpr, DataType, Expr, Field, Schema, TimeUnit,
-};
+use crate::plan::logical_plan::{sum_output_dtype, AggregateExpr, DataType, Field};
+#[cfg(test)]
+use crate::plan::logical_plan::{Expr, TimeUnit};
 use crate::plan::physical_plan::{ColumnIO, PhysicalPlan};
 
 /// Empty-slot sentinel; mirrors the literal baked into the keys kernel.
@@ -272,9 +274,16 @@ fn column_should_use_native_validity(
 // `groupby_with_pre.rs`. They now live in `crate::exec::groupby_common` (see
 // that module's header for the drift-bug rationale, incl. V-17 pack_keys).
 use crate::exec::groupby_common::{
-    decode_key, download_pinned_f32, download_pinned_f64, download_pinned_i32, download_pinned_i64,
-    next_pow2, pack_keys, unique_count, KeyComponent, KeyValue,
+    arrow_dtype_to_plan, bare_column_name, build_key_arrays_from_keys, build_output_arrow_schema,
+    checked_group_sum, checked_group_sum_native_validity, collect_filtered_primitive,
+    collect_filtered_timestamp, column_null_mask, downcast_err, download_pinned_f32,
+    download_pinned_f64, download_pinned_i32, download_pinned_i64, finalize_welford_states,
+    identity_i32, identity_i64, load_input_column_as_f64_filtered, next_pow2, pack_array,
+    pack_keys, prepare_filtered_keys, resolve_input, unique_count, widen_f32, KeyComponent,
+    Scalars, WelfordOutKind,
 };
+#[cfg(test)]
+use crate::exec::groupby_common::{filter_iter_to_f64, timestamp_array_from_i64};
 
 /// Resident on-device GROUP BY fast path — the perf companion to
 /// [`execute_groupby`]. Tries each tier executor's *resident* variant, which
@@ -842,20 +851,8 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
         arrays.push(arr);
     }
 
-    let base_schema = plan_schema_to_arrow_schema(&aggregate.output_schema)?;
-    let fields: Vec<arrow_schema::FieldRef> = base_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            if !f.is_nullable() && arrays.get(i).is_some_and(|a| a.null_count() > 0) {
-                Arc::new(f.as_ref().clone().with_nullable(true))
-            } else {
-                Arc::clone(f)
-            }
-        })
-        .collect();
-    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays)
+    let arrow_schema = build_output_arrow_schema(&aggregate.output_schema, &arrays)?;
+    RecordBatch::try_new(arrow_schema, arrays)
         .map_err(|e| BoltError::Other(format!("failed to build GROUP BY RecordBatch: {e}")))
 }
 
@@ -1674,281 +1671,6 @@ fn run_welford_aggregate(
     Ok(AccDownload::Welford { states })
 }
 
-/// Return the per-row validity mask for `col_io` in `batch`, or `None` if
-/// the column has no nulls (saves the per-row allocation in the hot path).
-fn column_null_mask(col_io: &ColumnIO, batch: &RecordBatch) -> BoltResult<Option<Vec<bool>>> {
-    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
-        BoltError::Plan(format!(
-            "aggregate input '{}' not present in table batch: {}",
-            col_io.name, e
-        ))
-    })?;
-    let arr = batch.column(idx);
-    if arr.null_count() == 0 {
-        Ok(None)
-    } else {
-        Ok(Some((0..arr.len()).map(|i| !arr.is_null(i)).collect()))
-    }
-}
-
-/// A filtered key column for a single aggregate launch: either a borrowed
-/// view of the shared `group_col` (the common fast path: no value-NULLs
-/// shrunk the row set further) or a freshly-uploaded smaller column for the
-/// (key_valid AND value_valid) joint mask. The variants paper over Rust's
-/// borrow-checker constraints around returning `&GpuVec<i64>` whose lifetime
-/// might come from local storage.
-enum FilteredKeys<'a> {
-    /// Reuse the shared post-key-filter key column. `host_keys` borrows the
-    /// per-query cached host image of that same column (bit-identical to a
-    /// D2H of `group_col`) so the host-side overflow check can read the
-    /// per-row group assignment without a device round-trip.
-    Borrowed {
-        group_col: &'a GpuVec<i64>,
-        host_keys: &'a [i64],
-        n_rows: usize,
-    },
-    /// Freshly-uploaded smaller column applying a value-NULL filter on top
-    /// of `key_valid`. The owned vec must live across the kernel launch.
-    /// `host_keys` owns the matching host image used to build it.
-    Owned {
-        group_col: GpuVec<i64>,
-        host_keys: Vec<i64>,
-        n_rows: usize,
-    },
-}
-
-impl<'a> FilteredKeys<'a> {
-    fn col(&self) -> &GpuVec<i64> {
-        match self {
-            FilteredKeys::Borrowed { group_col, .. } => group_col,
-            FilteredKeys::Owned { group_col, .. } => group_col,
-        }
-    }
-    fn n_rows(&self) -> usize {
-        match self {
-            FilteredKeys::Borrowed { n_rows, .. } | FilteredKeys::Owned { n_rows, .. } => *n_rows,
-        }
-    }
-    /// Host image of the per-row group-key column, aligned 1:1 with the
-    /// filtered value vec produced by `collect_filtered_primitive`. Used by
-    /// the host-side SUM overflow check to replicate the kernel's grouping.
-    fn host_keys(&self) -> &[i64] {
-        match self {
-            FilteredKeys::Borrowed { host_keys, .. } => host_keys,
-            FilteredKeys::Owned { host_keys, .. } => host_keys,
-        }
-    }
-}
-
-/// V-10 (grouped): host-side integer SUM overflow guard for GROUP BY.
-///
-/// The GPU group-by SUM accumulates each group with `atom.global.add.u64`
-/// (PTX has no signed `atom.add`; `.u64` is bit-identical for two's-complement
-/// addition). That atomic WRAPS modulo 2^64 on overflow, so a per-group sum
-/// exceeding `i64::MAX` would silently come back as a wrapped (often negative)
-/// value. The SCALAR SUM path in `aggregate.rs` instead ERRORS on i64 overflow
-/// via `i64::checked_add` (see `ReduceScalar::finalize`, the
-/// `"SUM(integer) overflow"` arm) to honour the engine's "never silently
-/// wrong" invariant. Without this guard, `SELECT SUM(x) FROM t` would error on
-/// overflow while `SELECT k, SUM(x) FROM t GROUP BY k` over the SAME data
-/// silently wrapped — an inconsistency this restores.
-///
-/// We cannot change the kernel PTX from this file, so we replicate the
-/// grouping on the host: `host_keys[i]` is the group key of `values[i]`
-/// (the two vecs are aligned 1:1 — both are produced from the same post-filter
-/// row set). We fold each group with `i64::checked_add`; the first group whose
-/// true sum leaves i64 range yields a `BoltError::Type` whose message mirrors
-/// the scalar path verbatim. Groups that do not overflow are untouched, so a
-/// correct (non-overflowing) query is never regressed — the kernel result is
-/// returned unchanged.
-///
-/// This pass is the exact arithmetic the kernel performs (integer addition is
-/// associative and commutative, so any accumulation order reaches the same i64
-/// result and overflows iff the device sum overflowed), making the detection
-/// faithful rather than a conservative magnitude bound. It costs one O(n) host
-/// pass plus an O(#groups) map; acceptable next to the H2D/D2H already on this
-/// path.
-///
-/// NOTE (kernel follow-up): the device atomic is still wrapping; this host
-/// guard is the build-safe restoration of the invariant. The proper long-term
-/// fix is an overflow flag raised inside the atomic kernel.
-// COVERAGE (integer SUM overflow, as of V-10): every reachable integer-SUM
-// finalization in the engine now raises the canonical "SUM(integer) overflow"
-// error rather than silently wrapping:
-//   - grouped SUM(Int64) / SUM(Int32->i64), host-strip path: guarded here via
-//     `checked_group_sum` in `run_typed_agg` (the values are host-materialised
-//     by `collect_filtered_primitive`, so the re-fold is free of an extra D2H);
-//   - grouped SUM, native-validity path: guarded via
-//     `checked_group_sum_native_validity` in `run_typed_agg_native_validity`;
-//   - the resident Tier-1 shared-mem path finalizes integer grouped SUM on
-//     the device (`groupby_shmem_exec::try_execute_resident_typed`) only when
-//     overflow is impossible: `SUM(Int32)` always (≤ 2^32 rows of |v| ≤ 2^31),
-//     `SUM(Int64)` only when a device-computed `max|v| * n_rows <= i64::MAX`;
-//     every other integer grouped SUM falls through to the guarded paths
-//     above;
-//   - scalar (non-grouped) integer SUM: `aggregate.rs`'s and `agg_with_pre.rs`'s
-//     `ReduceScalar for {i32,i64}` finalize the device partials with
-//     `checked_add` (agg_with_pre.rs was fixed in V-10 — it previously merged
-//     `Sum | Count` into `wrapping_add` and wrapped silently).
-// RESIDUAL/FUTURE GAP: the device group atomic (`atom.global.add.u64`) is still
-// itself wrapping; the host re-fold here is the build-safe restoration of the
-// invariant and depends on the grouped values being host-materialised. A
-// future never-materialised streaming grouped aggregate would bypass it.
-// TODO(overflow-kernel): add a saturating/overflow-detecting variant of the
-// u64 group SUM atomic (e.g. a per-launch device "overflow" flag set on signed
-// carry) so overflow is caught on-device for that future streaming case and the
-// host re-fold can be dropped.
-pub(crate) fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
-    debug_assert_eq!(
-        values.len(),
-        host_keys.len(),
-        "checked_group_sum: value/key columns must be aligned 1:1",
-    );
-    let mut sums: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::with_capacity(host_keys.len().min(1 << 20));
-    for (&v, &key) in values.iter().zip(host_keys.iter()) {
-        let slot = sums.entry(key).or_insert(0i64);
-        *slot = match slot.checked_add(v) {
-            Some(s) => s,
-            None => {
-                // Mirror the scalar contract's message verbatim
-                // (`aggregate.rs` ReduceScalar::finalize SUM arm) so callers
-                // and tests see one canonical integer-overflow error string.
-                return Err(BoltError::Type(
-                    "SUM(integer) overflow: accumulator exceeds i64 range".to_string(),
-                ));
-            }
-        };
-    }
-    Ok(())
-}
-
-/// V-10 (grouped, native-validity path): overflow guard for the
-/// `run_typed_agg_native_validity` SUM branches.
-///
-/// That path uploads the FULL value column (`values`, length `n_rows`) plus a
-/// device validity bitmap and lets the kernel skip NULL rows on-device, so it
-/// never builds a host-compacted value vec. To replicate the kernel's grouping
-/// for the overflow check we download the per-row key column host image
-/// (`group_col`, parallel to the batch by row index — guaranteed by the
-/// `key_valid.is_none()` precondition at the dispatch site) and fold per group
-/// with `i64::checked_add`, skipping rows where `value_valid[i]` is false
-/// exactly as the kernel does. Returns the same `BoltError::Type` as the
-/// host-strip path on overflow.
-///
-/// The single D2H of the key column here is the cost of restoring the
-/// invariant on this path; see the `// TODO(overflow-kernel)` on
-/// `checked_group_sum` for the on-device follow-up that would remove it.
-pub(crate) fn checked_group_sum_native_validity(
-    values: &[i64],
-    value_valid: &[bool],
-    group_col: &GpuVec<i64>,
-) -> BoltResult<()> {
-    debug_assert_eq!(values.len(), value_valid.len());
-    let host_keys: Vec<i64> = group_col.to_vec()?;
-    debug_assert_eq!(host_keys.len(), values.len());
-    // Compact out NULL value rows so the host fold sees exactly the rows the
-    // kernel accumulates.
-    let mut vals: Vec<i64> = Vec::with_capacity(values.len());
-    let mut keys: Vec<i64> = Vec::with_capacity(values.len());
-    for ((&v, &valid), &key) in values.iter().zip(value_valid.iter()).zip(host_keys.iter()) {
-        if valid {
-            vals.push(v);
-            keys.push(key);
-        }
-    }
-    checked_group_sum(&vals, &keys)
-}
-
-/// Decide whether to reuse the shared `group_col` (when no value-NULL filter
-/// shrinks the row set further) or upload a freshly-filtered key column for
-/// this aggregate. The shared `group_col` was built from a `host_keys` that
-/// already had the `key_valid` rows kept; if `value_valid` is `None` we can
-/// reuse it directly. Otherwise we refilter against the joint mask on the host
-/// and upload a fresh i64 column.
-///
-/// PERF (filtered-keys round-trip): the host image of the shared key column is
-/// INVARIANT across every aggregate in a query — they all reuse the same
-/// `key_col_gpu`, which `execute_groupby` uploaded from the per-query
-/// `host_keys` vec. Previously this function re-downloaded that identical
-/// column (one D2H per NULL-bearing aggregate) only to host-filter it; that
-/// extra D2H+H2D round-trip was redundant work re-done for the SAME keys. We
-/// now thread the already-resident `host_keys` slice in via `cached_host_keys`
-/// and host-filter directly off it, so the per-query D2H of the key column
-/// happens ZERO times here (it never needed to leave the host in the first
-/// place). The genuinely per-aggregate part — projecting the value-column NULL
-/// mask through `key_valid` and compacting the keys against it — is unchanged
-/// and still produces a per-aggregate `Owned` column with exactly the same
-/// rows as before.
-///
-/// `cached_host_keys` MUST be the same host vec that produced `group_col`
-/// (i.e. `execute_groupby`'s post-key-filter `host_keys`); it is therefore
-/// length `n_rows` and bit-identical to what a D2H of `group_col` would yield.
-///
-/// async-memcpy: the HtoD of the freshly-filtered keys still rides
-/// `stream` via `from_slice_async`, mirroring the per-aggregate buffer
-/// plumbing in `run_typed_agg`, so the upload chains behind the previous
-/// kernel's D2H and overlaps with unrelated stream activity.
-fn prepare_filtered_keys<'a>(
-    group_col: &'a GpuVec<i64>,
-    n_rows: usize,
-    key_valid: Option<&[bool]>,
-    value_valid: Option<&[bool]>,
-    // Tied to `'a` so the `Borrowed` variant can hold this slice as the
-    // per-row group host image for the V-10 overflow check (it lives as long
-    // as the borrowed `group_col`, which is what the returned value borrows).
-    cached_host_keys: &'a [i64],
-    stream: &CudaStream,
-) -> BoltResult<FilteredKeys<'a>> {
-    if value_valid.is_none() {
-        return Ok(FilteredKeys::Borrowed {
-            group_col,
-            host_keys: cached_host_keys,
-            n_rows,
-        });
-    }
-
-    // Project `value_valid` (indexed by ORIGINAL row position) through the
-    // key filter to align with the post-key-filter `host_keys` list.
-    let value_valid_unwrapped = value_valid.expect("checked above");
-    let value_valid_filtered: Vec<bool> = match key_valid {
-        Some(kv) => kv
-            .iter()
-            .zip(value_valid_unwrapped.iter())
-            .filter_map(|(&k, &v)| if k { Some(v) } else { None })
-            .collect(),
-        None => value_valid_unwrapped.to_vec(),
-    };
-    debug_assert_eq!(value_valid_filtered.len(), n_rows);
-
-    // PERF (filtered-keys round-trip): host-filter directly off the cached,
-    // already-resident `host_keys` slice instead of re-downloading the shared
-    // key column from the device. `cached_host_keys` is the very vec
-    // `execute_groupby` uploaded into `group_col`, so it is bit-identical to a
-    // D2H of `group_col` would-be result — we just skip the trip. This elides
-    // the per-aggregate D2H (and the prior pinned-buffer hop) entirely; only
-    // the genuinely per-aggregate H2D of the freshly-compacted column below
-    // remains. The debug assert pins the invariant that the cache matches the
-    // device column's length (== post-key-filter `n_rows`).
-    debug_assert_eq!(cached_host_keys.len(), n_rows);
-    let filtered: Vec<i64> = cached_host_keys
-        .iter()
-        .zip(value_valid_filtered.iter())
-        .filter_map(|(&k, &v)| if v { Some(k) } else { None })
-        .collect();
-    let filtered_n = filtered.len();
-    // async HtoD of the freshly-filtered key column on the caller's
-    // stream so the subsequent agg-kernel launch is automatically ordered
-    // after this upload without a separate barrier. Replaces the prior
-    // synchronous `GpuVec::from_slice` here.
-    let owned = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
-    Ok(FilteredKeys::Owned {
-        group_col: owned,
-        host_keys: filtered,
-        n_rows: filtered_n,
-    })
-}
-
 /// Common path for SUM/MIN/MAX. Uploads the typed input column, allocates a
 /// typed accumulator initialised to the op's identity, launches the agg
 /// kernel, and downloads the accumulator.
@@ -2408,61 +2130,6 @@ fn run_typed_agg(
     }
 }
 
-/// F7-finish: NULL-filtered i64 tick extraction for a grouped MIN/MAX over a
-/// `Timestamp*Array`. Dispatches on the concrete Arrow timestamp unit and
-/// reuses [`collect_filtered_primitive`] (which drops rows where either the
-/// key or the value is NULL) per unit. Returns an owned `Vec<i64>` because the
-/// concrete array type differs per unit.
-fn collect_filtered_timestamp(
-    arr: &dyn arrow_array::Array,
-    name: &str,
-    key_valid: Option<&[bool]>,
-    value_valid: Option<&[bool]>,
-) -> BoltResult<Vec<i64>> {
-    use arrow_array::types::{
-        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-        TimestampSecondType,
-    };
-    use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
-    macro_rules! collect_ts {
-        ($p:ty, $arr_ty:ty, $label:literal) => {{
-            let pa = arr
-                .as_any()
-                .downcast_ref::<$arr_ty>()
-                .ok_or_else(|| downcast_err(name, $label))?;
-            Ok(collect_filtered_primitive::<$p>(pa, key_valid, value_valid))
-        }};
-    }
-    match arr.data_type() {
-        ArrowDataType::Timestamp(ArrowTimeUnit::Second, _) => {
-            collect_ts!(
-                TimestampSecondType,
-                arrow_array::TimestampSecondArray,
-                "TimestampSecond"
-            )
-        }
-        ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, _) => collect_ts!(
-            TimestampMillisecondType,
-            arrow_array::TimestampMillisecondArray,
-            "TimestampMillisecond"
-        ),
-        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, _) => collect_ts!(
-            TimestampMicrosecondType,
-            arrow_array::TimestampMicrosecondArray,
-            "TimestampMicrosecond"
-        ),
-        ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, _) => collect_ts!(
-            TimestampNanosecondType,
-            arrow_array::TimestampNanosecondArray,
-            "TimestampNanosecond"
-        ),
-        other => Err(BoltError::Type(format!(
-            "GROUP BY aggregate input '{}' is not a Timestamp array: {:?}",
-            name, other
-        ))),
-    }
-}
-
 /// PV-stage-f: native-validity dispatch — upload the FULL value column +
 /// the packed validity bitmap and let the GPU skip NULL rows on the
 /// device, instead of host-stripping them before upload.
@@ -2661,329 +2328,15 @@ fn run_typed_agg_native_validity(
     }
 }
 
-/// Collect a primitive Arrow array's values into a fresh `Vec`, filtering
-/// out positions where (key_valid AND value_valid) is false. Either mask
-/// being `None` means "all true" for that side. The output length equals the
-/// post-filter row count.
-fn collect_filtered_primitive<P>(
-    pa: &arrow_array::PrimitiveArray<P>,
-    key_valid: Option<&[bool]>,
-    value_valid: Option<&[bool]>,
-) -> Vec<P::Native>
-where
-    P: arrow_array::types::ArrowPrimitiveType,
-    P::Native: Copy,
-{
-    let n = pa.len();
-    let vals = pa.values();
-    let mut out: Vec<P::Native> = Vec::with_capacity(n);
-    for i in 0..n {
-        let kv = key_valid.map(|m| m[i]).unwrap_or(true);
-        let vv = value_valid.map(|m| m[i]).unwrap_or(true);
-        if kv && vv {
-            out.push(vals[i]);
-        }
-    }
-    out
-}
-
-/// Pull a numeric input column out of `batch`, upcast each element to f64,
-/// and drop positions where (key_valid AND value_valid) is false. Either
-/// mask being `None` means "all true" for that side. Used by AVG so the
-/// numerator and denominator stay aligned with the (key-NULL, value-NULL)
-/// filter applied to the rest of the launch.
-fn load_input_column_as_f64_filtered(
-    col_io: &ColumnIO,
-    batch: &RecordBatch,
-    key_valid: Option<&[bool]>,
-    value_valid: Option<&[bool]>,
-) -> BoltResult<Vec<f64>> {
-    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
-        BoltError::Plan(format!(
-            "AVG input '{}' not present in table batch: {}",
-            col_io.name, e
-        ))
-    })?;
-    let arr = batch.column(idx);
-    match col_io.dtype {
-        DataType::Int32 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
-            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
-        }
-        DataType::Int64 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
-            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
-        }
-        DataType::Float32 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
-            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
-        }
-        DataType::Float64 => {
-            let pa = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
-            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
-        }
-        DataType::Bool => {
-            let ba = arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| downcast_err(&col_io.name, "Bool"))?;
-            let n = ba.len();
-            let mut out: Vec<f64> = Vec::with_capacity(n);
-            for i in 0..n {
-                let kv = key_valid.map(|m| m[i]).unwrap_or(true);
-                let vv = value_valid.map(|m| m[i]).unwrap_or(true);
-                if kv && vv {
-                    out.push(if ba.value(i) { 1.0 } else { 0.0 });
-                }
-            }
-            Ok(out)
-        }
-        DataType::Decimal128(_, scale) => {
-            let da = arr
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
-            let pow = 10f64.powi(scale as i32);
-            Ok(filter_iter_to_f64(da, key_valid, value_valid, |v| {
-                (v as f64) / pow
-            }))
-        }
-        DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
-            Err(BoltError::Type(format!(
-                "AVG input dtype {:?} not supported (column '{}')",
-                col_io.dtype, col_io.name
-            )))
-        }
-    }
-}
-
-/// Helper for `load_input_column_as_f64_filtered`: walks a primitive Arrow
-/// array, applies the joint key/value validity mask, and casts each surviving
-/// element via `f`.
-fn filter_iter_to_f64<P, F>(
-    pa: &arrow_array::PrimitiveArray<P>,
-    key_valid: Option<&[bool]>,
-    value_valid: Option<&[bool]>,
-    f: F,
-) -> Vec<f64>
-where
-    P: arrow_array::types::ArrowPrimitiveType,
-    P::Native: Copy,
-    F: Fn(P::Native) -> f64,
-{
-    let n = pa.len();
-    let vals = pa.values();
-    let mut out: Vec<f64> = Vec::with_capacity(n);
-    for i in 0..n {
-        let kv = key_valid.map(|m| m[i]).unwrap_or(true);
-        let vv = value_valid.map(|m| m[i]).unwrap_or(true);
-        if kv && vv {
-            out.push(f(vals[i]));
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Output assembly.
-// ---------------------------------------------------------------------------
-
-/// Build one Arrow array per group-by column by decoding each packed i64 key
-/// back through `decode_key`. Returns arrays in the order the columns appear
-/// in `aggregate.group_by` (which matches `components`).
 fn build_key_arrays(
     groups: &[(i64, usize)],
     components: &[KeyComponent],
 ) -> BoltResult<Vec<ArrayRef>> {
-    let m = components.len();
-    let n = groups.len();
-
-    // Per-column typed buffers; we allocate the right one based on the
-    // component dtype and push exactly one value per group.
-    enum ColBuf {
-        I32(Vec<i32>),
-        I64(Vec<i64>),
-        F32(Vec<f32>),
-        F64(Vec<f64>),
-        Bool(Vec<bool>),
-        Date32(Vec<i32>),
-        Timestamp {
-            vals: Vec<i64>,
-            unit: TimeUnit,
-            tz: Option<&'static str>,
-        },
-    }
-
-    let mut buffers: Vec<ColBuf> = Vec::with_capacity(m);
-    for comp in components {
-        match comp.original_dtype {
-            DataType::Int32 => buffers.push(ColBuf::I32(Vec::with_capacity(n))),
-            DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
-            DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
-            DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
-            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n))),
-            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n))),
-            DataType::Timestamp(unit, tz) => buffers.push(ColBuf::Timestamp {
-                vals: Vec::with_capacity(n),
-                unit,
-                tz,
-            }),
-            DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => {
-                return Err(BoltError::Type(format!(
-                    "GROUP BY key dtype {:?} not supported on output",
-                    comp.original_dtype
-                )))
-            }
-        }
-    }
-
-    // NULL-group fix: per-group validity for the key column(s). A group whose
-    // encoded key is the reserved `NULL_GROUP_KEY` sentinel is the synthesised
-    // SQL NULL group — its key value must be emitted as NULL, not decoded.
-    // (Only the single-column path synthesises this sentinel; see
-    // `execute_groupby`.) For genuine groups every key column is valid. We
-    // still push a placeholder value into the typed buffer at the NULL slot
-    // so the buffer length matches `n`; the validity mask masks it out.
-    let mut row_valid: Vec<bool> = Vec::with_capacity(n);
-    let mut any_null_group = false;
-
-    for (k, _) in groups {
-        let is_null_group = *k == NULL_GROUP_KEY;
-        row_valid.push(!is_null_group);
-        if is_null_group {
-            any_null_group = true;
-            // Push a placeholder (zero / 0.0 / false) into each typed buffer; it is
-            // never observed because the validity mask marks this row NULL.
-            for buf in buffers.iter_mut() {
-                match buf {
-                    ColBuf::I32(v) => v.push(0),
-                    ColBuf::I64(v) => v.push(0),
-                    ColBuf::F32(v) => v.push(0.0),
-                    ColBuf::F64(v) => v.push(0.0),
-                    ColBuf::Bool(v) => v.push(false),
-                    ColBuf::Date32(v) => v.push(0),
-                    ColBuf::Timestamp { vals, .. } => vals.push(0),
-                }
-            }
-            continue;
-        }
-        let decoded = decode_key(*k, components);
-        for (buf, val) in buffers.iter_mut().zip(decoded.iter()) {
-            match (buf, val) {
-                (ColBuf::I32(v), KeyValue::I32(x)) => v.push(*x),
-                (ColBuf::I64(v), KeyValue::I64(x)) => v.push(*x),
-                (ColBuf::F32(v), KeyValue::F32(x)) => v.push(*x),
-                (ColBuf::F64(v), KeyValue::F64(x)) => v.push(*x),
-                (ColBuf::Bool(v), KeyValue::Bool(x)) => v.push(*x),
-                (ColBuf::Date32(v), KeyValue::Date32(x)) => v.push(*x),
-                (ColBuf::Timestamp { vals, .. }, KeyValue::Timestamp(x)) => vals.push(*x),
-                _ => {
-                    return Err(BoltError::Other(
-                        "internal: decode_key produced a KeyValue variant \
-                         that disagrees with its KeyComponent dtype"
-                            .into(),
-                    ))
-                }
-            }
-        }
-    }
-
-    // Build each output array. When a NULL group is present we attach the
-    // per-row validity mask so its key cell is NULL; otherwise we build the
-    // dense (all-valid) array exactly as before (no behaviour change for the
-    // common no-NULL-key case). `*Array::from(Vec<Option<_>>)` threads the
-    // validity buffer through Arrow's builders.
-    let mut out: Vec<ArrayRef> = Vec::with_capacity(m);
-    for buf in buffers {
-        let arr: ArrayRef = if any_null_group {
-            match buf {
-                ColBuf::I32(v) => Arc::new(Int32Array::from(
-                    v.into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect::<Vec<Option<i32>>>(),
-                )) as ArrayRef,
-                ColBuf::I64(v) => Arc::new(Int64Array::from(
-                    v.into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect::<Vec<Option<i64>>>(),
-                )) as ArrayRef,
-                ColBuf::F32(v) => Arc::new(Float32Array::from(
-                    v.into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect::<Vec<Option<f32>>>(),
-                )) as ArrayRef,
-                ColBuf::F64(v) => Arc::new(Float64Array::from(
-                    v.into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect::<Vec<Option<f64>>>(),
-                )) as ArrayRef,
-                ColBuf::Bool(v) => Arc::new(BooleanArray::from(
-                    v.into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect::<Vec<Option<bool>>>(),
-                )) as ArrayRef,
-                ColBuf::Date32(v) => Arc::new(Date32Array::from(
-                    v.into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect::<Vec<Option<i32>>>(),
-                )) as ArrayRef,
-                ColBuf::Timestamp { vals, unit, tz } => {
-                    let tz_arc: Option<Arc<str>> = tz.map(Arc::from);
-                    let opts: Vec<Option<i64>> = vals
-                        .into_iter()
-                        .zip(row_valid.iter())
-                        .map(|(x, &ok)| if ok { Some(x) } else { None })
-                        .collect();
-                    match unit {
-                        TimeUnit::Second => {
-                            Arc::new(TimestampSecondArray::from(opts).with_timezone_opt(tz_arc))
-                                as ArrayRef
-                        }
-                        TimeUnit::Millisecond => Arc::new(
-                            TimestampMillisecondArray::from(opts).with_timezone_opt(tz_arc),
-                        ) as ArrayRef,
-                        TimeUnit::Microsecond => Arc::new(
-                            TimestampMicrosecondArray::from(opts).with_timezone_opt(tz_arc),
-                        ) as ArrayRef,
-                        TimeUnit::Nanosecond => {
-                            Arc::new(TimestampNanosecondArray::from(opts).with_timezone_opt(tz_arc))
-                                as ArrayRef
-                        }
-                    }
-                }
-            }
-        } else {
-            match buf {
-                ColBuf::I32(v) => Arc::new(Int32Array::from(v)) as ArrayRef,
-                ColBuf::I64(v) => Arc::new(Int64Array::from(v)) as ArrayRef,
-                ColBuf::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
-                ColBuf::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
-                ColBuf::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
-                ColBuf::Date32(v) => Arc::new(Date32Array::from(v)) as ArrayRef,
-                ColBuf::Timestamp { vals, unit, tz } => timestamp_array_from_i64(vals, unit, tz),
-            }
-        };
-        out.push(arr);
-    }
-    Ok(out)
+    build_key_arrays_from_keys(
+        groups.iter().map(|&(k, _)| k),
+        components,
+        Some(NULL_GROUP_KEY),
+    )
 }
 
 /// Build the output Arrow array for one aggregate, indexing the downloaded
@@ -3140,188 +2493,28 @@ fn build_agg_array(
     }
 }
 
-/// Typed batch of per-group scalar values, prior to dtype-casting into Arrow.
-enum Scalars {
-    /// Int32 column.
-    I32(Vec<i32>),
-    /// Int64 column.
-    I64(Vec<i64>),
-    /// Float32 column.
-    F32(Vec<f32>),
-    /// Float64 column.
-    F64(Vec<f64>),
-}
-
-/// Which finaliser to apply on top of a per-group [`crate::exec::welford::WelfordState`].
-///
-/// Tags the `(count, mean, M2)` triple with the SQL aggregate it backs:
-/// `VAR_POP` and `VAR_SAMP` return raw variances, `STDDEV_POP` and
-/// `STDDEV_SAMP` return their square roots. NULL semantics for each are
-/// owned by [`crate::exec::welford::WelfordState`] (see `var_pop`,
-/// `var_samp`, `stddev_pop`, `stddev_samp` — the public API documents the
-/// `count == 0` and `count <= 1` NULL cases).
-#[derive(Clone, Copy, Debug)]
-enum WelfordOutKind {
-    VarPop,
-    VarSamp,
-    StddevPop,
-    StddevSamp,
-}
-
-/// Walk `groups` and emit one Float64 cell per group by reading the
-/// per-slot `WelfordState` and finalising it through the matching
-/// [`crate::exec::welford`] helper. Empty slots / single-observation
-/// `VAR_SAMP` etc. yield SQL NULL via `Float64Array::from(Vec<Option<f64>>)`.
 fn finalize_welford_array(
     states: &[crate::exec::welford::WelfordState],
     groups: &[(i64, usize)],
     kind: WelfordOutKind,
     out_field: &Field,
 ) -> BoltResult<ArrayRef> {
-    if out_field.dtype != DataType::Float64 {
-        return Err(BoltError::Type(format!(
-            "GROUP BY VAR/STDDEV output dtype must be Float64, got {:?}",
-            out_field.dtype
-        )));
-    }
-    let mut out: Vec<Option<f64>> = Vec::with_capacity(groups.len());
-    for (_, slot) in groups {
-        let st = states.get(*slot).ok_or_else(|| {
-            BoltError::Other(format!(
-                "internal: groupby Welford slot {} out of range (len {})",
-                slot,
-                states.len()
-            ))
-        })?;
-        let v = match kind {
-            WelfordOutKind::VarPop => st.var_pop(),
-            WelfordOutKind::VarSamp => st.var_samp(),
-            WelfordOutKind::StddevPop => st.stddev_pop(),
-            WelfordOutKind::StddevSamp => st.stddev_samp(),
-        };
-        out.push(v);
-    }
-    Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
+    finalize_welford_states(
+        groups.iter().map(|(_, slot)| {
+            states.get(*slot).ok_or_else(|| {
+                BoltError::Other(format!(
+                    "internal: groupby Welford slot {} out of range (len {})",
+                    slot,
+                    states.len()
+                ))
+            })
+        }),
+        groups.len(),
+        kind,
+        out_field,
+    )
 }
 
-/// Cast a `Scalars` batch into an Arrow array of `out_dtype`. Mirrors the
-/// cross-dtype matrix in `aggregate.rs::scalar_to_array`.
-fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
-    match (scalars, out_dtype) {
-        (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v)) as ArrayRef),
-        (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v)) as ArrayRef),
-        (Scalars::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v)) as ArrayRef),
-        (Scalars::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v)) as ArrayRef),
-
-        // Cross-dtype paths the scalar reducer also accepts.
-        (Scalars::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
-            v.into_iter().map(|x| x as i64).collect::<Vec<_>>(),
-        )) as ArrayRef),
-        (Scalars::I32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
-            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
-        )) as ArrayRef),
-        (Scalars::I32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
-            v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
-        )) as ArrayRef),
-        (Scalars::I64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
-            v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
-        )) as ArrayRef),
-        (Scalars::F32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
-            v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
-        )) as ArrayRef),
-        // W8-B-007: SUM(Float32) accumulated in f64, rounded once here.
-        (Scalars::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
-            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
-        )) as ArrayRef),
-
-        // F7-finish: MIN/MAX(Date32) reduced on the i32-normalized storage;
-        // rebuild a `Date32Array` so the grouped result preserves the date
-        // type (a plain `Int32Array` would silently downgrade it).
-        (Scalars::I32(v), DataType::Date32) => {
-            Ok(Arc::new(arrow_array::Date32Array::from(v)) as ArrayRef)
-        }
-        // F7-finish: MIN/MAX(Timestamp) reduced on the i64-normalized storage;
-        // rebuild the concrete `Timestamp*Array` matching the output unit and
-        // reattach its timezone so the unit + tz survive end-to-end.
-        (Scalars::I64(v), DataType::Timestamp(unit, tz)) => {
-            Ok(timestamp_array_from_i64(v, unit, tz))
-        }
-
-        (_, dt) => Err(BoltError::Type(format!(
-            "GROUP BY: cannot pack scalars into output dtype {:?}",
-            dt
-        ))),
-    }
-}
-
-/// F7-finish: build the concrete Arrow `Timestamp*Array` for a per-group i64
-/// tick buffer, dispatching on `TimeUnit` and reattaching the optional
-/// timezone. Mirror of `gpu_compact::timestamp_array_from_i64`, kept local so
-/// `pack_array` can rebuild the grouped MIN/MAX result with the correct unit +
-/// tz.
-fn timestamp_array_from_i64(host: Vec<i64>, unit: TimeUnit, tz: Option<&'static str>) -> ArrayRef {
-    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
-    match unit {
-        TimeUnit::Second => {
-            Arc::new(arrow_array::TimestampSecondArray::from(host).with_timezone_opt(tz_owned))
-                as ArrayRef
-        }
-        TimeUnit::Millisecond => {
-            Arc::new(arrow_array::TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned))
-                as ArrayRef
-        }
-        TimeUnit::Microsecond => {
-            Arc::new(arrow_array::TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned))
-                as ArrayRef
-        }
-        TimeUnit::Nanosecond => {
-            Arc::new(arrow_array::TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned))
-                as ArrayRef
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Identities for the accumulator initialiser.
-// ---------------------------------------------------------------------------
-
-fn identity_i32(op: ReduceOp) -> i32 {
-    match op {
-        ReduceOp::Sum | ReduceOp::Count => 0,
-        ReduceOp::Min => i32::MAX,
-        ReduceOp::Max => i32::MIN,
-    }
-}
-
-fn identity_i64(op: ReduceOp) -> i64 {
-    match op {
-        ReduceOp::Sum | ReduceOp::Count => 0,
-        ReduceOp::Min => i64::MAX,
-        ReduceOp::Max => i64::MIN,
-    }
-}
-
-// MIN float identity is NaN (not +inf): the no-validity float MIN/MAX path
-// (`run_min_max_aggregate`) seeds these accumulators and reduces them on the
-// device via the NaN-as-largest CAS kernel
-// (`jit::float_atomics::compile_groupby_float_atomic_kernel`). Under the DuckDB
-// total order that kernel and the scalar path (`aggregate.rs::float_total_cmp`)
-// implement, NaN is the *largest* value, so the correct MIN identity (the
-// maximum of the order, such that `min(identity, x) == x`) is NaN, not +inf.
-//
-// With a +inf seed the kernel's MIN rule never lets a NaN candidate replace the
-// seed (replace = `(!cand_nan & slot_nan) | ordered`), so an all-NaN group would
-// wrongly surface +inf. Seeding NaN makes the first finite candidate replace it
-// (finite beats a NaN slot) while an all-NaN group keeps NaN — matching the
-// scalar reduction, which seeds MIN from the first element rather than ±inf.
-//
-// MAX keeps the -inf identity (the minimum of the order); the MAX rule already
-// lets a NaN candidate beat -inf, so all-NaN MAX correctly yields NaN.
-//
-// NOTE: this only feeds the NaN-aware `float_atomics` kernel. The validity path
-// (`groupby_valid.rs`) has its own `identity_f64`/`identity_f32` seeding the
-// bare-`setp` `valid_flag_float` kernel, which still relies on a ±inf seed and
-// is intentionally left unchanged here.
 fn identity_f32(op: ReduceOp) -> f32 {
     match op {
         ReduceOp::Sum | ReduceOp::Count => 0.0,
@@ -3336,66 +2529,6 @@ fn identity_f64(op: ReduceOp) -> f64 {
         ReduceOp::Min => f64::NAN,
         ReduceOp::Max => f64::NEG_INFINITY,
     }
-}
-
-/// Widen a Float32 value column to f64 for a double-precision `SUM`
-/// accumulator (W8-B-007). Every f32 is exactly representable as f64, so the
-/// only rounding left is the single narrowing of each group's total back to
-/// the Float32 output dtype.
-pub(crate) fn widen_f32(values: &[f32]) -> Vec<f64> {
-    values.iter().map(|&v| f64::from(v)).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Misc helpers (mirror of the private helpers in aggregate.rs).
-// ---------------------------------------------------------------------------
-
-/// Resolve `name` to its `ColumnIO` within `inputs`.
-fn resolve_input<'a>(inputs: &'a [ColumnIO], name: &str) -> BoltResult<&'a ColumnIO> {
-    inputs.iter().find(|c| c.name == name).ok_or_else(|| {
-        BoltError::Plan(format!(
-            "aggregate input column '{}' not found in plan inputs",
-            name
-        ))
-    })
-}
-
-/// Extract the column name from a bare-column-ref expression. The v1 path
-/// requires every aggregate input to be a bare column ref.
-fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
-    match expr {
-        Expr::Column(name) => Ok(name.as_str()),
-        Expr::Alias(inner, _) => bare_column_name(inner),
-        _ => Err(BoltError::Other(
-            "GROUP BY: aggregate input must be a bare column reference in v1".into(),
-        )),
-    }
-}
-
-/// `Type` error for a failed Arrow downcast on column `name`.
-fn downcast_err(name: &str, expected: &str) -> BoltError {
-    BoltError::Type(format!(
-        "GROUP BY input column '{}' could not be downcast to {}",
-        name, expected
-    ))
-}
-
-/// Map Arrow `DataType` to our plan `DataType` (mirrors `aggregate.rs`).
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    crate::exec::schema_convert::arrow_dtype_to_plan(d)
-}
-
-/// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
-///
-/// F7-finish: uses the MIN/MAX-temporal variant so a grouped
-/// `MIN`/`MAX`/`COUNT` over a `Date32`/`Timestamp` value column can build its
-/// temporal-typed output field (unit + tz carried through). Temporal GROUP BY
-/// *keys* are still rejected earlier in `build_key_arrays` (which runs before
-/// this schema build), and `SUM(temporal)` is rejected in `run_typed_agg`'s
-/// dtype dispatch — so the only temporal output fields that reach here are the
-/// supported aggregate reductions.
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -3816,7 +2949,7 @@ pub(crate) mod utf8_groupby {
         for f in orig_output_schema.fields.iter().skip(m_keys) {
             fields.push(f.clone());
         }
-        let arrow_schema = super::plan_schema_to_arrow_schema(&Schema::new(fields))?;
+        let arrow_schema = super::build_output_arrow_schema(&Schema::new(fields), &out_cols)?;
         RecordBatch::try_new(arrow_schema, out_cols).map_err(|e| {
             BoltError::Other(format!(
                 "execute_groupby (utf8): failed to rebuild Utf8-keyed result: {e}"
@@ -3964,7 +3097,8 @@ pub(crate) mod utf8_groupby {
         }
         out_cols.extend(agg_arrays);
 
-        let arrow_schema = super::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+        let arrow_schema =
+            crate::exec::groupby_common::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
         RecordBatch::try_new(arrow_schema, out_cols).map_err(|e| {
             BoltError::Other(format!(
                 "execute_groupby (utf8 host): failed to build result batch: {e}"

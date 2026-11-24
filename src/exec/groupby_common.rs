@@ -43,18 +43,20 @@
 //!   * `column_should_use_native_validity` / `dispatch_native_validity`
 //!     (different per-executor kernel coverage matrices).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::launch::CudaStream;
-use crate::plan::logical_plan::{DataType, TimeUnit};
+use crate::jit::agg_kernels::ReduceOp;
+use crate::plan::logical_plan::{DataType, Expr, Field, Schema, TimeUnit};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO};
 
 // ---------------------------------------------------------------------------
@@ -633,24 +635,678 @@ pub(crate) fn next_pow2(n: usize) -> usize {
 }
 
 /// `Type` error for a failed Arrow downcast on column `name`.
-///
-/// dedup (groupby_common): local copy used by [`load_key_column_bits`]; the
-/// executors keep their own identically-worded `downcast_err` for the other
-/// (non-shared) downcast sites.
-fn downcast_err(name: &str, expected: &str) -> BoltError {
+pub(crate) fn downcast_err(name: &str, expected: &str) -> BoltError {
     BoltError::Type(format!(
         "GROUP BY input column '{}' could not be downcast to {}",
         name, expected
     ))
 }
 
-/// Map Arrow `DataType` to our plan `DataType` (mirrors `aggregate.rs`).
-///
-/// dedup (groupby_common): used by [`load_key_column_bits`]; delegates to the
-/// shared `schema_convert` helper exactly as the executors' local
-/// `arrow_dtype_to_plan` aliases did.
-fn arrow_dtype_to_plan(d: &arrow_schema::DataType) -> BoltResult<DataType> {
+/// Map Arrow `DataType` to our plan `DataType`.
+pub(crate) fn arrow_dtype_to_plan(d: &arrow_schema::DataType) -> BoltResult<DataType> {
     crate::exec::schema_convert::arrow_dtype_to_plan(d)
+}
+
+/// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
+pub(crate) fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<arrow_schema::Schema>> {
+    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
+}
+
+/// Build an output Arrow `Schema`, upgrading any field whose corresponding
+/// output `ArrayRef` carries nulls to `nullable = true`.
+pub(crate) fn build_output_arrow_schema(
+    schema: &Schema,
+    arrays: &[ArrayRef],
+) -> BoltResult<Arc<arrow_schema::Schema>> {
+    let base = plan_schema_to_arrow_schema(schema)?;
+    let fields: Vec<arrow_schema::FieldRef> = base
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if !f.is_nullable() && arrays.get(i).is_some_and(|a| a.null_count() > 0) {
+                Arc::new(f.as_ref().clone().with_nullable(true))
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .collect();
+    Ok(Arc::new(arrow_schema::Schema::new(fields)))
+}
+
+/// Resolve `name` to its `ColumnIO` within `inputs`.
+pub(crate) fn resolve_input<'a>(inputs: &'a [ColumnIO], name: &str) -> BoltResult<&'a ColumnIO> {
+    inputs.iter().find(|c| c.name == name).ok_or_else(|| {
+        BoltError::Plan(format!(
+            "aggregate input column '{}' not found in plan inputs",
+            name
+        ))
+    })
+}
+
+/// Extract the column name from a bare-column-ref expression.
+pub(crate) fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
+    match expr {
+        Expr::Column(name) => Ok(name.as_str()),
+        Expr::Alias(inner, _) => bare_column_name(inner),
+        _ => Err(BoltError::Other(
+            "GROUP BY: aggregate input must be a bare column reference in v1".into(),
+        )),
+    }
+}
+
+/// Return the per-row validity mask for `col_io` in `batch`, or `None` if
+/// the column has no nulls.
+pub(crate) fn column_null_mask(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+) -> BoltResult<Option<Vec<bool>>> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "aggregate input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+    if arr.null_count() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((0..arr.len()).map(|i| !arr.is_null(i)).collect()))
+    }
+}
+
+/// A filtered key column for a single aggregate launch: either a borrowed
+/// view of the shared `group_col` or a freshly-uploaded smaller column for
+/// the `(key_valid AND value_valid)` joint mask.
+pub(crate) enum FilteredKeys<'a> {
+    Borrowed {
+        group_col: &'a GpuVec<i64>,
+        host_keys: &'a [i64],
+        n_rows: usize,
+    },
+    Owned {
+        group_col: GpuVec<i64>,
+        host_keys: Vec<i64>,
+        n_rows: usize,
+    },
+}
+
+impl<'a> FilteredKeys<'a> {
+    pub(crate) fn col(&self) -> &GpuVec<i64> {
+        match self {
+            FilteredKeys::Borrowed { group_col, .. } => group_col,
+            FilteredKeys::Owned { group_col, .. } => group_col,
+        }
+    }
+
+    pub(crate) fn n_rows(&self) -> usize {
+        match self {
+            FilteredKeys::Borrowed { n_rows, .. } | FilteredKeys::Owned { n_rows, .. } => *n_rows,
+        }
+    }
+
+    pub(crate) fn host_keys(&self) -> &[i64] {
+        match self {
+            FilteredKeys::Borrowed { host_keys, .. } => host_keys,
+            FilteredKeys::Owned { host_keys, .. } => host_keys,
+        }
+    }
+}
+
+/// Reuse `group_col` when `value_valid` is `None`, or host-filter
+/// `cached_host_keys` against the joint `(key_valid AND value_valid)` mask
+/// without a redundant D2H download and upload the compacted `i64` keys.
+pub(crate) fn prepare_filtered_keys<'a>(
+    group_col: &'a GpuVec<i64>,
+    n_rows: usize,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+    cached_host_keys: &'a [i64],
+    stream: &CudaStream,
+) -> BoltResult<FilteredKeys<'a>> {
+    let Some(value_valid_unwrapped) = value_valid else {
+        return Ok(FilteredKeys::Borrowed {
+            group_col,
+            host_keys: cached_host_keys,
+            n_rows,
+        });
+    };
+
+    let value_valid_filtered: Vec<bool> = match key_valid {
+        Some(kv) => kv
+            .iter()
+            .zip(value_valid_unwrapped.iter())
+            .filter_map(|(&k, &v)| if k { Some(v) } else { None })
+            .collect(),
+        None => value_valid_unwrapped.to_vec(),
+    };
+    debug_assert_eq!(value_valid_filtered.len(), n_rows);
+    debug_assert_eq!(cached_host_keys.len(), n_rows);
+
+    let filtered: Vec<i64> = cached_host_keys
+        .iter()
+        .zip(value_valid_filtered.iter())
+        .filter_map(|(&k, &v)| if v { Some(k) } else { None })
+        .collect();
+    let filtered_n = filtered.len();
+    let owned = GpuVec::<i64>::from_slice_async(&filtered, stream.raw())?;
+    Ok(FilteredKeys::Owned {
+        group_col: owned,
+        host_keys: filtered,
+        n_rows: filtered_n,
+    })
+}
+
+/// Host-side per-group integer `SUM` overflow guard (`i64::checked_add`).
+pub(crate) fn checked_group_sum(values: &[i64], host_keys: &[i64]) -> BoltResult<()> {
+    debug_assert_eq!(
+        values.len(),
+        host_keys.len(),
+        "checked_group_sum: value/key columns must be aligned 1:1",
+    );
+    let mut sums: HashMap<i64, i64> = HashMap::with_capacity(host_keys.len().min(1 << 20));
+    for (&v, &key) in values.iter().zip(host_keys.iter()) {
+        let slot = sums.entry(key).or_insert(0i64);
+        *slot = slot.checked_add(v).ok_or_else(|| {
+            BoltError::Type("SUM(integer) overflow: accumulator exceeds i64 range".to_string())
+        })?;
+    }
+    Ok(())
+}
+
+/// Native-validity companion to [`checked_group_sum`].
+pub(crate) fn checked_group_sum_native_validity(
+    values: &[i64],
+    value_valid: &[bool],
+    group_col: &GpuVec<i64>,
+) -> BoltResult<()> {
+    debug_assert_eq!(values.len(), value_valid.len());
+    let host_keys: Vec<i64> = group_col.to_vec()?;
+    debug_assert_eq!(host_keys.len(), values.len());
+    let mut vals: Vec<i64> = Vec::with_capacity(values.len());
+    let mut keys: Vec<i64> = Vec::with_capacity(values.len());
+    for ((&v, &valid), &key) in values.iter().zip(value_valid.iter()).zip(host_keys.iter()) {
+        if valid {
+            vals.push(v);
+            keys.push(key);
+        }
+    }
+    checked_group_sum(&vals, &keys)
+}
+
+/// Collect a primitive Arrow array's values into a `Vec`, keeping rows where
+/// `(key_valid AND value_valid)` is true.
+pub(crate) fn collect_filtered_primitive<P>(
+    pa: &arrow_array::PrimitiveArray<P>,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+) -> Vec<P::Native>
+where
+    P: arrow_array::types::ArrowPrimitiveType,
+    P::Native: Copy,
+{
+    let n = pa.len();
+    let vals = pa.values();
+    let mut out: Vec<P::Native> = Vec::with_capacity(n);
+    for i in 0..n {
+        let kv = key_valid.map(|m| m[i]).unwrap_or(true);
+        let vv = value_valid.map(|m| m[i]).unwrap_or(true);
+        if kv && vv {
+            out.push(vals[i]);
+        }
+    }
+    out
+}
+
+/// NULL-filtered `i64` tick extraction for grouped `MIN`/`MAX` over `Timestamp`.
+pub(crate) fn collect_filtered_timestamp(
+    arr: &dyn Array,
+    name: &str,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+) -> BoltResult<Vec<i64>> {
+    use arrow_array::types::{
+        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType,
+    };
+    use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
+    macro_rules! collect_ts {
+        ($p:ty, $arr_ty:ty, $label:literal) => {{
+            let pa = arr
+                .as_any()
+                .downcast_ref::<$arr_ty>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            Ok(collect_filtered_primitive::<$p>(pa, key_valid, value_valid))
+        }};
+    }
+    match arr.data_type() {
+        ArrowDataType::Timestamp(ArrowTimeUnit::Second, _) => {
+            collect_ts!(TimestampSecondType, TimestampSecondArray, "TimestampSecond")
+        }
+        ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, _) => collect_ts!(
+            TimestampMillisecondType,
+            TimestampMillisecondArray,
+            "TimestampMillisecond"
+        ),
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, _) => collect_ts!(
+            TimestampMicrosecondType,
+            TimestampMicrosecondArray,
+            "TimestampMicrosecond"
+        ),
+        ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, _) => collect_ts!(
+            TimestampNanosecondType,
+            TimestampNanosecondArray,
+            "TimestampNanosecond"
+        ),
+        other => Err(BoltError::Type(format!(
+            "GROUP BY aggregate input '{}' is not a Timestamp array: {:?}",
+            name, other
+        ))),
+    }
+}
+
+/// Pull a numeric/bool/decimal input column out of `batch`, convert to `f64`,
+/// and drop positions where `(key_valid AND value_valid)` is false.
+pub(crate) fn load_input_column_as_f64_filtered(
+    col_io: &ColumnIO,
+    batch: &RecordBatch,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+) -> BoltResult<Vec<f64>> {
+    let idx = batch.schema().index_of(&col_io.name).map_err(|e| {
+        BoltError::Plan(format!(
+            "AVG input '{}' not present in table batch: {}",
+            col_io.name, e
+        ))
+    })?;
+    let arr = batch.column(idx);
+    match col_io.dtype {
+        DataType::Int32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int32"))?;
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
+        }
+        DataType::Int64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Int64"))?;
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
+        }
+        DataType::Float32 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float32"))?;
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v as f64))
+        }
+        DataType::Float64 => {
+            let pa = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Float64"))?;
+            Ok(filter_iter_to_f64(pa, key_valid, value_valid, |v| v))
+        }
+        DataType::Bool => {
+            let ba = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Bool"))?;
+            let n = ba.len();
+            let mut out: Vec<f64> = Vec::with_capacity(n);
+            for i in 0..n {
+                let kv = key_valid.map(|m| m[i]).unwrap_or(true);
+                let vv = value_valid.map(|m| m[i]).unwrap_or(true);
+                if kv && vv {
+                    out.push(if ba.value(i) { 1.0 } else { 0.0 });
+                }
+            }
+            Ok(out)
+        }
+        DataType::Decimal128(_, scale) => {
+            let da = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| downcast_err(&col_io.name, "Decimal128"))?;
+            let pow = 10f64.powi(scale as i32);
+            Ok(filter_iter_to_f64(da, key_valid, value_valid, |v| {
+                (v as f64) / pow
+            }))
+        }
+        DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) | DataType::Extended(_) => {
+            Err(BoltError::Type(format!(
+                "AVG input dtype {:?} not supported (column '{}')",
+                col_io.dtype, col_io.name
+            )))
+        }
+    }
+}
+
+/// Walk a primitive Arrow array, apply the joint validity mask, and cast via `f`.
+pub(crate) fn filter_iter_to_f64<P, F>(
+    pa: &arrow_array::PrimitiveArray<P>,
+    key_valid: Option<&[bool]>,
+    value_valid: Option<&[bool]>,
+    f: F,
+) -> Vec<f64>
+where
+    P: arrow_array::types::ArrowPrimitiveType,
+    P::Native: Copy,
+    F: Fn(P::Native) -> f64,
+{
+    let n = pa.len();
+    let vals = pa.values();
+    let mut out: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let kv = key_valid.map(|m| m[i]).unwrap_or(true);
+        let vv = value_valid.map(|m| m[i]).unwrap_or(true);
+        if kv && vv {
+            out.push(f(vals[i]));
+        }
+    }
+    out
+}
+
+/// Build one Arrow array per group-by column by decoding each packed `i64` key
+/// through [`decode_key`]. When `null_sentinel` is `Some(sentinel)`, any group
+/// whose encoded key equals `sentinel` emits SQL `NULL` across its key cells.
+pub(crate) fn build_key_arrays_from_keys<I>(
+    keys: I,
+    components: &[KeyComponent],
+    null_sentinel: Option<i64>,
+) -> BoltResult<Vec<ArrayRef>>
+where
+    I: ExactSizeIterator<Item = i64>,
+{
+    let m = components.len();
+    let n = keys.len();
+
+    enum ColBuf {
+        I32(Vec<i32>),
+        I64(Vec<i64>),
+        F32(Vec<f32>),
+        F64(Vec<f64>),
+        Bool(Vec<bool>),
+        Date32(Vec<i32>),
+        Timestamp {
+            vals: Vec<i64>,
+            unit: TimeUnit,
+            tz: Option<&'static str>,
+        },
+    }
+
+    let mut buffers: Vec<ColBuf> = Vec::with_capacity(m);
+    for comp in components {
+        match comp.original_dtype {
+            DataType::Int32 => buffers.push(ColBuf::I32(Vec::with_capacity(n))),
+            DataType::Int64 => buffers.push(ColBuf::I64(Vec::with_capacity(n))),
+            DataType::Float32 => buffers.push(ColBuf::F32(Vec::with_capacity(n))),
+            DataType::Float64 => buffers.push(ColBuf::F64(Vec::with_capacity(n))),
+            DataType::Bool => buffers.push(ColBuf::Bool(Vec::with_capacity(n))),
+            DataType::Date32 => buffers.push(ColBuf::Date32(Vec::with_capacity(n))),
+            DataType::Timestamp(unit, tz) => buffers.push(ColBuf::Timestamp {
+                vals: Vec::with_capacity(n),
+                unit,
+                tz,
+            }),
+            DataType::Utf8 | DataType::Decimal128(_, _) | DataType::Extended(_) => {
+                return Err(BoltError::Type(format!(
+                    "GROUP BY key dtype {:?} not supported on output",
+                    comp.original_dtype
+                )))
+            }
+        }
+    }
+
+    let mut row_valid: Vec<bool> = Vec::with_capacity(n);
+    let mut any_null_group = false;
+
+    for k in keys {
+        let is_null_group = null_sentinel == Some(k);
+        row_valid.push(!is_null_group);
+        if is_null_group {
+            any_null_group = true;
+            for buf in buffers.iter_mut() {
+                match buf {
+                    ColBuf::I32(v) => v.push(0),
+                    ColBuf::I64(v) => v.push(0),
+                    ColBuf::F32(v) => v.push(0.0),
+                    ColBuf::F64(v) => v.push(0.0),
+                    ColBuf::Bool(v) => v.push(false),
+                    ColBuf::Date32(v) => v.push(0),
+                    ColBuf::Timestamp { vals, .. } => vals.push(0),
+                }
+            }
+            continue;
+        }
+        let decoded = decode_key(k, components);
+        for (buf, val) in buffers.iter_mut().zip(decoded.iter()) {
+            match (buf, val) {
+                (ColBuf::I32(v), KeyValue::I32(x)) => v.push(*x),
+                (ColBuf::I64(v), KeyValue::I64(x)) => v.push(*x),
+                (ColBuf::F32(v), KeyValue::F32(x)) => v.push(*x),
+                (ColBuf::F64(v), KeyValue::F64(x)) => v.push(*x),
+                (ColBuf::Bool(v), KeyValue::Bool(x)) => v.push(*x),
+                (ColBuf::Date32(v), KeyValue::Date32(x)) => v.push(*x),
+                (ColBuf::Timestamp { vals, .. }, KeyValue::Timestamp(x)) => vals.push(*x),
+                _ => {
+                    return Err(BoltError::Other(
+                        "internal: decode_key produced a KeyValue variant \
+                         that disagrees with its KeyComponent dtype"
+                            .into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ArrayRef> = Vec::with_capacity(m);
+    for buf in buffers {
+        let arr: ArrayRef = if any_null_group {
+            match buf {
+                ColBuf::I32(v) => Arc::new(Int32Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect::<Vec<_>>(),
+                )),
+                ColBuf::I64(v) => Arc::new(Int64Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect::<Vec<_>>(),
+                )),
+                ColBuf::F32(v) => Arc::new(Float32Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect::<Vec<_>>(),
+                )),
+                ColBuf::F64(v) => Arc::new(Float64Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect::<Vec<_>>(),
+                )),
+                ColBuf::Bool(v) => Arc::new(BooleanArray::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect::<Vec<_>>(),
+                )),
+                ColBuf::Date32(v) => Arc::new(Date32Array::from(
+                    v.into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect::<Vec<_>>(),
+                )),
+                ColBuf::Timestamp { vals, unit, tz } => {
+                    let tz_arc: Option<Arc<str>> = tz.map(Arc::from);
+                    let opts: Vec<Option<i64>> = vals
+                        .into_iter()
+                        .zip(row_valid.iter())
+                        .map(|(x, &ok)| ok.then_some(x))
+                        .collect();
+                    match unit {
+                        TimeUnit::Second => {
+                            Arc::new(TimestampSecondArray::from(opts).with_timezone_opt(tz_arc))
+                        }
+                        TimeUnit::Millisecond => Arc::new(
+                            TimestampMillisecondArray::from(opts).with_timezone_opt(tz_arc),
+                        ),
+                        TimeUnit::Microsecond => Arc::new(
+                            TimestampMicrosecondArray::from(opts).with_timezone_opt(tz_arc),
+                        ),
+                        TimeUnit::Nanosecond => {
+                            Arc::new(TimestampNanosecondArray::from(opts).with_timezone_opt(tz_arc))
+                        }
+                    }
+                }
+            }
+        } else {
+            match buf {
+                ColBuf::I32(v) => Arc::new(Int32Array::from(v)),
+                ColBuf::I64(v) => Arc::new(Int64Array::from(v)),
+                ColBuf::F32(v) => Arc::new(Float32Array::from(v)),
+                ColBuf::F64(v) => Arc::new(Float64Array::from(v)),
+                ColBuf::Bool(v) => Arc::new(BooleanArray::from(v)),
+                ColBuf::Date32(v) => Arc::new(Date32Array::from(v)),
+                ColBuf::Timestamp { vals, unit, tz } => timestamp_array_from_i64(vals, unit, tz),
+            }
+        };
+        out.push(arr);
+    }
+    Ok(out)
+}
+
+/// Typed batch of per-group scalar values prior to casting into Arrow.
+pub(crate) enum Scalars {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+}
+
+/// Cast a [`Scalars`] batch into an Arrow array of `out_dtype`.
+pub(crate) fn pack_array(out_dtype: DataType, scalars: Scalars) -> BoltResult<ArrayRef> {
+    match (scalars, out_dtype) {
+        (Scalars::I32(v), DataType::Int32) => Ok(Arc::new(Int32Array::from(v))),
+        (Scalars::I64(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(v))),
+        (Scalars::F32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(v))),
+        (Scalars::F64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(v))),
+        (Scalars::I32(v), DataType::Int64) => Ok(Arc::new(Int64Array::from(
+            v.into_iter().map(|x| x as i64).collect::<Vec<_>>(),
+        ))),
+        (Scalars::I32(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
+        ))),
+        (Scalars::I32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
+            v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
+        ))),
+        (Scalars::I64(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
+            v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
+        ))),
+        (Scalars::F32(v), DataType::Float64) => Ok(Arc::new(Float64Array::from(
+            v.into_iter().map(|x| x as f64).collect::<Vec<_>>(),
+        ))),
+        (Scalars::F64(v), DataType::Float32) => Ok(Arc::new(Float32Array::from(
+            v.into_iter().map(|x| x as f32).collect::<Vec<_>>(),
+        ))),
+        (Scalars::I32(v), DataType::Date32) => Ok(Arc::new(Date32Array::from(v))),
+        (Scalars::I64(v), DataType::Timestamp(unit, tz)) => {
+            Ok(timestamp_array_from_i64(v, unit, tz))
+        }
+        (_, dt) => Err(BoltError::Type(format!(
+            "GROUP BY: cannot pack scalars into output dtype {:?}",
+            dt
+        ))),
+    }
+}
+
+/// Build the concrete Arrow `Timestamp*Array` for a per-group `i64` tick buffer.
+pub(crate) fn timestamp_array_from_i64(
+    host: Vec<i64>,
+    unit: TimeUnit,
+    tz: Option<&'static str>,
+) -> ArrayRef {
+    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
+    match unit {
+        TimeUnit::Second => Arc::new(TimestampSecondArray::from(host).with_timezone_opt(tz_owned)),
+        TimeUnit::Millisecond => {
+            Arc::new(TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned))
+        }
+        TimeUnit::Microsecond => {
+            Arc::new(TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned))
+        }
+        TimeUnit::Nanosecond => {
+            Arc::new(TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned))
+        }
+    }
+}
+
+/// Tag for finalising a per-group [`crate::exec::welford::WelfordState`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WelfordOutKind {
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+}
+
+/// Finalise an ordered sequence of per-group `WelfordState`s into a nullable
+/// `Float64Array`.
+pub(crate) fn finalize_welford_states<'a, I>(
+    states: I,
+    n_groups: usize,
+    kind: WelfordOutKind,
+    out_field: &Field,
+) -> BoltResult<ArrayRef>
+where
+    I: IntoIterator<Item = BoltResult<&'a crate::exec::welford::WelfordState>>,
+{
+    if out_field.dtype != DataType::Float64 {
+        return Err(BoltError::Type(format!(
+            "GROUP BY VAR/STDDEV output dtype must be Float64, got {:?}",
+            out_field.dtype
+        )));
+    }
+    let mut out: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+    for st_res in states {
+        let st = st_res?;
+        let v = match kind {
+            WelfordOutKind::VarPop => st.var_pop(),
+            WelfordOutKind::VarSamp => st.var_samp(),
+            WelfordOutKind::StddevPop => st.stddev_pop(),
+            WelfordOutKind::StddevSamp => st.stddev_samp(),
+        };
+        out.push(v);
+    }
+    Ok(Arc::new(Float64Array::from(out)))
+}
+
+/// Integer accumulator identity for `i32`.
+pub(crate) fn identity_i32(op: ReduceOp) -> i32 {
+    match op {
+        ReduceOp::Sum | ReduceOp::Count => 0,
+        ReduceOp::Min => i32::MAX,
+        ReduceOp::Max => i32::MIN,
+    }
+}
+
+/// Integer accumulator identity for `i64`.
+pub(crate) fn identity_i64(op: ReduceOp) -> i64 {
+    match op {
+        ReduceOp::Sum | ReduceOp::Count => 0,
+        ReduceOp::Min => i64::MAX,
+        ReduceOp::Max => i64::MIN,
+    }
+}
+
+/// Widen a `Float32` value slice to `f64` for double-precision `SUM` accumulation.
+pub(crate) fn widen_f32(values: &[f32]) -> Vec<f64> {
+    values.iter().map(|&v| f64::from(v)).collect()
 }
 
 // ---------------------------------------------------------------------------
