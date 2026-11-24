@@ -57,11 +57,17 @@ use arrow_array::{
     Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
+#[cfg(test)]
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 use crate::error::{BoltError, BoltResult};
-use crate::exec::groupby_common::{canonicalise_f32, canonicalise_f64};
-use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Literal, Schema, TimeUnit};
+use crate::exec::groupby_common::{
+    arrow_dtype_to_plan, bare_column_name, build_output_arrow_schema, canonicalise_f32,
+    canonicalise_f64, downcast_err, timestamp_array_from_i64,
+};
+#[cfg(test)]
+use crate::plan::logical_plan::Schema;
+use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Field, Literal, TimeUnit};
 use crate::plan::physical_plan::{AggregateSpec, PhysicalPlan};
 
 // ---------------------------------------------------------------------------
@@ -1774,24 +1780,6 @@ fn pack_typed_array(out_dtype: DataType, col: TypedColumn) -> BoltResult<ArrayRe
     }
 }
 
-fn timestamp_array_from_i64(host: Vec<i64>, unit: TimeUnit, tz: Option<&'static str>) -> ArrayRef {
-    let tz_owned: Option<Arc<str>> = tz.map(Arc::from);
-    match unit {
-        TimeUnit::Second => {
-            Arc::new(TimestampSecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
-        }
-        TimeUnit::Millisecond => {
-            Arc::new(TimestampMillisecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
-        }
-        TimeUnit::Microsecond => {
-            Arc::new(TimestampMicrosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
-        }
-        TimeUnit::Nanosecond => {
-            Arc::new(TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
-        }
-    }
-}
-
 fn timestamp_opt_array_from_i64(
     host: Vec<Option<i64>>,
     unit: TimeUnit,
@@ -1812,57 +1800,6 @@ fn timestamp_opt_array_from_i64(
             Arc::new(TimestampNanosecondArray::from(host).with_timezone_opt(tz_owned)) as ArrayRef
         }
     }
-}
-
-fn build_output_arrow_schema(schema: &Schema, arrays: &[ArrayRef]) -> BoltResult<Arc<ArrowSchema>> {
-    let base = plan_schema_to_arrow_schema(schema)?;
-    let fields: Vec<arrow_schema::FieldRef> = base
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            if !f.is_nullable() && arrays.get(i).is_some_and(|a| a.null_count() > 0) {
-                Arc::new(f.as_ref().clone().with_nullable(true))
-            } else {
-                Arc::clone(f)
-            }
-        })
-        .collect();
-    Ok(Arc::new(ArrowSchema::new(fields)))
-}
-
-// ---------------------------------------------------------------------------
-// Misc helpers (mirror groupby.rs).
-// ---------------------------------------------------------------------------
-
-/// Extract the column name from a bare-column-ref expression. Rejects
-/// computed expressions like `SUM(a * b)`.
-fn bare_column_name(expr: &Expr) -> BoltResult<&str> {
-    match expr {
-        Expr::Column(name) => Ok(name.as_str()),
-        Expr::Alias(inner, _) => bare_column_name(inner),
-        _ => Err(BoltError::Other(
-            "wide GROUP BY: aggregate input must be a bare column reference".into(),
-        )),
-    }
-}
-
-/// `Type` error for a failed Arrow downcast on column `name`.
-fn downcast_err(name: &str, expected: &str) -> BoltError {
-    BoltError::Type(format!(
-        "wide GROUP BY input column '{}' could not be downcast to {}",
-        name, expected
-    ))
-}
-
-/// Map Arrow `DataType` to our plan `DataType` (mirrors `groupby.rs`).
-fn arrow_dtype_to_plan(d: &ArrowDataType) -> BoltResult<DataType> {
-    crate::exec::schema_convert::arrow_dtype_to_plan(d)
-}
-
-/// Build an Arrow `Schema` from our plan `Schema` for the output `RecordBatch`.
-fn plan_schema_to_arrow_schema(s: &Schema) -> BoltResult<Arc<ArrowSchema>> {
-    crate::exec::schema_convert::plan_schema_to_arrow_schema(s)
 }
 
 // ---------------------------------------------------------------------------
