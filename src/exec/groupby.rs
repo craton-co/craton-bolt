@@ -881,7 +881,7 @@ pub fn execute_groupby(plan: &PhysicalPlan, table_batch: &RecordBatch) -> BoltRe
 /// when a probe-bound overflow would otherwise silently drop a row. The Robin
 /// Hood variant was NOT changed and keeps its old 4-param ABI, so the counter
 /// is only appended on the linear branch.
-fn launch_keys_kernel(
+pub(crate) fn launch_keys_kernel(
     group_col: &GpuVec<i64>,
     keys_table: &mut GpuVec<i64>,
     n_rows: usize,
@@ -1008,7 +1008,7 @@ fn launch_keys_kernel(
 /// MIN/MAX path routes through `float_atomics`, whose kernel was NOT changed
 /// and keeps its old 6-param ABI — the counter is NOT attached there.
 #[allow(clippy::too_many_arguments)]
-fn launch_agg_kernel<T: Pod>(
+pub(crate) fn launch_agg_kernel<T: Pod>(
     op: ReduceOp,
     input_dtype: DataType,
     group_col: &GpuVec<i64>,
@@ -2515,7 +2515,7 @@ fn finalize_welford_array(
     )
 }
 
-fn identity_f32(op: ReduceOp) -> f32 {
+pub(crate) fn identity_f32(op: ReduceOp) -> f32 {
     match op {
         ReduceOp::Sum | ReduceOp::Count => 0.0,
         ReduceOp::Min => f32::NAN,
@@ -2523,7 +2523,7 @@ fn identity_f32(op: ReduceOp) -> f32 {
     }
 }
 
-fn identity_f64(op: ReduceOp) -> f64 {
+pub(crate) fn identity_f64(op: ReduceOp) -> f64 {
     match op {
         ReduceOp::Sum | ReduceOp::Count => 0.0,
         ReduceOp::Min => f64::NAN,

@@ -41,11 +41,20 @@ use crate::cuda::cuda_sys::{self, CUdeviceptr};
 use crate::cuda::GpuVec;
 use crate::error::{BoltError, BoltResult};
 use crate::exec::expr_agg;
+use crate::exec::gpu_compact::{gather_one, prefix_scan_mask, GatheredCol, ScanResult};
+use crate::exec::gpu_table::{GpuColumnData, GpuTable};
+use crate::exec::groupby::{identity_f32, identity_f64, launch_agg_kernel, launch_keys_kernel};
+use crate::exec::groupby_common::{
+    build_key_arrays_from_keys, build_output_arrow_schema, download_pinned_f32,
+    download_pinned_f64, download_pinned_i32, download_pinned_i64, identity_i32, identity_i64,
+    next_pow2, pack_array, KeyComponent, Scalars,
+};
 use crate::exec::launch::{grid_x_for, CudaStream};
 use crate::exec::module_cache;
 use crate::exec::n_rows_to_u32;
+use crate::jit::agg_kernels::ReduceOp;
 use crate::jit::compile_ptx;
-use crate::jit::hash_kernels::packed_validity_word_count;
+use crate::jit::hash_kernels::{packed_validity_word_count, I64_EMPTY_SENTINEL};
 use crate::plan::logical_plan::{AggregateExpr, DataType, Expr, Literal, TimeUnit};
 use crate::plan::physical_plan::{AggregateSpec, ColumnIO, KernelSpec, PhysicalPlan};
 
@@ -107,6 +116,1260 @@ pub fn execute_groupby_with_pre(
         NATIVE_VALIDITY_LAUNCHES.fetch_add(after - before, Ordering::Relaxed);
     }
     res
+}
+
+const RES_FILL_B64: &str = "bolt_res_fill_b64";
+const RES_FILL_B32: &str = "bolt_res_fill_b32";
+const RES_BITS_B32: &str = "bolt_res_bits_b32";
+const RES_BITS_BOOL: &str = "bolt_res_bits_bool";
+const RES_BITS_F32: &str = "bolt_res_bits_f32";
+const RES_BITS_B64: &str = "bolt_res_bits_b64";
+const RES_BITS_F64: &str = "bolt_res_bits_f64";
+const RES_PACK2: &str = "bolt_res_pack2";
+const RES_I32_TO_I64: &str = "bolt_res_i32_to_i64";
+const RES_I32_TO_F64: &str = "bolt_res_i32_to_f64";
+const RES_I64_TO_F64: &str = "bolt_res_i64_to_f64";
+const RES_F32_TO_F64: &str = "bolt_res_f32_to_f64";
+const RES_U8_TO_F64: &str = "bolt_res_u8_to_f64";
+
+fn resident_groupby_ptx() -> String {
+    format!(
+        r#".version 7.5
+.target sm_70
+.address_size 64
+
+.visible .entry {RES_FILL_B64}(.param .u64 p_dst, .param .b64 p_val, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<5>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_dst];
+    ld.param.b64 %rd1, [p_val];
+    cvta.to.global.u64 %rd0, %rd0;
+    mul.wide.u32 %rd2, %r3, 8;
+    add.u64 %rd3, %rd0, %rd2;
+    st.global.b64 [%rd3], %rd1;
+    ret;
+}}
+
+.visible .entry {RES_FILL_B32}(.param .u64 p_dst, .param .b32 p_val, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<4>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_dst];
+    ld.param.b32 %r5, [p_val];
+    cvta.to.global.u64 %rd0, %rd0;
+    mul.wide.u32 %rd1, %r3, 4;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.b32 [%rd2], %r5;
+    ret;
+}}
+
+.visible .entry {RES_BITS_B32}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<7>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.u32 %r5, [%rd3];
+    cvt.u64.u32 %rd4, %r5;
+    mul.wide.u32 %rd5, %r3, 8;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.u64 [%rd6], %rd4;
+    ret;
+}}
+
+.visible .entry {RES_BITS_BOOL}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<3>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<7>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    cvt.u64.u32 %rd2, %r3;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.u8 %r5, [%rd3];
+    setp.ne.u32 %p1, %r5, 0;
+    selp.u64 %rd4, 1, 0, %p1;
+    mul.wide.u32 %rd5, %r3, 8;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.u64 [%rd6], %rd4;
+    ret;
+}}
+
+.visible .entry {RES_BITS_F32}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<4>;
+    .reg .b32 %r<9>;
+    .reg .b64 %rd<7>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.u32 %r5, [%rd3];
+    and.b32 %r6, %r5, 2147483647;
+    setp.eq.u32 %p1, %r6, 0;
+    setp.gt.u32 %p2, %r6, 2139095040;
+    selp.u32 %r7, 0, %r5, %p1;
+    selp.u32 %r8, 2143289344, %r7, %p2;
+    cvt.u64.u32 %rd4, %r8;
+    mul.wide.u32 %rd5, %r3, 8;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.u64 [%rd6], %rd4;
+    ret;
+}}
+
+.visible .entry {RES_BITS_B64}(.param .u64 p_src, .param .u64 p_dst, .param .u64 p_flag, .param .u32 p_n)
+{{
+    .reg .pred %p<3>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<9>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 8;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.u64 %rd4, [%rd3];
+    add.u64 %rd5, %rd1, %rd2;
+    st.global.u64 [%rd5], %rd4;
+    mov.u64 %rd6, 0x8000000000000000;
+    setp.ne.u64 %p1, %rd4, %rd6;
+    @%p1 ret;
+    ld.param.u64 %rd7, [p_flag];
+    cvta.to.global.u64 %rd7, %rd7;
+    mov.u32 %r5, 1;
+    st.global.u32 [%rd7], %r5;
+    ret;
+}}
+
+.visible .entry {RES_BITS_F64}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<4>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<12>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 8;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.u64 %rd4, [%rd3];
+    mov.u64 %rd5, 0x7fffffffffffffff;
+    and.b64 %rd6, %rd4, %rd5;
+    setp.eq.u64 %p1, %rd6, 0;
+    mov.u64 %rd7, 0x7ff0000000000000;
+    setp.gt.u64 %p2, %rd6, %rd7;
+    selp.u64 %rd8, 0, %rd4, %p1;
+    mov.u64 %rd9, 0x7ff8000000000000;
+    selp.u64 %rd10, %rd9, %rd8, %p2;
+    add.u64 %rd11, %rd1, %rd2;
+    st.global.u64 [%rd11], %rd10;
+    ret;
+}}
+
+.visible .entry {RES_PACK2}(.param .u64 p_hi, .param .u64 p_lo, .param .u64 p_dst, .param .u64 p_flag, .param .u32 p_n)
+{{
+    .reg .pred %p<3>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<12>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_hi];
+    ld.param.u64 %rd1, [p_lo];
+    ld.param.u64 %rd2, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mul.wide.u32 %rd3, %r3, 8;
+    add.u64 %rd4, %rd0, %rd3;
+    add.u64 %rd5, %rd1, %rd3;
+    ld.global.u64 %rd6, [%rd4];
+    ld.global.u64 %rd7, [%rd5];
+    shl.b64 %rd8, %rd6, 32;
+    or.b64 %rd9, %rd8, %rd7;
+    add.u64 %rd10, %rd2, %rd3;
+    st.global.u64 [%rd10], %rd9;
+    mov.u64 %rd11, 0x8000000000000000;
+    setp.ne.u64 %p1, %rd9, %rd11;
+    @%p1 ret;
+    ld.param.u64 %rd4, [p_flag];
+    cvta.to.global.u64 %rd4, %rd4;
+    mov.u32 %r5, 1;
+    st.global.u32 [%rd4], %r5;
+    ret;
+}}
+
+.visible .entry {RES_I32_TO_I64}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<7>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.s32 %r5, [%rd3];
+    cvt.s64.s32 %rd4, %r5;
+    mul.wide.u32 %rd5, %r3, 8;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.s64 [%rd6], %rd4;
+    ret;
+}}
+
+.visible .entry {RES_I32_TO_F64}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    .reg .f64 %fd<2>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.s32 %r5, [%rd3];
+    cvt.rn.f64.s32 %fd0, %r5;
+    mul.wide.u32 %rd4, %r3, 8;
+    add.u64 %rd5, %rd1, %rd4;
+    st.global.f64 [%rd5], %fd0;
+    ret;
+}}
+
+.visible .entry {RES_I64_TO_F64}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<6>;
+    .reg .f64 %fd<2>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 8;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.s64 %rd4, [%rd3];
+    cvt.rn.f64.s64 %fd0, %rd4;
+    add.u64 %rd5, %rd1, %rd2;
+    st.global.f64 [%rd5], %fd0;
+    ret;
+}}
+
+.visible .entry {RES_F32_TO_F64}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<2>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd3];
+    cvt.f64.f32 %fd0, %f0;
+    mul.wide.u32 %rd4, %r3, 8;
+    add.u64 %rd5, %rd1, %rd4;
+    st.global.f64 [%rd5], %fd0;
+    ret;
+}}
+
+.visible .entry {RES_U8_TO_F64}(.param .u64 p_src, .param .u64 p_dst, .param .u32 p_n)
+{{
+    .reg .pred %p<3>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    .reg .f64 %fd<2>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_src];
+    ld.param.u64 %rd1, [p_dst];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    cvt.u64.u32 %rd2, %r3;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.u8 %r5, [%rd3];
+    setp.ne.u32 %p1, %r5, 0;
+    selp.f64 %fd0, 0d3FF0000000000000, 0d0000000000000000, %p1;
+    mul.wide.u32 %rd4, %r3, 8;
+    add.u64 %rd5, %rd1, %rd4;
+    st.global.f64 [%rd5], %fd0;
+    ret;
+}}
+"#
+    )
+}
+
+fn launch_res_op(
+    entry: &str,
+    n: usize,
+    params: &mut [*mut c_void],
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let module = module_cache::get_or_build_module(
+        module_path!(),
+        "groupby_resident_ops_v1".to_string(),
+        None,
+        || Ok(resident_groupby_ptx()),
+    )?;
+    let function = module.function(entry)?;
+    let n_u32 = n_rows_to_u32(n)?;
+    cuda_sys::ensure_ctx_current()?;
+    unsafe {
+        cuda_sys::check(cuda_sys::cuLaunchKernel(
+            function.raw(),
+            grid_x_for(n_u32, PRE_BLOCK_SIZE),
+            1,
+            1,
+            PRE_BLOCK_SIZE,
+            1,
+            1,
+            0,
+            stream.raw(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ))?;
+    }
+    Ok(())
+}
+
+fn fill_device_b64<T: Pod>(
+    dst: &mut GpuVec<T>,
+    val_bits: u64,
+    n: usize,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    debug_assert_eq!(std::mem::size_of::<T>(), 8);
+    let mut d = dst.device_ptr();
+    let mut v = val_bits;
+    let mut n32 = n_rows_to_u32(n)?;
+    let mut params: [*mut c_void; 3] = [
+        &mut d as *mut CUdeviceptr as *mut c_void,
+        &mut v as *mut u64 as *mut c_void,
+        &mut n32 as *mut u32 as *mut c_void,
+    ];
+    launch_res_op(RES_FILL_B64, n, &mut params, stream)
+}
+
+fn fill_device_b32<T: Pod>(
+    dst: &mut GpuVec<T>,
+    val_bits: u32,
+    n: usize,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    debug_assert_eq!(std::mem::size_of::<T>(), 4);
+    let mut d = dst.device_ptr();
+    let mut v = val_bits;
+    let mut n32 = n_rows_to_u32(n)?;
+    let mut params: [*mut c_void; 3] = [
+        &mut d as *mut CUdeviceptr as *mut c_void,
+        &mut v as *mut u32 as *mut c_void,
+        &mut n32 as *mut u32 as *mut c_void,
+    ];
+    launch_res_op(RES_FILL_B32, n, &mut params, stream)
+}
+
+fn unary_device_op(
+    entry: &str,
+    src: CUdeviceptr,
+    dst: CUdeviceptr,
+    n: usize,
+    stream: &CudaStream,
+) -> BoltResult<()> {
+    let mut s = src;
+    let mut d = dst;
+    let mut n32 = n_rows_to_u32(n)?;
+    let mut params: [*mut c_void; 3] = [
+        &mut s as *mut CUdeviceptr as *mut c_void,
+        &mut d as *mut CUdeviceptr as *mut c_void,
+        &mut n32 as *mut u32 as *mut c_void,
+    ];
+    launch_res_op(entry, n, &mut params, stream)
+}
+
+/// Fully on-device fast path for `PhysicalPlan::Aggregate { pre: Some(_), group_by: non-empty }`.
+///
+/// Reads `pre` inputs directly from the resident [`GpuTable`], runs the `pre`
+/// projection + optional `WHERE` predicate + prefix-scan + gather on VRAM,
+/// packs 1-column or 2-column 64-bit group keys on VRAM, and runs the GPU
+/// open-addressing hash-table keys + aggregate kernels without bouncing
+/// intermediate columns to host RAM. Returns `Ok(None)` when any precondition
+/// is outside device coverage (nullable inputs/outputs, `Decimal128`/`Utf8`,
+/// wide `>64`-bit keys, `SUM(Int64)`, `VAR_*`/`STDDEV_*`, or sentinel collision).
+pub(crate) fn try_execute_resident(
+    plan: &PhysicalPlan,
+    resident: &GpuTable,
+    synthetic: &dyn Fn(&str) -> Option<(DataType, CUdeviceptr)>,
+) -> BoltResult<Option<RecordBatch>> {
+    if std::env::var("BOLT_DEVICE_PIPELINE").is_ok_and(|v| v == "0") {
+        return Ok(None);
+    }
+    let (pre, aggregate) = match plan {
+        PhysicalPlan::Aggregate { pre, aggregate, .. } => (pre, aggregate),
+        _ => return Ok(None),
+    };
+    let Some(pre_spec) = pre.as_ref() else {
+        return Ok(None);
+    };
+    if aggregate.group_by.is_empty() {
+        return Ok(None);
+    }
+    if pre_spec.input_has_validity.iter().any(|&v| v)
+        || pre_spec.output_has_validity.iter().any(|&v| v)
+    {
+        return Ok(None);
+    }
+    let n_rows = resident.n_rows;
+    if n_rows == 0 || u32::try_from(n_rows).is_err() {
+        return Ok(None);
+    }
+
+    // 1. Resolve resident input pointers (must be null-free device columns).
+    let mut input_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(pre_spec.inputs.len());
+    for io in &pre_spec.inputs {
+        if let Some(col) = resident.columns.iter().find(|c| c.name == io.name) {
+            if col.dtype != io.dtype || col.data.validity_ptr().is_some() {
+                return Ok(None);
+            }
+            match &col.data {
+                GpuColumnData::I32 { .. }
+                | GpuColumnData::I64 { .. }
+                | GpuColumnData::F32 { .. }
+                | GpuColumnData::F64 { .. }
+                | GpuColumnData::Bool(_) => input_ptrs.push(col.data.device_ptr()),
+                _ => return Ok(None),
+            }
+        } else if let Some((dtype, ptr)) = synthetic(&io.name) {
+            if dtype != io.dtype {
+                return Ok(None);
+            }
+            input_ptrs.push(ptr);
+        } else {
+            return Ok(None);
+        }
+    }
+
+    // 2. Validate pre outputs, group keys (1-col <=64b or 2-col 32b+32b), and aggregates.
+    for io in &pre_spec.outputs {
+        match io.dtype {
+            DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Bool
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => {}
+            _ => return Ok(None),
+        }
+    }
+    let Ok(name_to_pre_ord) = build_pre_output_index(pre_spec) else {
+        return Ok(None);
+    };
+
+    let n_keys = aggregate.group_by.len();
+    if n_keys > 2 || aggregate.output_schema.fields.len() != n_keys + aggregate.aggregates.len() {
+        return Ok(None);
+    }
+    let mut key_pre_ords: Vec<usize> = Vec::with_capacity(n_keys);
+    let mut key_components: Vec<KeyComponent> = Vec::with_capacity(n_keys);
+    let mut total_key_bits: u32 = 0;
+    for (pos, &key_ord) in aggregate.group_by.iter().enumerate() {
+        let Some(key_io) = aggregate.inputs.get(key_ord) else {
+            return Ok(None);
+        };
+        let Some(&pre_ord) = name_to_pre_ord.get(&key_io.name) else {
+            return Ok(None);
+        };
+        if pre_spec.outputs[pre_ord].dtype != key_io.dtype {
+            return Ok(None);
+        }
+        let bits = match key_io.dtype {
+            DataType::Int32 | DataType::Float32 | DataType::Bool | DataType::Date32 => 32u32,
+            DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => 64u32,
+            _ => return Ok(None),
+        };
+        total_key_bits = total_key_bits.saturating_add(bits);
+        key_pre_ords.push(pre_ord);
+        key_components.push(KeyComponent {
+            name: key_io.name.clone(),
+            original_dtype: key_io.dtype,
+            bit_offset: if n_keys == 2 && pos == 0 { 32 } else { 0 },
+        });
+    }
+    if total_key_bits > 64 {
+        return Ok(None);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResAgg {
+        CountRow,
+        Reduce {
+            pre_ord: usize,
+            op: ReduceOp,
+            in_dtype: DataType,
+        },
+        Avg {
+            pre_ord: usize,
+            in_dtype: DataType,
+        },
+    }
+
+    let mut needed = vec![false; pre_spec.outputs.len()];
+    for &ko in &key_pre_ords {
+        needed[ko] = true;
+    }
+    let mut res_aggs: Vec<ResAgg> = Vec::with_capacity(aggregate.aggregates.len());
+    for agg in &aggregate.aggregates {
+        match agg {
+            AggregateExpr::Count(e) => {
+                if matches!(e, Expr::Literal(l) if !matches!(l, Literal::Null)) {
+                    res_aggs.push(ResAgg::CountRow);
+                } else if let Some(name) = expr_agg::try_bare_column(e) {
+                    if !name_to_pre_ord.contains_key(name) {
+                        return Ok(None);
+                    }
+                    // Pre-stage inputs & outputs are verified null-free above.
+                    res_aggs.push(ResAgg::CountRow);
+                } else {
+                    return Ok(None);
+                }
+            }
+            AggregateExpr::Sum(e) | AggregateExpr::Min(e) | AggregateExpr::Max(e) => {
+                let Some(name) = expr_agg::try_bare_column(e) else {
+                    return Ok(None);
+                };
+                let Some(&pre_ord) = name_to_pre_ord.get(name) else {
+                    return Ok(None);
+                };
+                let in_dtype = pre_spec.outputs[pre_ord].dtype;
+                let op = ReduceOp::from_agg(agg)?;
+                match (op, in_dtype) {
+                    // SUM(Int64) delegates to host-checked overflow path.
+                    (ReduceOp::Sum, DataType::Int64) => return Ok(None),
+                    (ReduceOp::Sum, DataType::Int32 | DataType::Float32 | DataType::Float64) => {}
+                    (
+                        ReduceOp::Min | ReduceOp::Max,
+                        DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Date32
+                        | DataType::Timestamp(_, _),
+                    ) => {}
+                    _ => return Ok(None),
+                }
+                needed[pre_ord] = true;
+                res_aggs.push(ResAgg::Reduce {
+                    pre_ord,
+                    op,
+                    in_dtype,
+                });
+            }
+            AggregateExpr::Avg(e) => {
+                let Some(name) = expr_agg::try_bare_column(e) else {
+                    return Ok(None);
+                };
+                let Some(&pre_ord) = name_to_pre_ord.get(name) else {
+                    return Ok(None);
+                };
+                let in_dtype = pre_spec.outputs[pre_ord].dtype;
+                match in_dtype {
+                    DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Bool => {}
+                    _ => return Ok(None),
+                }
+                needed[pre_ord] = true;
+                res_aggs.push(ResAgg::Avg { pre_ord, in_dtype });
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    // 3. Run pre kernel on device.
+    let stream = CudaStream::null_or_default();
+    let mut output_cols: Vec<PreCol> = Vec::with_capacity(pre_spec.outputs.len());
+    for io in &pre_spec.outputs {
+        output_cols.push(PreCol::alloc_zeros(io.dtype, n_rows, false)?);
+    }
+    if !pre_spec.outputs.is_empty() {
+        let pre_spec_for_ptx = KernelSpec {
+            input_has_validity: vec![false; pre_spec.inputs.len()],
+            output_has_validity: vec![false; pre_spec.outputs.len()],
+            ..pre_spec.clone()
+        };
+        let module = module_cache::get_or_build_module(
+            module_path!(),
+            format!("pre_kernel:{}:{:?}", PRE_KERNEL_ENTRY, pre_spec_for_ptx),
+            None,
+            || compile_ptx(&pre_spec_for_ptx, PRE_KERNEL_ENTRY),
+        )?;
+        let function = module.function(PRE_KERNEL_ENTRY)?;
+        let mut device_ptrs: Vec<CUdeviceptr> =
+            Vec::with_capacity(input_ptrs.len() + output_cols.len());
+        device_ptrs.extend_from_slice(&input_ptrs);
+        for c in &output_cols {
+            device_ptrs.push(c.device_ptr());
+        }
+        let mut n_rows_u32 = n_rows_to_u32(n_rows)?;
+        let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(device_ptrs.len() + 1);
+        for p in device_ptrs.iter_mut() {
+            kernel_params.push(p as *mut CUdeviceptr as *mut c_void);
+        }
+        kernel_params.push(&mut n_rows_u32 as *mut u32 as *mut c_void);
+        let grid_x = grid_x_for(n_rows_u32, PRE_BLOCK_SIZE);
+        unsafe {
+            cuda_sys::check(cuda_sys::cuLaunchKernel(
+                function.raw(),
+                grid_x,
+                1,
+                1,
+                PRE_BLOCK_SIZE,
+                1,
+                1,
+                0,
+                stream.raw(),
+                kernel_params.as_mut_ptr(),
+                ptr::null_mut(),
+            ))?;
+        }
+        drop(kernel_params);
+        drop(device_ptrs);
+    }
+
+    // 4. Optional WHERE predicate + device prefix-scan + gather of referenced outputs.
+    let scan: Option<(GpuVec<u8>, ScanResult)> = if pre_spec.predicate.is_some() {
+        let pred_spec = KernelSpec {
+            input_has_validity: vec![false; pre_spec.inputs.len()],
+            ..pre_spec.clone()
+        };
+        let pred_module = module_cache::get_or_build_module(
+            module_path!(),
+            format!("predicate_kernel:{}:{:?}", PRE_PREDICATE_ENTRY, pred_spec),
+            None,
+            || crate::jit::scan_kernel::compile_predicate_kernel(&pred_spec, PRE_PREDICATE_ENTRY),
+        )?;
+        let pred_function = pred_module.function(PRE_PREDICATE_ENTRY)?;
+        let mask = crate::exec::compact::alloc_mask_buffer(n_rows)?;
+        let validity_ptrs: Vec<CUdeviceptr> = Vec::new();
+        crate::exec::compact::launch_predicate_kernel(
+            pred_function,
+            &input_ptrs,
+            mask.device_ptr(),
+            &validity_ptrs,
+            n_rows_to_u32(n_rows)?,
+            &stream,
+        )?;
+        let sr = prefix_scan_mask(mask.device_ptr(), n_rows, &stream)?;
+        Some((mask, sr))
+    } else {
+        None
+    };
+
+    let n_surv = scan.as_ref().map_or(n_rows, |(_, sr)| sr.total_count);
+    if n_surv == 0 {
+        let arrow_schema =
+            crate::exec::schema_convert::plan_schema_to_arrow_schema(&aggregate.output_schema)?;
+        let empty_cols: Vec<ArrayRef> = arrow_schema
+            .fields()
+            .iter()
+            .map(|f| arrow_array::new_empty_array(f.data_type()))
+            .collect();
+        crate::metrics::metrics().inc(crate::metrics::Counter::DevicePipelines);
+        return Ok(Some(
+            RecordBatch::try_new(arrow_schema, empty_cols).map_err(|e| {
+                BoltError::Other(format!(
+                    "failed to build empty resident GROUP BY batch: {e}"
+                ))
+            })?,
+        ));
+    }
+
+    enum ResidentCol {
+        I32(GpuVec<i32>),
+        I64(GpuVec<i64>),
+        F32(GpuVec<f32>),
+        F64(GpuVec<f64>),
+        Bool(GpuVec<u8>),
+    }
+    impl ResidentCol {
+        fn ptr(&self) -> CUdeviceptr {
+            match self {
+                ResidentCol::I32(v) => v.device_ptr(),
+                ResidentCol::I64(v) => v.device_ptr(),
+                ResidentCol::F32(v) => v.device_ptr(),
+                ResidentCol::F64(v) => v.device_ptr(),
+                ResidentCol::Bool(v) => v.device_ptr(),
+            }
+        }
+    }
+
+    let mut cols: Vec<Option<ResidentCol>> = Vec::with_capacity(output_cols.len());
+    match &scan {
+        Some((_mask, sr)) => {
+            for (ord, col) in output_cols.iter().enumerate() {
+                if !needed[ord] {
+                    cols.push(None);
+                    continue;
+                }
+                let g = gather_one(
+                    col.device_ptr(),
+                    n_rows,
+                    sr,
+                    pre_spec.outputs[ord].dtype,
+                    &stream,
+                )?;
+                let rc = match g {
+                    GatheredCol::I32(v) | GatheredCol::Date32(v) => ResidentCol::I32(v),
+                    GatheredCol::I64(v) | GatheredCol::Timestamp { values: v, .. } => {
+                        ResidentCol::I64(v)
+                    }
+                    GatheredCol::F32(v) => ResidentCol::F32(v),
+                    GatheredCol::F64(v) => ResidentCol::F64(v),
+                    GatheredCol::Bool(v) => ResidentCol::Bool(v),
+                    _ => return Ok(None),
+                };
+                cols.push(Some(rc));
+            }
+            drop(output_cols);
+        }
+        None => {
+            for (ord, col) in output_cols.into_iter().enumerate() {
+                if !needed[ord] {
+                    cols.push(None);
+                    continue;
+                }
+                let rc = match col.values {
+                    PreColValues::I32(v) | PreColValues::Date32(v) => ResidentCol::I32(v),
+                    PreColValues::I64(v) | PreColValues::Timestamp { values: v, .. } => {
+                        ResidentCol::I64(v)
+                    }
+                    PreColValues::F32(v) => ResidentCol::F32(v),
+                    PreColValues::F64(v) => ResidentCol::F64(v),
+                    PreColValues::Bool(v) => ResidentCol::Bool(v),
+                    PreColValues::Decimal128 { .. } => return Ok(None),
+                };
+                cols.push(Some(rc));
+            }
+        }
+    }
+    drop(scan);
+
+    // 5. Pack group-by key(s) into `key_col_gpu: GpuVec<i64>` on VRAM + check i64::MIN sentinel.
+    let sentinel_flag = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+    let encode_stream = |pre_ord: usize, dst: &GpuVec<i64>| -> BoltResult<()> {
+        let src_ptr = cols[pre_ord].as_ref().expect("needed").ptr();
+        match pre_spec.outputs[pre_ord].dtype {
+            DataType::Int32 | DataType::Date32 => {
+                unary_device_op(RES_BITS_B32, src_ptr, dst.device_ptr(), n_surv, &stream)
+            }
+            DataType::Bool => {
+                unary_device_op(RES_BITS_BOOL, src_ptr, dst.device_ptr(), n_surv, &stream)
+            }
+            DataType::Float32 => {
+                unary_device_op(RES_BITS_F32, src_ptr, dst.device_ptr(), n_surv, &stream)
+            }
+            DataType::Float64 => {
+                unary_device_op(RES_BITS_F64, src_ptr, dst.device_ptr(), n_surv, &stream)
+            }
+            DataType::Int64 | DataType::Timestamp(_, _) => {
+                let mut s = src_ptr;
+                let mut d = dst.device_ptr();
+                let mut f = sentinel_flag.device_ptr();
+                let mut n32 = n_rows_to_u32(n_surv)?;
+                let mut params: [*mut c_void; 4] = [
+                    &mut s as *mut CUdeviceptr as *mut c_void,
+                    &mut d as *mut CUdeviceptr as *mut c_void,
+                    &mut f as *mut CUdeviceptr as *mut c_void,
+                    &mut n32 as *mut u32 as *mut c_void,
+                ];
+                launch_res_op(RES_BITS_B64, n_surv, &mut params, &stream)
+            }
+            _ => unreachable!("gated above"),
+        }
+    };
+
+    let key_col_gpu = GpuVec::<i64>::zeros_async(n_surv, stream.raw())?;
+    if n_keys == 1 {
+        encode_stream(key_pre_ords[0], &key_col_gpu)?;
+    } else {
+        let hi_bits = GpuVec::<i64>::zeros_async(n_surv, stream.raw())?;
+        let lo_bits = GpuVec::<i64>::zeros_async(n_surv, stream.raw())?;
+        encode_stream(key_pre_ords[0], &hi_bits)?;
+        encode_stream(key_pre_ords[1], &lo_bits)?;
+        let mut h = hi_bits.device_ptr();
+        let mut l = lo_bits.device_ptr();
+        let mut d = key_col_gpu.device_ptr();
+        let mut f = sentinel_flag.device_ptr();
+        let mut n32 = n_rows_to_u32(n_surv)?;
+        let mut params: [*mut c_void; 5] = [
+            &mut h as *mut CUdeviceptr as *mut c_void,
+            &mut l as *mut CUdeviceptr as *mut c_void,
+            &mut d as *mut CUdeviceptr as *mut c_void,
+            &mut f as *mut CUdeviceptr as *mut c_void,
+            &mut n32 as *mut u32 as *mut c_void,
+        ];
+        launch_res_op(RES_PACK2, n_surv, &mut params, &stream)?;
+    }
+    stream.synchronize()?;
+    if sentinel_flag.to_vec()?.first().copied().unwrap_or(0) != 0 {
+        return Ok(None);
+    }
+
+    // 6. Adaptive L2-friendly hash-table sizing + keys kernel launch.
+    let max_k = next_pow2(n_surv.saturating_mul(2).saturating_add(16)).clamp(64, 1 << 24);
+    let mut k = if max_k <= 65_536 { max_k } else { 65_536 };
+    let (keys_table, k_u32, overflow_counter) = loop {
+        let Ok(k_u32) = u32::try_from(k) else {
+            return Ok(None);
+        };
+        let mut kt = GpuVec::<i64>::zeros_async(k, stream.raw())?;
+        fill_device_b64(&mut kt, I64_EMPTY_SENTINEL as u64, k, &stream)?;
+        let ov = GpuVec::<u32>::zeros_async(1, stream.raw())?;
+        launch_keys_kernel(
+            &key_col_gpu,
+            &mut kt,
+            n_surv,
+            k_u32,
+            &stream,
+            ov.device_ptr(),
+        )?;
+        let ov_count = ov.to_vec()?.first().copied().unwrap_or(0);
+        if ov_count == 0 {
+            break (kt, k_u32, ov);
+        }
+        if k >= max_k {
+            return Ok(None);
+        }
+        k = (k.saturating_mul(8)).min(max_k);
+    };
+    let overflow_ptr = overflow_counter.device_ptr();
+
+    // 7. Run each aggregate on VRAM (sharing one `ones_gpu` across COUNT / AVG).
+    enum ResAcc {
+        I32(Vec<i32>),
+        I64(Vec<i64>),
+        F32(Vec<f32>),
+        F64(Vec<f64>),
+        Avg { sum: Vec<f64>, count: Vec<i64> },
+    }
+
+    let mut ones_gpu: Option<GpuVec<i64>> = None;
+    let mut count_acc_cached: Option<Vec<i64>> = None;
+    let ensure_count_acc = |ones_slot: &mut Option<GpuVec<i64>>,
+                            cached: &mut Option<Vec<i64>>|
+     -> BoltResult<Vec<i64>> {
+        if let Some(c) = cached {
+            return Ok(c.clone());
+        }
+        if ones_slot.is_none() {
+            let mut ones = GpuVec::<i64>::zeros_async(n_surv, stream.raw())?;
+            fill_device_b64(&mut ones, 1u64, n_surv, &stream)?;
+            *ones_slot = Some(ones);
+        }
+        let ones_ref = ones_slot.as_ref().expect("populated");
+        let mut acc = GpuVec::<i64>::zeros_async(k, stream.raw())?;
+        launch_agg_kernel::<i64>(
+            ReduceOp::Sum,
+            DataType::Int64,
+            &key_col_gpu,
+            &keys_table,
+            ones_ref,
+            &mut acc,
+            n_surv,
+            k_u32,
+            &stream,
+            None,
+            overflow_ptr,
+        )?;
+        let dl = download_pinned_i64(&acc, &stream)?;
+        *cached = Some(dl.clone());
+        Ok(dl)
+    };
+
+    let mut acc_results: Vec<ResAcc> = Vec::with_capacity(res_aggs.len());
+    for ra in &res_aggs {
+        match *ra {
+            ResAgg::CountRow => {
+                let cnt = ensure_count_acc(&mut ones_gpu, &mut count_acc_cached)?;
+                acc_results.push(ResAcc::I64(cnt));
+            }
+            ResAgg::Reduce {
+                pre_ord,
+                op,
+                in_dtype,
+            } => {
+                let col_ref = cols[pre_ord].as_ref().expect("needed");
+                match (op, in_dtype, col_ref) {
+                    (ReduceOp::Sum, DataType::Int32, ResidentCol::I32(src)) => {
+                        let widened = GpuVec::<i64>::zeros_async(n_surv, stream.raw())?;
+                        unary_device_op(
+                            RES_I32_TO_I64,
+                            src.device_ptr(),
+                            widened.device_ptr(),
+                            n_surv,
+                            &stream,
+                        )?;
+                        let mut acc = GpuVec::<i64>::zeros_async(k, stream.raw())?;
+                        launch_agg_kernel::<i64>(
+                            op,
+                            DataType::Int64,
+                            &key_col_gpu,
+                            &keys_table,
+                            &widened,
+                            &mut acc,
+                            n_surv,
+                            k_u32,
+                            &stream,
+                            None,
+                            overflow_ptr,
+                        )?;
+                        acc_results.push(ResAcc::I64(download_pinned_i64(&acc, &stream)?));
+                    }
+                    (_, DataType::Int32 | DataType::Date32, ResidentCol::I32(src)) => {
+                        let mut acc = GpuVec::<i32>::zeros_async(k, stream.raw())?;
+                        fill_device_b32(&mut acc, identity_i32(op) as u32, k, &stream)?;
+                        launch_agg_kernel::<i32>(
+                            op,
+                            DataType::Int32,
+                            &key_col_gpu,
+                            &keys_table,
+                            src,
+                            &mut acc,
+                            n_surv,
+                            k_u32,
+                            &stream,
+                            None,
+                            overflow_ptr,
+                        )?;
+                        acc_results.push(ResAcc::I32(download_pinned_i32(&acc, &stream)?));
+                    }
+                    (_, DataType::Int64 | DataType::Timestamp(_, _), ResidentCol::I64(src)) => {
+                        let mut acc = GpuVec::<i64>::zeros_async(k, stream.raw())?;
+                        fill_device_b64(&mut acc, identity_i64(op) as u64, k, &stream)?;
+                        launch_agg_kernel::<i64>(
+                            op,
+                            DataType::Int64,
+                            &key_col_gpu,
+                            &keys_table,
+                            src,
+                            &mut acc,
+                            n_surv,
+                            k_u32,
+                            &stream,
+                            None,
+                            overflow_ptr,
+                        )?;
+                        acc_results.push(ResAcc::I64(download_pinned_i64(&acc, &stream)?));
+                    }
+                    (ReduceOp::Sum, DataType::Float32, ResidentCol::F32(src)) => {
+                        let widened = GpuVec::<f64>::zeros_async(n_surv, stream.raw())?;
+                        unary_device_op(
+                            RES_F32_TO_F64,
+                            src.device_ptr(),
+                            widened.device_ptr(),
+                            n_surv,
+                            &stream,
+                        )?;
+                        let mut acc = GpuVec::<f64>::zeros_async(k, stream.raw())?;
+                        launch_agg_kernel::<f64>(
+                            op,
+                            DataType::Float64,
+                            &key_col_gpu,
+                            &keys_table,
+                            &widened,
+                            &mut acc,
+                            n_surv,
+                            k_u32,
+                            &stream,
+                            None,
+                            overflow_ptr,
+                        )?;
+                        acc_results.push(ResAcc::F64(download_pinned_f64(&acc, &stream)?));
+                    }
+                    (_, DataType::Float32, ResidentCol::F32(src)) => {
+                        let mut acc = GpuVec::<f32>::zeros_async(k, stream.raw())?;
+                        fill_device_b32(&mut acc, identity_f32(op).to_bits(), k, &stream)?;
+                        launch_agg_kernel::<f32>(
+                            op,
+                            DataType::Float32,
+                            &key_col_gpu,
+                            &keys_table,
+                            src,
+                            &mut acc,
+                            n_surv,
+                            k_u32,
+                            &stream,
+                            None,
+                            overflow_ptr,
+                        )?;
+                        acc_results.push(ResAcc::F32(download_pinned_f32(&acc, &stream)?));
+                    }
+                    (_, DataType::Float64, ResidentCol::F64(src)) => {
+                        let mut acc = GpuVec::<f64>::zeros_async(k, stream.raw())?;
+                        fill_device_b64(&mut acc, identity_f64(op).to_bits(), k, &stream)?;
+                        launch_agg_kernel::<f64>(
+                            op,
+                            DataType::Float64,
+                            &key_col_gpu,
+                            &keys_table,
+                            src,
+                            &mut acc,
+                            n_surv,
+                            k_u32,
+                            &stream,
+                            None,
+                            overflow_ptr,
+                        )?;
+                        acc_results.push(ResAcc::F64(download_pinned_f64(&acc, &stream)?));
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            ResAgg::Avg { pre_ord, in_dtype } => {
+                let col_ref = cols[pre_ord].as_ref().expect("needed");
+                let casted: Option<GpuVec<f64>> = match (in_dtype, col_ref) {
+                    (DataType::Float64, ResidentCol::F64(_)) => None,
+                    (DataType::Int32, ResidentCol::I32(src)) => {
+                        let out = GpuVec::<f64>::zeros_async(n_surv, stream.raw())?;
+                        unary_device_op(
+                            RES_I32_TO_F64,
+                            src.device_ptr(),
+                            out.device_ptr(),
+                            n_surv,
+                            &stream,
+                        )?;
+                        Some(out)
+                    }
+                    (DataType::Int64, ResidentCol::I64(src)) => {
+                        let out = GpuVec::<f64>::zeros_async(n_surv, stream.raw())?;
+                        unary_device_op(
+                            RES_I64_TO_F64,
+                            src.device_ptr(),
+                            out.device_ptr(),
+                            n_surv,
+                            &stream,
+                        )?;
+                        Some(out)
+                    }
+                    (DataType::Float32, ResidentCol::F32(src)) => {
+                        let out = GpuVec::<f64>::zeros_async(n_surv, stream.raw())?;
+                        unary_device_op(
+                            RES_F32_TO_F64,
+                            src.device_ptr(),
+                            out.device_ptr(),
+                            n_surv,
+                            &stream,
+                        )?;
+                        Some(out)
+                    }
+                    (DataType::Bool, ResidentCol::Bool(src)) => {
+                        let out = GpuVec::<f64>::zeros_async(n_surv, stream.raw())?;
+                        unary_device_op(
+                            RES_U8_TO_F64,
+                            src.device_ptr(),
+                            out.device_ptr(),
+                            n_surv,
+                            &stream,
+                        )?;
+                        Some(out)
+                    }
+                    _ => return Ok(None),
+                };
+                let f64_ref: &GpuVec<f64> = match (&casted, col_ref) {
+                    (Some(c), _) => c,
+                    (None, ResidentCol::F64(src)) => src,
+                    _ => unreachable!(),
+                };
+                let mut sum_acc = GpuVec::<f64>::zeros_async(k, stream.raw())?;
+                launch_agg_kernel::<f64>(
+                    ReduceOp::Sum,
+                    DataType::Float64,
+                    &key_col_gpu,
+                    &keys_table,
+                    f64_ref,
+                    &mut sum_acc,
+                    n_surv,
+                    k_u32,
+                    &stream,
+                    None,
+                    overflow_ptr,
+                )?;
+                let sum = download_pinned_f64(&sum_acc, &stream)?;
+                let count = ensure_count_acc(&mut ones_gpu, &mut count_acc_cached)?;
+                acc_results.push(ResAcc::Avg { sum, count });
+            }
+        }
+    }
+
+    let host_keys_table = download_pinned_i64(&keys_table, &stream)?;
+    if overflow_counter.to_vec()?.first().copied().unwrap_or(0) != 0 {
+        return Ok(None);
+    }
+
+    let mut groups: Vec<(i64, usize)> = host_keys_table
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, &kv)| (kv != I64_EMPTY_SENTINEL).then_some((kv, slot)))
+        .collect();
+    groups.sort_unstable_by_key(|(kv, _)| *kv);
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(n_keys + res_aggs.len());
+    arrays.extend(build_key_arrays_from_keys(
+        groups.iter().map(|&(kv, _)| kv),
+        &key_components,
+        None,
+    )?);
+
+    for (i, acc) in acc_results.iter().enumerate() {
+        let out_dtype = aggregate.output_schema.fields[n_keys + i].dtype;
+        let arr = match acc {
+            ResAcc::I32(host) => pack_array(
+                out_dtype,
+                Scalars::I32(groups.iter().map(|&(_, s)| host[s]).collect()),
+            )?,
+            ResAcc::I64(host) => pack_array(
+                out_dtype,
+                Scalars::I64(groups.iter().map(|&(_, s)| host[s]).collect()),
+            )?,
+            ResAcc::F32(host) => pack_array(
+                out_dtype,
+                Scalars::F32(groups.iter().map(|&(_, s)| host[s]).collect()),
+            )?,
+            ResAcc::F64(host) => pack_array(
+                out_dtype,
+                Scalars::F64(groups.iter().map(|&(_, s)| host[s]).collect()),
+            )?,
+            ResAcc::Avg { sum, count } => {
+                let out: Vec<Option<f64>> = groups
+                    .iter()
+                    .map(|&(_, s)| {
+                        let c = count[s];
+                        (c != 0).then(|| sum[s] / (c as f64))
+                    })
+                    .collect();
+                Arc::new(Float64Array::from(out)) as ArrayRef
+            }
+        };
+        arrays.push(arr);
+    }
+
+    let arrow_schema = build_output_arrow_schema(&aggregate.output_schema, &arrays)?;
+    crate::metrics::metrics().inc(crate::metrics::Counter::DevicePipelines);
+    Ok(Some(RecordBatch::try_new(arrow_schema, arrays).map_err(
+        |e| {
+            BoltError::Other(format!(
+                "failed to build resident GROUP BY RecordBatch: {e}"
+            ))
+        },
+    )?))
 }
 
 /// Run `pre_spec` on `table_batch` (projection + optional predicate mask),
@@ -195,18 +1458,10 @@ pub(crate) fn materialize_pre_stage_batch(
 
         if let AggregateExpr::Count(Expr::Literal(lit)) = agg {
             if !matches!(lit, Literal::Null) {
-                let synth_name = format!("__bolt_pre_count_{i}");
-                extra_cols.push((
-                    ColumnIO {
-                        name: synth_name.clone(),
-                        dtype: DataType::Int64,
-                    },
-                    HostCol {
-                        values: HostColValues::I64(vec![1i64; n_compacted]),
-                        validity: None,
-                    },
-                ));
-                rewritten_aggs.push(AggregateExpr::Count(Expr::Column(synth_name)));
+                // `aggregate`, `groupby`, `groupby_valid`, `groupby_wide`, and
+                // the Tier-1/Tier-2 COUNT(*) fast paths all execute
+                // `Count(Literal)` directly without a backing column.
+                rewritten_aggs.push(agg.clone());
                 continue;
             }
         }

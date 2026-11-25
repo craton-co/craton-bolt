@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
@@ -750,12 +750,16 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
     assert_eq!(sn.values(), &[2, 1, 2]);
 
     // 2. ROLLUP over multi-column GROUP BY with WHERE + computed SUM.
+    //    Surviving rows with `k2 IS NOT NULL` have keys (1, 10), (1, 20), and (NULL, 10):
+    //      level (k1, k2): (1, 10), (1, 20), (NULL, 10)  -> 3 rows
+    //      level (k1):     (1, NULL), (NULL, NULL)       -> 2 rows
+    //      level ():       (NULL, NULL)                  -> 1 row
+    //    Total SQL-standard ROLLUP rows = 6.
     let rollup = engine
         .sql("SELECT k1, k2, SUM(v * 2.0) FROM nulls WHERE keep = 1 AND k2 IS NOT NULL GROUP BY ROLLUP(k1, k2)")
         .expect("ROLLUP with pre")
         .into_record_batch();
-    // Sets: (1, 10), (1, 20), (1, NULL), (NULL, NULL) -> 4 rows.
-    assert_eq!(rollup.num_rows(), 4);
+    assert_eq!(rollup.num_rows(), 6);
 
     // 3. SUM(Int64) overflow with pre must raise BoltError::Type across BOTH
     //    packed 2-key (`groupby.rs`) AND wide 2-key (`groupby_wide.rs`).
@@ -798,4 +802,145 @@ fn e2e_null_keys_all_null_group_rollup_and_sum_overflow_with_pre() {
             Err(other) => panic!("expected BoltError::Type for `{sql}`, got {other:?}"),
         }
     }
+}
+
+#[test]
+#[ignore = "requires CUDA runtime"]
+fn e2e_resident_groupby_with_pre_matches_host_and_increments_device_pipelines() {
+    use craton_bolt::metrics::{metrics, Counter};
+
+    let mut engine = craton_bolt::Engine::new().expect("Engine::new failed");
+
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("region_id", ArrowDataType::Int32, false),
+            ArrowField::new("category_id", ArrowDataType::Int32, false),
+            ArrowField::new("order_day", ArrowDataType::Int32, false),
+            ArrowField::new("qty", ArrowDataType::Int32, false),
+            ArrowField::new("price", ArrowDataType::Float64, false),
+            ArrowField::new("weight_f32", ArrowDataType::Float32, false),
+            ArrowField::new("flag", ArrowDataType::Boolean, false),
+            ArrowField::new("f_key", ArrowDataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2, 2])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![10, 10, 20, 10, 10, 20])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![200, 150, 250, 300, 310, 100])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2, 99, 3, 4, 5, 99])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![10.0, 99.0, 20.0, 5.0, 15.0, 88.0])) as ArrayRef,
+            Arc::new(Float32Array::from(vec![1.5, 9.0, 2.5, 3.0, 4.0, 8.0])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![
+                true, true, false, true, false, true,
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                0.0,
+                -0.0,
+                -0.0,
+                f64::from_bits(0x7ff8_0000_0000_0001),
+                f64::from_bits(0x7ff8_0000_0000_0099),
+                1.0,
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    engine.register_table("res_sales", batch).unwrap();
+
+    // 1) 2-col GROUP BY + WHERE + fused arithmetic pre + COUNT(*), SUM(Int32->Int64),
+    //    SUM(Float32), AVG, MIN, MAX — must stay 100% VRAM-resident and increment DevicePipelines.
+    let before = metrics().counter(Counter::DevicePipelines).get();
+    let b = engine
+        .sql(
+            "SELECT region_id, category_id, \
+                    SUM(qty * price) AS rev, \
+                    SUM(qty) AS total_qty, \
+                    SUM(weight_f32) AS total_w, \
+                    AVG(price) AS avg_price, \
+                    MIN(qty) AS min_q, \
+                    MAX(qty) AS max_q, \
+                    COUNT(*) AS cnt \
+             FROM res_sales \
+             WHERE order_day >= 180 \
+             GROUP BY region_id, category_id \
+             ORDER BY region_id, category_id",
+        )
+        .unwrap()
+        .into_record_batch();
+    let after = metrics().counter(Counter::DevicePipelines).get();
+    assert!(
+        after > before,
+        "expected VRAM-resident groupby_with_pre to increment Counter::DevicePipelines ({before} -> {after})"
+    );
+    // Surviving rows (order_day >= 180):
+    //   row 0: (1, 10), qty=2, price=10, w=1.5 -> rev=20, qty=2, w=1.5, avg=10, min=2, max=2, cnt=1
+    //   row 2: (1, 20), qty=3, price=20, w=2.5 -> rev=60, qty=3, w=2.5, avg=20, min=3, max=3, cnt=1
+    //   rows 3,4: (2, 10), qty=4,5, price=5,15, w=3,4 -> rev=20+75=95, qty=9, w=7.0, avg=10, min=4, max=5, cnt=2
+    assert_eq!(b.num_rows(), 3);
+    let r = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let c = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    let rev = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let tq = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+    let tw = b.column(4).as_any().downcast_ref::<Float32Array>().unwrap();
+    let ap = b.column(5).as_any().downcast_ref::<Float64Array>().unwrap();
+    let min_q = b.column(6).as_any().downcast_ref::<Int32Array>().unwrap();
+    let max_q = b.column(7).as_any().downcast_ref::<Int32Array>().unwrap();
+    let cnt = b.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(r.values().as_ref(), &[1, 1, 2]);
+    assert_eq!(c.values().as_ref(), &[10, 20, 10]);
+    assert_eq!(rev.values().as_ref(), &[20.0, 60.0, 95.0]);
+    assert_eq!(tq.values().as_ref(), &[2, 3, 9]);
+    assert_eq!(tw.values().as_ref(), &[1.5, 2.5, 7.0]);
+    assert_eq!(ap.values().as_ref(), &[10.0, 20.0, 10.0]);
+    assert_eq!(min_q.values().as_ref(), &[2, 3, 4]);
+    assert_eq!(max_q.values().as_ref(), &[2, 3, 5]);
+    assert_eq!(cnt.values().as_ref(), &[1, 1, 2]);
+
+    // 2) 1-col Float64 key with -0.0 / +0.0 and distinct NaN payloads + AVG(Bool) on VRAM:
+    let before2 = metrics().counter(Counter::DevicePipelines).get();
+    let b2 = engine
+        .sql(
+            "SELECT f_key, COUNT(*) AS cnt, AVG(flag) AS flag_rate \
+             FROM res_sales \
+             WHERE order_day >= 180 \
+             GROUP BY f_key",
+        )
+        .unwrap()
+        .into_record_batch();
+    let after2 = metrics().counter(Counter::DevicePipelines).get();
+    assert!(
+        after2 > before2,
+        "expected 1-col Float64 resident groupby_with_pre to increment DevicePipelines"
+    );
+    // Surviving rows: row 0 (+0.0, true), row 2 (-0.0, false) -> merged +0.0 group (cnt=2, avg=0.5);
+    //                 rows 3,4 (two NaN payloads, true & false) -> merged NaN group (cnt=2, avg=0.5).
+    assert_eq!(b2.num_rows(), 2);
+    let fk = b2
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let cnt2 = b2.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let fr = b2
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(fk.value(0).to_bits(), 0.0_f64.to_bits());
+    assert!(fk.value(1).is_nan());
+    assert_eq!(cnt2.values().as_ref(), &[2, 2]);
+    assert_eq!(fr.values().as_ref(), &[0.5, 0.5]);
+
+    // 3) Empty post-WHERE survival on resident fast path returns 0 rows cleanly:
+    let before3 = metrics().counter(Counter::DevicePipelines).get();
+    let b3 = engine
+        .sql(
+            "SELECT region_id, category_id, COUNT(*) AS cnt \
+             FROM res_sales \
+             WHERE order_day > 9999 \
+             GROUP BY region_id, category_id",
+        )
+        .unwrap()
+        .into_record_batch();
+    let after3 = metrics().counter(Counter::DevicePipelines).get();
+    assert!(after3 > before3);
+    assert_eq!(b3.num_rows(), 0);
 }

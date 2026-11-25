@@ -4122,26 +4122,22 @@ fn aggregate_needs_materialized_input(
     if host_only_predicate {
         return Ok(true);
     }
-    // A `Utf8` / `Bool` group key or aggregate argument cannot be a
+    // A `Utf8` / `Extended` group key or aggregate argument cannot be a
     // pre-kernel output; with a predicate (or projection) in the chain a
     // pre-kernel is required, so bind the filtered rows instead and let the
-    // aggregate read the columns directly.
+    // aggregate read the columns directly. (`Bool`, `Date32`, `Timestamp`,
+    // and `Decimal128` are natively supported by `PreCol` / `groupby_with_pre`.)
     let input_schema = input.schema()?;
-    let feeds_utf8 = group_by
-        .iter()
-        .chain(aggregates.iter().map(aggregate_input_expr))
-        .any(|e| matches!(e.dtype(&input_schema), Ok(DataType::Utf8)));
-    let feeds_non_numeric = group_by
+    let feeds_non_pre = group_by
         .iter()
         .chain(aggregates.iter().map(aggregate_input_expr))
         .any(|e| {
             matches!(
                 e.dtype(&input_schema),
-                Ok(DataType::Utf8) | Ok(DataType::Bool)
+                Ok(DataType::Utf8 | DataType::Extended(_))
             )
         });
-    Ok((feeds_non_numeric && resolved.predicate.is_some())
-        || (feeds_utf8 && resolved.projection.is_some()))
+    Ok(feeds_non_pre && (resolved.predicate.is_some() || resolved.projection.is_some()))
 }
 
 /// An aggregate's input plan with its group keys and aggregates.
