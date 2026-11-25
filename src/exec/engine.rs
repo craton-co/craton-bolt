@@ -4284,12 +4284,39 @@ impl Engine {
                 // populates the slot table.
                 let out = match (!aggregate.group_by.is_empty(), pre.is_some()) {
                     (true, true) => {
-                        let inputs = pre.as_ref().map_or(&[][..], |p| p.inputs.as_slice());
-                        let batch = self.materialize_table_for_inputs(
-                            table,
-                            inputs.iter().map(|io| io.name.as_str()),
-                        )?;
-                        crate::exec::groupby_with_pre::execute_groupby_with_pre(phys, &batch)?
+                        let synthetic = |name: &str| {
+                            let original = name.strip_prefix("__idx_")?;
+                            let registry = self.dict_registry.borrow();
+                            let dict = registry.dictionary(table, original)?;
+                            let ptr = match dict {
+                                crate::cuda::dictionary_any::DictionaryColumnAny::I32(d) => {
+                                    d.indices.device_ptr()
+                                }
+                                crate::cuda::dictionary_any::DictionaryColumnAny::I64(d) => {
+                                    d.indices.device_ptr()
+                                }
+                            };
+                            Some((dict.index_dtype(), ptr))
+                        };
+                        let fast = match self.ensure_gpu_table(table) {
+                            Ok(resident) => crate::exec::groupby_with_pre::try_execute_resident(
+                                phys, &resident, &synthetic,
+                            )?,
+                            Err(_) => None,
+                        };
+                        match fast {
+                            Some(b) => b,
+                            None => {
+                                let inputs = pre.as_ref().map_or(&[][..], |p| p.inputs.as_slice());
+                                let batch = self.materialize_table_for_inputs(
+                                    table,
+                                    inputs.iter().map(|io| io.name.as_str()),
+                                )?;
+                                crate::exec::groupby_with_pre::execute_groupby_with_pre(
+                                    phys, &batch,
+                                )?
+                            }
+                        }
                     }
                     (true, false) => {
                         // Performance: try the resident on-device GROUP BY path
