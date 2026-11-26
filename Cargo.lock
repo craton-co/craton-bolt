@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "craton-bolt"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "arrow 53.4.1",
  "arrow-array 53.4.1",

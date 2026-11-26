@@ -64,7 +64,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
 
-    for scale in scales_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for scale in scales_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let pq_path = format!("{data_dir}/sales_{scale}.parquet");
         println!("\n================ BOLT GPU SCALE: {scale} ({pq_path}) ================");
         let t_load = Instant::now();
@@ -74,7 +78,9 @@ fn main() {
 
         let mut engine = Engine::new().expect("CUDA Engine::new");
         let t_reg = Instant::now();
-        engine.register_table("sales", batch).expect("register_table");
+        engine
+            .register_table("sales", batch)
+            .expect("register_table");
         println!("  registered in VRAM in {:.2?}", t_reg.elapsed());
 
         for &(qname, sql) in QUERIES {

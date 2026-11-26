@@ -33,7 +33,7 @@ RUN rustup toolchain install 1.85.0 --profile minimal
 
 # Build the audited tools through Cargo rather than executing a network-fetched
 # shell installer in the CI image.
-RUN cargo install --locked cargo-llvm-cov --version 0.6.16 \
+RUN cargo install --locked cargo-llvm-cov --version 0.9.2 \
  && cargo install --locked cargo-deny --version 0.20.2 \
  && cargo install --locked cargo-public-api --version 0.52.0
 EOF

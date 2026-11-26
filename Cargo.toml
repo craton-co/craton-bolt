@@ -1,12 +1,11 @@
 [package]
 name = "craton-bolt"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 description = "JIT-compiled GPU SQL engine — runtime PTX codegen with Rust-tracked CUDA memory safety"
 license = "AGPL-3.0-only"
 authors      = ["Craton Software Company <opensource@craton.com.ar>"]
 repository   = "https://github.com/craton-co/craton-bolt"
-homepage     = "https://github.com/craton-co/craton-bolt"
 documentation = "https://docs.rs/craton-bolt"
 readme       = "README.md"
 keywords     = ["sql", "gpu", "cuda", "jit", "arrow"]
@@ -261,6 +260,11 @@ path = "examples/profile_groupby.rs"
 [[example]]
 name = "profile_overhead"
 path = "examples/profile_overhead.rs"
+
+[[example]]
+name = "bolt_sales_bench"
+path = "examples/bolt_sales_bench.rs"
+required-features = ["storage"]
 
 [profile.release]
 opt-level = 3
