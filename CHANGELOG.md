@@ -4,6 +4,18 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-27
+
+### Added
+
+- Multi-column `GROUP BY` with pre-aggregation fast path and zero-column `COUNT(*)`.
+
+### Fixed
+
+- Declared required `storage` feature for `examples/bolt_sales_bench.rs` in `Cargo.toml`.
+- Fixed clippy `needless_bool` lint in `src/exec/gpu_sort.rs`.
+- Removed redundant `package.homepage` from `Cargo.toml`.
+
 ## [0.12.1] - 2026-11-26
 
 ### Fixed

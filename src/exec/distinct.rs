@@ -420,9 +420,7 @@ pub fn execute_distinct(input: QueryHandle) -> BoltResult<QueryHandle> {
                 | BoltError::Unsupported(_)
                 | BoltError::Cuda(_)
                 | BoltError::CudaWithCode { .. },
-            ) => {
-                /* unavailable, declined, or driver error -> host fallback */
-            }
+            ) => { /* unavailable, declined, or driver error -> host fallback */ }
             Err(e) => return Err(e),
         }
     }

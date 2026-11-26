@@ -880,10 +880,7 @@ pub(crate) fn radix_dispatch_predicate(
     // from the `SortExpr`.
     let _ = nulls_first;
     // u32 indices payload.
-    if arr.len() > (u32::MAX as usize) {
-        return false;
-    }
-    true
+    arr.len() <= (u32::MAX as usize)
 }
 
 /// **Pure** predicate for a multi-key radix dispatch.

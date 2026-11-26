@@ -39,10 +39,11 @@ exclude = []
 
 [licenses]
 # Apache-2.0 + MIT is the standard Rust-ecosystem permissive set. We add
-# BSD-2-Clause, BSD-3-Clause, ISC, Unicode-DFS-2016 because common transitive
-# deps (e.g., regex's `unicode-ident`) ship under them.
+# AGPL-3.0-only for craton-bolt itself, and BSD-2-Clause, BSD-3-Clause, ISC,
+# Unicode-DFS-2016 because common transitive deps ship under them.
 version = 2
 allow = [
+    "AGPL-3.0-only",
     "Apache-2.0",
     "MIT",
     "BSD-2-Clause",
@@ -136,6 +137,14 @@ ignore = [
     # Affects wasm32 only; Craton Bolt is native CUDA (x86_64/aarch64) and never builds for
     # wasm32. Pinned by `zstd 0.13.3` <- `parquet 53.4.1`; leaves on Arrow major bump.
     "RUSTSEC-2026-0410",
+    # RUSTSEC-2026-0435 — `thrift 0.17.0` unbounded memory allocation in binary protocol.
+    # Reached via `parquet 53.4.1` under the `storage` feature. Parquet reads local/trusted
+    # parquet files, not unauthenticated network Thrift streams. Pinned by `parquet 53.4.1`;
+    # leaves on Arrow/Parquet major bump.
+    "RUSTSEC-2026-0435",
+    # RUSTSEC-2026-0543 — `chrono 0.4.39` is unmaintained.
+    # Reached via `arrow 53.4.1`. Arrow 53 pins chrono 0.4; leaves on Arrow major bump.
+    "RUSTSEC-2026-0543",
 ]
 
 [sources]

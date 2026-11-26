@@ -476,8 +476,8 @@ mod nan_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
-    use std::sync::atomic::Ordering;
     use parking_lot::Mutex;
+    use std::sync::atomic::Ordering;
 
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 

@@ -257,7 +257,7 @@ disabled (the default).
 #### Accepted advisory debt
 
 The advisory gate is blocking on **both** the default and the `--all-features`
-graph. Seven advisories are nonetheless tolerated, listed explicitly in
+graph. Nine advisories are nonetheless tolerated, listed explicitly in
 `deny.toml` rather than suppressed by loosening the policy. All are
 re-checked whenever the owning dependency is bumped, and all leave the
 graph on that bump.
@@ -271,6 +271,8 @@ graph on that bump.
 | `RUSTSEC-2026-0391` | `zstd 0.13.3` | `parquet 53.4.1`, `storage` feature | Reused context stream leak on abandoned streams. Parquet manages isolated stream sessions and does not reuse abandoned context handles across tenant boundaries. Pinned by `parquet 53.4.1` (requiring `zstd 0.13`); leaves on Arrow/Parquet major bump. |
 | `RUSTSEC-2026-0403` | `zstd-safe 7.2.1` | `parquet 53.4.1`, `storage` feature | Uninitialized memory exposed when streaming decompression of a legacy frame fails. Parquet writes and reads standard modern zstd frames, not corrupt v0.4–v0.7 legacy frames. Pinned by `parquet 53.4.1`; leaves on Arrow/Parquet major bump. |
 | `RUSTSEC-2026-0410` | `zstd-sys 2.0.13+zstd.1.5.6` | `parquet 53.4.1`, `storage` feature | Memory corruption in WebAssembly allocator shim on allocation failure. Craton Bolt targets native x86_64/aarch64 with CUDA, never wasm32. Pinned by `zstd 0.13.3` via `parquet 53.4.1`; leaves on Arrow/Parquet major bump. |
+| `RUSTSEC-2026-0435` | `thrift 0.17.0` | `parquet 53.4.1`, `storage` feature | Unbounded memory allocation in Thrift binary protocol `read_bytes`. Parquet reads local/trusted parquet files, not unauthenticated network Thrift streams. Pinned by `parquet 53.4.1`; leaves on Arrow/Parquet major bump. |
+| `RUSTSEC-2026-0543` | `chrono 0.4.39` | `arrow 53.4.1` | Unmaintained notice. Pinned by `arrow 53.4.1`; leaves on Arrow major bump. |
 
 There is no longer a non-blocking advisory lane: the former `rust-cuda`
 build-toolchain tree, which was the reason one existed, has been removed.
